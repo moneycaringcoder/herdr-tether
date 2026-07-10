@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The managed terminal overlay now lists active Tether workloads beneath each host, resumes the selected exact session ID without traversing creation fields, and retains **Create new workload** as a sibling action.
+- Explorer resume and create intents share the existing focused split-right, split-down, and new-tab placement boundary. Closing and closed records are excluded from resumable choices.
+
 ## [0.1.0] - 2026-07-10
 
 ### Added

@@ -10,8 +10,8 @@ Implemented and covered by the current command/test surface:
 
 - durable local and SSH-backed `tmux` create, inspect, attach, and explicit close;
 - configured hosts plus literal aliases read from `~/.ssh/config`;
-- an interactive host → directory → shell/preset → placement picker;
-- Herdr plugin overlays and split-right, split-down, or new-tab placement;
+- an interactive host → workload/create → placement explorer with direct resume of active Tether workloads;
+- Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
 - versioned, private, atomic configuration and session-state persistence;
 - list, resume, close, age-based closed-metadata pruning, and JSON output;
 - Linux and macOS declared by the plugin manifest.
@@ -23,12 +23,13 @@ Important limitations:
 - `session prune` removes only sufficiently old records already marked `closed`; it does not kill workloads or probe/reconnect to hosts.
 - Commands and presets intentionally run through `/bin/sh -lc` on the selected machine. Configure only commands you trust.
 - Remote Herdr is not required. `host check` reports a remote `herdr` binary when present, but v0.1 does not use it for session transport.
+- Herdr 0.7.3 does not expose native non-terminal plugin UI or sidebar extensions. Tether therefore uses the supported manifest-declared terminal overlay.
 
 ### Verification status for this run
 
-The current branch passed 36 automated tests, a locked release build, and a Herdr 0.7.3 development link/action-list/unlink smoke. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4.
+The current branch passes 38 automated tests and a locked release build. Coverage includes the explorer resume intent and its exact `session resume <ID>` command in addition to the v0.1 lifecycle suite. A tmux-hosted interactive smoke selected an active persisted workload in the explorer and invoked `attach-session` for that exact ID.
 
-The resumed workload retained the same PID while its counter advanced after detach. Verification also covered a directory containing spaces, literal shell metacharacters without injection, and exact close/prune isolation with an unrelated `tmux` session left intact. Native Herdr placement interaction and the macOS live smoke remain manual checks; CI covers the macOS Rust gates.
+For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
 ## Prerequisites
 
@@ -92,13 +93,15 @@ herdr-tether setup --yes
 herdr-tether doctor
 ```
 
-Open the interactive picker:
+Open the interactive explorer:
 
 ```sh
 herdr-tether open
 ```
 
-Or create a local session without the picker:
+Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Closed records are not offered as resumable workloads.
+
+Or create a local session without the explorer:
 
 ```sh
 herdr-tether open \

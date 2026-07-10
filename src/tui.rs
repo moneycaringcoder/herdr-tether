@@ -18,8 +18,8 @@ use ratatui::{
 
 use crate::{
     config::Config,
-    model::Placement,
-    state::{SessionRecord, State},
+    model::{Placement, SessionId},
+    state::{SessionRecord, SessionStatus, State},
 };
 
 const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
@@ -47,11 +47,18 @@ impl PickerCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PickerWorkload {
+    pub id: SessionId,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PickerHost {
     pub name: String,
     pub target: Option<String>,
     pub directories: Vec<String>,
     pub commands: Vec<PickerCommand>,
+    pub workloads: Vec<PickerWorkload>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +92,7 @@ impl PickerOptions {
                 target: None,
                 directories,
                 commands: vec![PickerCommand::Shell],
+                workloads: active_workloads(state, "local"),
             });
         }
 
@@ -113,6 +121,7 @@ impl PickerOptions {
                 target: Some(host.target.clone()),
                 directories,
                 commands,
+                workloads: active_workloads(state, &host.name),
             });
         }
 
@@ -142,6 +151,32 @@ fn recent_directories(state: &State, host: &str) -> Vec<String> {
     }
     directories
 }
+fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
+    let mut sessions: Vec<&SessionRecord> = state
+        .sessions
+        .iter()
+        .filter(|session| session.host == host && session.status == SessionStatus::Active)
+        .collect();
+    sessions.sort_by(|left, right| {
+        right
+            .last_used_at
+            .cmp(&left.last_used_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    sessions
+        .into_iter()
+        .map(|session| {
+            let command = session.preset.as_deref().unwrap_or("shell");
+            let id = session.id.to_string();
+            let short_id = &id[id.len().saturating_sub(8)..];
+            PickerWorkload {
+                id: session.id,
+                label: format!("Resume {} · {} · …{}", session.directory, command, short_id),
+            }
+        })
+        .collect()
+}
 
 fn push_unique(values: &mut Vec<String>, candidate: &str) {
     if !candidate.is_empty() && !values.iter().any(|value| value == candidate) {
@@ -158,9 +193,16 @@ pub struct OpenSelection {
     pub placement: Placement,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerSelection {
+    Create(OpenSelection),
+    Resume { id: SessionId, placement: Placement },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PickerStage {
     Host,
+    Resource,
     Directory,
     Command,
     Placement,
@@ -178,7 +220,7 @@ pub enum PickerEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerOutcome {
     Continue,
-    Selected(OpenSelection),
+    Selected(PickerSelection),
     Cancelled,
 }
 
@@ -187,9 +229,11 @@ pub struct PickerState {
     options: PickerOptions,
     stage: PickerStage,
     host_index: usize,
+    resource_index: usize,
     directory_index: usize,
     command_index: usize,
     placement_index: usize,
+    resume_id: Option<SessionId>,
 }
 
 impl PickerState {
@@ -211,9 +255,11 @@ impl PickerState {
             options,
             stage: PickerStage::Host,
             host_index: 0,
+            resource_index: 0,
             directory_index: 0,
             command_index: 0,
             placement_index,
+            resume_id: None,
         })
     }
 
@@ -244,19 +290,37 @@ impl PickerState {
     fn back(&mut self) -> PickerOutcome {
         self.stage = match self.stage {
             PickerStage::Host => return PickerOutcome::Cancelled,
-            PickerStage::Directory => PickerStage::Host,
+            PickerStage::Resource => PickerStage::Host,
+            PickerStage::Directory => PickerStage::Resource,
             PickerStage::Command => PickerStage::Directory,
+            PickerStage::Placement if self.resume_id.is_some() => PickerStage::Resource,
             PickerStage::Placement => PickerStage::Command,
         };
+        if self.stage != PickerStage::Placement {
+            self.resume_id = None;
+        }
         PickerOutcome::Continue
     }
 
     fn confirm(&mut self) -> PickerOutcome {
         match self.stage {
             PickerStage::Host => {
+                self.resource_index = 0;
                 self.directory_index = 0;
                 self.command_index = 0;
-                self.stage = PickerStage::Directory;
+                self.resume_id = None;
+                self.stage = PickerStage::Resource;
+                PickerOutcome::Continue
+            }
+            PickerStage::Resource => {
+                let host = &self.options.hosts[self.host_index];
+                if let Some(workload) = host.workloads.get(self.resource_index) {
+                    self.resume_id = Some(workload.id);
+                    self.stage = PickerStage::Placement;
+                } else {
+                    self.resume_id = None;
+                    self.stage = PickerStage::Directory;
+                }
                 PickerOutcome::Continue
             }
             PickerStage::Directory => {
@@ -271,21 +335,27 @@ impl PickerState {
         }
     }
 
-    fn selection(&self) -> OpenSelection {
+    fn selection(&self) -> PickerSelection {
+        let placement = PLACEMENTS[self.placement_index];
+        if let Some(id) = self.resume_id {
+            return PickerSelection::Resume { id, placement };
+        }
+
         let host = &self.options.hosts[self.host_index];
         let (preset, command) = host.commands[self.command_index].selection_parts();
-        OpenSelection {
+        PickerSelection::Create(OpenSelection {
             host: host.name.clone(),
             directory: host.directories[self.directory_index].clone(),
             preset,
             command,
-            placement: PLACEMENTS[self.placement_index],
-        }
+            placement,
+        })
     }
 
     fn current_len(&self) -> usize {
         match self.stage {
             PickerStage::Host => self.options.hosts.len(),
+            PickerStage::Resource => self.options.hosts[self.host_index].workloads.len() + 1,
             PickerStage::Directory => self.options.hosts[self.host_index].directories.len(),
             PickerStage::Command => self.options.hosts[self.host_index].commands.len(),
             PickerStage::Placement => PLACEMENTS.len(),
@@ -295,6 +365,7 @@ impl PickerState {
     fn current_index(&self) -> usize {
         match self.stage {
             PickerStage::Host => self.host_index,
+            PickerStage::Resource => self.resource_index,
             PickerStage::Directory => self.directory_index,
             PickerStage::Command => self.command_index,
             PickerStage::Placement => self.placement_index,
@@ -304,6 +375,7 @@ impl PickerState {
     fn current_index_mut(&mut self) -> &mut usize {
         match self.stage {
             PickerStage::Host => &mut self.host_index,
+            PickerStage::Resource => &mut self.resource_index,
             PickerStage::Directory => &mut self.directory_index,
             PickerStage::Command => &mut self.command_index,
             PickerStage::Placement => &mut self.placement_index,
@@ -312,7 +384,8 @@ impl PickerState {
 
     fn title(&self) -> &'static str {
         match self.stage {
-            PickerStage::Host => "Host",
+            PickerStage::Host => "Hosts",
+            PickerStage::Resource => "Workloads",
             PickerStage::Directory => "Directory",
             PickerStage::Command => "Shell or preset",
             PickerStage::Placement => "Placement",
@@ -327,6 +400,14 @@ impl PickerState {
                 .iter()
                 .map(|host| host.name.as_str())
                 .collect(),
+            PickerStage::Resource => {
+                let host = &self.options.hosts[self.host_index];
+                host.workloads
+                    .iter()
+                    .map(|workload| workload.label.as_str())
+                    .chain(std::iter::once("Create new workload"))
+                    .collect()
+            }
             PickerStage::Directory => self.options.hosts[self.host_index]
                 .directories
                 .iter()
@@ -357,9 +438,9 @@ fn placement_index(placement: Placement) -> usize {
     }
 }
 
-/// Runs the interactive terminal picker. Escape and Ctrl-C always return
+/// Runs the interactive terminal explorer. Escape and Ctrl-C always return
 /// `Ok(None)`; terminal modes are restored before the function returns.
-pub fn run_picker(options: PickerOptions) -> Result<Option<OpenSelection>> {
+pub fn run_picker(options: PickerOptions) -> Result<Option<PickerSelection>> {
     let mut state = PickerState::new(options)?;
     enable_raw_mode().context("enable terminal raw mode")?;
     if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
@@ -382,7 +463,7 @@ pub fn run_picker(options: PickerOptions) -> Result<Option<OpenSelection>> {
     }
 }
 
-fn run_terminal_picker(state: &mut PickerState) -> Result<Option<OpenSelection>> {
+fn run_terminal_picker(state: &mut PickerState) -> Result<Option<PickerSelection>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize terminal picker")?;
     terminal.clear().context("clear terminal picker")?;

@@ -7,7 +7,7 @@ use herdr_tether::{
     herdr::{HerdrClient, HerdrContext},
     model::{Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
-    tui::{PickerEvent, PickerOptions, PickerOutcome, PickerStage, PickerState},
+    tui::{PickerEvent, PickerOptions, PickerOutcome, PickerSelection, PickerStage, PickerState},
 };
 use tempfile::tempdir;
 
@@ -177,6 +177,10 @@ fn picker_walks_host_directory_command_and_placement() {
     assert_eq!(picker.stage(), PickerStage::Host);
     picker.handle(PickerEvent::Next);
     assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
     assert_eq!(picker.stage(), PickerStage::Directory);
     assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
     assert_eq!(picker.stage(), PickerStage::Command);
@@ -184,14 +188,63 @@ fn picker_walks_host_directory_command_and_placement() {
     assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
     assert_eq!(picker.stage(), PickerStage::Placement);
     picker.handle(PickerEvent::Next);
-    let PickerOutcome::Selected(selection) = picker.handle(PickerEvent::Confirm) else {
-        panic!("picker did not return a selection");
+    let PickerOutcome::Selected(PickerSelection::Create(selection)) =
+        picker.handle(PickerEvent::Confirm)
+    else {
+        panic!("picker did not return a create selection");
     };
     assert_eq!(selection.host, "build-box");
     assert_eq!(selection.directory, "/srv/recent");
     assert_eq!(selection.preset.as_deref(), Some("agent"));
     assert_eq!(selection.command, "exec codex");
     assert_eq!(selection.placement, Placement::SplitDown);
+}
+
+#[test]
+fn explorer_resumes_an_existing_workload_without_create_steps() {
+    let (config, mut state) = picker_fixture();
+    let mut closed = state.sessions[0].clone();
+    closed.id = "tether-0197f198000070008000000000000003"
+        .parse::<SessionId>()
+        .unwrap();
+    closed.status = SessionStatus::Closed;
+    closed.closed_at = Some(closed.last_used_at);
+    state.sessions.push(closed);
+
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let build_box = options
+        .hosts
+        .iter()
+        .find(|host| host.name == "build-box")
+        .unwrap();
+    assert_eq!(build_box.workloads.len(), 2);
+    assert!(
+        build_box
+            .workloads
+            .iter()
+            .all(|workload| workload.id.to_string() != "tether-0197f198000070008000000000000003")
+    );
+
+    let expected_id = build_box.workloads[0].id;
+    let mut explorer = PickerState::new(options).unwrap();
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Placement);
+
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::Resume {
+            id: expected_id,
+            placement: Placement::SplitRight,
+        })
+    );
 }
 
 #[test]
