@@ -51,10 +51,7 @@ impl State {
                 bail!("duplicate session id `{}`", session.id);
             }
             require_nonempty(&session.host, &format!("session at index {index} host"))?;
-            require_nonempty(
-                &session.target,
-                &format!("session `{}` target", session.id),
-            )?;
+            require_nonempty(&session.target, &format!("session `{}` target", session.id))?;
             require_nonempty(
                 &session.directory,
                 &format!("session `{}` directory", session.id),
@@ -110,8 +107,7 @@ impl StateStore {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read state `{}`", self.path.display()));
+                return Err(error).with_context(|| format!("read state `{}`", self.path.display()));
             }
         };
 

@@ -34,9 +34,8 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("create temporary file beside `{}`", path.display())
-                });
+                return Err(error)
+                    .with_context(|| format!("create temporary file beside `{}`", path.display()));
             }
         }
     }

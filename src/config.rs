@@ -62,7 +62,6 @@ impl Config {
         true
     }
 
-
     pub fn validate(&self) -> Result<()> {
         if self.version != Self::CURRENT_VERSION {
             bail!(
@@ -97,7 +96,10 @@ impl Config {
             for (preset_index, preset) in host.presets.iter().enumerate() {
                 require_nonempty(
                     &preset.name,
-                    &format!("preset at index {preset_index} for host `{}` name", host.name),
+                    &format!(
+                        "preset at index {preset_index} for host `{}` name",
+                        host.name
+                    ),
                 )?;
                 if !preset_names.insert(preset.name.as_str()) {
                     bail!(

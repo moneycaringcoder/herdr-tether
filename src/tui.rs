@@ -368,8 +368,8 @@ pub fn run_picker(options: PickerOptions) -> Result<Option<OpenSelection>> {
     }
 
     let result = run_terminal_picker(&mut state);
-    let leave_result = execute!(io::stdout(), LeaveAlternateScreen, Show)
-        .context("restore terminal screen");
+    let leave_result =
+        execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen");
     let raw_result = disable_raw_mode().context("disable terminal raw mode");
 
     match result {

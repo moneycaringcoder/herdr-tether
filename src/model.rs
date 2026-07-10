@@ -43,7 +43,9 @@ impl fmt::Display for SessionId {
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("invalid session id `{value}`: expected `tether-` followed by a lowercase UUIDv7 in 32 hexadecimal digits")]
+#[error(
+    "invalid session id `{value}`: expected `tether-` followed by a lowercase UUIDv7 in 32 hexadecimal digits"
+)]
 pub struct SessionIdError {
     value: String,
 }

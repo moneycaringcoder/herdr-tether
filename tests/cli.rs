@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -32,7 +32,9 @@ impl Sandbox {
             .env_remove("HERDR_BIN_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("HERDR_WORKSPACE_ID")
-            .env_remove("HERDR_TAB_ID");
+            .env_remove("HERDR_TAB_ID")
+            .env_remove("PANE_ID")
+            .env_remove("WORKSPACE_ID");
         command
     }
 
@@ -43,6 +45,41 @@ impl Sandbox {
     fn state_file(&self) -> std::path::PathBuf {
         self.path("xdg-state/herdr-tether/state.json")
     }
+}
+
+const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
+
+fn active_state(id: &str) -> String {
+    format!(
+        r#"{{
+  "version": 1,
+  "sessions": [{{
+    "id": "{id}",
+    "host": "local",
+    "target": "local",
+    "directory": "/tmp",
+    "preset": null,
+    "status": "active",
+    "created_at": "2026-01-01T00:00:00Z",
+    "last_used_at": "2026-01-01T00:00:00Z",
+    "closed_at": null
+  }}]
+}}"#
+    )
+}
+
+fn install_tmux_script(sandbox: &Sandbox, body: &str) -> (std::ffi::OsString, std::path::PathBuf) {
+    let bin = sandbox.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
+            .unwrap();
+    (path, tmux)
 }
 
 #[test]
@@ -80,7 +117,11 @@ fn host_commands_persist_explicit_hosts_and_surface_ssh_aliases() {
     let sandbox = Sandbox::new();
     let ssh_dir = sandbox.path("home/.ssh");
     fs::create_dir_all(&ssh_dir).unwrap();
-    fs::write(ssh_dir.join("config"), "Host from-ssh-config\n  HostName 192.0.2.20\n").unwrap();
+    fs::write(
+        ssh_dir.join("config"),
+        "Host from-ssh-config\n  HostName 192.0.2.20\n",
+    )
+    .unwrap();
 
     sandbox
         .command()
@@ -111,7 +152,11 @@ fn host_commands_persist_explicit_hosts_and_surface_ssh_aliases() {
     assert!(sandbox.config_file().exists());
     #[cfg(unix)]
     assert_eq!(
-        fs::metadata(sandbox.config_file()).unwrap().permissions().mode() & 0o777,
+        fs::metadata(sandbox.config_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
 
@@ -193,7 +238,11 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
         ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let created = String::from_utf8(output.stdout).unwrap();
     let session_id = created
         .split_whitespace()
@@ -234,13 +283,7 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
     sandbox
         .command()
         .env("PATH", &path)
-        .args([
-            "session",
-            "prune",
-            "--dry-run",
-            "--older-than-days",
-            "0",
-        ])
+        .args(["session", "prune", "--dry-run", "--older-than-days", "0"])
         .assert()
         .success()
         .stdout(predicate::str::contains(&session_id));
@@ -316,7 +359,251 @@ fn host_check_reports_remote_tmux_and_read_only_herdr_discovery() {
         .stdout(predicate::str::contains("herdr 0.7.3"));
 
     let transcript = fs::read_to_string(log).unwrap();
-    assert!(transcript.lines().all(|line| line.contains("<BatchMode=yes>")));
+    assert!(
+        transcript
+            .lines()
+            .all(|line| line.contains("<BatchMode=yes>"))
+    );
     assert!(!transcript.contains("StrictHostKeyChecking"));
     assert!(!transcript.contains("herdr --remote"));
+}
+
+#[test]
+fn close_marks_a_missing_workload_closed_without_killing_it() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
+    let log = sandbox.path("tmux.log");
+    let body = format!(
+        "printf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  display-message) exit 1 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
+        log.display()
+    );
+    let (path, _) = install_tmux_script(&sandbox, &body);
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args(["session", "close", SESSION_ID])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("closed"));
+
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("display-message"));
+    assert!(!transcript.contains("kill-session"));
+    let persisted = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(persisted.contains(r#""status": "closed""#));
+    assert!(!persisted.contains(r#""closed_at": null"#));
+}
+
+#[test]
+fn close_unknown_or_failed_running_workload_preserves_active_metadata() {
+    for (name, body) in [
+        (
+            "unknown",
+            "case \"$1\" in\n  display-message) printf 'not-a-count'; exit 0 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
+        ),
+        (
+            "failed-running-close",
+            "case \"$1\" in\n  display-message) printf '0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+        fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
+        let before = fs::read(sandbox.state_file()).unwrap();
+        let log = sandbox.path("tmux.log");
+        let instrumented = format!("printf '%s\\n' \"$1\" >> '{}'\n{body}", log.display());
+        let (path, _) = install_tmux_script(&sandbox, &instrumented);
+
+        sandbox
+            .command()
+            .env("PATH", path)
+            .args(["session", "close", SESSION_ID])
+            .assert()
+            .failure();
+
+        assert_eq!(
+            fs::read(sandbox.state_file()).unwrap(),
+            before,
+            "{name} must not mutate metadata"
+        );
+        let transcript = fs::read_to_string(log).unwrap();
+        if name == "unknown" {
+            assert!(!transcript.contains("kill-session"));
+        } else {
+            assert!(transcript.contains("kill-session"));
+        }
+    }
+}
+
+#[test]
+fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
+    for (name, state, body, expected) in [
+        (
+            "missing",
+            active_state(SESSION_ID),
+            "case \"$1\" in display-message) exit 1;; esac\nexit 0",
+            "no longer exists",
+        ),
+        (
+            "unknown",
+            active_state(SESSION_ID),
+            "case \"$1\" in display-message) printf 'unknown'; exit 0;; esac\nexit 0",
+            "could not determine",
+        ),
+        (
+            "closed",
+            active_state(SESSION_ID)
+                .replace(r#""status": "active""#, r#""status": "closed""#)
+                .replace(
+                    r#""closed_at": null"#,
+                    r#""closed_at": "2026-01-01T00:00:01Z""#,
+                ),
+            "exit 99",
+            "is closed",
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+        fs::write(sandbox.state_file(), state).unwrap();
+        let before = fs::read(sandbox.state_file()).unwrap();
+        let (path, _) = install_tmux_script(&sandbox, body);
+
+        sandbox
+            .command()
+            .env("PATH", path)
+            .args(["session", "resume", SESSION_ID])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+
+        assert_eq!(
+            fs::read(sandbox.state_file()).unwrap(),
+            before,
+            "{name} must not mutate metadata"
+        );
+    }
+}
+
+#[test]
+fn open_rejects_whitespace_directory_and_command_before_backend_create() {
+    for arguments in [
+        [
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            " \t ",
+            "--command",
+            "true",
+        ],
+        [
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            "/tmp",
+            "--command",
+            " \t ",
+        ],
+    ] {
+        let sandbox = Sandbox::new();
+        let log = sandbox.path("tmux.log");
+        let body = format!("printf '%s\\n' \"$*\" >> '{}'\nexit 0", log.display());
+        let (path, _) = install_tmux_script(&sandbox, &body);
+
+        sandbox
+            .command()
+            .env("PATH", path)
+            .args(arguments)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("must not be empty"));
+
+        assert!(!log.exists(), "backend must not be invoked");
+    }
+}
+
+#[test]
+fn open_reloads_state_after_backend_creation_before_persisting() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), r#"{"version":1,"sessions":[]}"#).unwrap();
+    let concurrent_id = "tether-0197f198000070008000000000000002";
+    let concurrent_state = active_state(concurrent_id);
+    let body = format!(
+        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; fi\nexit 0",
+        concurrent_state,
+        sandbox.state_file().display()
+    );
+    let (path, _) = install_tmux_script(&sandbox, &body);
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args([
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            "/tmp",
+            "--command",
+            "true",
+        ])
+        .assert()
+        .success();
+
+    let persisted = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(persisted.contains(concurrent_id));
+    let document: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(document["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn herdr_context_prefers_canonical_names_and_rejects_empty_values() {
+    let sandbox = Sandbox::new();
+    let herdr = sandbox.path("herdr");
+    fs::write(&herdr, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+
+    for (name, value) in [
+        ("HERDR_BIN_PATH", ""),
+        ("HERDR_PANE_ID", " \t "),
+        ("HERDR_WORKSPACE_ID", ""),
+    ] {
+        sandbox
+            .command()
+            .env("HERDR_BIN_PATH", &herdr)
+            .env("HERDR_PANE_ID", "w1:p1")
+            .env("HERDR_WORKSPACE_ID", "w1")
+            .env(name, value)
+            .args(["plugin", "open"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("empty"));
+    }
+}
+
+#[test]
+fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
+    let sandbox = Sandbox::new();
+    let herdr = sandbox.path("herdr");
+    fs::write(
+        &herdr,
+        "#!/bin/sh\nprintf '%s' '{\"id\":\"cli-1\",\"result\":{\"type\":\"plugin_pane_opened\"}}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", herdr)
+        .env("PANE_ID", "w1:p1")
+        .env("WORKSPACE_ID", "w1")
+        .args(["plugin", "open"])
+        .assert()
+        .success();
 }

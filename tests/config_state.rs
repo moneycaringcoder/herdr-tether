@@ -46,7 +46,10 @@ fn config_round_trips_atomically_with_private_permissions() {
         "atomic write must not leave temporary files"
     );
     #[cfg(unix)]
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -113,7 +116,10 @@ fn state_round_trips_and_migrates_v0() {
     store.save(&state).unwrap();
     assert_eq!(store.load().unwrap(), state);
     #[cfg(unix)]
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
     fs::write(
         &path,

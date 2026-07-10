@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
@@ -35,7 +35,10 @@ fi
 "#,
         log = log.display()
     );
-    fs::write(path, script).unwrap();
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }

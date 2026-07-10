@@ -20,25 +20,41 @@ impl HerdrContext {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             binary: required_os_env("HERDR_BIN_PATH")?.into(),
-            pane_id: required_string_env("PANE_ID")?,
-            workspace_id: required_string_env("WORKSPACE_ID")?,
+            pane_id: required_string_env("HERDR_PANE_ID", Some("PANE_ID"))?,
+            workspace_id: required_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
         })
     }
 }
 
 fn required_os_env(name: &str) -> Result<OsString> {
-    env::var_os(name).ok_or_else(|| anyhow::anyhow!("Herdr did not provide {name}"))
+    let value = env::var_os(name).ok_or_else(|| anyhow::anyhow!("Herdr did not provide {name}"))?;
+    if value.to_string_lossy().trim().is_empty() {
+        bail!("Herdr provided an empty {name}");
+    }
+    Ok(value)
 }
 
-fn required_string_env(name: &str) -> Result<String> {
-    env::var(name)
-        .with_context(|| format!("Herdr did not provide a valid UTF-8 {name}"))
-        .and_then(|value| {
-            if value.trim().is_empty() {
-                bail!("Herdr provided an empty {name}");
-            }
-            Ok(value)
-        })
+fn required_string_env(name: &str, fallback: Option<&str>) -> Result<String> {
+    match env::var(name) {
+        Ok(value) => require_nonempty_env(name, value),
+        Err(env::VarError::NotPresent) => {
+            let fallback =
+                fallback.ok_or_else(|| anyhow::anyhow!("Herdr did not provide {name}"))?;
+            let value = env::var(fallback)
+                .with_context(|| format!("Herdr did not provide a valid UTF-8 {name}"))?;
+            require_nonempty_env(fallback, value)
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("Herdr did not provide a valid UTF-8 {name}")
+        }
+    }
+}
+
+fn require_nonempty_env(name: &str, value: String) -> Result<String> {
+    if value.trim().is_empty() {
+        bail!("Herdr provided an empty {name}");
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,9 +93,7 @@ impl HerdrClient {
         require_result_type(&response, "pane_ran")?;
         let ran_pane = result_string(&response, &["pane_id"], "pane run response pane_id")?;
         if ran_pane != pane_id {
-            bail!(
-                "Herdr ran the command in pane `{ran_pane}`, not newly created pane `{pane_id}`"
-            );
+            bail!("Herdr ran the command in pane `{ran_pane}`, not newly created pane `{pane_id}`");
         }
 
         Ok(PlacedPane { pane_id })

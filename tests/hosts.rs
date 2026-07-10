@@ -25,9 +25,11 @@ fn discovers_only_literal_openssh_host_aliases() {
     fs::write(
         &path,
         r#"
-# Tether must ignore comments and wildcard blocks.
-Host build-box code.example.test # two literal aliases
+# Tether must ignore full-line comments and wildcard blocks.
+   # An indented comment is still a comment.
+Host build-box code.example.test
     HostName 192.0.2.10
+Host hash#alias # trailing text is aliases not an inline comment
 Host *.internal !bastion
     User deploy
 host laptop
@@ -42,20 +44,39 @@ Match host *
 
     assert_eq!(
         discover_aliases(&path).unwrap(),
-        ["build-box", "code.example.test", "laptop"]
+        [
+            "build-box",
+            "code.example.test",
+            "hash#alias",
+            "#",
+            "trailing",
+            "text",
+            "is",
+            "aliases",
+            "not",
+            "an",
+            "inline",
+            "comment",
+            "laptop",
+        ]
     );
 }
 
 #[test]
 fn a_missing_ssh_config_yields_an_empty_catalog() {
     let temp = tempdir().unwrap();
-    assert!(discover_aliases(&temp.path().join("missing")).unwrap().is_empty());
+    assert!(
+        discover_aliases(&temp.path().join("missing"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
-fn explicit_targets_accept_alias_user_host_and_ssh_uri() {
+fn explicit_targets_accept_alias_user_host_and_lowercase_ssh_uri() {
     for target in [
         "build-box",
+        "hash#alias",
         "builder@example.test",
         "ssh://builder@example.test:2222",
         "ssh://builder@[2001:db8::10]:2222",
@@ -70,6 +91,8 @@ fn explicit_targets_accept_alias_user_host_and_ssh_uri() {
         "host;touch-nope",
         "host\nname",
         "ssh://",
+        "SSH://builder@example.test",
+        "http://builder@example.test",
     ] {
         assert!(validate_ssh_target(target).is_err(), "accepted {target:?}");
     }
@@ -78,7 +101,9 @@ fn explicit_targets_accept_alias_user_host_and_ssh_uri() {
 #[test]
 fn hosts_are_added_and_removed_without_hand_editing() {
     let mut config = Config::default();
-    config.add_host(host("build-box", "builder@example.test")).unwrap();
+    config
+        .add_host(host("build-box", "builder@example.test"))
+        .unwrap();
     assert_eq!(config.hosts.len(), 1);
 
     let duplicate = config
@@ -96,7 +121,13 @@ fn hosts_are_added_and_removed_without_hand_editing() {
 fn config_validation_rejects_reserved_names_and_nul_data() {
     let mut config = Config::default();
     config.hosts.push(host("local", "example.test"));
-    assert!(config.validate().unwrap_err().to_string().contains("reserved"));
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("reserved")
+    );
 
     let mut config = Config::default();
     let mut invalid = host("build-box", "example.test");

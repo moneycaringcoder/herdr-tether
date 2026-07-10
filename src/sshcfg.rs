@@ -19,8 +19,8 @@ pub fn discover_aliases(path: &Path) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
 
     for line in source.lines() {
-        let line = line.split_once('#').map_or(line, |(before, _)| before).trim();
-        if line.is_empty() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
@@ -56,20 +56,17 @@ pub fn validate_ssh_target(target: &str) -> Result<()> {
         bail!("SSH target must not contain whitespace");
     }
 
-    if target
-        .get(..6)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ssh://"))
-    {
-        validate_ssh_uri(&target[6..])
+    if let Some(authority) = target.strip_prefix("ssh://") {
+        validate_ssh_uri(authority)
     } else {
         validate_destination(target)
     }
 }
 
 fn split_directive(line: &str) -> (&str, &str) {
-    let boundary = line
-        .char_indices()
-        .find_map(|(index, character)| (character.is_ascii_whitespace() || character == '=').then_some(index));
+    let boundary = line.char_indices().find_map(|(index, character)| {
+        (character.is_ascii_whitespace() || character == '=').then_some(index)
+    });
 
     match boundary {
         Some(index) => {
@@ -87,7 +84,9 @@ fn split_directive(line: &str) -> (&str, &str) {
 fn is_literal_alias(alias: &str) -> bool {
     !alias.is_empty()
         && !alias.starts_with('!')
-        && !alias.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+        && !alias
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
         && is_host(alias)
 }
 
@@ -182,7 +181,7 @@ fn is_host(host: &str) -> bool {
         && !host.starts_with('-')
         && host
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'#'))
 }
 
 fn validate_port_suffix(suffix: &str) -> Result<()> {

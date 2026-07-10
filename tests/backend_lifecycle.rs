@@ -35,9 +35,7 @@ fn read_argv(log: &Path) -> Vec<String> {
 }
 
 fn id() -> SessionId {
-    "tether-0197f198000070008000000000000001"
-        .parse()
-        .unwrap()
+    "tether-0197f198000070008000000000000001".parse().unwrap()
 }
 
 #[test]
@@ -46,7 +44,10 @@ fn posix_quote_handles_adversarial_values_without_interpolation() {
         ("", "''"),
         ("plain", "'plain'"),
         ("it's", "'it'\\''s'"),
-        ("$(touch /tmp/nope); `id` | & < > *", "'$(touch /tmp/nope); `id` | & < > *'"),
+        (
+            "$(touch /tmp/nope); `id` | & < > *",
+            "'$(touch /tmp/nope); `id` | & < > *'",
+        ),
         ("line one\nline two\t$HOME", "'line one\nline two\t$HOME'"),
         ("héllø", "'héllø'"),
     ];
@@ -96,7 +97,11 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
             "'tmux' 'new-session' '-d' '-s' 'tether-0197f198000070008000000000000001' '-c' '/srv/it'\\''s $(touch /tmp/nope)\nline' '--' '/bin/sh' '-lc' 'printf '\\''%s\\n'\\'' \"$HOME\"; echo `id`'",
         ]
     );
-    assert_eq!(argv.len(), 9, "ssh must receive one remote command argument");
+    assert_eq!(
+        argv.len(),
+        9,
+        "ssh must receive one remote command argument"
+    );
 }
 
 #[test]
@@ -107,11 +112,7 @@ fn attach_only_attaches_and_close_is_the_only_kill_path() {
     let log = temp.path().join("ssh.args");
     write_fake(&ssh, &log, "", 0);
     write_fake(&tmux, &temp.path().join("tmux.args"), "", 0);
-    let backend = TmuxBackend::remote(
-        "build-box",
-        ProcessBinaries::new(ssh, tmux),
-    )
-    .unwrap();
+    let backend = TmuxBackend::remote("build-box", ProcessBinaries::new(ssh, tmux)).unwrap();
 
     let attach = backend.attach_command(&id()).unwrap();
     assert_eq!(attach.program.file_name().unwrap(), "ssh");
@@ -139,7 +140,10 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     write_fake(&tmux, &log, "2", 0);
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
-    assert_eq!(backend.inspect(&id()).unwrap(), WorkloadState::Running { attached: 2 });
+    assert_eq!(
+        backend.inspect(&id()).unwrap(),
+        WorkloadState::Running { attached: 2 }
+    );
     assert_eq!(
         read_argv(&log),
         [
@@ -153,13 +157,49 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
 }
 
 #[test]
+fn inspect_maps_exit_one_to_missing_and_other_failures_to_unknown() {
+    for (status, expected) in [
+        (1, WorkloadState::Missing),
+        (2, WorkloadState::Unknown),
+        (255, WorkloadState::Unknown),
+    ] {
+        let temp = tempdir().unwrap();
+        let tmux = temp.path().join("tmux");
+        write_fake(&tmux, &temp.path().join("tmux.args"), "", status);
+        let backend =
+            TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+        assert_eq!(
+            backend.inspect(&id()).unwrap(),
+            expected,
+            "unexpected inspect state for exit status {status}"
+        );
+    }
+}
+
+#[test]
 fn explicit_ssh_targets_reject_option_and_shell_injection() {
     let binaries = ProcessBinaries::new("ssh", "tmux");
-    for target in ["", "-oProxyCommand=bad", "host name", "host;touch-nope", "host\nname"] {
-        assert!(TmuxBackend::remote(target, binaries.clone()).is_err(), "accepted {target:?}");
+    for target in [
+        "",
+        "-oProxyCommand=bad",
+        "host name",
+        "host;touch-nope",
+        "host\nname",
+    ] {
+        assert!(
+            TmuxBackend::remote(target, binaries.clone()).is_err(),
+            "accepted {target:?}"
+        );
     }
     assert!(TmuxBackend::remote("user@example.test", binaries.clone()).is_ok());
-    assert!(TmuxBackend::remote("ssh://user@example.test:2222", binaries).is_ok());
+    assert!(TmuxBackend::remote("ssh://user@example.test:2222", binaries.clone()).is_ok());
+    for target in ["SSH://user@example.test", "http://user@example.test"] {
+        assert!(
+            TmuxBackend::remote(target, binaries.clone()).is_err(),
+            "accepted mismatched URI scheme {target:?}"
+        );
+    }
 }
 
 #[test]
@@ -178,7 +218,12 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
     };
 
     assert_eq!(
-        cleanup_eligibility(&record, WorkloadState::Running { attached: 0 }, now, Duration::days(7)),
+        cleanup_eligibility(
+            &record,
+            WorkloadState::Running { attached: 0 },
+            now,
+            Duration::days(7)
+        ),
         CleanupEligibility::KeepActive
     );
     assert_eq!(
@@ -197,7 +242,12 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         CleanupEligibility::RemoveMetadata
     );
     assert_eq!(
-        cleanup_eligibility(&record, WorkloadState::Running { attached: 0 }, now, Duration::days(7)),
+        cleanup_eligibility(
+            &record,
+            WorkloadState::Running { attached: 0 },
+            now,
+            Duration::days(7)
+        ),
         CleanupEligibility::KeepActive,
         "prune must not kill a workload that still exists"
     );

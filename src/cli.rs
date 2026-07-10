@@ -328,7 +328,11 @@ fn require_probe_success(name: &str, output: &std::process::Output) -> Result<()
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr);
-    bail!("{name} probe failed with status {}: {}", output.status, detail.trim())
+    bail!(
+        "{name} probe failed with status {}: {}",
+        output.status,
+        detail.trim()
+    )
 }
 
 fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
@@ -345,15 +349,15 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     let complete = args.host.is_some()
         && args.directory.is_some()
         && (args.command.is_some() || args.preset.is_some());
-    let state = state_store.load()?;
     let selection = if complete {
         selection_from_args(&config, &aliases, args)?
     } else {
+        let state = state_store.load()?;
         selection_from_picker(&config, &aliases, &state, args)?
             .context("session selection was cancelled")?
     };
 
-    create_and_attach(paths, &config, state, selection)
+    create_and_attach(paths, &config, selection)
 }
 
 fn selection_from_args(
@@ -393,8 +397,7 @@ fn selection_from_picker(
         picker_config.hosts.retain(|host| host.name == requested);
     }
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
-    let options =
-        PickerOptions::from_config_state(&picker_config, state, &home, include_local);
+    let options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
     let Some(mut selection) = run_picker(options)? else {
         return Ok(None);
     };
@@ -418,12 +421,13 @@ fn selection_from_picker(
     Ok(Some(selection))
 }
 
-fn create_and_attach(
-    paths: &AppPaths,
-    config: &Config,
-    mut state: State,
-    selection: OpenSelection,
-) -> Result<()> {
+fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection) -> Result<()> {
+    if selection.directory.trim().is_empty() {
+        bail!("session directory must not be empty");
+    }
+    if selection.command.trim().is_empty() {
+        bail!("session command must not be empty");
+    }
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let host = resolve_host_from(config, &aliases, &selection.host)?;
     let id = SessionId::new();
@@ -435,6 +439,13 @@ fn create_and_attach(
     };
     backend.create(&launch)?;
 
+    let mut state = match StateStore::new(paths.state_file.clone()).load() {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = backend.close(&id);
+            return Err(error).context("reload state before persisting newly created session");
+        }
+    };
     let now = Utc::now();
     state.sessions.push(SessionRecord {
         id,
@@ -453,7 +464,8 @@ fn create_and_attach(
     }
 
     println!("created {id}");
-    if let Some(context) = herdr_context() {
+    if env::var_os("HERDR_BIN_PATH").is_some() {
+        let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
         let resume = CommandSpec::new(
             executable,
@@ -520,7 +532,13 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 bail!("session `{id}` is already closed");
             }
             let backend = backend_for(&record.target)?;
-            backend.close(&id)?;
+            match backend.inspect(&id)? {
+                crate::backend::WorkloadState::Missing => {}
+                crate::backend::WorkloadState::Running { .. } => backend.close(&id)?,
+                crate::backend::WorkloadState::Unknown => {
+                    bail!("could not determine whether session `{id}` exists")
+                }
+            }
             let now = Utc::now();
             record.status = SessionStatus::Closed;
             record.last_used_at = now;
@@ -563,7 +581,7 @@ fn prune(store: &StateStore, args: PruneArgs) -> Result<()> {
 }
 
 fn plugin_command(command: PluginCommand) -> Result<()> {
-    let context = herdr_context().context("Herdr plugin context is not available")?;
+    let context = HerdrContext::from_env()?;
     let entrypoint = match command {
         PluginCommand::Open => "picker",
         PluginCommand::Setup => "setup",
@@ -698,20 +716,6 @@ fn run_attach(spec: CommandSpec) -> Result<()> {
         bail!("attach command failed with status {status}");
     }
     Ok(())
-}
-
-fn herdr_context() -> Option<HerdrContext> {
-    let pane_id = env::var("PANE_ID")
-        .ok()
-        .or_else(|| env::var("HERDR_PANE_ID").ok())?;
-    let workspace_id = env::var("WORKSPACE_ID")
-        .ok()
-        .or_else(|| env::var("HERDR_WORKSPACE_ID").ok())?;
-    Some(HerdrContext {
-        binary: env::var_os("HERDR_BIN_PATH")?.into(),
-        pane_id,
-        workspace_id,
-    })
 }
 
 fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {

@@ -11,7 +11,10 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
     assert_eq!(
         value["platforms"].as_array().unwrap(),
-        &[toml::Value::String("linux".into()), toml::Value::String("macos".into())]
+        &[
+            toml::Value::String("linux".into()),
+            toml::Value::String("macos".into())
+        ]
     );
 
     let build = value["build"].as_array().unwrap();
