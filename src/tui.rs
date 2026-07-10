@@ -22,6 +22,10 @@ use ratatui::{
 
 use crate::{
     config::Config,
+    discovery::{
+        DiscoveryCompletion, DiscoveryLocation, DiscoveryMessage, DiscoveryRequest, DiscoveryRun,
+        DiscoveryService,
+    },
     model::{Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
     status::{
@@ -222,7 +226,7 @@ pub enum PickerStage {
     Placement,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerEvent {
     Previous,
     Next,
@@ -230,6 +234,12 @@ pub enum PickerEvent {
     Back,
     Cancel,
     Refresh,
+    BeginFilter,
+    BeginPath,
+    Insert(char),
+    Delete,
+    SubmitInput,
+    ExitInput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,6 +248,20 @@ pub enum PickerOutcome {
     RefreshRequested,
     Selected(PickerSelection),
     Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerInput {
+    None,
+    Filter(String),
+    DirectPath(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscoveryView {
+    Loading,
+    Finished(DiscoveryCompletion),
+    RootError,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +347,12 @@ pub struct PickerState {
     generation: u64,
     host_status: HashMap<String, StatusCell<HostReachability>>,
     workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
+    discovery_generation: u64,
+    base_directories: HashMap<String, Vec<String>>,
+    discovery: HashMap<String, DiscoveryView>,
+    directory_filter: String,
+    input: PickerInput,
+    selected_directory: Option<String>,
 }
 
 impl PickerState {
@@ -339,6 +369,11 @@ impl PickerState {
             }
         }
 
+        let base_directories = options
+            .hosts
+            .iter()
+            .map(|host| (host.name.clone(), host.directories.clone()))
+            .collect();
         let placement_index = placement_index(options.default_placement);
         Ok(Self {
             options,
@@ -352,11 +387,127 @@ impl PickerState {
             generation: 0,
             host_status: HashMap::new(),
             workload_status: HashMap::new(),
+            discovery_generation: 0,
+            base_directories,
+            discovery: HashMap::new(),
+            directory_filter: String::new(),
+            input: PickerInput::None,
+            selected_directory: None,
         })
     }
 
     pub fn stage(&self) -> PickerStage {
         self.stage
+    }
+
+    pub fn input(&self) -> &PickerInput {
+        &self.input
+    }
+
+    pub fn directory_paths(&self, host: &str) -> Option<Vec<&str>> {
+        self.options
+            .hosts
+            .iter()
+            .find(|candidate| candidate.name == host)
+            .map(|candidate| candidate.directories.iter().map(String::as_str).collect())
+    }
+
+    pub fn visible_directories(&self) -> Vec<&str> {
+        self.visible_directory_indices()
+            .into_iter()
+            .map(|index| self.options.hosts[self.host_index].directories[index].as_str())
+            .collect()
+    }
+
+    pub fn begin_discovery(&mut self, generation: u64) {
+        self.discovery_generation = generation;
+        self.discovery.clear();
+        for host in &mut self.options.hosts {
+            if let Some(base) = self.base_directories.get(&host.name) {
+                host.directories.clone_from(base);
+            }
+            self.discovery
+                .insert(host.name.clone(), DiscoveryView::Loading);
+        }
+        self.directory_index = 0;
+    }
+
+    pub fn apply_discovery(&mut self, message: DiscoveryMessage) -> bool {
+        if message.generation() != self.discovery_generation {
+            return false;
+        }
+        match message {
+            DiscoveryMessage::Repository { host, path, .. } => {
+                let Some(host) = self
+                    .options
+                    .hosts
+                    .iter_mut()
+                    .find(|candidate| candidate.name == host)
+                else {
+                    return false;
+                };
+                push_unique(&mut host.directories, &path);
+                self.clamp_directory_index();
+                true
+            }
+            DiscoveryMessage::RootError { host, .. } => {
+                let Some(view) = self.discovery.get_mut(&host) else {
+                    return false;
+                };
+                *view = DiscoveryView::RootError;
+                true
+            }
+            DiscoveryMessage::HostFinished {
+                host, completion, ..
+            } => {
+                let Some(view) = self.discovery.get_mut(&host) else {
+                    return false;
+                };
+                if *view != DiscoveryView::RootError || completion != DiscoveryCompletion::Complete
+                {
+                    *view = DiscoveryView::Finished(completion);
+                }
+                true
+            }
+            DiscoveryMessage::Finished { .. } => false,
+        }
+    }
+
+    fn discovery_request(&self) -> DiscoveryRequest {
+        DiscoveryRequest {
+            generation: self.discovery_generation,
+            locations: self
+                .options
+                .hosts
+                .iter()
+                .map(|host| DiscoveryLocation {
+                    host: host.name.clone(),
+                    target: host.target.clone(),
+                    roots: self
+                        .base_directories
+                        .get(&host.name)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+
+    fn visible_directory_indices(&self) -> Vec<usize> {
+        let query = self.directory_filter.to_lowercase();
+        self.options.hosts[self.host_index]
+            .directories
+            .iter()
+            .enumerate()
+            .filter_map(|(index, directory)| {
+                (query.is_empty() || directory.to_lowercase().contains(&query)).then_some(index)
+            })
+            .collect()
+    }
+
+    fn clamp_directory_index(&mut self) {
+        let length = self.visible_directory_indices().len();
+        self.directory_index = self.directory_index.min(length.saturating_sub(1));
     }
 
     pub fn host_label(&self, name: &str) -> Option<&str> {
@@ -458,23 +609,98 @@ impl PickerState {
     }
 
     pub fn handle(&mut self, event: PickerEvent) -> PickerOutcome {
+        if self.input != PickerInput::None && !matches!(event, PickerEvent::Cancel) {
+            return self.handle_input(event);
+        }
         match event {
             PickerEvent::Cancel => PickerOutcome::Cancelled,
             PickerEvent::Refresh => PickerOutcome::RefreshRequested,
+            PickerEvent::BeginFilter if self.stage == PickerStage::Directory => {
+                self.input = PickerInput::Filter(self.directory_filter.clone());
+                PickerOutcome::Continue
+            }
+            PickerEvent::BeginPath if self.stage == PickerStage::Directory => {
+                self.input = PickerInput::DirectPath(String::new());
+                PickerOutcome::Continue
+            }
             PickerEvent::Back => self.back(),
             PickerEvent::Previous => {
                 let length = self.current_len();
+                if length == 0 {
+                    return PickerOutcome::Continue;
+                }
                 let index = self.current_index_mut();
                 *index = if *index == 0 { length - 1 } else { *index - 1 };
                 PickerOutcome::Continue
             }
             PickerEvent::Next => {
                 let length = self.current_len();
+                if length == 0 {
+                    return PickerOutcome::Continue;
+                }
                 let index = self.current_index_mut();
                 *index = (*index + 1) % length;
                 PickerOutcome::Continue
             }
             PickerEvent::Confirm => self.confirm(),
+            PickerEvent::BeginFilter
+            | PickerEvent::BeginPath
+            | PickerEvent::Insert(_)
+            | PickerEvent::Delete
+            | PickerEvent::SubmitInput
+            | PickerEvent::ExitInput => PickerOutcome::Continue,
+        }
+    }
+
+    fn handle_input(&mut self, event: PickerEvent) -> PickerOutcome {
+        match event {
+            PickerEvent::Cancel => PickerOutcome::Cancelled,
+            PickerEvent::ExitInput => {
+                self.input = PickerInput::None;
+                PickerOutcome::Continue
+            }
+            PickerEvent::Insert(character) => {
+                if let PickerInput::Filter(query) | PickerInput::DirectPath(query) = &mut self.input
+                {
+                    query.push(character);
+                    if let PickerInput::Filter(query) = &self.input {
+                        self.directory_filter.clone_from(query);
+                        self.directory_index = 0;
+                    }
+                }
+                PickerOutcome::Continue
+            }
+            PickerEvent::Delete => {
+                if let PickerInput::Filter(query) | PickerInput::DirectPath(query) = &mut self.input
+                {
+                    query.pop();
+                    if let PickerInput::Filter(query) = &self.input {
+                        self.directory_filter.clone_from(query);
+                        self.clamp_directory_index();
+                    }
+                }
+                PickerOutcome::Continue
+            }
+            PickerEvent::SubmitInput => {
+                let input = std::mem::replace(&mut self.input, PickerInput::None);
+                match input {
+                    PickerInput::Filter(query) => {
+                        self.directory_filter = query;
+                        self.clamp_directory_index();
+                    }
+                    PickerInput::DirectPath(path) if !path.trim().is_empty() => {
+                        self.selected_directory = Some(path);
+                        self.directory_filter.clear();
+                        self.stage = PickerStage::Command;
+                    }
+                    PickerInput::DirectPath(path) => {
+                        self.input = PickerInput::DirectPath(path);
+                    }
+                    PickerInput::None => {}
+                }
+                PickerOutcome::Continue
+            }
+            _ => PickerOutcome::Continue,
         }
     }
 
@@ -501,6 +727,8 @@ impl PickerState {
                 self.directory_index = 0;
                 self.command_index = 0;
                 self.resume_id = None;
+                self.selected_directory = None;
+                self.directory_filter.clear();
                 self.stage = if self.options.hosts[self.host_index].workloads.is_empty() {
                     PickerStage::Directory
                 } else {
@@ -521,11 +749,19 @@ impl PickerState {
                     self.stage = PickerStage::Placement;
                 } else {
                     self.resume_id = None;
+                    self.selected_directory = None;
+                    self.directory_filter.clear();
                     self.stage = PickerStage::Directory;
                 }
                 PickerOutcome::Continue
             }
             PickerStage::Directory => {
+                let indices = self.visible_directory_indices();
+                let Some(index) = indices.get(self.directory_index) else {
+                    return PickerOutcome::Continue;
+                };
+                self.selected_directory =
+                    Some(self.options.hosts[self.host_index].directories[*index].clone());
                 self.stage = PickerStage::Command;
                 PickerOutcome::Continue
             }
@@ -547,7 +783,10 @@ impl PickerState {
         let (preset, command) = host.commands[self.command_index].selection_parts();
         PickerSelection::Create(OpenSelection {
             host: host.name.clone(),
-            directory: host.directories[self.directory_index].clone(),
+            directory: self
+                .selected_directory
+                .clone()
+                .expect("create selection has a directory"),
             preset,
             command,
             placement,
@@ -558,7 +797,7 @@ impl PickerState {
         match self.stage {
             PickerStage::Host => self.options.hosts.len(),
             PickerStage::Resource => self.options.hosts[self.host_index].workloads.len() + 1,
-            PickerStage::Directory => self.options.hosts[self.host_index].directories.len(),
+            PickerStage::Directory => self.visible_directory_indices().len(),
             PickerStage::Command => self.options.hosts[self.host_index].commands.len(),
             PickerStage::Placement => PLACEMENTS.len(),
         }
@@ -610,17 +849,80 @@ impl PickerState {
                     .chain(std::iter::once("Create new workload"))
                     .collect()
             }
-            PickerStage::Directory => self.options.hosts[self.host_index]
-                .directories
-                .iter()
-                .map(String::as_str)
-                .collect(),
+            PickerStage::Directory => {
+                let host = &self.options.hosts[self.host_index];
+                let mut labels = self
+                    .visible_directory_indices()
+                    .into_iter()
+                    .map(|index| host.directories[index].as_str())
+                    .collect::<Vec<_>>();
+                if labels.is_empty() {
+                    labels.push("No matches · p enter path");
+                }
+                labels
+            }
             PickerStage::Command => self.options.hosts[self.host_index]
                 .commands
                 .iter()
                 .map(PickerCommand::label)
                 .collect(),
             PickerStage::Placement => PLACEMENT_LABELS.to_vec(),
+        }
+    }
+    fn discovery_label(&self, host: &str) -> Option<&'static str> {
+        match self.discovery.get(host) {
+            Some(DiscoveryView::Loading) => Some("Scanning repositories…"),
+            Some(DiscoveryView::RootError) => Some("Repository scan error · r retry"),
+            Some(DiscoveryView::Finished(DiscoveryCompletion::Complete)) | None => None,
+            Some(DiscoveryView::Finished(DiscoveryCompletion::ResultsLimit)) => {
+                Some("Repository result limit reached")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::EntriesLimit)) => {
+                Some("Repository entry limit reached")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::TimedOut)) => {
+                Some("Repository scan timed out · r retry")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::Unavailable)) => {
+                Some("Repository scan unavailable · r retry")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::OutputLimit)) => {
+                Some("Repository output limit reached")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::Malformed)) => {
+                Some("Repository scan returned invalid data")
+            }
+            Some(DiscoveryView::Finished(DiscoveryCompletion::Error)) => {
+                Some("Repository scan error · r retry")
+            }
+        }
+    }
+
+    fn footer_text(&self) -> String {
+        match &self.input {
+            PickerInput::Filter(query) => {
+                format!("Filter: {query} · type · Backspace delete · Enter/Esc close")
+            }
+            PickerInput::DirectPath(path) => {
+                format!("Path: {path} · type · Backspace delete · Enter use · Esc close")
+            }
+            PickerInput::None => {
+                let mut parts = Vec::new();
+                if !self.directory_filter.is_empty() && self.stage == PickerStage::Directory {
+                    parts.push(format!("Filter: {}", self.directory_filter));
+                }
+                if self.stage == PickerStage::Directory
+                    && let Some(label) =
+                        self.discovery_label(&self.options.hosts[self.host_index].name)
+                {
+                    parts.push(label.to_owned());
+                }
+                parts.push(
+                    "↑/↓ navigate · Enter select · / filter · p path · r refresh · ← back · Esc cancel"
+                        .to_owned(),
+                );
+                parts.join(" · ")
+            }
         }
     }
 }
@@ -645,6 +947,7 @@ fn placement_index(placement: Placement) -> usize {
 pub fn run_picker(
     options: PickerOptions,
     status_service: StatusService,
+    discovery_service: DiscoveryService,
 ) -> Result<Option<PickerSelection>> {
     let mut state = PickerState::new(options)?;
     enable_raw_mode().context("enable terminal raw mode")?;
@@ -653,7 +956,7 @@ pub fn run_picker(
         return Err(error).context("enter terminal alternate screen");
     }
 
-    let result = run_terminal_picker(&mut state, &status_service);
+    let result = run_terminal_picker(&mut state, &status_service, &discovery_service);
     let leave_result =
         execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen");
     let raw_result = disable_raw_mode().context("disable terminal raw mode");
@@ -677,20 +980,34 @@ fn start_status_run(
     service.start(state.status_request())
 }
 
+fn start_discovery_run(
+    state: &mut PickerState,
+    service: &DiscoveryService,
+    generation: u64,
+) -> DiscoveryRun {
+    state.begin_discovery(generation);
+    service.start(state.discovery_request())
+}
+
 fn run_terminal_picker(
     state: &mut PickerState,
     status_service: &StatusService,
+    discovery_service: &DiscoveryService,
 ) -> Result<Option<PickerSelection>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize terminal picker")?;
     terminal.clear().context("clear terminal picker")?;
     let mut generation = 1_u64;
     let mut status_run = start_status_run(state, status_service, generation);
+    let mut discovery_run = start_discovery_run(state, discovery_service, generation);
     let mut dirty = true;
 
     loop {
         while let Ok(message) = status_run.receiver.try_recv() {
             dirty |= state.apply_status(message);
+        }
+        while let Ok(message) = discovery_run.receiver.try_recv() {
+            dirty |= state.apply_discovery(message);
         }
         if dirty {
             terminal
@@ -705,7 +1022,7 @@ fn run_terminal_picker(
             dirty = true;
             continue;
         };
-        let Some(picker_event) = map_key(key) else {
+        let Some(picker_event) = map_key(key, &state.input, state.stage) else {
             continue;
         };
         dirty = true;
@@ -713,10 +1030,12 @@ fn run_terminal_picker(
             PickerOutcome::Continue => {}
             PickerOutcome::RefreshRequested => {
                 status_run.cancel();
+                discovery_run.cancel();
                 generation = generation
                     .checked_add(1)
                     .context("status refresh generation overflow")?;
                 status_run = start_status_run(state, status_service, generation);
+                discovery_run = start_discovery_run(state, discovery_service, generation);
             }
             PickerOutcome::Selected(selection) => return Ok(Some(selection)),
             PickerOutcome::Cancelled => return Ok(None),
@@ -724,7 +1043,7 @@ fn run_terminal_picker(
     }
 }
 
-fn map_key(key: KeyEvent) -> Option<PickerEvent> {
+fn map_key(key: KeyEvent, input: &PickerInput, stage: PickerStage) -> Option<PickerEvent> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
@@ -733,12 +1052,29 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
     {
         return Some(PickerEvent::Cancel);
     }
+    if input != &PickerInput::None {
+        return match key.code {
+            KeyCode::Esc => Some(PickerEvent::ExitInput),
+            KeyCode::Enter => Some(PickerEvent::SubmitInput),
+            KeyCode::Backspace => Some(PickerEvent::Delete),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(PickerEvent::Insert(character))
+            }
+            _ => None,
+        };
+    }
     match key.code {
         KeyCode::Esc => Some(PickerEvent::Cancel),
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Some(PickerEvent::Previous),
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Some(PickerEvent::Next),
         KeyCode::Backspace | KeyCode::Left => Some(PickerEvent::Back),
         KeyCode::Enter | KeyCode::Right => Some(PickerEvent::Confirm),
+        KeyCode::Char('/') if stage == PickerStage::Directory => Some(PickerEvent::BeginFilter),
+        KeyCode::Char('p' | 'P') if stage == PickerStage::Directory => Some(PickerEvent::BeginPath),
         KeyCode::Char('r' | 'R')
             if key.kind == KeyEventKind::Press
                 && !key
@@ -754,7 +1090,7 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
 fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
-    let area = centered_rect(frame.area(), 72, visible_rows.saturating_add(6).max(8));
+    let area = centered_rect(frame.area(), 72, visible_rows.saturating_add(7).max(9));
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(" Tether · {} ", state.title()))
@@ -769,10 +1105,11 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(inner);
 
     let selected = state.current_index();
+    let has_selection = state.current_len() > 0;
     let max_rows = chunks[0].height as usize;
     let start = selected.saturating_sub(max_rows.saturating_sub(1));
     let lines: Vec<Line<'_>> = labels
@@ -781,7 +1118,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         .skip(start)
         .take(max_rows)
         .map(|(index, label)| {
-            if index == selected {
+            if has_selection && index == selected {
                 Line::from(vec![
                     Span::styled("> ", Style::default().fg(Color::Cyan)),
                     Span::styled(
@@ -798,7 +1135,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
-        Paragraph::new("↑/↓ navigate · Enter/→ select · r refresh · ← back · Esc cancel")
+        Paragraph::new(state.footer_text())
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray))
             .wrap(Wrap { trim: true }),
@@ -824,24 +1161,50 @@ mod tests {
     #[test]
     fn refresh_key_maps_only_on_press() {
         assert_eq!(
-            map_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            map_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+            ),
             Some(PickerEvent::Refresh)
         );
         assert_eq!(
-            map_key(KeyEvent::new_with_kind(
-                KeyCode::Char('r'),
-                KeyModifiers::NONE,
-                KeyEventKind::Repeat,
-            )),
+            map_key(
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                ),
+                &PickerInput::None,
+                PickerStage::Host,
+            ),
             None
         );
         assert_eq!(
-            map_key(KeyEvent::new_with_kind(
-                KeyCode::Char('r'),
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            )),
+            map_key(
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ),
+                &PickerInput::None,
+                PickerStage::Host,
+            ),
             None
         );
+    }
+
+    #[test]
+    fn input_mode_maps_command_keys_to_text() {
+        for character in ['r', 'j', 'k', 'p', '/'] {
+            assert_eq!(
+                map_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    &PickerInput::Filter(String::new()),
+                    PickerStage::Directory,
+                ),
+                Some(PickerEvent::Insert(character))
+            );
+        }
     }
 }
