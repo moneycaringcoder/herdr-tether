@@ -2,6 +2,7 @@ use std::{
     env,
     path::PathBuf,
     process::{Command, Stdio},
+    time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,7 @@ use crate::{
     paths::AppPaths,
     sshcfg::discover_aliases,
     state::{SessionRecord, SessionStatus, State, StateStore},
+    status::StatusService,
     tmux::TmuxBackend,
     tui::{OpenSelection, PickerOptions, PickerSelection, run_picker},
 };
@@ -403,7 +405,12 @@ fn selection_from_picker(
             host.workloads.clear();
         }
     }
-    let Some(selection) = run_picker(options)? else {
+    let status_service = StatusService::new(
+        ProcessBinaries::new("ssh", "tmux"),
+        StdDuration::from_secs(3),
+        4,
+    );
+    let Some(selection) = run_picker(options, status_service)? else {
         return Ok(None);
     };
 

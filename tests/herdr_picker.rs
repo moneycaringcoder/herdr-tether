@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::Path, sync::Mutex};
+use std::{fs, io::Write, path::Path, sync::Mutex, time::SystemTime};
 
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
@@ -7,6 +7,7 @@ use herdr_tether::{
     herdr::{HerdrClient, HerdrContext},
     model::{Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
+    status::{HostReachability, StatusMessage, WorkloadStatus},
     tui::{PickerEvent, PickerOptions, PickerOutcome, PickerSelection, PickerStage, PickerState},
 };
 use tempfile::tempdir;
@@ -265,6 +266,115 @@ fn explorer_skips_empty_workload_stage_for_create() {
     assert_eq!(explorer.stage(), PickerStage::Directory);
     assert_eq!(explorer.handle(PickerEvent::Back), PickerOutcome::Continue);
     assert_eq!(explorer.stage(), PickerStage::Host);
+}
+
+#[test]
+fn status_updates_progressively_and_refresh_rejects_stale_generation() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let workload_id = options
+        .hosts
+        .iter()
+        .find(|host| host.name == "build-box")
+        .unwrap()
+        .workloads[0]
+        .id;
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.handle(PickerEvent::Next);
+    explorer.handle(PickerEvent::Confirm);
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+
+    explorer.begin_refresh(1);
+    assert_eq!(
+        explorer.host_label("build-box"),
+        Some("build-box [loading]")
+    );
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+
+    assert!(explorer.apply_status(StatusMessage::Host {
+        generation: 1,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert_eq!(explorer.host_label("build-box"), Some("build-box [online]"));
+    assert_eq!(explorer.host_label("local"), Some("local [loading]"));
+    assert!(explorer.apply_status(StatusMessage::Workload {
+        generation: 1,
+        id: workload_id,
+        status: WorkloadStatus::Running { attached: 2 },
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert!(
+        explorer
+            .workload_label(workload_id)
+            .unwrap()
+            .ends_with("[running · 2 attached]")
+    );
+
+    explorer.begin_refresh(2);
+    assert_eq!(
+        explorer.host_label("build-box"),
+        Some("build-box [stale: online]")
+    );
+    assert!(!explorer.apply_status(StatusMessage::Host {
+        generation: 1,
+        host: "build-box".into(),
+        status: HostReachability::Unreachable,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert_eq!(
+        explorer.host_label("build-box"),
+        Some("build-box [stale: online]")
+    );
+    assert!(explorer.apply_status(StatusMessage::Host {
+        generation: 2,
+        host: "build-box".into(),
+        status: HostReachability::TimedOut,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert_eq!(
+        explorer.host_label("build-box"),
+        Some("build-box [timeout]")
+    );
+}
+
+#[test]
+fn fresh_missing_workload_cannot_be_resumed() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let workload_id = options.hosts[0].workloads[0].id;
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.begin_refresh(1);
+    assert!(explorer.apply_status(StatusMessage::Workload {
+        generation: 1,
+        id: workload_id,
+        status: WorkloadStatus::Missing,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    explorer.handle(PickerEvent::Confirm);
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+}
+
+#[test]
+fn refresh_event_requests_work_without_resetting_navigation() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.handle(PickerEvent::Confirm);
+    assert_eq!(explorer.stage(), PickerStage::Directory);
+
+    assert_eq!(
+        explorer.handle(PickerEvent::Refresh),
+        PickerOutcome::RefreshRequested
+    );
+    assert_eq!(explorer.stage(), PickerStage::Directory);
 }
 
 #[test]
