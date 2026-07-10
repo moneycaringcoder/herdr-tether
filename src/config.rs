@@ -3,7 +3,10 @@ use std::{collections::HashSet, fs, io, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{model::Placement, storage::atomic_write};
+use crate::{
+    model::Placement,
+    storage::{atomic_write, with_advisory_lock},
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommandPreset {
@@ -136,6 +139,15 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    pub fn update<T>(&self, operation: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+        with_advisory_lock(&self.path, || {
+            let mut config = self.load()?;
+            let result = operation(&mut config)?;
+            self.save(&config)?;
+            Ok(result)
+        })
     }
 
     pub fn load(&self) -> Result<Config> {

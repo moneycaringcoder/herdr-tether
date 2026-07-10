@@ -5,10 +5,44 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+pub(crate) fn with_advisory_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let parent = usable_parent(path);
+    ensure_private_directory(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
+    let lock_path = parent.join(format!(".{}.lock", file_name.to_string_lossy()));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("open storage lock `{}`", lock_path.display()))?;
+    #[cfg(unix)]
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set private permissions on `{}`", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("lock storage `{}`", path.display()))?;
+
+    let result = operation();
+    let unlock =
+        FileExt::unlock(&lock).with_context(|| format!("unlock storage `{}`", path.display()));
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = usable_parent(path);

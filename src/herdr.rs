@@ -131,6 +131,7 @@ impl HerdrClient {
                 self.context.pane_id.clone(),
                 "--direction".to_owned(),
                 direction.to_owned(),
+                "--focus".to_owned(),
             ],
         )?;
         require_result_type(&response, "pane_split")?;

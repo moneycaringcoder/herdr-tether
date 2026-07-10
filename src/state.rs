@@ -4,13 +4,17 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{model::SessionId, storage::atomic_write};
+use crate::{
+    model::SessionId,
+    storage::{atomic_write, with_advisory_lock},
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     #[default]
     Active,
+    Closing,
     Closed,
 }
 
@@ -66,9 +70,10 @@ impl State {
                 );
             }
             match (session.status, session.closed_at) {
-                (SessionStatus::Active, Some(_)) => {
-                    bail!("active session `{}` must not have closed_at", session.id)
-                }
+                (SessionStatus::Active | SessionStatus::Closing, Some(_)) => bail!(
+                    "non-closed session `{}` must not have closed_at",
+                    session.id
+                ),
                 (SessionStatus::Closed, None) => {
                     bail!("closed session `{}` must have closed_at", session.id)
                 }
@@ -100,6 +105,19 @@ pub struct StateStore {
 impl StateStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    pub fn update<T>(&self, operation: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.exclusive(|store| {
+            let mut state = store.load()?;
+            let result = operation(&mut state)?;
+            store.save(&state)?;
+            Ok(result)
+        })
+    }
+
+    pub fn exclusive<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        with_advisory_lock(&self.path, || operation(self))
     }
 
     pub fn load(&self) -> Result<State> {

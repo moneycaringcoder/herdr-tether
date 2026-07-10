@@ -1,4 +1,9 @@
-use std::fs;
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration as StdDuration,
+};
 
 use chrono::{TimeZone, Utc};
 use herdr_tether::{
@@ -131,4 +136,48 @@ fn state_round_trips_and_migrates_v0() {
     assert_eq!(migrated.sessions[0].status, SessionStatus::Active);
     assert!(migrated.sessions[0].preset.is_none());
     assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+}
+
+#[test]
+fn concurrent_state_updates_preserve_both_records() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+
+    for suffix in ["0001", "0002"] {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            StateStore::new(path)
+                .update(|state| {
+                    thread::sleep(StdDuration::from_millis(50));
+                    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+                    state.sessions.push(SessionRecord {
+                        id: format!("tether-0197f19800007000800000000000{suffix}")
+                            .parse()
+                            .unwrap(),
+                        host: "local".into(),
+                        target: "local".into(),
+                        directory: "/tmp".into(),
+                        preset: None,
+                        status: SessionStatus::Active,
+                        created_at: now,
+                        last_used_at: now,
+                        closed_at: None,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        }));
+    }
+
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let state = StateStore::new(path).load().unwrap();
+    assert_eq!(state.sessions.len(), 2);
 }

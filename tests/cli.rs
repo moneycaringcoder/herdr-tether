@@ -423,11 +423,18 @@ fn close_unknown_or_failed_running_workload_preserves_active_metadata() {
             .assert()
             .failure();
 
-        assert_eq!(
-            fs::read(sandbox.state_file()).unwrap(),
-            before,
-            "{name} must not mutate metadata"
-        );
+        let after = fs::read(sandbox.state_file()).unwrap();
+        if name == "unknown" {
+            assert_eq!(after, before, "unknown state must remain unchanged");
+        } else {
+            let persisted = String::from_utf8(after).unwrap();
+            assert!(
+                persisted.contains(r#""status": "closing""#),
+                "failed close must persist a recoverable closing marker"
+            );
+            let document: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+            assert!(document["sessions"][0]["closed_at"].is_null());
+        }
         let transcript = fs::read_to_string(log).unwrap();
         if name == "unknown" {
             assert!(!transcript.contains("kill-session"));
@@ -451,6 +458,12 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
             active_state(SESSION_ID),
             "case \"$1\" in list-sessions) printf 'malformed'; exit 0;; esac\nexit 0",
             "could not determine",
+        ),
+        (
+            "closing",
+            active_state(SESSION_ID).replace(r#""status": "active""#, r#""status": "closing""#),
+            "exit 99",
+            "is closing",
         ),
         (
             "closed",

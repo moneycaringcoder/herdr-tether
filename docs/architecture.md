@@ -7,11 +7,12 @@ Tether makes the lifetime of a terminal workload independent of the Herdr pane o
 The implementation preserves these invariants:
 
 1. creating a workload precedes recording it as active;
-2. a persistence failure after create triggers a best-effort close of that new workload;
+2. a persistence failure after create triggers a best-effort close; if rollback also fails, the exact workload ID and both failures are reported;
 3. attach/resume never closes a workload, including when attach fails or the connection drops;
-4. only explicit close may invoke `kill-session`; it marks metadata closed only after the workload is proven missing or an exact-session kill succeeds;
-5. pruning removes only old closed metadata and never kills or probes workloads;
-6. every `tmux` operation uses an exact session target derived from a generated Tether ID.
+4. only explicit close may invoke `kill-session`; before killing a running workload it persists a recoverable `closing` marker, then finalizes metadata only after the workload is proven missing or exact-session kill succeeds;
+5. config and state mutations hold per-file advisory locks across load, mutation, and atomic save;
+6. pruning removes only old closed metadata and never kills or probes workloads;
+7. every `tmux` operation uses an exact session target derived from a generated Tether ID.
 
 Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is not native remote Herdr federation.
 
@@ -74,7 +75,7 @@ The remote target validator prevents values that could become SSH options or she
 `src/herdr.rs` is a local Herdr CLI adapter, not a durable backend. It consumes Herdr's executable, pane ID, and workspace ID from plugin context. It can:
 
 - open a manifest-declared `picker` or `setup` plugin pane as an overlay;
-- split the invoking pane right or down;
+- split and focus the invoking pane right or down;
 - create a tab and extract its root pane ID;
 - run one POSIX-quoted `CommandSpec` in the newly returned pane;
 - validate Herdr's JSON result type and returned pane identity.
@@ -110,19 +111,19 @@ Placement is meaningful only when Herdr context is available. In an ordinary ter
 1. Resolve target and command.
 2. Generate a UUID-v7-derived Tether session ID.
 3. `DurableBackend::create` starts detached `tmux`.
-4. Append active metadata and save atomically.
-5. If save fails, best-effort `close` the just-created backend session and return the persistence error.
+4. Append active metadata and save it under the state-file advisory lock.
+5. If save fails, best-effort `close` the just-created backend session. If rollback also fails, report both failures and the exact ID of the workload that may remain.
 6. Attach directly or place a Herdr resume command.
 
 A failure in step 6 leaves the workload and active metadata intact by design.
 
 ### Resume
 
-Resume rejects unknown or closed records. It reconstructs a backend from the record's retained target and inspects the exact ID. Only `Running` is attachable; `Missing` and `Unknown` are explicit errors. The successful pre-attach path updates `last_used_at` and atomically saves it, then launches attach. A subsequent attach failure does not close or rewrite the record.
+Resume rejects unknown, closing, or closed records. Under the state-file lock it reconstructs a backend from the record's retained target and inspects the exact ID. Only `Running` is attachable; `Missing` and `Unknown` are explicit errors. The successful pre-attach path updates `last_used_at` and atomically saves it, releases the lock, then launches attach. A subsequent attach failure does not close or rewrite the record.
 
 ### Close
 
-Close rejects unknown and already closed records. It inspects the backend first. A workload proven `Missing` is marked closed without issuing `kill-session`; `Unknown` is retained unchanged; a running workload is marked closed only after exact-session backend close succeeds. It then sets `last_used_at` and `closed_at` and saves. A state-write failure after a successful kill can leave active metadata for an absent workload; it is reported rather than silently reconciled.
+Close rejects unknown and already closed records and holds the state-file lock for the transition. A workload proven `Missing` is finalized closed without issuing `kill-session`; `Unknown` is retained unchanged. For a running workload, close first persists `Closing`, performs the exact-session kill, then persists `Closed` with `last_used_at` and `closed_at`. If kill or the final save fails, the durable `Closing` marker remains; a later `close` re-inspects and safely retries or finalizes the transition.
 
 ### Prune
 
@@ -130,7 +131,7 @@ Prune computes eligibility from record status, `closed_at`, current time, and re
 
 ## Persistence and security
 
-The atomic writer creates parent directories, enforces Unix mode `0700` on those directories and `0600` on new temporary files, writes and syncs a unique sibling temporary file, atomically renames it over the destination, then syncs the parent directory. Config/state validation occurs before save. Missing files yield empty current-version values; supported legacy version 0 data migrates on load.
+The storage layer creates parent directories and persistent sibling advisory-lock files, enforcing Unix mode `0700` on directories and `0600` on lock/data/temporary files. Mutating CLI operations serialize load → mutation → save under the per-file lock. The atomic writer writes and syncs a unique sibling temporary file, atomically renames it over the destination, then syncs the parent directory. Config/state validation occurs before save. Missing files yield empty current-version values; supported legacy version 0 data migrates on load.
 
 Stored metadata includes targets and trusted preset names/commands in config plus session location/lifecycle data in state. It does not include SSH passwords, private keys, terminal contents, or telemetry identifiers. There is no telemetry subsystem.
 
@@ -144,7 +145,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise command parsing and state behavior, config migration/private writes, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and failure paths, adversarial POSIX quoting, Herdr response parsing/placement, picker transitions/cancellation, and manifest shape. The current run reported 35 passing tests and a locked release build.
+Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, picker transitions/cancellation, and manifest shape. The current run reported 36 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 

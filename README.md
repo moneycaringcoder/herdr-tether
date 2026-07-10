@@ -26,7 +26,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passed 35 automated tests, a locked release build, and a Herdr 0.7.3 development link/action-list/unlink smoke. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4.
+The current branch passed 36 automated tests, a locked release build, and a Herdr 0.7.3 development link/action-list/unlink smoke. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4.
 
 The resumed workload retained the same PID while its counter advanced after detach. Verification also covered a directory containing spaces, literal shell metacharacters without injection, and exact close/prune isolation with an unrelated `tmux` session left intact. Native Herdr placement interaction and the macOS live smoke remain manual checks; CI covers the macOS Rust gates.
 
@@ -159,7 +159,7 @@ herdr-tether open [--host <NAME>] [--directory <DIR>]
                   [--placement split-right|split-down|new-tab]
 ```
 
-Supplying host, directory, and exactly one command source bypasses the picker. Otherwise the picker supplies missing choices. Outside Herdr, Tether runs the attach command in the current terminal. In Herdr plugin context, it creates the chosen split/tab and runs `session resume <ID>` there.
+Supplying host, directory, and exactly one command source bypasses the picker. Otherwise the picker walks its four list-based stages and applies any supplied arguments as overrides; it does not provide free-form search or path entry in v0.1. Outside Herdr, Tether runs the attach command in the current terminal. In Herdr plugin context, it creates the chosen split/tab and runs `session resume <ID>` there.
 
 ```text
 herdr-tether session list [--json]
@@ -170,7 +170,7 @@ herdr-tether session prune [--dry-run] [--older-than-days <DAYS>]
 
 - `list` shows persisted metadata; JSON includes the complete records.
 - `resume` refuses closed, missing, or indeterminate workloads; a valid attempt updates `last_used_at` before attaching.
-- `close` is the only lifecycle command allowed to invoke `tmux kill-session`. It inspects first: a workload proven missing is marked closed without a kill; a running workload is marked closed only after exact-session kill succeeds; an indeterminate workload is left unchanged.
+- `close` is the only lifecycle command allowed to invoke `tmux kill-session`. It inspects first: a workload proven missing is marked closed without a kill; a running workload is first marked `closing`, then killed by exact session ID and finalized as closed. A failed kill or final state write leaves the recoverable `closing` marker for a later `close` retry; an indeterminate workload is left unchanged.
 - `prune` prints eligible IDs and removes only closed metadata at least 30 days old by default. `--dry-run` only prints. `--older-than-days 0` makes every already-closed record eligible.
 
 ```text
@@ -201,7 +201,7 @@ Default paths outside plugin context:
 - config: `${XDG_CONFIG_HOME:-$HOME/.config}/herdr-tether/config.toml`
 - state: `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tether/state.json`
 
-Inside a plugin, `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR` independently take precedence. Missing files load as empty version-1 data. On Unix, parent directories are forced to mode `0700`; newly written temporary files are mode `0600`. Writes use a same-directory temporary file, file sync, atomic rename, and directory sync.
+Inside a plugin, `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR` independently take precedence. Missing files load as empty version-1 data. On Unix, parent directories are forced to mode `0700`; data, temporary, and advisory-lock files are mode `0600`. Mutating CLI operations hold a per-file advisory lock across load, mutation, and atomic save. Writes use a same-directory temporary file, file sync, atomic rename, and directory sync.
 
 State stores IDs, resolved target, host label, directory, preset name, lifecycle status, and timestamps—not terminal output or credentials. If state persistence fails after creating a workload, Tether attempts to close that newly created workload. Failed attach/resume does not implicitly kill it.
 

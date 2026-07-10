@@ -75,8 +75,8 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
     assert_eq!(tab.pane_id, "w1:p10");
 
     let transcript = fs::read_to_string(log).unwrap();
-    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright"));
-    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tdown"));
+    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright\t--focus"));
+    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tdown\t--focus"));
     assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1"));
     assert!(transcript.contains(
         "CALL\tpane\trun\tw1:p9\t'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"

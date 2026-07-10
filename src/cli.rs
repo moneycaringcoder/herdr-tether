@@ -189,10 +189,8 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
 
     let config_store = ConfigStore::new(paths.config_file.clone());
     let state_store = StateStore::new(paths.state_file.clone());
-    let config = config_store.load()?;
-    let state = state_store.load()?;
-    config_store.save(&config)?;
-    state_store.save(&state)?;
+    config_store.update(|_| Ok(()))?;
+    state_store.update(|_| Ok(()))?;
 
     println!("Tether configuration: {}", paths.config_file.display());
     println!("Tether state: {}", paths.state_file.display());
@@ -210,7 +208,6 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
     let store = ConfigStore::new(paths.config_file.clone());
     match command {
         HostCommand::Add(args) => {
-            let mut config = store.load()?;
             let host = HostConfig {
                 name: args.name,
                 target: args.target,
@@ -225,18 +222,18 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
                     .collect(),
             };
             let name = host.name.clone();
-            config.add_host(host)?;
-            store.save(&config)?;
+            store.update(|config| config.add_host(host))?;
             println!("added host {name}");
             Ok(())
         }
         HostCommand::List(args) => list_hosts(paths, &store.load()?, args.json),
         HostCommand::Remove { name } => {
-            let mut config = store.load()?;
-            if !config.remove_host(&name) {
-                bail!("unknown configured host `{name}`");
-            }
-            store.save(&config)?;
+            store.update(|config| {
+                if !config.remove_host(&name) {
+                    bail!("unknown configured host `{name}`");
+                }
+                Ok(())
+            })?;
             println!("removed host {name}");
             Ok(())
         }
@@ -439,15 +436,8 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     };
     backend.create(&launch)?;
 
-    let mut state = match StateStore::new(paths.state_file.clone()).load() {
-        Ok(state) => state,
-        Err(error) => {
-            let _ = backend.close(&id);
-            return Err(error).context("reload state before persisting newly created session");
-        }
-    };
     let now = Utc::now();
-    state.sessions.push(SessionRecord {
+    let record = SessionRecord {
         id,
         host: selection.host,
         target: host.target,
@@ -457,10 +447,19 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         created_at: now,
         last_used_at: now,
         closed_at: None,
-    });
-    if let Err(error) = StateStore::new(paths.state_file.clone()).save(&state) {
-        let _ = backend.close(&id);
-        return Err(error).context("persist newly created session");
+    };
+    let store = StateStore::new(paths.state_file.clone());
+    if let Err(error) = store.update(|state| {
+        state.sessions.push(record);
+        Ok(())
+    }) {
+        let cleanup = backend.close(&id);
+        return match cleanup {
+            Ok(()) => Err(error).context("persist newly created session"),
+            Err(cleanup_error) => Err(error).context(format!(
+                "persist newly created session; rollback close for `{id}` also failed: {cleanup_error:#}; the workload may still be running"
+            )),
+        };
     }
 
     println!("created {id}");
@@ -500,50 +499,65 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             Ok(())
         }
         SessionCommand::Resume { id } => {
-            let mut state = store.load()?;
-            let record = state
-                .sessions
-                .iter_mut()
-                .find(|record| record.id == id)
-                .with_context(|| format!("unknown session `{id}`"))?;
-            if record.status == SessionStatus::Closed {
-                bail!("session `{id}` is closed");
-            }
-            let backend = backend_for(&record.target)?;
-            match backend.inspect(&id)? {
-                crate::backend::WorkloadState::Running { .. } => {}
-                crate::backend::WorkloadState::Missing => bail!("session `{id}` no longer exists"),
-                crate::backend::WorkloadState::Unknown => {
-                    bail!("could not determine whether session `{id}` exists")
+            let attach = store.update(|state| {
+                let record = state
+                    .sessions
+                    .iter_mut()
+                    .find(|record| record.id == id)
+                    .with_context(|| format!("unknown session `{id}`"))?;
+                match record.status {
+                    SessionStatus::Active => {}
+                    SessionStatus::Closing => bail!("session `{id}` is closing; retry close"),
+                    SessionStatus::Closed => bail!("session `{id}` is closed"),
                 }
-            }
-            record.last_used_at = Utc::now();
-            store.save(&state)?;
-            run_attach(backend.attach_command(&id)?)
+                let backend = backend_for(&record.target)?;
+                match backend.inspect(&id)? {
+                    crate::backend::WorkloadState::Running { .. } => {}
+                    crate::backend::WorkloadState::Missing => {
+                        bail!("session `{id}` no longer exists")
+                    }
+                    crate::backend::WorkloadState::Unknown => {
+                        bail!("could not determine whether session `{id}` exists")
+                    }
+                }
+                record.last_used_at = Utc::now();
+                backend.attach_command(&id)
+            })?;
+            run_attach(attach)
         }
         SessionCommand::Close { id } => {
-            let mut state = store.load()?;
-            let record = state
-                .sessions
-                .iter_mut()
-                .find(|record| record.id == id)
-                .with_context(|| format!("unknown session `{id}`"))?;
-            if record.status == SessionStatus::Closed {
-                bail!("session `{id}` is already closed");
-            }
-            let backend = backend_for(&record.target)?;
-            match backend.inspect(&id)? {
-                crate::backend::WorkloadState::Missing => {}
-                crate::backend::WorkloadState::Running { .. } => backend.close(&id)?,
-                crate::backend::WorkloadState::Unknown => {
-                    bail!("could not determine whether session `{id}` exists")
+            store.exclusive(|store| {
+                let mut state = store.load()?;
+                let index = state
+                    .sessions
+                    .iter()
+                    .position(|record| record.id == id)
+                    .with_context(|| format!("unknown session `{id}`"))?;
+                let status = state.sessions[index].status;
+                if status == SessionStatus::Closed {
+                    bail!("session `{id}` is already closed");
                 }
-            }
-            let now = Utc::now();
-            record.status = SessionStatus::Closed;
-            record.last_used_at = now;
-            record.closed_at = Some(now);
-            store.save(&state)?;
+                let backend = backend_for(&state.sessions[index].target)?;
+                match backend.inspect(&id)? {
+                    crate::backend::WorkloadState::Missing => {}
+                    crate::backend::WorkloadState::Running { .. } => {
+                        if status == SessionStatus::Active {
+                            state.sessions[index].status = SessionStatus::Closing;
+                            store.save(&state)?;
+                        }
+                        backend.close(&id)?;
+                    }
+                    crate::backend::WorkloadState::Unknown => {
+                        bail!("could not determine whether session `{id}` exists")
+                    }
+                }
+                let now = Utc::now();
+                let record = &mut state.sessions[index];
+                record.status = SessionStatus::Closed;
+                record.last_used_at = now;
+                record.closed_at = Some(now);
+                store.save(&state)
+            })?;
             println!("closed {id}");
             Ok(())
         }
@@ -555,29 +569,39 @@ fn prune(store: &StateStore, args: PruneArgs) -> Result<()> {
     let days = i64::try_from(args.older_than_days).context("--older-than-days is too large")?;
     let retention = Duration::try_days(days).context("--older-than-days is too large")?;
     let now = Utc::now();
-    let mut state = store.load()?;
-    let mut remove = Vec::new();
+    let collect = |state: &State| {
+        state
+            .sessions
+            .iter()
+            .filter(|record| {
+                cleanup_eligibility(
+                    record,
+                    // A Closed record is written only after kill-session succeeds. Do
+                    // not reconnect merely to rediscover that intentional absence.
+                    crate::backend::WorkloadState::Missing,
+                    now,
+                    retention,
+                ) == CleanupEligibility::RemoveMetadata
+            })
+            .map(|record| record.id)
+            .collect::<Vec<_>>()
+    };
 
-    for record in &state.sessions {
-        if cleanup_eligibility(
-            record,
-            // A Closed record is written only after kill-session succeeds. Do
-            // not reconnect merely to rediscover that intentional absence.
-            crate::backend::WorkloadState::Missing,
-            now,
-            retention,
-        ) == CleanupEligibility::RemoveMetadata
-        {
-            println!("{}", record.id);
-            remove.push(record.id);
+    if args.dry_run {
+        for id in collect(&store.load()?) {
+            println!("{id}");
         }
+        return Ok(());
     }
 
-    if !args.dry_run && !remove.is_empty() {
+    store.update(|state| {
+        let remove = collect(state);
+        for id in &remove {
+            println!("{id}");
+        }
         state.sessions.retain(|record| !remove.contains(&record.id));
-        store.save(&state)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn plugin_command(command: PluginCommand) -> Result<()> {

@@ -12,8 +12,8 @@ Tether:
 
 - invokes the system `ssh` client directly, with the remote target as a separate argument, and relies on OpenSSH authentication and the user's `known_hosts` and strict host-key policy;
 - does not collect or persist passwords, private keys, tokens, or telemetry;
-- writes configuration and session metadata atomically, with private directory/file permissions on Unix;
-- inspects an established workload on explicit session close, kills only an exact running session, and leaves indeterminate workloads unchanged; if initial metadata persistence fails, it kills the just-created workload as rollback. Pruning removes only sufficiently old metadata for sessions already proven absent or killed by explicit close; prune does not reconnect to or probe hosts.
+- writes configuration and session metadata through advisory-locked, atomic transactions, with private directory/file permissions on Unix;
+- inspects an established workload on explicit session close, persists a recoverable `closing` marker before killing an exact running session, and leaves indeterminate workloads unchanged; if initial metadata persistence fails, it attempts to kill the just-created workload and reports both failures plus the exact ID if rollback also fails. Pruning removes only sufficiently old metadata for sessions already proven absent or killed by explicit close; prune does not reconnect to or probe hosts.
 
 The trust boundary includes the local user account, the installed `ssh`, `tmux`, and Herdr executables, user-controlled configuration and command presets, and any selected remote host. Tether does not sandbox commands, secure a compromised endpoint, configure SSH trust, rotate credentials, or replace host authorization. Configuration can contain command presets; session metadata contains host targets, working directories, preset labels, identifiers, and timestamps. Protect the user account and backups accordingly.
 
