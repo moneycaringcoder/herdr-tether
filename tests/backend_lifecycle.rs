@@ -24,17 +24,18 @@ fn write_fake(path: &Path, log: &Path, stdout: &str, status: i32) {
         log = log.display(),
         stdout = stdout.replace('\'', "'\\''"),
     );
+    let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
-        .open(path)
+        .open(&temporary)
         .unwrap();
     file.write_all(script.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(temporary, path).unwrap();
 }
 
 fn read_argv(log: &Path) -> Vec<String> {
