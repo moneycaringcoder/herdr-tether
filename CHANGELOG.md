@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-10
 
 ### Added
 
@@ -14,9 +14,9 @@
 ### Limitations and verification
 
 - Remote sessions are SSH-backed `tmux`, not native remote Herdr federation or remote pane streaming.
-- Automated coverage passed 35 tests and a locked release build. Herdr 0.7.3 plugin link, action listing, and unlink were exercised live.
-- A local `tmux` session survived a failed non-TTY attach; explicit close then removed only that session.
-- Live SSH localhost lifecycle verification is incomplete because strict host-key verification rejected the attempted connection. No successful live remote lifecycle is claimed.
+- Automated coverage passed 35 tests and a locked release build. Herdr 0.7.3 plugin link, action listing, and unlink were exercised live; GitHub CI passed on Ubuntu 24.04 and macOS 14.
+- A strict-BatchMode live SSH run from Hermes to `dev` verified remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation.
+- Live adversarial quoting preserved a directory containing spaces and literal shell metacharacters without creating the injected sentinel. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
 ### Acknowledgement
 

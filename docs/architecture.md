@@ -61,7 +61,7 @@ This trait owns durable workload lifecycle only. It does not own configuration, 
 Local operations execute `tmux` with separated argv. Remote operations build one POSIX-quoted remote `tmux` command and pass it to OpenSSH after `--`:
 
 - create: detached `tmux new-session`, exact generated name, selected directory, then `/bin/sh -lc <command>`;
-- inspect: `tmux display-message` for the exact target and attached-client count;
+- inspect: exact-name-filtered `tmux list-sessions` output with the attached-client count;
 - attach: `tmux attach-session` for the exact target;
 - close: `tmux kill-session` for the exact target.
 
@@ -146,9 +146,9 @@ Security is deliberately delegated at clear boundaries:
 
 Automated tests exercise command parsing and state behavior, config migration/private writes, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and failure paths, adversarial POSIX quoting, Herdr response parsing/placement, picker transitions/cancellation, and manifest shape. The current run reported 35 passing tests and a locked release build.
 
-Live smoke in this run covered Herdr 0.7.3 development link, action list, and unlink. It also covered creation and survival of a local `tmux` workload through a failed non-TTY attach, followed by explicit close removing only that workload. The attach itself was not successfully exercised because it was non-interactive.
+Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 
-The remote localhost attempt failed at strict OpenSSH host-key verification. Therefore live remote create, attach, disconnect continuity, resume, close, and prune isolation remain manual verification, as do real Herdr action invocation/overlay behavior, all three placements with mixed local/remote panes, picker Esc state immutability, setup's non-modification of Herdr config, adversarial live remote directory/command quoting with no injected file, unrelated-session isolation, and macOS build/action smoke. Reproducible acceptance steps are maintained in the README's **Independent Hermes verification** section.
+The same run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. Native Herdr action/overlay interaction, all three placements with mixed local/remote panes, picker Esc state immutability, setup's non-modification of Herdr config, the equivalent local real-TTY lifecycle, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's **Independent Hermes verification** section.
 
 ## Future native federation path
 
@@ -180,7 +180,7 @@ No `RemoteHerdrBackend` exists today. Naming it here is an architectural path, n
 
 ## Roadmap
 
-1. Complete the README's strict-host-key remote lifecycle, isolation, placement, cancellation, config-integrity, and macOS manual checks.
+1. Complete native Herdr placement, cancellation/config-integrity, local real-TTY, and macOS live acceptance checks.
 2. Define native federation identity, capabilities, lifecycle, and failure semantics before changing the backend trait.
 3. Implement and test `RemoteHerdrBackend` only after those contracts are stable.
 4. Add explicit operator-driven reconciliation for missing active workloads without weakening conservative pruning.

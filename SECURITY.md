@@ -17,6 +17,6 @@ Tether:
 
 The trust boundary includes the local user account, the installed `ssh`, `tmux`, and Herdr executables, user-controlled configuration and command presets, and any selected remote host. Tether does not sandbox commands, secure a compromised endpoint, configure SSH trust, rotate credentials, or replace host authorization. Configuration can contain command presets; session metadata contains host targets, working directories, preset labels, identifiers, and timestamps. Protect the user account and backups accordingly.
 
-Remote localhost smoke verification has not been completed: the attempted connection was rejected by strict host-key verification. This is not evidence that remote lifecycle behavior has been live-verified.
+Live strict-BatchMode verification from Hermes to `dev` covered remote create, real-TTY attach, detach, same-PID continuity, resume, exact close, prune isolation, and adversarial quoting without sentinel creation. Native Herdr placement interaction and macOS live lifecycle remain acceptance checks.
 
-Only the latest development state is currently supported; no released version exists yet.
+Security fixes are provided for the latest release. Older development snapshots are unsupported.
