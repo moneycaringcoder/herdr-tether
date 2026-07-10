@@ -20,12 +20,14 @@ Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is
 
 ```mermaid
 flowchart LR
-    CLI[CLI / picker] --> Select[host + directory + command + placement]
+    CLI[CLI / explorer] --> Intent{create or resume?}
+    Intent -->|create| Select[host + directory + command + placement]
     Select --> Durable[DurableBackend]
     Durable --> Tmux[TmuxBackend]
     Tmux -->|local argv| Local[local tmux]
     Tmux -->|BatchMode SSH + quoted remote argv| Remote[remote tmux]
     Select --> Store[ConfigStore / StateStore]
+    Intent -->|resume exact ID| Context
     Select --> Context{Herdr context?}
     Context -->|no| Attach[run attach command in current terminal]
     Context -->|yes| Herdr[HerdrClient]
@@ -34,7 +36,7 @@ flowchart LR
     Resume --> Durable
 ```
 
-For `open`, the CLI resolves a host before creating or loading state when an explicit host was supplied. It obtains a complete selection from arguments or the picker, creates a new session through the backend, atomically saves an active `SessionRecord`, then attaches. In Herdr context, attachment is indirect: `HerdrClient` creates the requested pane and runs this executable's `session resume <ID>` command in that exact pane. Outside Herdr, the backend's attach command runs directly.
+For `open`, the CLI resolves a host before creating or loading state when an explicit host was supplied. A fully specified create request bypasses the explorer. Otherwise, the explorer returns a typed intent: create obtains directory, command, and placement before creating and atomically recording a new workload; resume carries an existing active record's exact ID directly to attachment. In Herdr context, both paths place this executable's `session resume <ID>` command in the exact returned pane. Outside Herdr, attachment runs in the current terminal.
 
 ## Actual boundaries
 
@@ -96,13 +98,14 @@ The remote target validator prevents values that could become SSH options or she
 
 - local first when included;
 - configured hosts and then discovered non-duplicate SSH aliases;
-- recent session directories (newest use first), configured roots, then a local HOME or `~` fallback;
+- active Tether workload records newest-use first, excluding closing and closed records;
+- recent session directories newest-use first, configured roots, then a local HOME or `~` fallback;
 - built-in shell first, followed by configured presets;
 - configured UI placement, split right by default.
 
-The state machine is host → directory → command → placement. Cancellation returns no selection. It does not create a backend or save state. Partial CLI arguments constrain or override the corresponding picker result; a fully specified host/directory/command or preset bypasses the picker.
+The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
 
-Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is recorded in the selection but attachment happens in that terminal. In Herdr, placement creates a transient split/tab and starts `session resume`; the backend workload is already durable before pane creation.
+Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is retained but attachment happens in that terminal. In Herdr, placement creates and focuses the requested split/tab and starts exact-ID `session resume`. Newly created workloads are already durable before pane creation; existing workloads remain owned by tmux when their Herdr view closes.
 
 ## Lifecycle and failure semantics
 

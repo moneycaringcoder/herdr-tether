@@ -19,7 +19,7 @@ use crate::{
     sshcfg::discover_aliases,
     state::{SessionRecord, SessionStatus, State, StateStore},
     tmux::TmuxBackend,
-    tui::{OpenSelection, PickerOptions, run_picker},
+    tui::{OpenSelection, PickerOptions, PickerSelection, run_picker},
 };
 
 #[derive(Debug, Parser)]
@@ -347,14 +347,17 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         && args.directory.is_some()
         && (args.command.is_some() || args.preset.is_some());
     let selection = if complete {
-        selection_from_args(&config, &aliases, args)?
+        PickerSelection::Create(selection_from_args(&config, &aliases, args)?)
     } else {
         let state = state_store.load()?;
         selection_from_picker(&config, &aliases, &state, args)?
             .context("session selection was cancelled")?
     };
 
-    create_and_attach(paths, &config, selection)
+    match selection {
+        PickerSelection::Create(selection) => create_and_attach(paths, &config, selection),
+        PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
+    }
 }
 
 fn selection_from_args(
@@ -382,7 +385,7 @@ fn selection_from_picker(
     aliases: &[String],
     state: &State,
     args: OpenArgs,
-) -> Result<Option<OpenSelection>> {
+) -> Result<Option<PickerSelection>> {
     let requested_host = args.host.as_deref();
     let mut picker_config = config.clone();
     append_alias_hosts(&mut picker_config, aliases);
@@ -394,28 +397,41 @@ fn selection_from_picker(
         picker_config.hosts.retain(|host| host.name == requested);
     }
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
-    let options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
-    let Some(mut selection) = run_picker(options)? else {
+    let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
+    if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
+        for host in &mut options.hosts {
+            host.workloads.clear();
+        }
+    }
+    let Some(selection) = run_picker(options)? else {
         return Ok(None);
     };
 
-    if let Some(host_name) = args.host {
-        resolve_host_from(config, aliases, &host_name)?;
-        selection.host = host_name;
+    match selection {
+        PickerSelection::Create(mut selection) => {
+            if let Some(host_name) = args.host {
+                resolve_host_from(config, aliases, &host_name)?;
+                selection.host = host_name;
+            }
+            if let Some(directory) = args.directory {
+                selection.directory = directory;
+            }
+            if args.command.is_some() || args.preset.is_some() {
+                let host = resolve_host_from(config, aliases, &selection.host)?;
+                let (preset, command) = resolve_command(&host, args.preset, args.command)?;
+                selection.preset = preset;
+                selection.command = command;
+            }
+            if let Some(placement) = args.placement {
+                selection.placement = placement.into();
+            }
+            Ok(Some(PickerSelection::Create(selection)))
+        }
+        PickerSelection::Resume { id, placement } => Ok(Some(PickerSelection::Resume {
+            id,
+            placement: args.placement.map(Placement::from).unwrap_or(placement),
+        })),
     }
-    if let Some(directory) = args.directory {
-        selection.directory = directory;
-    }
-    if args.command.is_some() || args.preset.is_some() {
-        let host = resolve_host_from(config, aliases, &selection.host)?;
-        let (preset, command) = resolve_command(&host, args.preset, args.command)?;
-        selection.preset = preset;
-        selection.command = command;
-    }
-    if let Some(placement) = args.placement {
-        selection.placement = placement.into();
-    }
-    Ok(Some(selection))
 }
 
 fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection) -> Result<()> {
@@ -466,15 +482,29 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
-        let resume = CommandSpec::new(
-            executable,
-            vec!["session".to_owned(), "resume".to_owned(), id.to_string()],
-        );
+        let resume = resume_command(executable, id);
         HerdrClient::new(context).place(&resume, selection.placement)?;
         Ok(())
     } else {
         run_attach(backend.attach_command(&id)?)
     }
+}
+fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
+    if env::var_os("HERDR_BIN_PATH").is_some() {
+        let context = HerdrContext::from_env()?;
+        let executable = env::current_exe().context("locate the Tether executable")?;
+        let resume = resume_command(executable, id);
+        HerdrClient::new(context).place(&resume, placement)?;
+        Ok(())
+    } else {
+        session_command(paths, SessionCommand::Resume { id })
+    }
+}
+fn resume_command(executable: PathBuf, id: SessionId) -> CommandSpec {
+    CommandSpec::new(
+        executable,
+        vec!["session".to_owned(), "resume".to_owned(), id.to_string()],
+    )
 }
 
 fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
@@ -753,4 +783,28 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
         name: name.to_owned(),
         command: command.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_command_targets_the_exact_selected_session() {
+        let id = "tether-0197f198000070008000000000000001"
+            .parse::<SessionId>()
+            .unwrap();
+
+        let command = resume_command(PathBuf::from("/plugin/herdr-tether"), id);
+
+        assert_eq!(command.program, PathBuf::from("/plugin/herdr-tether"));
+        assert_eq!(
+            command.args,
+            [
+                "session",
+                "resume",
+                "tether-0197f198000070008000000000000001"
+            ]
+        );
+    }
 }
