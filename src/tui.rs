@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
@@ -20,6 +24,10 @@ use crate::{
     config::Config,
     model::{Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
+    status::{
+        HostReachability, StatusHost, StatusMessage, StatusRequest, StatusRun, StatusService,
+        WorkloadStatus,
+    },
 };
 
 const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
@@ -49,12 +57,14 @@ impl PickerCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PickerWorkload {
     pub id: SessionId,
+    pub base_label: String,
     pub label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PickerHost {
     pub name: String,
+    pub label: String,
     pub target: Option<String>,
     pub directories: Vec<String>,
     pub commands: Vec<PickerCommand>,
@@ -89,6 +99,7 @@ impl PickerOptions {
             }
             hosts.push(PickerHost {
                 name: "local".to_owned(),
+                label: "local".to_owned(),
                 target: None,
                 directories,
                 commands: vec![PickerCommand::Shell],
@@ -118,6 +129,7 @@ impl PickerOptions {
             }));
             hosts.push(PickerHost {
                 name: host.name.clone(),
+                label: host.name.clone(),
                 target: Some(host.target.clone()),
                 directories,
                 commands,
@@ -170,9 +182,11 @@ fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
             let command = session.preset.as_deref().unwrap_or("Shell");
             let id = session.id.to_string();
             let short_id = &id[id.len().saturating_sub(8)..];
+            let label = format!("Resume …{} · {} · {}", short_id, command, session.directory);
             PickerWorkload {
                 id: session.id,
-                label: format!("Resume …{} · {} · {}", short_id, command, session.directory),
+                base_label: label.clone(),
+                label,
             }
         })
         .collect()
@@ -215,13 +229,85 @@ pub enum PickerEvent {
     Confirm,
     Back,
     Cancel,
+    Refresh,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerOutcome {
     Continue,
+    RefreshRequested,
     Selected(PickerSelection),
     Cancelled,
+}
+
+#[derive(Clone, Debug)]
+struct StatusCell<T> {
+    value: Option<T>,
+    stale: bool,
+    loading: bool,
+}
+
+impl<T> Default for StatusCell<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            stale: false,
+            loading: false,
+        }
+    }
+}
+
+impl<T> StatusCell<T> {
+    fn begin_refresh(&mut self) {
+        self.stale = self.value.is_some();
+        self.loading = self.value.is_none();
+    }
+
+    fn apply(&mut self, value: T, _checked_at: std::time::SystemTime) {
+        self.value = Some(value);
+        self.stale = false;
+        self.loading = false;
+    }
+}
+
+fn format_status_label<T>(
+    base: &str,
+    cell: Option<&StatusCell<T>>,
+    text: impl Fn(&T) -> String,
+) -> String {
+    match cell {
+        Some(cell) if cell.loading => format!("[loading] {base}"),
+        Some(cell) if cell.stale => cell.value.as_ref().map_or_else(
+            || format!("[loading] {base}"),
+            |value| format!("[stale: {}] {base}", text(value)),
+        ),
+        Some(cell) => cell.value.as_ref().map_or_else(
+            || base.to_owned(),
+            |value| format!("[{}] {base}", text(value)),
+        ),
+        None => base.to_owned(),
+    }
+}
+
+fn host_status_text(status: &HostReachability) -> String {
+    match status {
+        HostReachability::Reachable => "online",
+        HostReachability::Unreachable => "offline",
+        HostReachability::TimedOut => "timeout",
+        HostReachability::Error => "error",
+    }
+    .to_owned()
+}
+
+fn workload_status_text(status: &WorkloadStatus) -> String {
+    match status {
+        WorkloadStatus::Running { attached: 0 } => "running".to_owned(),
+        WorkloadStatus::Running { attached } => format!("running · {attached} attached"),
+        WorkloadStatus::Missing => "missing".to_owned(),
+        WorkloadStatus::Unknown => "unknown".to_owned(),
+        WorkloadStatus::TimedOut => "timeout".to_owned(),
+        WorkloadStatus::Error => "error".to_owned(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +320,9 @@ pub struct PickerState {
     command_index: usize,
     placement_index: usize,
     resume_id: Option<SessionId>,
+    generation: u64,
+    host_status: HashMap<String, StatusCell<HostReachability>>,
+    workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
 }
 
 impl PickerState {
@@ -260,6 +349,9 @@ impl PickerState {
             command_index: 0,
             placement_index,
             resume_id: None,
+            generation: 0,
+            host_status: HashMap::new(),
+            workload_status: HashMap::new(),
         })
     }
 
@@ -267,9 +359,108 @@ impl PickerState {
         self.stage
     }
 
+    pub fn host_label(&self, name: &str) -> Option<&str> {
+        self.options
+            .hosts
+            .iter()
+            .find(|host| host.name == name)
+            .map(|host| host.label.as_str())
+    }
+
+    pub fn workload_label(&self, id: SessionId) -> Option<&str> {
+        self.options
+            .hosts
+            .iter()
+            .flat_map(|host| &host.workloads)
+            .find(|workload| workload.id == id)
+            .map(|workload| workload.label.as_str())
+    }
+
+    pub fn begin_refresh(&mut self, generation: u64) {
+        self.generation = generation;
+        for host in &self.options.hosts {
+            self.host_status
+                .entry(host.name.clone())
+                .or_default()
+                .begin_refresh();
+            for workload in &host.workloads {
+                self.workload_status
+                    .entry(workload.id)
+                    .or_default()
+                    .begin_refresh();
+            }
+        }
+        self.rebuild_status_labels();
+    }
+
+    pub fn apply_status(&mut self, message: StatusMessage) -> bool {
+        if message.generation() != self.generation {
+            return false;
+        }
+        let applied = match message {
+            StatusMessage::Host {
+                host,
+                status,
+                checked_at,
+                ..
+            } => self.host_status.get_mut(&host).is_some_and(|cell| {
+                cell.apply(status, checked_at);
+                true
+            }),
+            StatusMessage::Workload {
+                id,
+                status,
+                checked_at,
+                ..
+            } => self.workload_status.get_mut(&id).is_some_and(|cell| {
+                cell.apply(status, checked_at);
+                true
+            }),
+            StatusMessage::Finished { .. } => false,
+        };
+        if applied {
+            self.rebuild_status_labels();
+        }
+        applied
+    }
+
+    fn status_request(&self) -> StatusRequest {
+        StatusRequest {
+            generation: self.generation,
+            hosts: self
+                .options
+                .hosts
+                .iter()
+                .map(|host| StatusHost {
+                    name: host.name.clone(),
+                    target: host.target.clone(),
+                    workloads: host.workloads.iter().map(|workload| workload.id).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn rebuild_status_labels(&mut self) {
+        for host in &mut self.options.hosts {
+            host.label = format_status_label(
+                &host.name,
+                self.host_status.get(&host.name),
+                host_status_text,
+            );
+            for workload in &mut host.workloads {
+                workload.label = format_status_label(
+                    &workload.base_label,
+                    self.workload_status.get(&workload.id),
+                    workload_status_text,
+                );
+            }
+        }
+    }
+
     pub fn handle(&mut self, event: PickerEvent) -> PickerOutcome {
         match event {
             PickerEvent::Cancel => PickerOutcome::Cancelled,
+            PickerEvent::Refresh => PickerOutcome::RefreshRequested,
             PickerEvent::Back => self.back(),
             PickerEvent::Previous => {
                 let length = self.current_len();
@@ -320,6 +511,12 @@ impl PickerState {
             PickerStage::Resource => {
                 let host = &self.options.hosts[self.host_index];
                 if let Some(workload) = host.workloads.get(self.resource_index) {
+                    let missing = self.workload_status.get(&workload.id).is_some_and(|cell| {
+                        !cell.stale && matches!(cell.value, Some(WorkloadStatus::Missing))
+                    });
+                    if missing {
+                        return PickerOutcome::Continue;
+                    }
                     self.resume_id = Some(workload.id);
                     self.stage = PickerStage::Placement;
                 } else {
@@ -403,7 +600,7 @@ impl PickerState {
                 .options
                 .hosts
                 .iter()
-                .map(|host| host.name.as_str())
+                .map(|host| host.label.as_str())
                 .collect(),
             PickerStage::Resource => {
                 let host = &self.options.hosts[self.host_index];
@@ -445,7 +642,10 @@ fn placement_index(placement: Placement) -> usize {
 
 /// Runs the interactive terminal explorer. Escape and Ctrl-C always return
 /// `Ok(None)`; terminal modes are restored before the function returns.
-pub fn run_picker(options: PickerOptions) -> Result<Option<PickerSelection>> {
+pub fn run_picker(
+    options: PickerOptions,
+    status_service: StatusService,
+) -> Result<Option<PickerSelection>> {
     let mut state = PickerState::new(options)?;
     enable_raw_mode().context("enable terminal raw mode")?;
     if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
@@ -453,7 +653,7 @@ pub fn run_picker(options: PickerOptions) -> Result<Option<PickerSelection>> {
         return Err(error).context("enter terminal alternate screen");
     }
 
-    let result = run_terminal_picker(&mut state);
+    let result = run_terminal_picker(&mut state, &status_service);
     let leave_result =
         execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen");
     let raw_result = disable_raw_mode().context("disable terminal raw mode");
@@ -468,23 +668,56 @@ pub fn run_picker(options: PickerOptions) -> Result<Option<PickerSelection>> {
     }
 }
 
-fn run_terminal_picker(state: &mut PickerState) -> Result<Option<PickerSelection>> {
+fn start_status_run(
+    state: &mut PickerState,
+    service: &StatusService,
+    generation: u64,
+) -> StatusRun {
+    state.begin_refresh(generation);
+    service.start(state.status_request())
+}
+
+fn run_terminal_picker(
+    state: &mut PickerState,
+    status_service: &StatusService,
+) -> Result<Option<PickerSelection>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize terminal picker")?;
     terminal.clear().context("clear terminal picker")?;
+    let mut generation = 1_u64;
+    let mut status_run = start_status_run(state, status_service, generation);
+    let mut dirty = true;
 
     loop {
-        terminal
-            .draw(|frame| render_picker(frame, state))
-            .context("draw terminal picker")?;
+        while let Ok(message) = status_run.receiver.try_recv() {
+            dirty |= state.apply_status(message);
+        }
+        if dirty {
+            terminal
+                .draw(|frame| render_picker(frame, state))
+                .context("draw terminal picker")?;
+            dirty = false;
+        }
+        if !event::poll(Duration::from_millis(50)).context("poll terminal picker input")? {
+            continue;
+        }
         let Event::Key(key) = event::read().context("read terminal picker input")? else {
+            dirty = true;
             continue;
         };
         let Some(picker_event) = map_key(key) else {
             continue;
         };
+        dirty = true;
         match state.handle(picker_event) {
             PickerOutcome::Continue => {}
+            PickerOutcome::RefreshRequested => {
+                status_run.cancel();
+                generation = generation
+                    .checked_add(1)
+                    .context("status refresh generation overflow")?;
+                status_run = start_status_run(state, status_service, generation);
+            }
             PickerOutcome::Selected(selection) => return Ok(Some(selection)),
             PickerOutcome::Cancelled => return Ok(None),
         }
@@ -506,6 +739,14 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Some(PickerEvent::Next),
         KeyCode::Backspace | KeyCode::Left => Some(PickerEvent::Back),
         KeyCode::Enter | KeyCode::Right => Some(PickerEvent::Confirm),
+        KeyCode::Char('r' | 'R')
+            if key.kind == KeyEventKind::Press
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(PickerEvent::Refresh)
+        }
         _ => None,
     }
 }
@@ -513,7 +754,7 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
 fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
-    let area = centered_rect(frame.area(), 56, visible_rows.saturating_add(6).max(8));
+    let area = centered_rect(frame.area(), 72, visible_rows.saturating_add(6).max(8));
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(" Tether · {} ", state.title()))
@@ -557,7 +798,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
-        Paragraph::new("↑/↓ navigate · Enter/→ select · ← back · Esc cancel")
+        Paragraph::new("↑/↓ navigate · Enter/→ select · r refresh · ← back · Esc cancel")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray))
             .wrap(Wrap { trim: true }),
@@ -573,5 +814,34 @@ fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rec
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_key_maps_only_on_press() {
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(PickerEvent::Refresh)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            None
+        );
+        assert_eq!(
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            None
+        );
     }
 }

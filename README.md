@@ -11,6 +11,7 @@ Implemented and covered by the current command/test surface:
 - durable local and SSH-backed `tmux` create, inspect, attach, and explicit close;
 - configured hosts plus literal aliases read from `~/.ssh/config`;
 - an interactive host → workload/create → placement explorer with direct resume of active Tether workloads;
+- progressive local/remote reachability and workload status with independent three-second probe deadlines and explicit `r` refresh;
 - Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
 - versioned, private, atomic configuration and session-state persistence;
 - list, resume, close, age-based closed-metadata pruning, and JSON output;
@@ -20,6 +21,7 @@ Important limitations:
 
 - Closing a Herdr pane, losing SSH, or a failed attach does not close the `tmux` workload. Use `session close` explicitly.
 - Tether does not adopt arbitrary existing `tmux` sessions or automatically remove active records whose workload disappeared.
+- Explorer observations are point-in-time and cached only while that overlay remains open. Refresh marks prior results visibly stale until each host completes; timeout, offline, error, unknown, running, and missing are distinct.
 - `session prune` removes only sufficiently old records already marked `closed`; it does not kill workloads or probe/reconnect to hosts.
 - Commands and presets intentionally run through `/bin/sh -lc` on the selected machine. Configure only commands you trust.
 - Remote Herdr is not required. `host check` reports a remote `herdr` binary when present, but v0.1 does not use it for session transport.
@@ -27,7 +29,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 39 automated tests and a locked release build. Coverage includes the explorer resume intent, empty-workload create path, and exact `session resume <ID>` command in addition to the v0.1 lifecycle suite. A tmux-hosted interactive smoke selected an active persisted workload in the explorer and invoked `attach-session` for that exact ID.
+The current branch passes 46 automated tests and a locked release build. Coverage includes progressive multi-host status, timeout/cancellation and process cleanup, conservative failure mapping, refresh generations and stale labels, exact resume IDs, and the v0.1 lifecycle suite. A tmux-hosted interactive smoke displayed fresh local status, performed an explicit refresh, selected the persisted workload, and invoked `attach-session` for that exact ID.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -99,7 +101,7 @@ Open the interactive explorer:
 herdr-tether open
 ```
 
-Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Hosts with no active workload go directly to creation. Closing and closed records are not offered as resumable workloads.
+Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh. Existing observations become visibly `stale` until their host completes. A freshly proven-missing workload cannot be resumed. Hosts with no active workload go directly to creation. Closing and closed records are not offered as resumable workloads.
 
 Or create a local session without the explorer:
 
@@ -186,14 +188,15 @@ The hidden `plugin open` and `plugin setup` commands are manifest action entrypo
 
 ## Picker and Herdr placement
 
-The picker proceeds through:
+The explorer proceeds through:
 
 1. host (`local`, configured hosts, then discovered SSH aliases);
-2. directory (most recently used directories first, then configured roots; `HOME` locally or `~` as fallback);
-3. built-in shell or a host preset;
-4. split right, split down, or new tab.
+2. active workload or **Create new workload** when workloads exist;
+3. directory for creation (most recently used first, then configured roots; `HOME` locally or `~` as fallback);
+4. built-in shell or a host preset for creation;
+5. split right, split down, or new tab.
 
-Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, and `Esc`/`Ctrl-C` cancel. The default placement is split right.
+Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. The default placement is split right.
 
 Plugin actions first open `picker` or `setup` as a managed overlay. After selection, Tether asks Herdr to create exactly one split or tab and run the generated resume command in the returned pane ID. The durable workload remains a local or SSH-backed `tmux` session; the Herdr pane is only its view.
 

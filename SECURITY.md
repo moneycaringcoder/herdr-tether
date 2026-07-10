@@ -11,6 +11,7 @@ Tether 0.1 supports macOS and Linux and manages durable `tmux` sessions locally 
 Tether:
 
 - invokes the system `ssh` client directly, with the remote target as a separate argument, and relies on OpenSSH authentication and the user's `known_hosts` and strict host-key policy;
+- performs explorer status probes non-interactively with null stdin, a three-second local deadline, fixed concurrency, 64 KiB output caps, cancellation, and process-group cleanup; remote probes preserve OpenSSH host-key policy and classify uncertainty conservatively rather than treating transport failures as missing workloads;
 - does not collect or persist passwords, private keys, tokens, or telemetry;
 - writes configuration and session metadata through advisory-locked, atomic transactions, with private directory/file permissions on Unix;
 - inspects an established workload on explicit session close, persists a recoverable `closing` marker before killing an exact running session, and leaves indeterminate workloads unchanged; if initial metadata persistence fails, it attempts to kill the just-created workload and reports both failures plus the exact ID if rollback also fails. Pruning removes only sufficiently old metadata for sessions already proven absent or killed by explicit close; prune does not reconnect to or probe hosts.

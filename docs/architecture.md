@@ -21,6 +21,8 @@ Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is
 ```mermaid
 flowchart LR
     CLI[CLI / explorer] --> Intent{create or resume?}
+    CLI --> Status[StatusService]
+    Status --> Tmux
     Intent -->|create| Select[host + directory + command + placement]
     Select --> Durable[DurableBackend]
     Durable --> Tmux[TmuxBackend]
@@ -72,6 +74,14 @@ All SSH operations use `BatchMode=yes`. Interactive attach additionally requests
 
 The remote target validator prevents values that could become SSH options or shell syntax. The remote command builder POSIX-quotes every `tmux` argument. Session targeting uses `=<ID>` rather than a prefix.
 
+### `StatusService`
+
+`src/status.rs` owns ephemeral, non-destructive explorer observations. It snapshots hosts and active Tether IDs without holding a state lock, then runs one `tmux list-sessions` probe per host through a fixed four-worker pool. Results are published independently, so one slow host does not delay completed hosts.
+
+Each probe has a three-second monotonic deadline. Probe stdin is null, stdout/stderr are drained without blocking and capped at 64 KiB, and Linux/macOS probes run in their own process group. Timeout, refresh cancellation, or receiver drop kills and reaps the active group. Remote probes retain `BatchMode=yes`, target validation, separated SSH argv, normal host-key checking, and POSIX-quoted remote tmux argv.
+
+Generation-tagged messages distinguish host `reachable`, `unreachable`, `timed out`, and `error` from workload `running`, `missing`, `unknown`, `timed out`, and `error`. Exit 255 is remote-unreachable; tmux exit 1 is reachable-with-no-session; malformed or truncated successful output is never treated as missing. These observations never rewrite durable session metadata.
+
 ### `HerdrClient`
 
 `src/herdr.rs` is a local Herdr CLI adapter, not a durable backend. It consumes Herdr's executable, pane ID, and workspace ID from plugin context. It can:
@@ -104,6 +114,8 @@ The remote target validator prevents values that could become SSH options or she
 - configured UI placement, split right by default.
 
 The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
+
+The terminal loop polls input at 50 ms while draining status messages; it does not block on a host probe. The first generation renders `loading`. Pressing `r` starts a new generation, cancels the previous run, retains previous values as visibly `stale`, and rejects late prior-generation messages. A current fresh `missing` result disables resume for that row. Cache lifetime is one explorer invocation; reopening starts from truthful loading state rather than presenting persisted metadata as live.
 
 Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is retained but attachment happens in that terminal. In Herdr, placement creates and focuses the requested split/tab and starts exact-ID `session resume`. Newly created workloads are already durable before pane creation; existing workloads remain owned by tmux when their Herdr view closes.
 
@@ -148,7 +160,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, picker transitions/cancellation, and manifest shape. The current run reported 36 passing tests and a locked release build.
+Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, explorer transitions/cancellation, and bounded progressive status including timeout, process cleanup, conservative error mapping, refresh generations, and stale labels. The current run reported 46 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 

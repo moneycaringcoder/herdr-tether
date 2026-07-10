@@ -6,6 +6,8 @@
 
 - The managed terminal overlay now lists active Tether workloads beneath each host, resumes the selected exact session ID without traversing creation fields, and retains **Create new workload** as a sibling action. Hosts without active workloads proceed directly to creation.
 - Explorer resume and create intents share the existing focused split-right, split-down, and new-tab placement boundary. Closing and closed records are excluded from resumable choices.
+- Added progressive, non-destructive host and Tether workload status to the explorer. Four bounded workers isolate slow hosts; each local/SSH probe has a three-second deadline, cancellation and process-group cleanup, null stdin, and capped output.
+- Added explicit `r` refresh with generation-safe stale/fresh presentation. Host rows distinguish online/offline/timeout/error; workload rows distinguish running/missing/unknown/timeout/error, and freshly missing workloads cannot be resumed.
 
 ## [0.1.0] - 2026-07-10
 

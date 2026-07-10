@@ -8,6 +8,7 @@ pub mod paths;
 pub mod quote;
 pub mod sshcfg;
 pub mod state;
+pub mod status;
 mod storage;
 pub mod tmux;
 pub mod tui;

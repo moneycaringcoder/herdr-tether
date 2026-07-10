@@ -76,6 +76,16 @@ impl TmuxBackend {
             .output()
             .with_context(|| format!("run `{}`", spec.program.display()))
     }
+    pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
+        self.tmux_spec(
+            vec![
+                "list-sessions".to_owned(),
+                "-F".to_owned(),
+                "#{session_name}\t#{session_attached}".to_owned(),
+            ],
+            false,
+        )
+    }
 
     fn require_success(&self, operation: &str, spec: &CommandSpec) -> Result<()> {
         let output = self.output(spec)?;
