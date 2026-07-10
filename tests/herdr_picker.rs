@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::Path};
+use std::{fs, io::Write, path::Path, sync::Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
@@ -13,6 +13,8 @@ use tempfile::tempdir;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+static FAKE_HERDR_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_fake_herdr(path: &Path, log: &Path) {
     let script = format!(
@@ -53,6 +55,9 @@ fn context(binary: &Path) -> HerdrContext {
 
 #[test]
 fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
@@ -85,6 +90,9 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
 
 #[test]
 fn plugin_action_opens_the_declared_overlay_entrypoint() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");

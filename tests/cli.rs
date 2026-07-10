@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, MutexGuard},
+};
 
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -6,14 +10,20 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct Sandbox {
     temp: TempDir,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Sandbox {
     fn new() -> Self {
         Self {
             temp: tempfile::tempdir().unwrap(),
+            _guard: CLI_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         }
     }
 
