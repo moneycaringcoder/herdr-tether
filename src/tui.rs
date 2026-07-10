@@ -172,7 +172,7 @@ fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
             let short_id = &id[id.len().saturating_sub(8)..];
             PickerWorkload {
                 id: session.id,
-                label: format!("Resume {} · {} · …{}", session.directory, command, short_id),
+                label: format!("Resume …{} · {} · {}", short_id, command, session.directory),
             }
         })
         .collect()
@@ -557,7 +557,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
-        Paragraph::new("↑/↓ navigate · Enter select · ← back · Esc cancel")
+        Paragraph::new("↑/↓ navigate · Enter/→ select · ← back · Esc cancel")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray))
             .wrap(Wrap { trim: true }),

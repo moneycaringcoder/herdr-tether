@@ -218,7 +218,11 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
         .find(|host| host.name == "build-box")
         .unwrap();
     assert_eq!(build_box.workloads.len(), 2);
-    assert!(build_box.workloads[0].label.contains("Shell"));
+    assert!(
+        build_box.workloads[0]
+            .label
+            .starts_with("Resume …00000002 · Shell · ")
+    );
     assert!(
         build_box
             .workloads
