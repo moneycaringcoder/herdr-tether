@@ -1,0 +1,203 @@
+use std::{fs, io::Write, path::Path, sync::Mutex};
+
+use chrono::{Duration, TimeZone, Utc};
+use herdr_tether::{
+    backend::CommandSpec,
+    config::{CommandPreset, Config, HostConfig, UiDefaults},
+    herdr::{HerdrClient, HerdrContext},
+    model::{Placement, SessionId},
+    state::{SessionRecord, SessionStatus, State},
+    tui::{PickerEvent, PickerOptions, PickerOutcome, PickerStage, PickerState},
+};
+use tempfile::tempdir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+static FAKE_HERDR_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_fake_herdr(path: &Path, log: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+printf 'CALL' >> '{log}'
+for arg do printf '\t%s' "$arg" >> '{log}'; done
+printf '\n' >> '{log}'
+if [ "$1 $2" = "pane split" ]; then
+  printf '%s' '{{"id":"cli-1","result":{{"type":"pane_split","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
+elif [ "$1 $2" = "tab create" ]; then
+  printf '%s' '{{"id":"cli-2","result":{{"type":"tab_created","tab":{{"tab_id":"w1:t9","workspace_id":"w1"}},"root_pane":{{"pane_id":"w1:p10","workspace_id":"w1","tab_id":"w1:t9"}}}}}}'
+elif [ "$1 $2" = "pane run" ]; then
+  printf '%s' '{{"id":"cli-3","result":{{"type":"pane_ran","pane_id":"'$3'"}}}}'
+elif [ "$1 $2 $3" = "plugin pane open" ]; then
+  printf '%s' '{{"id":"cli-4","result":{{"type":"plugin_pane_opened","plugin_pane":{{"pane":{{"pane_id":"w1:p11"}}}}}}}}'
+else
+  printf '%s' '{{"id":"bad","error":{{"message":"unexpected fake invocation"}}}}'
+  exit 2
+fi
+"#,
+        log = log.display()
+    );
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn context(binary: &Path) -> HerdrContext {
+    HerdrContext {
+        binary: binary.into(),
+        pane_id: "w1:p1".into(),
+        workspace_id: "w1".into(),
+    }
+}
+
+#[test]
+fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log);
+    let client = HerdrClient::new(context(&binary));
+    let command = CommandSpec {
+        program: "/tmp/plugin root/herdr-tether".into(),
+        args: vec![
+            "session".into(),
+            "resume".into(),
+            "tether-0197f198000070008000000000000001".into(),
+        ],
+    };
+
+    let right = client.place(&command, Placement::SplitRight).unwrap();
+    assert_eq!(right.pane_id, "w1:p9");
+    let down = client.place(&command, Placement::SplitDown).unwrap();
+    assert_eq!(down.pane_id, "w1:p9");
+    let tab = client.place(&command, Placement::NewTab).unwrap();
+    assert_eq!(tab.pane_id, "w1:p10");
+
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright\t--focus"));
+    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tdown\t--focus"));
+    assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1"));
+    assert!(transcript.contains(
+        "CALL\tpane\trun\tw1:p9\t'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
+    ));
+}
+
+#[test]
+fn plugin_action_opens_the_declared_overlay_entrypoint() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log);
+    let client = HerdrClient::new(context(&binary));
+
+    client.open_plugin_pane("picker").unwrap();
+
+    assert!(fs::read_to_string(log).unwrap().contains(
+        "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\toverlay"
+    ));
+}
+
+fn picker_fixture() -> (Config, State) {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let config = Config {
+        version: Config::CURRENT_VERSION,
+        hosts: vec![HostConfig {
+            name: "build-box".into(),
+            target: "builder@example.test".into(),
+            roots: vec!["/srv/configured".into(), "/srv/shared".into()],
+            presets: vec![CommandPreset {
+                name: "agent".into(),
+                command: "exec codex".into(),
+            }],
+        }],
+        ui: UiDefaults {
+            placement: Placement::SplitRight,
+        },
+    };
+    let state = State {
+        version: State::CURRENT_VERSION,
+        sessions: vec![
+            SessionRecord {
+                id: "tether-0197f198000070008000000000000001"
+                    .parse::<SessionId>()
+                    .unwrap(),
+                host: "build-box".into(),
+                target: "builder@example.test".into(),
+                directory: "/srv/shared".into(),
+                preset: Some("agent".into()),
+                status: SessionStatus::Active,
+                created_at: now - Duration::days(2),
+                last_used_at: now - Duration::hours(2),
+                closed_at: None,
+            },
+            SessionRecord {
+                id: "tether-0197f198000070008000000000000002"
+                    .parse::<SessionId>()
+                    .unwrap(),
+                host: "build-box".into(),
+                target: "builder@example.test".into(),
+                directory: "/srv/recent".into(),
+                preset: None,
+                status: SessionStatus::Active,
+                created_at: now - Duration::days(1),
+                last_used_at: now - Duration::hours(1),
+                closed_at: None,
+            },
+        ],
+    };
+    (config, state)
+}
+
+#[test]
+fn picker_walks_host_directory_command_and_placement() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let build_box = options
+        .hosts
+        .iter()
+        .find(|host| host.name == "build-box")
+        .unwrap();
+    assert_eq!(
+        build_box.directories,
+        ["/srv/recent", "/srv/shared", "/srv/configured"]
+    );
+    assert_eq!(build_box.commands[0].label(), "Shell");
+    assert_eq!(build_box.commands[1].label(), "agent");
+
+    let mut picker = PickerState::new(options).unwrap();
+    assert_eq!(picker.stage(), PickerStage::Host);
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Directory);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Command);
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Placement);
+    picker.handle(PickerEvent::Next);
+    let PickerOutcome::Selected(selection) = picker.handle(PickerEvent::Confirm) else {
+        panic!("picker did not return a selection");
+    };
+    assert_eq!(selection.host, "build-box");
+    assert_eq!(selection.directory, "/srv/recent");
+    assert_eq!(selection.preset.as_deref(), Some("agent"));
+    assert_eq!(selection.command, "exec codex");
+    assert_eq!(selection.placement, Placement::SplitDown);
+}
+
+#[test]
+fn cancelling_picker_produces_no_selection() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let mut picker = PickerState::new(options).unwrap();
+    assert_eq!(picker.handle(PickerEvent::Cancel), PickerOutcome::Cancelled);
+}

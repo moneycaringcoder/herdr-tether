@@ -1,0 +1,28 @@
+[package]
+name = "herdr-tether"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Durable tmux terminals with Herdr integration"
+license = "MIT"
+repository = "https://github.com/moneycaringcoder/herdr-tether"
+keywords = ["herdr", "terminal", "ssh", "tmux"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+fs2 = "0.4"
+ratatui = "0.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "0.9"
+uuid = { version = "1.19", features = ["serde", "v7"] }
+
+[dev-dependencies]
+assert_cmd = "2.1"
+predicates = "3.1"
+tempfile = "3.23"
