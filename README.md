@@ -26,9 +26,9 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passed 35 automated tests, a locked release build, and a Herdr 0.7.3 development link/action-list/unlink smoke. A live local `tmux` workload was created, survived a failed non-TTY attach, and was removed only by explicit close. **The local non-TTY attach itself was not exercised successfully.**
+The current branch passed 35 automated tests, a locked release build, and a Herdr 0.7.3 development link/action-list/unlink smoke. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4.
 
-**The live remote SSH path was not exercised in this run:** the localhost attempt stopped at OpenSSH strict host-key verification. No remote create/attach/resume/close claim is inferred from that failed attempt. The exact remaining live checks are listed in [Independent Hermes verification](#independent-hermes-verification).
+The resumed workload retained the same PID while its counter advanced after detach. Verification also covered a directory containing spaces, literal shell metacharacters without injection, and exact close/prune isolation with an unrelated `tmux` session left intact. Native Herdr placement interaction and the macOS live smoke remain manual checks; CI covers the macOS Rust gates.
 
 ## Prerequisites
 
@@ -260,7 +260,7 @@ That is the durability contract. Reopen with `session resume <ID>` or intentiona
 
 ## Independent Hermes verification
 
-The following are **manual verification still required**, not claims from the current run. Use a disposable SSH host and disposable directories. First make strict host-key and BatchMode authentication succeed without changing Tether:
+The following is the reproducible verification checklist. Items 1–3 were completed against `dev` from the Hermes host under strict host-key checking and BatchMode authentication; items 4–8 remain release/user acceptance checks. Use disposable SSH targets and directories when repeating it:
 
 ```sh
 export TARGET=dev@example.com
@@ -308,10 +308,10 @@ Then record evidence for every item:
 4. **Herdr overlay, all placements, and mixed locality.** Run `herdr plugin action invoke open --plugin moneycaringcoder.tether` for three separate selections and choose split right, split down, and new tab. Leave at least one local and one remote Tether pane open together. Verify each resume command runs in the pane Herdr just returned, then close those panes and confirm their `tmux` workloads remain resumable.
 5. **Cancel is side-effect free.** Locate the state path printed by `herdr-tether setup --yes`. Save both `sha256sum <state.json>` (or `shasum -a 256` on macOS) and `herdr-tether session list --json`. Invoke the picker and press `Esc` at host, directory, command, and placement in four separate runs. Both saved values must remain identical after every cancellation.
 6. **Setup does not edit Herdr config.** Save a checksum of the actual Herdr config, run `herdr-tether setup --yes`, then run `herdr plugin action invoke setup --plugin moneycaringcoder.tether`. Recompute after each operation; the Herdr config checksum must remain identical.
-7. **Local real-TTY attach.** From an interactive terminal, open a local workload, verify attachment succeeds, detach, resume the same ID, and explicitly close it. Also keep an unrelated local `tmux` session throughout and verify exact-session isolation. The prior non-TTY run proved only durable create/survival/explicit close—not attach.
+7. **Local real-TTY attach.** From an interactive terminal, open a local workload, verify attachment succeeds, detach, resume the same ID, and explicitly close it. Also keep an unrelated local `tmux` session throughout and verify exact-session isolation. The remote real-TTY path is verified; this item remains the equivalent local lifecycle check.
 8. **macOS build/action smoke.** On supported macOS run `cargo build --release --locked`, `herdr plugin link "$(pwd)"`, `herdr plugin action list --plugin moneycaringcoder.tether`, both action invocations, local create/detach/resume/close, and split-right/split-down/new-tab placement. Unlink after evidence collection.
 
-After verification, remove the disposable host entry and sessions. Do not report remote support as live-verified until items 1–3 succeed under strict host-key checking.
+After verification, remove the disposable host entry and sessions. Do not report native Herdr placement or macOS live behavior until the corresponding checks above succeed.
 
 Post-verification publishing actions, not performed on this branch:
 

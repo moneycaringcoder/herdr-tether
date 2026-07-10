@@ -149,7 +149,7 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     write_fake(&ssh, &temp.path().join("ssh.args"), "", 0);
-    write_fake(&tmux, &log, "2", 0);
+    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001\t2", 0);
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
     assert_eq!(
@@ -159,18 +159,19 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     assert_eq!(
         read_argv(&log),
         [
-            "display-message",
-            "-p",
-            "-t",
-            "=tether-0197f198000070008000000000000001",
-            "#{session_attached}",
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
+            "-f",
+            "#{==:#{session_name},tether-0197f198000070008000000000000001}",
         ]
     );
 }
 
 #[test]
-fn inspect_maps_exit_one_to_missing_and_other_failures_to_unknown() {
+fn inspect_maps_missing_and_failure_results() {
     for (status, expected) in [
+        (0, WorkloadState::Missing),
         (1, WorkloadState::Missing),
         (2, WorkloadState::Unknown),
         (255, WorkloadState::Unknown),

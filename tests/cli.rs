@@ -200,7 +200,7 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
 
 fn write_fake_tmux(path: &Path, log: &Path) {
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$(tail -n 1 '{log}')\" in\n  display-message*) printf '0' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$(tail -n 1 '{log}')\" in\n  list-sessions*) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); printf '%s\\t0' \"$id\" ;;\nesac\nexit 0\n",
         log = log.display()
     );
     fs::write(path, script).unwrap();
@@ -375,7 +375,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
     fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
     let log = sandbox.path("tmux.log");
     let body = format!(
-        "printf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  display-message) exit 1 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
+        "printf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  list-sessions) exit 0 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
         log.display()
     );
     let (path, _) = install_tmux_script(&sandbox, &body);
@@ -389,7 +389,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
         .stdout(predicate::str::contains("closed"));
 
     let transcript = fs::read_to_string(log).unwrap();
-    assert!(transcript.contains("display-message"));
+    assert!(transcript.contains("list-sessions"));
     assert!(!transcript.contains("kill-session"));
     let persisted = fs::read_to_string(sandbox.state_file()).unwrap();
     assert!(persisted.contains(r#""status": "closed""#));
@@ -401,11 +401,11 @@ fn close_unknown_or_failed_running_workload_preserves_active_metadata() {
     for (name, body) in [
         (
             "unknown",
-            "case \"$1\" in\n  display-message) printf 'not-a-count'; exit 0 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'malformed'; exit 0 ;;\n  kill-session) exit 99 ;;\nesac\nexit 0",
         ),
         (
             "failed-running-close",
-            "case \"$1\" in\n  display-message) printf '0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001\\t0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -443,13 +443,13 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
         (
             "missing",
             active_state(SESSION_ID),
-            "case \"$1\" in display-message) exit 1;; esac\nexit 0",
+            "case \"$1\" in list-sessions) exit 0;; esac\nexit 0",
             "no longer exists",
         ),
         (
             "unknown",
             active_state(SESSION_ID),
-            "case \"$1\" in display-message) printf 'unknown'; exit 0;; esac\nexit 0",
+            "case \"$1\" in list-sessions) printf 'malformed'; exit 0;; esac\nexit 0",
             "could not determine",
         ),
         (

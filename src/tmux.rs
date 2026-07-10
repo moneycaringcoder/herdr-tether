@@ -116,27 +116,37 @@ impl DurableBackend for TmuxBackend {
     }
 
     fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
+        let id_text = id.to_string();
         let spec = self.tmux_spec(
             vec![
-                "display-message".to_owned(),
-                "-p".to_owned(),
-                "-t".to_owned(),
-                exact_target(id),
-                "#{session_attached}".to_owned(),
+                "list-sessions".to_owned(),
+                "-F".to_owned(),
+                "#{session_name}\t#{session_attached}".to_owned(),
+                "-f".to_owned(),
+                format!("#{{==:#{{session_name}},{id_text}}}"),
             ],
             false,
         )?;
         let output = self.output(&spec)?;
         if output.status.success() {
-            return Ok(
-                match String::from_utf8(output.stdout)
-                    .ok()
-                    .and_then(|value| value.trim().parse::<u32>().ok())
-                {
-                    Some(attached) => WorkloadState::Running { attached },
-                    None => WorkloadState::Unknown,
-                },
-            );
+            let stdout = match String::from_utf8(output.stdout) {
+                Ok(stdout) => stdout,
+                Err(_) => return Ok(WorkloadState::Unknown),
+            };
+            let line = stdout.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                return Ok(WorkloadState::Missing);
+            }
+            let Some((name, attached)) = line.split_once('\t') else {
+                return Ok(WorkloadState::Unknown);
+            };
+            if name != id_text {
+                return Ok(WorkloadState::Unknown);
+            }
+            return Ok(match attached.parse::<u32>() {
+                Ok(attached) => WorkloadState::Running { attached },
+                Err(_) => WorkloadState::Unknown,
+            });
         }
 
         Ok(if output.status.code() == Some(1) {
