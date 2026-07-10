@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -243,7 +243,6 @@ pub enum PickerOutcome {
 #[derive(Clone, Debug)]
 struct StatusCell<T> {
     value: Option<T>,
-    checked_at: Option<SystemTime>,
     stale: bool,
     loading: bool,
 }
@@ -252,7 +251,6 @@ impl<T> Default for StatusCell<T> {
     fn default() -> Self {
         Self {
             value: None,
-            checked_at: None,
             stale: false,
             loading: false,
         }
@@ -265,9 +263,8 @@ impl<T> StatusCell<T> {
         self.loading = self.value.is_none();
     }
 
-    fn apply(&mut self, value: T, checked_at: SystemTime) {
+    fn apply(&mut self, value: T, _checked_at: std::time::SystemTime) {
         self.value = Some(value);
-        self.checked_at = Some(checked_at);
         self.stale = false;
         self.loading = false;
     }
@@ -279,14 +276,14 @@ fn format_status_label<T>(
     text: impl Fn(&T) -> String,
 ) -> String {
     match cell {
-        Some(cell) if cell.loading => format!("{base} [loading]"),
+        Some(cell) if cell.loading => format!("[loading] {base}"),
         Some(cell) if cell.stale => cell.value.as_ref().map_or_else(
-            || format!("{base} [loading]"),
-            |value| format!("{base} [stale: {}]", text(value)),
+            || format!("[loading] {base}"),
+            |value| format!("[stale: {}] {base}", text(value)),
         ),
         Some(cell) => cell.value.as_ref().map_or_else(
             || base.to_owned(),
-            |value| format!("{base} [{}]", text(value)),
+            |value| format!("[{}] {base}", text(value)),
         ),
         None => base.to_owned(),
     }
@@ -326,7 +323,6 @@ pub struct PickerState {
     generation: u64,
     host_status: HashMap<String, StatusCell<HostReachability>>,
     workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
-    in_flight: bool,
 }
 
 impl PickerState {
@@ -356,7 +352,6 @@ impl PickerState {
             generation: 0,
             host_status: HashMap::new(),
             workload_status: HashMap::new(),
-            in_flight: false,
         })
     }
 
@@ -383,7 +378,6 @@ impl PickerState {
 
     pub fn begin_refresh(&mut self, generation: u64) {
         self.generation = generation;
-        self.in_flight = true;
         for host in &self.options.hosts {
             self.host_status
                 .entry(host.name.clone())
@@ -422,10 +416,7 @@ impl PickerState {
                 cell.apply(status, checked_at);
                 true
             }),
-            StatusMessage::Finished { .. } => {
-                self.in_flight = false;
-                true
-            }
+            StatusMessage::Finished { .. } => false,
         };
         if applied {
             self.rebuild_status_labels();
@@ -749,9 +740,10 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
         KeyCode::Backspace | KeyCode::Left => Some(PickerEvent::Back),
         KeyCode::Enter | KeyCode::Right => Some(PickerEvent::Confirm),
         KeyCode::Char('r' | 'R')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            if key.kind == KeyEventKind::Press
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             Some(PickerEvent::Refresh)
         }
@@ -762,7 +754,7 @@ fn map_key(key: KeyEvent) -> Option<PickerEvent> {
 fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
-    let area = centered_rect(frame.area(), 56, visible_rows.saturating_add(6).max(8));
+    let area = centered_rect(frame.area(), 72, visible_rows.saturating_add(6).max(8));
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(" Tether · {} ", state.title()))
@@ -830,10 +822,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refresh_key_maps_only_on_press_or_repeat() {
+    fn refresh_key_maps_only_on_press() {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
             Some(PickerEvent::Refresh)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            None
         );
         assert_eq!(
             map_key(KeyEvent::new_with_kind(

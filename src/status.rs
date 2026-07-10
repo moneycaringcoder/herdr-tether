@@ -22,6 +22,7 @@ use crate::{
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_DRAIN_BYTES_PER_TICK: usize = MAX_CAPTURE_BYTES + 8192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostReachability {
@@ -432,14 +433,19 @@ fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Resul
         return Ok(());
     };
     let mut buffer = [0_u8; 8192];
+    let mut drained = 0;
     loop {
         match pipe.read(&mut buffer) {
             Ok(0) => return Ok(()),
             Ok(length) => {
+                drained += length;
                 let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.bytes.len());
                 let retained = remaining.min(length);
                 capture.bytes.extend_from_slice(&buffer[..retained]);
                 capture.truncated |= retained < length;
+                if drained >= MAX_DRAIN_BYTES_PER_TICK {
+                    return Ok(());
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

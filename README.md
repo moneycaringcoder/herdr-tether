@@ -188,14 +188,15 @@ The hidden `plugin open` and `plugin setup` commands are manifest action entrypo
 
 ## Picker and Herdr placement
 
-The picker proceeds through:
+The explorer proceeds through:
 
 1. host (`local`, configured hosts, then discovered SSH aliases);
-2. directory (most recently used directories first, then configured roots; `HOME` locally or `~` as fallback);
-3. built-in shell or a host preset;
-4. split right, split down, or new tab.
+2. active workload or **Create new workload** when workloads exist;
+3. directory for creation (most recently used first, then configured roots; `HOME` locally or `~` as fallback);
+4. built-in shell or a host preset for creation;
+5. split right, split down, or new tab.
 
-Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, and `Esc`/`Ctrl-C` cancel. The default placement is split right.
+Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. The default placement is split right.
 
 Plugin actions first open `picker` or `setup` as a managed overlay. After selection, Tether asks Herdr to create exactly one split or tab and run the generated resume command in the returned pane ID. The durable workload remains a local or SSH-backed `tmux` session; the Herdr pane is only its view.
 

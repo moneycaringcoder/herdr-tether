@@ -287,7 +287,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
     explorer.begin_refresh(1);
     assert_eq!(
         explorer.host_label("build-box"),
-        Some("build-box [loading]")
+        Some("[loading] build-box")
     );
     assert_eq!(explorer.stage(), PickerStage::Resource);
 
@@ -297,8 +297,8 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         status: HostReachability::Reachable,
         checked_at: SystemTime::UNIX_EPOCH,
     }));
-    assert_eq!(explorer.host_label("build-box"), Some("build-box [online]"));
-    assert_eq!(explorer.host_label("local"), Some("local [loading]"));
+    assert_eq!(explorer.host_label("build-box"), Some("[online] build-box"));
+    assert_eq!(explorer.host_label("local"), Some("[loading] local"));
     assert!(explorer.apply_status(StatusMessage::Workload {
         generation: 1,
         id: workload_id,
@@ -309,13 +309,13 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         explorer
             .workload_label(workload_id)
             .unwrap()
-            .ends_with("[running · 2 attached]")
+            .starts_with("[running · 2 attached] Resume …00000002")
     );
 
     explorer.begin_refresh(2);
     assert_eq!(
         explorer.host_label("build-box"),
-        Some("build-box [stale: online]")
+        Some("[stale: online] build-box")
     );
     assert!(!explorer.apply_status(StatusMessage::Host {
         generation: 1,
@@ -325,7 +325,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
     }));
     assert_eq!(
         explorer.host_label("build-box"),
-        Some("build-box [stale: online]")
+        Some("[stale: online] build-box")
     );
     assert!(explorer.apply_status(StatusMessage::Host {
         generation: 2,
@@ -335,7 +335,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
     }));
     assert_eq!(
         explorer.host_label("build-box"),
-        Some("build-box [timeout]")
+        Some("[timeout] build-box")
     );
 }
 

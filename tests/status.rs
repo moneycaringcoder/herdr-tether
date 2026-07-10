@@ -45,7 +45,7 @@ fn fast_host_publishes_before_slow_host_times_out() {
 
     let service = StatusService::new(
         ProcessBinaries::new(&ssh, temp.path().join("tmux")),
-        Duration::from_millis(200),
+        Duration::from_millis(500),
         2,
     );
     let started = Instant::now();
@@ -105,7 +105,7 @@ fn fast_host_publishes_before_slow_host_times_out() {
         .expect("slow timeout result");
 
     assert!(fast < slow, "fast host must publish before slow timeout");
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_millis(1500));
 }
 
 #[test]

@@ -160,7 +160,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, picker transitions/cancellation, and manifest shape. The current run reported 36 passing tests and a locked release build.
+Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, explorer transitions/cancellation, and bounded progressive status including timeout, process cleanup, conservative error mapping, refresh generations, and stale labels. The current run reported 46 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 
