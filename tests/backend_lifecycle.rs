@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
@@ -20,7 +24,15 @@ fn write_fake(path: &Path, log: &Path, stdout: &str, status: i32) {
         log = log.display(),
         stdout = stdout.replace('\'', "'\\''"),
     );
-    fs::write(path, script).unwrap();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
