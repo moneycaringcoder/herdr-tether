@@ -148,7 +148,7 @@ Automated tests exercise command parsing and state behavior, config migration/pr
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 
-The same run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. Native Herdr action/overlay interaction, all three placements with mixed local/remote panes, picker Esc state immutability, setup's non-modification of Herdr config, the equivalent local real-TTY lifecycle, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's **Independent Hermes verification** section.
+The same run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. A separate real-TTY run on Hermes verified the equivalent local create/attach/detach/resume/close lifecycle and unrelated-session isolation. Native Herdr action/overlay interaction, all three placements with mixed local/remote panes, picker Esc state immutability, setup's non-modification of Herdr config, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's **Independent Hermes verification** section.
 
 ## Future native federation path
 
@@ -180,7 +180,7 @@ No `RemoteHerdrBackend` exists today. Naming it here is an architectural path, n
 
 ## Roadmap
 
-1. Complete native Herdr placement, cancellation/config-integrity, local real-TTY, and macOS live acceptance checks.
+1. Complete native Herdr placement, cancellation/config-integrity, and macOS live acceptance checks.
 2. Define native federation identity, capabilities, lifecycle, and failure semantics before changing the backend trait.
 3. Implement and test `RemoteHerdrBackend` only after those contracts are stable.
 4. Add explicit operator-driven reconciliation for missing active workloads without weakening conservative pruning.
