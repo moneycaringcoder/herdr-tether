@@ -41,6 +41,27 @@ pub struct Config {
 
 impl Config {
     pub const CURRENT_VERSION: u32 = 1;
+    pub fn add_host(&mut self, host: HostConfig) -> Result<()> {
+        if self.hosts.iter().any(|existing| existing.name == host.name) {
+            bail!("host `{}` already exists", host.name);
+        }
+
+        self.hosts.push(host);
+        if let Err(error) = self.validate() {
+            self.hosts.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn remove_host(&mut self, name: &str) -> bool {
+        let Some(index) = self.hosts.iter().position(|host| host.name == name) else {
+            return false;
+        };
+        self.hosts.remove(index);
+        true
+    }
+
 
     pub fn validate(&self) -> Result<()> {
         if self.version != Self::CURRENT_VERSION {
@@ -55,10 +76,15 @@ impl Config {
         for (host_index, host) in self.hosts.iter().enumerate() {
             let location = format!("host at index {host_index}");
             require_nonempty(&host.name, &format!("{location} name"))?;
+            if host.name.eq_ignore_ascii_case("local") {
+                bail!("host name `{}` is reserved", host.name);
+            }
             if !host_names.insert(host.name.as_str()) {
                 bail!("duplicate host name `{}`", host.name);
             }
             require_nonempty(&host.target, &format!("host `{}` target", host.name))?;
+            crate::sshcfg::validate_ssh_target(&host.target)
+                .with_context(|| format!("invalid target for host `{}`", host.name))?;
 
             for (root_index, root) in host.roots.iter().enumerate() {
                 require_nonempty(
@@ -168,6 +194,9 @@ impl ConfigStore {
 }
 
 fn require_nonempty(value: &str, field: &str) -> Result<()> {
+    if value.contains('\0') {
+        bail!("{field} must not contain NUL");
+    }
     if value.trim().is_empty() {
         bail!("{field} must not be empty");
     }
