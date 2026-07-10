@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
+    sync::Mutex,
 };
 
 use chrono::{Duration, TimeZone, Utc};
@@ -17,6 +18,8 @@ use tempfile::tempdir;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+static FAKE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_fake(path: &Path, log: &Path, stdout: &str, status: i32) {
     let script = format!(
@@ -73,6 +76,7 @@ fn posix_quote_handles_adversarial_values_without_interpolation() {
 
 #[test]
 fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
@@ -119,6 +123,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
 
 #[test]
 fn attach_only_attaches_and_close_is_the_only_kill_path() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
@@ -145,6 +150,7 @@ fn attach_only_attaches_and_close_is_the_only_kill_path() {
 
 #[test]
 fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
@@ -171,6 +177,7 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
 
 #[test]
 fn inspect_maps_missing_and_failure_results() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
     for (status, expected) in [
         (0, WorkloadState::Missing),
         (1, WorkloadState::Missing),
