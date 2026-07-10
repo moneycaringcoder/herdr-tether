@@ -103,7 +103,7 @@ The remote target validator prevents values that could become SSH options or she
 - built-in shell first, followed by configured presets;
 - configured UI placement, split right by default.
 
-The state machine is host → workload/create. An active workload proceeds directly to placement and returns a typed exact-ID resume intent. **Create new workload** proceeds through directory → command → placement and returns a create intent. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
+The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
 
 Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is retained but attachment happens in that terminal. In Herdr, placement creates and focuses the requested split/tab and starts exact-ID `session resume`. Newly created workloads are already durable before pane creation; existing workloads remain owned by tmux when their Herdr view closes.
 

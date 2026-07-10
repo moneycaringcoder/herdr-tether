@@ -27,7 +27,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 38 automated tests and a locked release build. Coverage includes the explorer resume intent and its exact `session resume <ID>` command in addition to the v0.1 lifecycle suite. A tmux-hosted interactive smoke selected an active persisted workload in the explorer and invoked `attach-session` for that exact ID.
+The current branch passes 39 automated tests and a locked release build. Coverage includes the explorer resume intent, empty-workload create path, and exact `session resume <ID>` command in addition to the v0.1 lifecycle suite. A tmux-hosted interactive smoke selected an active persisted workload in the explorer and invoked `attach-session` for that exact ID.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -99,7 +99,7 @@ Open the interactive explorer:
 herdr-tether open
 ```
 
-Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Closed records are not offered as resumable workloads.
+Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Hosts with no active workload go directly to creation. Closing and closed records are not offered as resumable workloads.
 
 Or create a local session without the explorer:
 

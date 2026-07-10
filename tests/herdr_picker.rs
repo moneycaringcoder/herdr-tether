@@ -218,6 +218,7 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
         .find(|host| host.name == "build-box")
         .unwrap();
     assert_eq!(build_box.workloads.len(), 2);
+    assert!(build_box.workloads[0].label.contains("Shell"));
     assert!(
         build_box
             .workloads
@@ -245,6 +246,21 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
             placement: Placement::SplitRight,
         })
     );
+}
+
+#[test]
+fn explorer_skips_empty_workload_stage_for_create() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let mut explorer = PickerState::new(options).unwrap();
+
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Directory);
+    assert_eq!(explorer.handle(PickerEvent::Back), PickerOutcome::Continue);
+    assert_eq!(explorer.stage(), PickerStage::Host);
 }
 
 #[test]

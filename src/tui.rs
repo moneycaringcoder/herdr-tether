@@ -167,7 +167,7 @@ fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
     sessions
         .into_iter()
         .map(|session| {
-            let command = session.preset.as_deref().unwrap_or("shell");
+            let command = session.preset.as_deref().unwrap_or("Shell");
             let id = session.id.to_string();
             let short_id = &id[id.len().saturating_sub(8)..];
             PickerWorkload {
@@ -291,14 +291,15 @@ impl PickerState {
         self.stage = match self.stage {
             PickerStage::Host => return PickerOutcome::Cancelled,
             PickerStage::Resource => PickerStage::Host,
+            PickerStage::Directory if self.options.hosts[self.host_index].workloads.is_empty() => {
+                PickerStage::Host
+            }
             PickerStage::Directory => PickerStage::Resource,
             PickerStage::Command => PickerStage::Directory,
             PickerStage::Placement if self.resume_id.is_some() => PickerStage::Resource,
             PickerStage::Placement => PickerStage::Command,
         };
-        if self.stage != PickerStage::Placement {
-            self.resume_id = None;
-        }
+        self.resume_id = None;
         PickerOutcome::Continue
     }
 
@@ -309,7 +310,11 @@ impl PickerState {
                 self.directory_index = 0;
                 self.command_index = 0;
                 self.resume_id = None;
-                self.stage = PickerStage::Resource;
+                self.stage = if self.options.hosts[self.host_index].workloads.is_empty() {
+                    PickerStage::Directory
+                } else {
+                    PickerStage::Resource
+                };
                 PickerOutcome::Continue
             }
             PickerStage::Resource => {
@@ -550,7 +555,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[0]);
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
         Paragraph::new("↑/↓ navigate · Enter select · ← back · Esc cancel")
             .alignment(Alignment::Center)
