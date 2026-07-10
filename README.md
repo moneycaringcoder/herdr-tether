@@ -12,6 +12,8 @@ Implemented and covered by the current command/test surface:
 - configured hosts plus literal aliases read from `~/.ssh/config`;
 - an interactive host → workload/create → placement explorer with direct resume of active Tether workloads;
 - progressive local/remote reachability and workload status with independent three-second probe deadlines and explicit `r` refresh;
+- bounded local and BatchMode-SSH repository discovery from each host's seed directories (recent workload directories, configured roots, and the local `HOME`/remote `~` fallback), with progressive results, deterministic local ordering, and no symlink traversal;
+- case-insensitive directory filtering and literal direct-path entry from the explorer;
 - Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
 - versioned, private, atomic configuration and session-state persistence;
 - list, resume, close, age-based closed-metadata pruning, and JSON output;
@@ -29,7 +31,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 46 automated tests and a locked release build. Coverage includes progressive multi-host status, timeout/cancellation and process cleanup, conservative failure mapping, refresh generations and stale labels, exact resume IDs, and the v0.1 lifecycle suite. A tmux-hosted interactive smoke displayed fresh local status, performed an explicit refresh, selected the persisted workload, and invoked `attach-session` for that exact ID.
+The current branch passes 59 automated tests and a locked release build. Coverage includes bounded repository discovery, adversarial remote-root quoting and parser responses, explorer filter/direct-path behavior, progressive multi-host status, timeout/cancellation and process cleanup, conservative failure mapping, refresh generations and stale labels, exact resume IDs, and the v0.1 lifecycle suite. Tmux-hosted interactive smokes selected a newly discovered repository for creation and separately exercised fresh status, explicit refresh, and exact-ID resume.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -101,7 +103,7 @@ Open the interactive explorer:
 herdr-tether open
 ```
 
-Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select its directory, shell/preset, and placement. Host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh. Existing observations become visibly `stale` until their host completes. A freshly proven-missing workload cannot be resumed. Hosts with no active workload go directly to creation. Closing and closed records are not offered as resumable workloads.
+Choose a host, then resume an active Tether workload directly or choose **Create new workload** and select a discovered repository/recent directory, shell/preset, and placement. Repository scans start after the overlay opens and append results progressively without blocking navigation. Host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh both status and repository discovery. Existing status observations become visibly `stale` until their host completes. A freshly proven-missing workload cannot be resumed. Hosts with no active workload go directly to creation. Closing and closed records are not offered as resumable workloads.
 
 Or create a local session without the explorer:
 
@@ -164,7 +166,7 @@ herdr-tether open [--host <NAME>] [--directory <DIR>]
                   [--placement split-right|split-down|new-tab]
 ```
 
-Supplying host, directory, and exactly one command source bypasses the picker. Otherwise the picker walks its four list-based stages and applies any supplied arguments as overrides; it does not provide free-form search or path entry in v0.1. Outside Herdr, Tether runs the attach command in the current terminal. In Herdr plugin context, it creates the chosen split/tab and runs `session resume <ID>` there.
+Supplying host, directory, and exactly one command source bypasses the explorer. Otherwise the explorer returns a typed create or resume intent and applies any supplied arguments as overrides. On the directory stage, `/` opens a case-insensitive filter and `p` opens literal direct-path entry; `Enter` applies the input and `Esc` closes it without cancelling the explorer. Outside Herdr, Tether runs the attach command in the current terminal. In Herdr plugin context, it creates the chosen split/tab and runs `session resume <ID>` there.
 
 ```text
 herdr-tether session list [--json]
@@ -192,11 +194,11 @@ The explorer proceeds through:
 
 1. host (`local`, configured hosts, then discovered SSH aliases);
 2. active workload or **Create new workload** when workloads exist;
-3. directory for creation (most recently used first, then configured roots; `HOME` locally or `~` as fallback);
+3. directory for creation (most recently used first, configured roots, then repositories discovered asynchronously beneath those roots);
 4. built-in shell or a host preset for creation;
 5. split right, split down, or new tab.
 
-Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. The default placement is split right.
+Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. On the directory stage, `/` filters and `p` enters a literal path; while editing, printable keys insert text, `Backspace` deletes, `Enter` applies, and `Esc` returns to the list. The default placement is split right.
 
 Plugin actions first open `picker` or `setup` as a managed overlay. After selection, Tether asks Herdr to create exactly one split or tab and run the generated resume command in the returned pane ID. The durable workload remains a local or SSH-backed `tmux` session; the Herdr pane is only its view.
 

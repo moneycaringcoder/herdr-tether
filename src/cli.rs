@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries},
     config::{CommandPreset, Config, ConfigStore, HostConfig},
+    discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
     lifecycle::{CleanupEligibility, cleanup_eligibility},
     model::{Placement, SessionId},
@@ -410,7 +411,17 @@ fn selection_from_picker(
         StdDuration::from_secs(3),
         4,
     );
-    let Some(selection) = run_picker(options, status_service)? else {
+    let discovery_service = DiscoveryService::new(
+        ProcessBinaries::new("ssh", "tmux"),
+        DiscoveryLimits {
+            max_depth: 4,
+            max_entries: 4096,
+            max_results: 64,
+            timeout: StdDuration::from_secs(3),
+            workers: 4,
+        },
+    );
+    let Some(selection) = run_picker(options, status_service, discovery_service)? else {
         return Ok(None);
     };
 

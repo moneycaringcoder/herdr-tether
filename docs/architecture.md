@@ -22,6 +22,8 @@ Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is
 flowchart LR
     CLI[CLI / explorer] --> Intent{create or resume?}
     CLI --> Status[StatusService]
+    CLI --> Discovery[DiscoveryService]
+    Discovery --> Roots[bounded local / SSH root scans]
     Status --> Tmux
     Intent -->|create| Select[host + directory + command + placement]
     Select --> Durable[DurableBackend]
@@ -82,6 +84,14 @@ Each probe has a three-second monotonic deadline. Probe stdin is null, stdout/st
 
 Generation-tagged messages distinguish host `reachable`, `unreachable`, `timed out`, and `error` from workload `running`, `missing`, `unknown`, `timed out`, and `error`. Exit 255 is remote-unreachable; tmux exit 1 is reachable-with-no-session; malformed or truncated successful output is never treated as missing. These observations never rewrite durable session metadata.
 
+### `DiscoveryService`
+
+`src/discovery.rs` owns ephemeral repository discovery beneath the same ordered roots already used as seed directories. A fixed worker pool scans hosts independently and publishes generation-tagged repository and completion events, so local results and fast hosts remain usable while another SSH target is slow.
+
+Local traversal is lexical, depth/entry/result/time bounded, prunes at repositories, accepts `.git` directories or files, and uses `symlink_metadata` so it never follows a symlink. Remote traversal runs one fixed portable `/bin/sh` scanner through BatchMode OpenSSH with validated target argv and POSIX-quoted roots; it applies the same depth, entry, result, and no-symlink constraints. Its output is a NUL-framed protocol: malformed framing, invalid root indexes, absolute paths, and parent traversal invalidate the response; an isolated non-UTF-8 path record is skipped while valid records remain available with an error status. The shared bounded process runner supplies the wall-clock deadline, output cap, cancellation, process-group cleanup, and null stdin.
+
+Discovery is overlay-local and never rewrites configuration or session state. Refresh cancels both status and discovery generations, removes old discovered rows, preserves configured/recent seed directories, and rejects late messages.
+
 ### `HerdrClient`
 
 `src/herdr.rs` is a local Herdr CLI adapter, not a durable backend. It consumes Herdr's executable, pane ID, and workspace ID from plugin context. It can:
@@ -109,13 +119,13 @@ Generation-tagged messages distinguish host `reachable`, `unreachable`, `timed o
 - local first when included;
 - configured hosts and then discovered non-duplicate SSH aliases;
 - active Tether workload records newest-use first, excluding closing and closed records;
-- recent session directories newest-use first, configured roots, then a local HOME or `~` fallback;
+- recent session directories newest-use first, configured roots, then repositories discovered progressively beneath those roots;
 - built-in shell first, followed by configured presets;
 - configured UI placement, split right by default.
 
-The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
+The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. The directory stage supports case-insensitive filtering and verbatim direct-path entry without introducing a second modal widget. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
 
-The terminal loop polls input at 50 ms while draining status messages; it does not block on a host probe. The first generation renders `loading`. Pressing `r` starts a new generation, cancels the previous run, retains previous values as visibly `stale`, and rejects late prior-generation messages. A current fresh `missing` result disables resume for that row. Cache lifetime is one explorer invocation; reopening starts from truthful loading state rather than presenting persisted metadata as live.
+The terminal loop polls input at 50 ms while draining both status and discovery messages; it does not block on a host probe or root scan. The first generation renders status `loading` and repository `scanning` states. Pressing `r` starts new generations and cancels the previous runs. Status retains previous values as visibly `stale`; discovery retains only configured/recent seeds and repopulates found repositories. Both reducers reject late prior-generation messages. A current fresh `missing` status disables resume. Cache lifetime is one explorer invocation; reopening starts from truthful loading/scanning states rather than presenting persisted observations as live.
 
 Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is retained but attachment happens in that terminal. In Herdr, placement creates and focuses the requested split/tab and starts exact-ID `session resume`. Newly created workloads are already durable before pane creation; existing workloads remain owned by tmux when their Herdr view closes.
 
@@ -160,7 +170,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, explorer transitions/cancellation, and bounded progressive status including timeout, process cleanup, conservative error mapping, refresh generations, and stale labels. The current run reported 46 passing tests and a locked release build.
+Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, bounded local/remote repository discovery, adversarial root quoting, malformed/unsafe response rejection, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, explorer transitions/filter/direct-path/cancellation, and bounded progressive status including timeout, process cleanup, conservative error mapping, refresh generations, and stale labels. The current run reported 59 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 

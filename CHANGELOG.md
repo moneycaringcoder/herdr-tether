@@ -8,6 +8,8 @@
 - Explorer resume and create intents share the existing focused split-right, split-down, and new-tab placement boundary. Closing and closed records are excluded from resumable choices.
 - Added progressive, non-destructive host and Tether workload status to the explorer. Four bounded workers isolate slow hosts; each local/SSH probe has a three-second deadline, cancellation and process-group cleanup, null stdin, and capped output.
 - Added explicit `r` refresh with generation-safe stale/fresh presentation. Host rows distinguish online/offline/timeout/error; workload rows distinguish running/missing/unknown/timeout/error, and freshly missing workloads cannot be resumed.
+- Added asynchronous bounded repository discovery beneath recent workload directories, configured roots, and the local `HOME`/remote `~` fallback. Local traversal is deterministic and does not follow symlinks; remote scans use BatchMode SSH, quoted root argv, fixed depth/entry/result/deadline/output limits, and a validated NUL-framed protocol.
+- Added case-insensitive directory filtering with `/` and literal direct-path entry with `p`. Refresh now restarts both status and discovery generations while rejecting stale results.
 
 ## [0.1.0] - 2026-07-10
 

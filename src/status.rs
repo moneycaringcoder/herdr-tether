@@ -187,10 +187,10 @@ fn probe_host(
     };
     let result = backend
         .and_then(|backend| backend.status_spec())
-        .map_or(ProbeResult::Error, |spec| {
+        .map_or(BoundedOutput::Error, |spec| {
             run_bounded(&spec, timeout, cancelled)
         });
-    if matches!(result, ProbeResult::Cancelled) || cancelled.load(Ordering::Acquire) {
+    if matches!(result, BoundedOutput::Cancelled) || cancelled.load(Ordering::Acquire) {
         return;
     }
 
@@ -227,10 +227,10 @@ fn probe_host(
 
 fn classify_result(
     host: &StatusHost,
-    result: ProbeResult,
+    result: BoundedOutput,
 ) -> (HostReachability, Vec<(SessionId, WorkloadStatus)>) {
     match result {
-        ProbeResult::Completed {
+        BoundedOutput::Completed {
             status,
             stdout,
             stdout_truncated: false,
@@ -256,15 +256,15 @@ fn classify_result(
                 uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
             ),
         },
-        ProbeResult::Completed { status, .. } if status.success() => (
+        BoundedOutput::Completed { status, .. } if status.success() => (
             HostReachability::Reachable,
             uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
         ),
-        ProbeResult::Completed { status, .. } if status.code() == Some(1) => (
+        BoundedOutput::Completed { status, .. } if status.code() == Some(1) => (
             HostReachability::Reachable,
             uniform_workloads(&host.workloads, WorkloadStatus::Missing),
         ),
-        ProbeResult::Completed { status, .. }
+        BoundedOutput::Completed { status, .. }
             if host.target.is_some() && status.code() == Some(255) =>
         {
             (
@@ -272,15 +272,15 @@ fn classify_result(
                 uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
             )
         }
-        ProbeResult::TimedOut => (
+        BoundedOutput::TimedOut => (
             HostReachability::TimedOut,
             uniform_workloads(&host.workloads, WorkloadStatus::TimedOut),
         ),
-        ProbeResult::Error | ProbeResult::Completed { .. } => (
+        BoundedOutput::Error | BoundedOutput::Completed { .. } => (
             HostReachability::Error,
             uniform_workloads(&host.workloads, WorkloadStatus::Error),
         ),
-        ProbeResult::Cancelled => unreachable!("cancelled probes do not publish"),
+        BoundedOutput::Cancelled => unreachable!("cancelled probes do not publish"),
     }
 }
 
@@ -310,7 +310,7 @@ fn parse_sessions(stdout: &[u8]) -> Option<HashMap<SessionId, u32>> {
     Some(sessions)
 }
 
-enum ProbeResult {
+pub(crate) enum BoundedOutput {
     Completed {
         status: ExitStatus,
         stdout: Vec<u8>,
@@ -321,7 +321,11 @@ enum ProbeResult {
     Error,
 }
 
-fn run_bounded(spec: &CommandSpec, timeout: Duration, cancelled: &AtomicBool) -> ProbeResult {
+pub(crate) fn run_bounded(
+    spec: &CommandSpec,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> BoundedOutput {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -332,13 +336,13 @@ fn run_bounded(spec: &CommandSpec, timeout: Duration, cancelled: &AtomicBool) ->
     command.process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return ProbeResult::Error,
+        Err(_) => return BoundedOutput::Error,
     };
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     if set_nonblocking(&stdout).is_err() || set_nonblocking(&stderr).is_err() {
         terminate_child(&mut child);
-        return ProbeResult::Error;
+        return BoundedOutput::Error;
     }
     let mut stdout_capture = Capture::default();
     let mut stderr_capture = Capture::default();
@@ -349,19 +353,19 @@ fn run_bounded(spec: &CommandSpec, timeout: Duration, cancelled: &AtomicBool) ->
             || drain_pipe(stderr.as_mut(), &mut stderr_capture).is_err()
         {
             terminate_child(&mut child);
-            return ProbeResult::Error;
+            return BoundedOutput::Error;
         }
         if cancelled.load(Ordering::Acquire) {
             terminate_child(&mut child);
             let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
             let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
-            return ProbeResult::Cancelled;
+            return BoundedOutput::Cancelled;
         }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
                 let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
-                return ProbeResult::Completed {
+                return BoundedOutput::Completed {
                     status,
                     stdout: stdout_capture.bytes,
                     stdout_truncated: stdout_capture.truncated,
@@ -371,12 +375,12 @@ fn run_bounded(spec: &CommandSpec, timeout: Duration, cancelled: &AtomicBool) ->
                 terminate_child(&mut child);
                 let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
                 let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
-                return ProbeResult::TimedOut;
+                return BoundedOutput::TimedOut;
             }
             Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
             Err(_) => {
                 terminate_child(&mut child);
-                return ProbeResult::Error;
+                return BoundedOutput::Error;
             }
         }
     }

@@ -4,11 +4,15 @@ use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
     backend::CommandSpec,
     config::{CommandPreset, Config, HostConfig, UiDefaults},
+    discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext},
     model::{Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
     status::{HostReachability, StatusMessage, WorkloadStatus},
-    tui::{PickerEvent, PickerOptions, PickerOutcome, PickerSelection, PickerStage, PickerState},
+    tui::{
+        PickerEvent, PickerInput, PickerOptions, PickerOutcome, PickerSelection, PickerStage,
+        PickerState,
+    },
 };
 use tempfile::tempdir;
 
@@ -375,6 +379,82 @@ fn refresh_event_requests_work_without_resetting_navigation() {
         PickerOutcome::RefreshRequested
     );
     assert_eq!(explorer.stage(), PickerStage::Directory);
+}
+
+#[test]
+fn discovery_appends_after_seed_directories_and_ignores_old_generations() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.begin_discovery(4);
+
+    assert!(explorer.apply_discovery(DiscoveryMessage::Repository {
+        generation: 4,
+        host: "build-box".into(),
+        path: "/srv/discovered".into(),
+    }));
+    assert_eq!(
+        explorer.directory_paths("build-box").unwrap(),
+        [
+            "/srv/recent",
+            "/srv/shared",
+            "/srv/configured",
+            "/srv/discovered"
+        ]
+    );
+    assert!(!explorer.apply_discovery(DiscoveryMessage::Repository {
+        generation: 3,
+        host: "build-box".into(),
+        path: "/srv/stale".into(),
+    }));
+    assert!(explorer.apply_discovery(DiscoveryMessage::HostFinished {
+        generation: 4,
+        host: "build-box".into(),
+        completion: DiscoveryCompletion::Complete,
+    }));
+    assert!(
+        !explorer
+            .directory_paths("build-box")
+            .unwrap()
+            .contains(&"/srv/stale")
+    );
+}
+
+#[test]
+fn directory_filter_and_direct_path_preserve_create_flow() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.handle(PickerEvent::Confirm);
+    explorer.handle(PickerEvent::Next);
+    explorer.handle(PickerEvent::Next);
+    explorer.handle(PickerEvent::Confirm);
+    assert_eq!(explorer.stage(), PickerStage::Directory);
+
+    explorer.handle(PickerEvent::BeginFilter);
+    for character in "shared".chars() {
+        explorer.handle(PickerEvent::Insert(character));
+    }
+    assert_eq!(explorer.input(), &PickerInput::Filter("shared".into()));
+    assert_eq!(explorer.visible_directories(), vec!["/srv/shared"]);
+    explorer.handle(PickerEvent::ExitInput);
+
+    explorer.handle(PickerEvent::BeginPath);
+    for character in "/tmp/direct path".chars() {
+        explorer.handle(PickerEvent::Insert(character));
+    }
+    assert_eq!(
+        explorer.handle(PickerEvent::SubmitInput),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Command);
+    explorer.handle(PickerEvent::Confirm);
+    let PickerOutcome::Selected(PickerSelection::Create(selection)) =
+        explorer.handle(PickerEvent::Confirm)
+    else {
+        panic!("direct path did not produce a create selection");
+    };
+    assert_eq!(selection.directory, "/tmp/direct path");
 }
 
 #[test]

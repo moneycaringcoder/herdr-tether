@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod cli;
 pub mod config;
+pub mod discovery;
 pub mod herdr;
 pub mod lifecycle;
 pub mod model;
