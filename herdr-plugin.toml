@@ -1,0 +1,31 @@
+id = "moneycaringcoder.tether"
+name = "Tether for Herdr"
+version = "0.1.0"
+min_herdr_version = "0.7.3"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+artifacts = ["target/release/herdr-tether"]
+
+[[actions]]
+id = "open"
+title = "Tether: Open"
+command = ["target/release/herdr-tether", "plugin", "open"]
+
+[[actions]]
+id = "setup"
+title = "Tether: Setup"
+command = ["target/release/herdr-tether", "plugin", "setup"]
+
+[[panes]]
+id = "picker"
+title = "Tether: Open"
+placement = "overlay"
+command = ["target/release/herdr-tether", "open"]
+
+[[panes]]
+id = "setup"
+title = "Tether: Setup"
+placement = "overlay"
+command = ["target/release/herdr-tether", "setup"]

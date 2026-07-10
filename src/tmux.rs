@@ -45,6 +45,8 @@ impl TmuxBackend {
                 let remote_command = remote_tmux_command(&arguments)?;
                 let mut ssh_arguments = if interactive {
                     vec![
+                        "-o".to_owned(),
+                        "BatchMode=yes".to_owned(),
                         "-t".to_owned(),
                         "-o".to_owned(),
                         "ServerAliveInterval=15".to_owned(),

@@ -7,3 +7,7 @@ pub mod lifecycle;
 pub mod quote;
 pub mod sshcfg;
 pub mod tmux;
+pub mod cli;
+pub mod herdr;
+pub mod paths;
+pub mod tui;
