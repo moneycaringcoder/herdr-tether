@@ -143,10 +143,16 @@ fn probe_failures_do_not_masquerade_as_live_or_missing() {
     fs::write(
         &ssh,
         r#"#!/bin/sh
-case " $* " in
-  *" offline "*) exit 255 ;;
-  *" empty "*) exit 1 ;;
-  *" malformed "*) printf 'tether-not-an-id\t0\n' ;;
+target=
+for argument do
+  case "$argument" in
+    offline|empty|malformed) target=$argument ;;
+  esac
+done
+case "$target" in
+  offline) exit 255 ;;
+  empty) exit 1 ;;
+  malformed) printf 'tether-not-an-id\t0\n' ;;
   *) exit 99 ;;
 esac
 "#,
