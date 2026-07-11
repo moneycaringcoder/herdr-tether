@@ -1,8 +1,15 @@
-use std::{collections::HashSet, fs, io, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs::OpenOptions,
+    io::{self, Read},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     model::{OwnershipProof, SessionId, TmuxSessionId},
@@ -172,7 +179,7 @@ impl StateStore {
     }
 
     fn load_unlocked(&self) -> Result<State> {
-        let source = match fs::read_to_string(&self.path) {
+        let source = match read_regular_state_file(&self.path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
             Err(error) => {
@@ -240,6 +247,35 @@ impl StateStore {
         atomic_write(&self.path, serialized.as_bytes())
             .with_context(|| format!("save state `{}`", self.path.display()))
     }
+}
+
+fn read_regular_state_file(path: &std::path::Path) -> io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state path is a symbolic link",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state path is not a regular file",
+        ));
+    }
+
+    let mut source = String::new();
+    file.read_to_string(&mut source)?;
+    Ok(source)
 }
 
 fn require_nonempty(value: &str, field: &str) -> Result<()> {

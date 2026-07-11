@@ -18,7 +18,10 @@ use herdr_tether::{
 use tempfile::tempdir;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::{
+    ffi::CString,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+};
 
 fn sample_config() -> Config {
     Config {
@@ -464,6 +467,81 @@ fn concurrent_state_updates_preserve_both_records() {
 
     let state = StateStore::new(path).load().unwrap();
     assert_eq!(state.sessions.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn state_rejects_symlink_and_fifo_storage_paths() {
+    let temp = tempdir().unwrap();
+    let target = temp.path().join("target.json");
+    fs::write(&target, r#"{"version":2,"sessions":[]}"#).unwrap();
+    let symlink_path = temp.path().join("symlink-state.json");
+    std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+    let symlink_error = format!("{:#}", StateStore::new(symlink_path).load().unwrap_err());
+    assert!(
+        symlink_error.contains("symbolic link") || symlink_error.contains("regular file"),
+        "unexpected symlink error: {symlink_error}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        r#"{"version":2,"sessions":[]}"#
+    );
+
+    let fifo_path = temp.path().join("fifo-state.json");
+    let fifo_c_path = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c_path.as_ptr(), 0o600) }, 0);
+    let fifo_error = format!("{:#}", StateStore::new(fifo_path).load().unwrap_err());
+    assert!(
+        fifo_error.contains("regular file"),
+        "unexpected FIFO error: {fifo_error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_lock_path_cannot_split_state_mutual_exclusion() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    StateStore::new(path.clone()).save(&State::default()).unwrap();
+    let lock_path = temp.path().join(".state.json.lock");
+    let displaced_lock_path = temp.path().join(".state.json.lock.displaced");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let update_path = path.clone();
+    let updater = thread::spawn(move || {
+        StateStore::new(update_path)
+            .update(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    entered_rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+    fs::rename(&lock_path, &displaced_lock_path).unwrap();
+
+    let (load_done_tx, load_done_rx) = mpsc::channel();
+    let load_path = path.clone();
+    let loader = thread::spawn(move || {
+        let result = StateStore::new(load_path).load();
+        load_done_tx.send(result).unwrap();
+    });
+    assert!(
+        load_done_rx
+            .recv_timeout(StdDuration::from_millis(100))
+            .is_err(),
+        "replacement lock inode must not allow a concurrent state operation"
+    );
+
+    release_tx.send(()).unwrap();
+    updater.join().unwrap();
+    load_done_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    loader.join().unwrap();
 }
 
 const TETHER_BINDING: &str = r#"[[keys.command]]

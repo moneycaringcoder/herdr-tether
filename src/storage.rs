@@ -33,6 +33,21 @@ fn with_advisory_lock_mode<T>(
 ) -> Result<T> {
     let parent = usable_parent(path);
     ensure_directory(parent, private_parent)?;
+    #[cfg(unix)]
+    let parent_lock = {
+        let directory = File::open(parent)
+            .with_context(|| format!("open storage directory `{}`", parent.display()))?;
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("inspect storage directory `{}`", parent.display()))?;
+        if !metadata.is_dir() {
+            anyhow::bail!("storage parent `{}` is not a directory", parent.display());
+        }
+        directory
+            .lock_exclusive()
+            .with_context(|| format!("lock storage directory `{}`", parent.display()))?;
+        directory
+    };
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
@@ -68,10 +83,15 @@ fn with_advisory_lock_mode<T>(
     let result = operation();
     let unlock =
         FileExt::unlock(&lock).with_context(|| format!("unlock storage `{}`", path.display()));
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    #[cfg(unix)]
+    let parent_unlock = FileExt::unlock(&parent_lock)
+        .with_context(|| format!("unlock storage directory `{}`", parent.display()));
+    #[cfg(not(unix))]
+    let parent_unlock: Result<()> = Ok(());
+    match (result, unlock, parent_unlock) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
     }
 }
 
