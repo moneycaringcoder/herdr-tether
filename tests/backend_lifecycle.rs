@@ -3,9 +3,12 @@ use std::{
     io::Write,
     path::Path,
     sync::Mutex,
+    thread,
+    time::Duration as StdDuration,
 };
 
 use chrono::{Duration, TimeZone, Utc};
+use fs2::FileExt;
 use herdr_tether::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     lifecycle::{
@@ -50,6 +53,29 @@ fn read_argv(log: &Path) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(|value| String::from_utf8(value.to_vec()).unwrap())
         .collect()
+}
+
+fn wait_for_file(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn assert_advisory_lock_available(path: &Path) {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    file.try_lock_exclusive()
+        .expect("state advisory lock held during transport");
+    FileExt::unlock(&file).unwrap();
 }
 
 fn id() -> SessionId {
@@ -104,14 +130,15 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let lock_path = temp.path().join(".state.json.lock");
-    let observed = temp.path().join("observed");
+    let started = temp.path().join("started");
+    let release = temp.path().join("release");
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     let script = format!(
-        "#!/bin/sh\ncase \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\nflock -n '{lock}' -c true || exit 71\nprintf ok > '{observed}'\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        "#!/bin/sh\nprintf ok > '{started}'\nwhile [ ! -e '{release}' ]; do sleep 0.01; done\ncase \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        started = started.display(),
+        release = release.display(),
         state = state_path.display(),
-        lock = lock_path.display(),
-        observed = observed.display(),
         log = log.display(),
     );
     fs::write(&tmux, script).unwrap();
@@ -129,11 +156,14 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
 
-    let result = service.close_owned(id()).unwrap();
+    let close = thread::spawn(move || service.close_owned(id()));
+    wait_for_file(&started);
+    assert_advisory_lock_available(&lock_path);
+    fs::write(&release, []).unwrap();
+    let result = close.join().unwrap().unwrap();
 
     assert_eq!(result.id, id());
     assert_eq!(result.workload, ClosedWorkload::Missing);
-    assert_eq!(fs::read_to_string(observed).unwrap(), "ok");
     let state = store.load().unwrap();
     let record = &state.sessions[0];
     assert_eq!(record.status, SessionStatus::Closed);
@@ -212,12 +242,19 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let lock_path = temp.path().join(".state.json.lock");
+    let inspect_started = temp.path().join("inspect-started");
+    let inspect_release = temp.path().join("inspect-release");
+    let close_started = temp.path().join("close-started");
+    let close_release = temp.path().join("close-release");
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     let script = format!(
-        "#!/bin/sh\nflock -n '{lock}' -c true || exit 71\ncase \"$1\" in\nlist-sessions)\n  case \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n  printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session)\n  case \"$(cat '{state}')\" in *'\"status\": \"closing\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  printf ok > '{inspect_started}'\n  while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n  printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"closing\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        inspect_started = inspect_started.display(),
+        inspect_release = inspect_release.display(),
+        close_started = close_started.display(),
+        close_release = close_release.display(),
         state = state_path.display(),
-        lock = lock_path.display(),
         log = log.display(),
     );
     fs::write(&tmux, script).unwrap();
@@ -235,7 +272,14 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
 
-    let result = service.close_owned(id()).unwrap();
+    let close = thread::spawn(move || service.close_owned(id()));
+    wait_for_file(&inspect_started);
+    assert_advisory_lock_available(&lock_path);
+    fs::write(&inspect_release, []).unwrap();
+    wait_for_file(&close_started);
+    assert_advisory_lock_available(&lock_path);
+    fs::write(&close_release, []).unwrap();
+    let result = close.join().unwrap().unwrap();
 
     assert_eq!(result.workload, ClosedWorkload::Terminated);
     assert_eq!(
