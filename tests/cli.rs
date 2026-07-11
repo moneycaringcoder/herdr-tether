@@ -304,7 +304,8 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
         .env("PATH", &path)
         .args(["session", "prune", "--older-than-days", "0"])
         .assert()
-        .success();
+        .success()
+        .stdout(format!("{session_id}\n"));
     sandbox
         .command()
         .env("PATH", &path)

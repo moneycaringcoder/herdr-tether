@@ -29,7 +29,7 @@ use crate::{
         DiscoveryCompletion, DiscoveryLocation, DiscoveryMessage, DiscoveryRequest, DiscoveryRun,
         DiscoveryService,
     },
-    lifecycle::{CloseOwnedError, LifecycleService},
+    lifecycle::{CloseOwnedError, LifecycleService, PrunePreview, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
     status::{
@@ -285,6 +285,9 @@ pub enum PickerEvent {
     Close,
     ConfirmClose,
     DismissClose,
+    BeginPrune,
+    ConfirmPrune,
+    DismissPrune,
     BeginFilter,
     BeginPath,
     Insert(char),
@@ -297,7 +300,18 @@ pub enum PickerEvent {
 pub enum PickerOutcome {
     Continue,
     RefreshRequested,
-    CloseOwnedRequested { id: SessionId, generation: u64 },
+    CloseOwnedRequested {
+        id: SessionId,
+        generation: u64,
+    },
+    PrunePreviewRequested {
+        older_than_days: u64,
+        generation: u64,
+    },
+    PruneApplyRequested {
+        preview: PrunePreview,
+        generation: u64,
+    },
     Selected(PickerSelection),
     Cancelled,
 }
@@ -320,6 +334,50 @@ pub struct PickerCloseResult {
     pub id: SessionId,
     pub generation: u64,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickerPrunePhase {
+    Preview,
+    Apply,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerPruneModal {
+    Confirm {
+        preview: PrunePreview,
+    },
+    Failed {
+        phase: PickerPrunePhase,
+        preview: Option<PrunePreview>,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerPruneResult {
+    Preview {
+        generation: u64,
+        result: Result<PrunePreview, String>,
+    },
+    Apply {
+        generation: u64,
+        preview: PrunePreview,
+        removed_ids: Option<Vec<SessionId>>,
+        skipped_ids: Option<Vec<SessionId>>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PickerPrunePending {
+    Preview {
+        generation: u64,
+    },
+    Apply {
+        generation: u64,
+        preview: PrunePreview,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,10 +543,18 @@ pub struct PickerState {
     close_modal: Option<PickerCloseModal>,
     pending_close: Option<(SessionId, u64)>,
     close_failed: HashMap<SessionId, String>,
+    retention_days: u64,
+    prune_modal: Option<PickerPruneModal>,
+    pending_prune: Option<PickerPrunePending>,
+    prune_notice: Option<String>,
 }
 
 impl PickerState {
     pub fn new(options: PickerOptions) -> Result<Self> {
+        Self::with_retention(options, 30)
+    }
+
+    pub fn with_retention(options: PickerOptions, retention_days: u64) -> Result<Self> {
         if options.hosts.is_empty() {
             bail!("the picker has no hosts");
         }
@@ -530,6 +596,10 @@ impl PickerState {
             close_modal: None,
             pending_close: None,
             close_failed: HashMap::new(),
+            retention_days,
+            prune_modal: None,
+            pending_prune: None,
+            prune_notice: None,
         })
     }
 
@@ -547,6 +617,137 @@ impl PickerState {
 
     pub fn close_busy(&self) -> bool {
         self.pending_close.is_some()
+    }
+
+    pub fn prune_modal(&self) -> Option<&PickerPruneModal> {
+        self.prune_modal.as_ref()
+    }
+
+    pub fn prune_busy(&self) -> bool {
+        self.pending_prune.is_some()
+    }
+
+    pub fn prune_phase(&self) -> Option<PickerPrunePhase> {
+        match (&self.pending_prune, &self.prune_modal) {
+            (Some(PickerPrunePending::Preview { .. }), _)
+            | (
+                None,
+                Some(PickerPruneModal::Failed {
+                    phase: PickerPrunePhase::Preview,
+                    ..
+                }),
+            ) => Some(PickerPrunePhase::Preview),
+            (Some(PickerPrunePending::Apply { .. }), _)
+            | (
+                None,
+                Some(PickerPruneModal::Failed {
+                    phase: PickerPrunePhase::Apply,
+                    ..
+                }),
+            ) => Some(PickerPrunePhase::Apply),
+            _ => None,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn apply_prune_result(&mut self, result: PickerPruneResult) -> bool {
+        match result {
+            PickerPruneResult::Preview { generation, result } => {
+                if self.pending_prune != Some(PickerPrunePending::Preview { generation }) {
+                    return false;
+                }
+                if result
+                    .as_ref()
+                    .is_ok_and(|preview| preview.older_than_days() != self.retention_days)
+                {
+                    self.pending_prune = None;
+                    self.prune_modal = Some(PickerPruneModal::Failed {
+                        phase: PickerPrunePhase::Preview,
+                        preview: None,
+                        error: "Prune preview retention changed; retry".to_owned(),
+                    });
+                    return true;
+                }
+                self.pending_prune = None;
+                match result {
+                    Ok(preview) if preview.ids().is_empty() => {
+                        self.prune_modal = None;
+                        self.prune_notice = Some("No closed metadata eligible".to_owned());
+                        true
+                    }
+                    Ok(preview) => {
+                        self.prune_notice = None;
+                        self.prune_modal = Some(PickerPruneModal::Confirm { preview });
+                        true
+                    }
+                    Err(error) => {
+                        self.prune_modal = Some(PickerPruneModal::Failed {
+                            phase: PickerPrunePhase::Preview,
+                            preview: None,
+                            error: bounded_error_text(&sanitize_terminal_text(&error)),
+                        });
+                        true
+                    }
+                }
+            }
+            PickerPruneResult::Apply {
+                generation,
+                preview,
+                removed_ids,
+                skipped_ids,
+                error,
+            } => {
+                if self.pending_prune
+                    != Some(PickerPrunePending::Apply {
+                        generation,
+                        preview: preview.clone(),
+                    })
+                {
+                    return false;
+                }
+                self.pending_prune = None;
+                if let Some(error) = error {
+                    self.prune_modal = Some(PickerPruneModal::Failed {
+                        phase: PickerPrunePhase::Apply,
+                        preview: Some(preview),
+                        error: bounded_error_text(&sanitize_terminal_text(&error)),
+                    });
+                    return true;
+                }
+                let (Some(removed_ids), Some(skipped_ids)) = (removed_ids, skipped_ids) else {
+                    self.prune_modal = Some(PickerPruneModal::Failed {
+                        phase: PickerPrunePhase::Apply,
+                        preview: Some(preview),
+                        error: "Prune returned an incomplete result; retry".to_owned(),
+                    });
+                    return true;
+                };
+                let expected = preview.ids().iter().copied().collect::<HashSet<_>>();
+                let actual = removed_ids
+                    .iter()
+                    .chain(&skipped_ids)
+                    .copied()
+                    .collect::<HashSet<_>>();
+                if actual != expected || removed_ids.len() + skipped_ids.len() != expected.len() {
+                    self.prune_modal = Some(PickerPruneModal::Failed {
+                        phase: PickerPrunePhase::Apply,
+                        preview: Some(preview),
+                        error: "Prune result did not match the confirmed preview; retry".to_owned(),
+                    });
+                    return true;
+                }
+                self.prune_modal = None;
+                self.prune_notice = Some(format!(
+                    "Removed {} closed metadata · skipped {}",
+                    removed_ids.len(),
+                    skipped_ids.len()
+                ));
+                true
+            }
+        }
     }
 
     pub fn apply_close_result(&mut self, result: PickerCloseResult) -> bool {
@@ -903,6 +1104,16 @@ impl PickerState {
         {
             return PickerOutcome::Continue;
         }
+        if let Some(pending) = &self.pending_prune {
+            if matches!(pending, PickerPrunePending::Preview { .. })
+                && matches!(event, PickerEvent::Cancel)
+            {
+                return PickerOutcome::Cancelled;
+            }
+            if !matches!(event, PickerEvent::Previous | PickerEvent::Next) {
+                return PickerOutcome::Continue;
+            }
+        }
         if matches!(event, PickerEvent::Cancel) {
             return PickerOutcome::Cancelled;
         }
@@ -916,13 +1127,23 @@ impl PickerState {
                 _ => PickerOutcome::Continue,
             };
         }
+        if self.prune_modal.is_some() {
+            return match event {
+                PickerEvent::DismissPrune => {
+                    self.prune_modal = None;
+                    PickerOutcome::Continue
+                }
+                PickerEvent::ConfirmPrune => self.confirm_prune(),
+                _ => PickerOutcome::Continue,
+            };
+        }
         if self.input != PickerInput::None {
             return self.handle_input(event);
         }
         match event {
-            PickerEvent::Refresh if self.pending_close.is_none() => PickerOutcome::RefreshRequested,
-            PickerEvent::Refresh => PickerOutcome::Continue,
+            PickerEvent::Refresh => PickerOutcome::RefreshRequested,
             PickerEvent::Close => self.begin_close(),
+            PickerEvent::BeginPrune => self.begin_prune(),
             PickerEvent::BeginFilter if self.stage == PickerStage::Directory => {
                 self.input = PickerInput::Filter(self.directory_filter.clone());
                 PickerOutcome::Continue
@@ -954,6 +1175,8 @@ impl PickerState {
             PickerEvent::Cancel
             | PickerEvent::ConfirmClose
             | PickerEvent::DismissClose
+            | PickerEvent::ConfirmPrune
+            | PickerEvent::DismissPrune
             | PickerEvent::BeginFilter
             | PickerEvent::BeginPath
             | PickerEvent::Insert(_)
@@ -963,6 +1186,46 @@ impl PickerState {
         }
     }
 
+    fn begin_prune(&mut self) -> PickerOutcome {
+        self.prune_notice = None;
+        self.pending_prune = Some(PickerPrunePending::Preview {
+            generation: self.generation,
+        });
+        PickerOutcome::PrunePreviewRequested {
+            older_than_days: self.retention_days,
+            generation: self.generation,
+        }
+    }
+
+    fn confirm_prune(&mut self) -> PickerOutcome {
+        let modal = self.prune_modal.take();
+        match modal {
+            Some(PickerPruneModal::Confirm { preview })
+            | Some(PickerPruneModal::Failed {
+                phase: PickerPrunePhase::Apply,
+                preview: Some(preview),
+                ..
+            }) => {
+                let generation = self.generation;
+                self.pending_prune = Some(PickerPrunePending::Apply {
+                    generation,
+                    preview: preview.clone(),
+                });
+                PickerOutcome::PruneApplyRequested {
+                    preview,
+                    generation,
+                }
+            }
+            Some(PickerPruneModal::Failed {
+                phase: PickerPrunePhase::Preview,
+                ..
+            }) => self.begin_prune(),
+            other => {
+                self.prune_modal = other;
+                PickerOutcome::Continue
+            }
+        }
+    }
     fn begin_close(&mut self) -> PickerOutcome {
         if self.stage != PickerStage::Resource || self.pending_close.is_some() {
             return PickerOutcome::Continue;
@@ -1326,6 +1589,22 @@ impl PickerState {
     }
 
     fn modal_text(&self) -> Option<String> {
+        if let Some(modal) = &self.prune_modal {
+            return Some(match modal {
+                PickerPruneModal::Confirm { preview } => format!(
+                    "{} closed metadata older than {} days · y confirm · n/Esc keep · No host contact · IDs: session prune --dry-run",
+                    preview.ids().len(),
+                    preview.older_than_days()
+                ),
+                PickerPruneModal::Failed { phase, error, .. } => format!(
+                    "y retry · n/Esc dismiss · {} failed: {error} · No host contact",
+                    match phase {
+                        PickerPrunePhase::Preview => "Preview",
+                        PickerPrunePhase::Apply => "Prune",
+                    }
+                ),
+            });
+        }
         match self.close_modal.as_ref()? {
             PickerCloseModal::Confirm { id } => Some(format!(
                 "y confirm · n/Esc keep · Close exact {id}? Terminates its tmux session."
@@ -1337,17 +1616,33 @@ impl PickerState {
     }
 
     pub fn frame_title(&self) -> String {
-        match self.close_modal.as_ref() {
-            Some(PickerCloseModal::Confirm { .. }) => "Confirm close".to_owned(),
-            Some(PickerCloseModal::Failed { .. }) => "Close failed".to_owned(),
-            None if self.pending_close.is_some() => "Closing workload".to_owned(),
-            None => self.title().to_owned(),
+        match (&self.prune_modal, &self.pending_prune, &self.close_modal) {
+            (Some(PickerPruneModal::Confirm { .. }), _, _) => "Confirm prune".to_owned(),
+            (Some(PickerPruneModal::Failed { .. }), _, _) => "Prune failed".to_owned(),
+            (_, Some(PickerPrunePending::Preview { .. }), _) => "Previewing prune".to_owned(),
+            (_, Some(PickerPrunePending::Apply { .. }), _) => "Pruning metadata".to_owned(),
+            (_, _, Some(PickerCloseModal::Confirm { .. })) => "Confirm close".to_owned(),
+            (_, _, Some(PickerCloseModal::Failed { .. })) => "Close failed".to_owned(),
+            (_, _, None) if self.pending_close.is_some() => "Closing workload".to_owned(),
+            _ => self.title().to_owned(),
         }
     }
 
     pub fn footer_text(&self) -> String {
         if let Some((id, _)) = self.pending_close {
             return format!("Closing · wait for result · {id} · ↑/↓ navigate");
+        }
+        if let Some(pending) = &self.pending_prune {
+            return match pending {
+                PickerPrunePending::Preview { .. } => {
+                    "Previewing closed metadata · wait for result · No host contact · ↑/↓ navigate"
+                        .to_owned()
+                }
+                PickerPrunePending::Apply { preview, .. } => format!(
+                    "Pruning {} closed metadata · wait for result · No host contact · ↑/↓ navigate",
+                    preview.ids().len()
+                ),
+            };
         }
         if let Some(text) = self.modal_text() {
             return text;
@@ -1361,6 +1656,9 @@ impl PickerState {
             }
             PickerInput::None => {
                 let mut parts = Vec::new();
+                if let Some(notice) = &self.prune_notice {
+                    parts.push(notice.clone());
+                }
                 if !self.directory_filter.is_empty() && self.stage == PickerStage::Directory {
                     parts.push(format!("Filter: {}", self.directory_filter));
                 }
@@ -1385,8 +1683,13 @@ impl PickerState {
                 } else {
                     ""
                 };
+                let path_hint = if self.stage == PickerStage::Directory {
+                    " · / filter · p path"
+                } else {
+                    ""
+                };
                 parts.push(format!(
-                    "↑/↓ navigate · Enter select{close_hint} · / filter · p path · r refresh · ← back · Esc cancel"
+                    "↑/↓ navigate · Enter select{close_hint}{path_hint} · P prune closed · r refresh · ← back · Esc cancel"
                 ));
                 parts.join(" · ")
             }
@@ -1448,6 +1751,10 @@ pub fn format_close_error(error: CloseOwnedError) -> String {
     sanitize_terminal_text(&format!("{:#}", anyhow::Error::new(error)))
 }
 
+fn format_prune_error(error: crate::lifecycle::PruneError) -> String {
+    sanitize_terminal_text(&format!("{:#}", anyhow::Error::new(error)))
+}
+
 const PLACEMENTS: [Placement; 3] = [
     Placement::SplitRight,
     Placement::SplitDown,
@@ -1471,8 +1778,10 @@ pub fn run_picker(
     status_service: StatusService,
     discovery_service: DiscoveryService,
     lifecycle_service: LifecycleService,
+    prune_service: PruneService,
+    retention_days: u64,
 ) -> Result<Option<PickerSelection>> {
-    let mut state = PickerState::new(options)?;
+    let mut state = PickerState::with_retention(options, retention_days)?;
     enable_raw_mode().context("enable terminal raw mode")?;
     if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
         let _ = disable_raw_mode();
@@ -1484,6 +1793,7 @@ pub fn run_picker(
         &status_service,
         &discovery_service,
         &lifecycle_service,
+        &prune_service,
     );
     let leave_result =
         execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen");
@@ -1522,6 +1832,7 @@ fn run_terminal_picker(
     status_service: &StatusService,
     discovery_service: &DiscoveryService,
     lifecycle_service: &LifecycleService,
+    prune_service: &PruneService,
 ) -> Result<Option<PickerSelection>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize terminal picker")?;
@@ -1531,6 +1842,8 @@ fn run_terminal_picker(
     let mut discovery_run = start_discovery_run(state, discovery_service, generation);
     let mut dirty = true;
     let (close_sender, close_receiver) = mpsc::channel::<PickerCloseResult>();
+    let (prune_preview_sender, prune_preview_receiver) = mpsc::channel::<PickerPruneResult>();
+    let (prune_apply_sender, prune_apply_receiver) = mpsc::channel::<PickerPruneResult>();
 
     loop {
         while let Ok(message) = status_run.receiver.try_recv() {
@@ -1551,6 +1864,12 @@ fn run_terminal_picker(
                 dirty = true;
             }
         }
+        while let Ok(result) = prune_preview_receiver.try_recv() {
+            dirty |= state.apply_prune_result(result);
+        }
+        while let Ok(result) = prune_apply_receiver.try_recv() {
+            dirty |= state.apply_prune_result(result);
+        }
         if dirty {
             terminal
                 .draw(|frame| render_picker(frame, state))
@@ -1564,9 +1883,13 @@ fn run_terminal_picker(
             dirty = true;
             continue;
         };
-        let Some(picker_event) =
-            map_key(key, &state.input, state.stage, state.close_modal.is_some())
-        else {
+        let Some(picker_event) = map_key_with_modals(
+            key,
+            &state.input,
+            state.stage,
+            state.close_modal.is_some(),
+            state.prune_modal.is_some(),
+        ) else {
             continue;
         };
         dirty = true;
@@ -1593,17 +1916,66 @@ fn run_terminal_picker(
                     });
                 });
             }
+            PickerOutcome::PrunePreviewRequested {
+                older_than_days,
+                generation,
+            } => {
+                let service = prune_service.clone();
+                let sender = prune_preview_sender.clone();
+                thread::spawn(move || {
+                    let result = service.preview(older_than_days).map_err(format_prune_error);
+                    let _ = sender.send(PickerPruneResult::Preview { generation, result });
+                });
+            }
+            PickerOutcome::PruneApplyRequested {
+                preview,
+                generation,
+            } => {
+                let service = prune_service.clone();
+                let sender = prune_apply_sender.clone();
+                thread::spawn(move || {
+                    let result = service.apply(&preview);
+                    let message = match result {
+                        Ok(result) => PickerPruneResult::Apply {
+                            generation,
+                            preview,
+                            removed_ids: Some(result.removed_ids),
+                            skipped_ids: Some(result.skipped_ids),
+                            error: None,
+                        },
+                        Err(error) => PickerPruneResult::Apply {
+                            generation,
+                            preview,
+                            removed_ids: None,
+                            skipped_ids: None,
+                            error: Some(format_prune_error(error)),
+                        },
+                    };
+                    let _ = sender.send(message);
+                });
+            }
             PickerOutcome::Selected(selection) => return Ok(Some(selection)),
             PickerOutcome::Cancelled => return Ok(None),
         }
     }
 }
 
+#[cfg(test)]
 fn map_key(
     key: KeyEvent,
     input: &PickerInput,
     stage: PickerStage,
     close_modal: bool,
+) -> Option<PickerEvent> {
+    map_key_with_modals(key, input, stage, close_modal, false)
+}
+
+fn map_key_with_modals(
+    key: KeyEvent,
+    input: &PickerInput,
+    stage: PickerStage,
+    close_modal: bool,
+    prune_modal: bool,
 ) -> Option<PickerEvent> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
@@ -1612,6 +1984,20 @@ fn map_key(
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
         return Some(PickerEvent::Cancel);
+    }
+    if prune_modal {
+        if key.kind != KeyEventKind::Press
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Some(PickerEvent::ConfirmPrune),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(PickerEvent::DismissPrune),
+            _ => None,
+        };
     }
     if close_modal {
         if key.kind != KeyEventKind::Press
@@ -1649,7 +2035,15 @@ fn map_key(
         KeyCode::Backspace | KeyCode::Left => Some(PickerEvent::Back),
         KeyCode::Enter | KeyCode::Right => Some(PickerEvent::Confirm),
         KeyCode::Char('/') if stage == PickerStage::Directory => Some(PickerEvent::BeginFilter),
-        KeyCode::Char('p' | 'P') if stage == PickerStage::Directory => Some(PickerEvent::BeginPath),
+        KeyCode::Char('P')
+            if key.kind == KeyEventKind::Press
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(PickerEvent::BeginPrune)
+        }
+        KeyCode::Char('p') if stage == PickerStage::Directory => Some(PickerEvent::BeginPath),
         KeyCode::Char('c' | 'C')
             if stage == PickerStage::Resource
                 && key.kind == KeyEventKind::Press
@@ -1687,7 +2081,10 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
             .max(9),
     );
     frame.render_widget(Clear, area);
-    let destructive = state.close_modal.is_some() || state.pending_close.is_some();
+    let destructive = state.close_modal.is_some()
+        || state.pending_close.is_some()
+        || state.prune_modal.is_some()
+        || state.pending_prune.is_some();
     let accent = if destructive { Color::Red } else { Color::Cyan };
     let block = Block::default()
         .title(format!(" Tether · {} ", state.frame_title()))
@@ -1909,6 +2306,60 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn global_prune_key_is_uppercase_press_only_unmodified_and_modal_isolated() {
+        assert_eq!(
+            map_key_with_modals(
+                KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+                false,
+                false,
+            ),
+            Some(PickerEvent::BeginPrune)
+        );
+        for key in [
+            KeyEvent::new_with_kind(KeyCode::Char('P'), KeyModifiers::NONE, KeyEventKind::Repeat),
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::ALT),
+        ] {
+            assert_eq!(
+                map_key_with_modals(key, &PickerInput::None, PickerStage::Host, false, false,),
+                None
+            );
+        }
+        assert_eq!(
+            map_key_with_modals(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Directory,
+                false,
+                false,
+            ),
+            Some(PickerEvent::BeginPath)
+        );
+        assert_eq!(
+            map_key_with_modals(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+                false,
+                true,
+            ),
+            Some(PickerEvent::ConfirmPrune)
+        );
+        assert_eq!(
+            map_key_with_modals(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Resource,
+                false,
+                true,
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2010,6 +2461,100 @@ mod close_render_tests {
         assert!(rendered.contains("Close failed"));
         assert!(rendered.contains("y retry"));
         assert!(rendered.contains("n/Esc dismiss"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.fg == Color::Red)
+        );
+    }
+
+    fn prune_preview() -> PrunePreview {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::state::StateStore::new(temp.path().join("state.json"));
+        let now = chrono::Utc::now();
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![SessionRecord {
+                    id: "tether-0197f198000070008000000000000099".parse().unwrap(),
+                    host: "old".to_owned(),
+                    target: "old.example".to_owned(),
+                    directory: "/old".to_owned(),
+                    preset: None,
+                    status: SessionStatus::Closed,
+                    created_at: now - chrono::Duration::days(40),
+                    last_used_at: now - chrono::Duration::days(40),
+                    closed_at: Some(now - chrono::Duration::days(40)),
+                }],
+            })
+            .unwrap();
+        PruneService::new(store).preview(14).unwrap()
+    }
+
+    #[test]
+    fn narrow_prune_frames_prioritize_guidance_and_red_destructive_accent() {
+        let (mut picker, _) = close_picker();
+        picker.close_modal = None;
+        picker.retention_days = 14;
+        let preview = prune_preview();
+        let mut terminal = Terminal::new(TestBackend::new(32, 16)).unwrap();
+
+        assert!(matches!(
+            picker.handle(PickerEvent::BeginPrune),
+            PickerOutcome::PrunePreviewRequested { .. }
+        ));
+        terminal
+            .draw(|frame| render_picker(frame, &picker))
+            .unwrap();
+        let pending = rendered_text(&terminal)
+            .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(pending.contains("Previewing prune"));
+        assert!(pending.contains("No host contact"));
+
+        assert!(picker.apply_prune_result(PickerPruneResult::Preview {
+            generation: 9,
+            result: Ok(preview.clone()),
+        }));
+        terminal
+            .draw(|frame| render_picker(frame, &picker))
+            .unwrap();
+        let confirm = rendered_text(&terminal)
+            .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(confirm.contains("Confirm prune"));
+        assert!(confirm.contains("1 closed metadata"));
+        assert!(confirm.contains("14 days"));
+        assert!(confirm.contains("y confirm"));
+        assert!(confirm.contains("n/Esc keep"));
+        assert!(confirm.contains("No host contact"));
+
+        picker.handle(PickerEvent::ConfirmPrune);
+        assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+            generation: 9,
+            preview,
+            removed_ids: None,
+            skipped_ids: None,
+            error: Some("persistence unavailable".to_owned()),
+        }));
+        terminal
+            .draw(|frame| render_picker(frame, &picker))
+            .unwrap();
+        let failed = rendered_text(&terminal)
+            .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(failed.contains("Prune failed"));
+        assert!(failed.contains("y retry"));
+        assert!(failed.contains("n/Esc dismiss"));
         assert!(
             terminal
                 .backend()

@@ -1,4 +1,4 @@
-use std::{sync::atomic::AtomicBool, time::Duration as StdDuration};
+use std::{collections::HashSet, sync::atomic::AtomicBool, time::Duration as StdDuration};
 
 use anyhow::{Error as AnyError, anyhow};
 use thiserror::Error;
@@ -312,6 +312,142 @@ fn sanitize_transport_detail(text: &str) -> String {
     bounded
 }
 
+/// An immutable set of exact persisted records selected for a possible prune.
+///
+/// The candidate snapshots are intentionally private: callers can display the
+/// IDs but cannot widen or alter the set that [`PruneService::apply`] will
+/// revalidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrunePreview {
+    captured_at: DateTime<Utc>,
+    retention_days: u64,
+    candidate_ids: Vec<SessionId>,
+    candidates: Vec<SessionRecord>,
+}
+
+impl PrunePreview {
+    pub fn captured_at(&self) -> DateTime<Utc> {
+        self.captured_at
+    }
+
+    pub fn older_than_days(&self) -> u64 {
+        self.retention_days
+    }
+
+    pub fn ids(&self) -> &[SessionId] {
+        &self.candidate_ids
+    }
+}
+
+/// The truthful outcome of applying a previously captured prune preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneResult {
+    pub removed_ids: Vec<SessionId>,
+    pub skipped_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Error)]
+pub enum PruneError {
+    #[error("retention of {0} days is too large")]
+    RetentionTooLarge(u64),
+    #[error("access session state")]
+    State(#[source] AnyError),
+}
+
+/// Previews and atomically applies closed-metadata pruning using state only.
+#[derive(Clone, Debug)]
+pub struct PruneService {
+    store: StateStore,
+}
+
+impl PruneService {
+    pub fn new(store: StateStore) -> Self {
+        Self { store }
+    }
+
+    /// Captures one wall-clock instant and one immutable candidate snapshot.
+    pub fn preview(&self, retention_days: u64) -> Result<PrunePreview, PruneError> {
+        self.preview_at(retention_days, Utc::now())
+    }
+
+    /// Captures a preview at an explicit instant.
+    ///
+    /// This is useful to make cutoff-boundary decisions deterministic while
+    /// retaining the same conversion and persistence behavior as [`Self::preview`].
+    pub fn preview_at(
+        &self,
+        retention_days: u64,
+        captured_at: DateTime<Utc>,
+    ) -> Result<PrunePreview, PruneError> {
+        let retention = retention_duration(retention_days)?;
+        let state = self.store.load().map_err(PruneError::State)?;
+        let candidates = state
+            .sessions
+            .into_iter()
+            .filter(|record| {
+                cleanup_eligibility(record, WorkloadState::Missing, captured_at, retention)
+                    == CleanupEligibility::RemoveMetadata
+            })
+            .collect::<Vec<_>>();
+        let candidate_ids = candidates.iter().map(|record| record.id).collect();
+        Ok(PrunePreview {
+            captured_at,
+            retention_days,
+            candidate_ids,
+            candidates,
+        })
+    }
+    /// Applies only unchanged, still-eligible records from `preview`.
+    ///
+    /// Loading, revalidation, removal, and persistence occur under one state
+    /// update lock. Missing, changed, or no-longer-eligible candidates are
+    /// reported as skipped and do not prevent independent valid candidates
+    /// from being removed.
+    pub fn apply(&self, preview: &PrunePreview) -> Result<PruneResult, PruneError> {
+        let retention = retention_duration(preview.retention_days)?;
+        let apply_at = Utc::now();
+        self.store
+            .update(|state| {
+                let mut removed_ids = Vec::with_capacity(preview.candidates.len());
+                let mut skipped_ids = Vec::new();
+                for snapshot in &preview.candidates {
+                    let unchanged_and_eligible = state
+                        .sessions
+                        .iter()
+                        .find(|record| record.id == snapshot.id)
+                        .is_some_and(|record| {
+                            record == snapshot
+                                && cleanup_eligibility(
+                                    record,
+                                    WorkloadState::Missing,
+                                    apply_at,
+                                    retention,
+                                ) == CleanupEligibility::RemoveMetadata
+                        });
+                    if unchanged_and_eligible {
+                        removed_ids.push(snapshot.id);
+                    } else {
+                        skipped_ids.push(snapshot.id);
+                    }
+                }
+                let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
+                state
+                    .sessions
+                    .retain(|record| !removed.contains(&record.id));
+                Ok(PruneResult {
+                    removed_ids,
+                    skipped_ids,
+                })
+            })
+            .map_err(PruneError::State)
+    }
+}
+
+fn retention_duration(days: u64) -> Result<Duration, PruneError> {
+    let days = i64::try_from(days).map_err(|_| PruneError::RetentionTooLarge(days))?;
+    Duration::try_days(days).ok_or(PruneError::RetentionTooLarge(days as u64))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupEligibility {
     KeepActive,
@@ -336,7 +472,7 @@ pub fn cleanup_eligibility(
         WorkloadState::Missing => {}
     }
 
-    if record.status == SessionStatus::Active {
+    if record.status != SessionStatus::Closed {
         return CleanupEligibility::KeepActive;
     }
 

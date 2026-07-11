@@ -6,15 +6,16 @@ use herdr_tether::{
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext},
-    lifecycle::CloseOwnedError,
+    lifecycle::{CloseOwnedError, PrunePreview, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
-    state::{SessionRecord, SessionStatus, State},
+    state::{SessionRecord, SessionStatus, State, StateStore},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
     },
     tui::{
         PickerCloseModal, PickerCloseResult, PickerEvent, PickerInput, PickerOptions,
-        PickerOutcome, PickerSelection, PickerStage, PickerState, format_close_error,
+        PickerOutcome, PickerPruneModal, PickerPrunePhase, PickerPruneResult, PickerSelection,
+        PickerStage, PickerState, format_close_error,
     },
 };
 use tempfile::tempdir;
@@ -896,4 +897,336 @@ fn external_and_create_resources_cannot_represent_close_requests() {
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert!(picker.close_modal().is_none());
     assert!(!picker.close_busy());
+}
+
+fn prune_preview(days: u64, count: usize) -> PrunePreview {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc::now();
+    let sessions = (0..count)
+        .map(|index| SessionRecord {
+            id: format!("tether-0197f198000070008000000000000{:03}", index + 100)
+                .parse()
+                .unwrap(),
+            host: "archived".into(),
+            target: "nobody@example.test".into(),
+            directory: "/closed".into(),
+            preset: None,
+            status: SessionStatus::Closed,
+            created_at: now - Duration::days(60),
+            last_used_at: now - Duration::days(40),
+            closed_at: Some(now - Duration::days(40)),
+        })
+        .collect();
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions,
+        })
+        .unwrap();
+    PruneService::new(store).preview(days).unwrap()
+}
+
+fn prune_picker() -> PickerState {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::with_retention(options, config.retention.closed_days).unwrap();
+    picker.begin_refresh(11);
+    picker
+}
+
+#[test]
+fn global_prune_preview_is_selection_independent_and_requires_explicit_confirmation() {
+    let mut picker = prune_picker();
+    let before = picker.footer_text();
+    assert!(before.contains("P prune closed"));
+    assert_eq!(
+        picker.handle(PickerEvent::BeginPrune),
+        PickerOutcome::PrunePreviewRequested {
+            older_than_days: 14,
+            generation: 11,
+        }
+    );
+    assert!(picker.prune_busy());
+    assert_eq!(
+        picker.handle(PickerEvent::Cancel),
+        PickerOutcome::Cancelled,
+        "read-only preview may be abandoned before confirmation"
+    );
+    for event in [
+        PickerEvent::Back,
+        PickerEvent::Confirm,
+        PickerEvent::Refresh,
+        PickerEvent::Close,
+        PickerEvent::BeginPrune,
+    ] {
+        assert_eq!(picker.handle(event), PickerOutcome::Continue);
+    }
+
+    let preview = prune_preview(14, 2);
+    assert!(picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    }));
+    assert_eq!(
+        picker.prune_modal(),
+        Some(&PickerPruneModal::Confirm {
+            preview: preview.clone()
+        })
+    );
+    let footer = picker.footer_text();
+    assert!(footer.contains("2 closed metadata"));
+    assert!(footer.contains("14 days"));
+    assert!(footer.contains("No host contact"));
+    assert!(footer.contains("y confirm"));
+    assert!(footer.contains("n/Esc keep"));
+    assert_eq!(
+        picker.handle(PickerEvent::DismissPrune),
+        PickerOutcome::Continue
+    );
+    assert!(picker.prune_modal().is_none());
+
+    assert_eq!(
+        picker.handle(PickerEvent::BeginPrune),
+        PickerOutcome::PrunePreviewRequested {
+            older_than_days: 14,
+            generation: 11,
+        }
+    );
+    assert!(picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    }));
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::PruneApplyRequested {
+            preview,
+            generation: 11,
+        }
+    );
+    assert!(picker.prune_busy());
+    for event in [
+        PickerEvent::Cancel,
+        PickerEvent::Back,
+        PickerEvent::Confirm,
+        PickerEvent::Refresh,
+        PickerEvent::Close,
+        PickerEvent::BeginPrune,
+    ] {
+        assert_eq!(
+            picker.handle(event),
+            PickerOutcome::Continue,
+            "confirmed prune cannot be abandoned"
+        );
+    }
+}
+
+#[test]
+fn prune_zero_success_mismatch_and_failures_are_truthful_bounded_and_retryable() {
+    let mut picker = prune_picker();
+    let initial_labels = picker.resource_labels("build-box").unwrap();
+    picker.handle(PickerEvent::BeginPrune);
+    assert!(!picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 10,
+        result: Ok(prune_preview(14, 1)),
+    }));
+    assert!(picker.prune_busy());
+    assert!(picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Err("preview\u{1b}[31m failed\n".repeat(100)),
+    }));
+    assert_eq!(picker.prune_phase(), Some(PickerPrunePhase::Preview));
+    assert!(!picker.footer_text().contains('\u{1b}'));
+    assert!(picker.footer_text().chars().count() < 400);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::PrunePreviewRequested {
+            older_than_days: 14,
+            generation: 11,
+        }
+    );
+
+    let empty = prune_preview(14, 0);
+    assert!(picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(empty),
+    }));
+    assert!(picker.prune_modal().is_none());
+    assert!(picker.footer_text().contains("No closed metadata eligible"));
+
+    picker.handle(PickerEvent::BeginPrune);
+    let preview = prune_preview(14, 2);
+    picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    });
+    picker.handle(PickerEvent::ConfirmPrune);
+    assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview: preview.clone(),
+        removed_ids: None,
+        skipped_ids: None,
+        error: Some("apply\u{1b}]0;spoof\u{7} failed\n".repeat(100)),
+    }));
+    assert_eq!(picker.prune_phase(), Some(PickerPrunePhase::Apply));
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::PruneApplyRequested {
+            preview: preview.clone(),
+            generation: 11,
+        }
+    );
+    let removed = preview.ids()[0..1].to_vec();
+    let skipped = preview.ids()[1..].to_vec();
+    assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview,
+        removed_ids: Some(removed),
+        skipped_ids: Some(skipped),
+        error: None,
+    }));
+    assert!(picker.footer_text().contains("Removed 1"));
+    assert!(picker.footer_text().contains("skipped 1"));
+    assert_eq!(picker.resource_labels("build-box").unwrap(), initial_labels);
+    assert_eq!(picker.generation(), 11);
+}
+
+#[test]
+fn prune_integrity_failures_remain_retryable_and_generation_safe() {
+    let mut mismatch_picker = prune_picker();
+    mismatch_picker.handle(PickerEvent::BeginPrune);
+    let mismatch_preview = prune_preview(14, 2);
+    mismatch_picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(mismatch_preview.clone()),
+    });
+    mismatch_picker.handle(PickerEvent::ConfirmPrune);
+    assert!(
+        !mismatch_picker.apply_prune_result(PickerPruneResult::Apply {
+            generation: 10,
+            preview: mismatch_preview.clone(),
+            removed_ids: Some(Vec::new()),
+            skipped_ids: Some(mismatch_preview.ids().to_vec()),
+            error: None,
+        })
+    );
+    assert!(mismatch_picker.prune_busy());
+    assert!(
+        mismatch_picker.apply_prune_result(PickerPruneResult::Apply {
+            generation: 11,
+            preview: mismatch_preview.clone(),
+            removed_ids: Some(Vec::new()),
+            skipped_ids: Some(Vec::new()),
+            error: None,
+        })
+    );
+    assert!(matches!(
+        mismatch_picker.prune_modal(),
+        Some(PickerPruneModal::Failed {
+            phase: PickerPrunePhase::Apply,
+            preview: Some(preview),
+            ..
+        }) if preview == &mismatch_preview
+    ));
+    assert_eq!(
+        mismatch_picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::PruneApplyRequested {
+            preview: mismatch_preview,
+            generation: 11,
+        }
+    );
+
+    let mut incomplete_picker = prune_picker();
+    incomplete_picker.handle(PickerEvent::BeginPrune);
+    let incomplete_preview = prune_preview(14, 1);
+    incomplete_picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(incomplete_preview.clone()),
+    });
+    incomplete_picker.handle(PickerEvent::ConfirmPrune);
+    assert!(
+        incomplete_picker.apply_prune_result(PickerPruneResult::Apply {
+            generation: 11,
+            preview: incomplete_preview.clone(),
+            removed_ids: None,
+            skipped_ids: None,
+            error: None,
+        })
+    );
+    assert!(matches!(
+        incomplete_picker.prune_modal(),
+        Some(PickerPruneModal::Failed {
+            phase: PickerPrunePhase::Apply,
+            preview: Some(preview),
+            ..
+        }) if preview == &incomplete_preview
+    ));
+
+    let mut retention_picker = prune_picker();
+    retention_picker.handle(PickerEvent::BeginPrune);
+    assert!(
+        retention_picker.apply_prune_result(PickerPruneResult::Preview {
+            generation: 11,
+            result: Ok(prune_preview(13, 1)),
+        })
+    );
+    assert!(!retention_picker.prune_busy());
+    assert_eq!(
+        retention_picker.prune_phase(),
+        Some(PickerPrunePhase::Preview)
+    );
+    assert_eq!(
+        retention_picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::PrunePreviewRequested {
+            older_than_days: 14,
+            generation: 11,
+        }
+    );
+}
+
+#[test]
+fn confirmed_prune_result_survives_defensive_status_generation_change() {
+    let mut picker = prune_picker();
+    picker.handle(PickerEvent::BeginPrune);
+    let preview = prune_preview(14, 1);
+    picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    });
+    picker.handle(PickerEvent::ConfirmPrune);
+    picker.begin_refresh(12);
+
+    assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview: preview.clone(),
+        removed_ids: Some(preview.ids().to_vec()),
+        skipped_ids: Some(Vec::new()),
+        error: None,
+    }));
+    assert!(!picker.prune_busy());
+    assert!(picker.footer_text().contains("Removed 1"));
+}
+
+#[test]
+fn prune_and_close_modal_inputs_never_cross_route() {
+    let (mut close_picker, _, _) = owned_close_picker();
+    close_picker.handle(PickerEvent::Close);
+    assert_eq!(
+        close_picker.handle(PickerEvent::ConfirmPrune),
+        PickerOutcome::Continue
+    );
+    assert!(close_picker.close_modal().is_some());
+
+    let mut prune_picker = prune_picker();
+    prune_picker.handle(PickerEvent::BeginPrune);
+    let preview = prune_preview(14, 1);
+    prune_picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview),
+    });
+    assert_eq!(
+        prune_picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::Continue
+    );
+    assert!(prune_picker.prune_modal().is_some());
 }
