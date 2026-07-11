@@ -402,7 +402,38 @@ fn write_fake_tmux(path: &Path, log: &Path) {
     let proof_file = log.with_extension("proof");
     let id_file = log.with_extension("id");
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) previous=; for arg do if [ \"$previous\" = '-s' ]; then printf '%s' \"$arg\" > '{id_file}'; fi; case \"$arg\" in TETHER_OWNERSHIP_PROOF=*) printf '%s' \"${{arg#*=}}\" > '{proof_file}' ;; esac; previous=$arg; done; printf '$7:%%3' ;;\n  list-sessions) id=$(cat '{id_file}' 2>/dev/null); proof=$(cat '{proof_file}' 2>/dev/null); case \"$*\" in *TETHER_OWNERSHIP_PROOF*) if [ -n \"$id\" ]; then printf '%s:$7:0:0::%s' \"$id\" \"$proof\"; fi ;; *'#{{session_id}}'*) if [ -n \"$id\" ]; then printf '%s:$7' \"$id\"; fi ;; *) if [ -n \"$id\" ]; then printf '%s:0' \"$id\"; fi ;; esac ;;\n  kill-session) rm -f '{id_file}' '{proof_file}' ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
+        r#"#!/bin/sh
+printf '%s' "$1" >> '{log}'
+command=$1
+shift
+for arg do printf ' <%s>' "$arg" >> '{log}'; done
+printf '\n' >> '{log}'
+case "$command" in
+  new-session)
+    previous=
+    for arg do
+      if [ "$previous" = '-s' ]; then printf '%s' "$arg" > '{id_file}'; fi
+      case "$arg" in TETHER_OWNERSHIP_PROOF=*) printf '%s' "${{arg#*=}}" > '{proof_file}' ;; esac
+      previous=$arg
+    done
+    printf '$7:%%3'
+    ;;
+  list-sessions)
+    id=$(cat '{id_file}' 2>/dev/null)
+    proof=$(cat '{proof_file}' 2>/dev/null)
+    case "$*" in
+      *TETHER_OWNERSHIP_PROOF*) if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi ;;
+      *'#{{session_id}}'*) if [ -n "$id" ]; then printf '%s:$7' "$id"; fi ;;
+      *) if [ -n "$id" ]; then printf '%s:0' "$id"; fi ;;
+    esac
+    ;;
+  if-shell)
+    case "$*" in *'kill-session -t'*) rm -f '{id_file}' '{proof_file}' ;; esac
+    ;;
+  display-message) printf '%s' '/tmp/project with spaces' ;;
+esac
+exit 0
+"#,
         log = log.display(),
         proof_file = proof_file.display(),
         id_file = id_file.display(),
@@ -610,7 +641,7 @@ fn stop_unknown_preserves_running_and_failed_stop_is_recoverable() {
         ),
         (
             "failed-running-close",
-            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000099'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000099'; exit 0 ;;\n  if-shell) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -645,9 +676,9 @@ fn stop_unknown_preserves_running_and_failed_stop_is_recoverable() {
         }
         let transcript = fs::read_to_string(log).unwrap();
         if name == "unknown" {
-            assert!(!transcript.contains("kill-session"));
+            assert!(!transcript.contains("if-shell"));
         } else {
-            assert!(transcript.contains("kill-session"));
+            assert!(transcript.contains("if-shell"));
         }
     }
 }
