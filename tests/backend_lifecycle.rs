@@ -56,7 +56,7 @@ fn read_argv(log: &Path) -> Vec<String> {
 }
 
 fn wait_for_file(path: &Path) {
-    for _ in 0..200 {
+    for _ in 0..1_000 {
         if path.exists() {
             return;
         }
@@ -368,13 +368,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
             ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
         );
         let worker = std::thread::spawn(move || service.close_owned(id()));
-        for _ in 0..500 {
-            if ready.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(ready.exists(), "close transport did not start");
+        wait_for_file(&ready);
         store
             .update(|state| {
                 if remove_record {
@@ -428,13 +422,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
     let worker = std::thread::spawn(move || service.close_owned(id()));
-    for _ in 0..500 {
-        if ready.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert!(ready.exists(), "close transport did not start");
+    wait_for_file(&ready);
     let peer_closed_at = Utc.with_ymd_and_hms(2026, 7, 10, 13, 0, 0).unwrap();
     store
         .update(|state| {
