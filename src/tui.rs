@@ -3193,6 +3193,7 @@ mod close_render_tests {
                     preset: None,
                     command: Some("exec shell".to_owned()),
                     tmux_session_id: None,
+                    ownership_proof: None,
                     status: SessionStatus::Ended,
                     created_at: now - chrono::Duration::days(40),
                     last_used_at: now - chrono::Duration::days(40),
