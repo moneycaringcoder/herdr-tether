@@ -815,6 +815,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     for expected in [
         "'tmux' 'new-session' '-d'",
         &posix_quote(directory).unwrap(),
+        "'TETHER_OWNERSHIP_PROOF=0197f198000070008000000000000002'",
         &posix_quote(launch_script).unwrap(),
         &posix_quote(command).unwrap(),
     ] {

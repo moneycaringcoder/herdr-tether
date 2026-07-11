@@ -466,7 +466,16 @@ impl LifecycleService {
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                self.close_exact(&backend, id, identity)?;
+                match self.inspect_exact(&backend, &id, &ownership_proof)? {
+                    WorkloadState::Ended {
+                        identity: current, ..
+                    } if current == identity => self.close_exact(&backend, id, identity)?,
+                    WorkloadState::Missing => {}
+                    WorkloadState::Unknown => {
+                        return Err(CloseOwnedError::WorkloadUnknown(id));
+                    }
+                    _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+                }
             }
             WorkloadState::Missing => {}
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
