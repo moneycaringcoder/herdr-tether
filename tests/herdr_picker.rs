@@ -481,7 +481,11 @@ fn proofless_legacy_workload_offers_only_metadata_remove() {
         picker.close_modal(),
         Some(&PickerCloseModal::Confirm { id })
     );
-    assert!(picker.footer_text().contains("same-named tmux session is untouched"));
+    assert!(
+        picker
+            .footer_text()
+            .contains("same-named tmux session is untouched")
+    );
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
         PickerOutcome::CloseOwnedRequested {

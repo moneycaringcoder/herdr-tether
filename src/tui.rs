@@ -1197,9 +1197,11 @@ impl PickerState {
                 .entry(host.name.clone())
                 .or_default()
                 .begin_refresh();
-            for workload in host.workloads.iter().filter(|workload| {
-                workload.status == SessionStatus::Running && !workload.legacy
-            }) {
+            for workload in host
+                .workloads
+                .iter()
+                .filter(|workload| workload.status == SessionStatus::Running && !workload.legacy)
+            {
                 self.workload_status
                     .entry(workload.id)
                     .or_default()
@@ -1390,7 +1392,6 @@ impl PickerState {
         })
     }
 
-
     fn current_legacy_id(&self) -> Option<SessionId> {
         if self.stage != PickerStage::Resource {
             return None;
@@ -1402,9 +1403,7 @@ impl PickerState {
             .workloads
             .iter()
             .find(|workload| {
-                workload.id == id
-                    && workload.legacy
-                    && workload.status != SessionStatus::Removed
+                workload.id == id && workload.legacy && workload.status != SessionStatus::Removed
             })
             .map(|workload| workload.id)
     }
@@ -2005,12 +2004,15 @@ impl PickerState {
     }
 
     fn close_action(&self, id: SessionId) -> PickerCloseAction {
-        if self.options.hosts.iter().flat_map(|host| &host.workloads).any(
-            |workload| {
-                workload.id == id
-                    && (workload.legacy || workload.status == SessionStatus::Ended)
-            },
-        ) {
+        if self
+            .options
+            .hosts
+            .iter()
+            .flat_map(|host| &host.workloads)
+            .any(|workload| {
+                workload.id == id && (workload.legacy || workload.status == SessionStatus::Ended)
+            })
+        {
             PickerCloseAction::Remove
         } else {
             PickerCloseAction::Stop
@@ -2046,14 +2048,15 @@ impl PickerState {
             });
         }
         match self.close_modal.as_ref()? {
-            PickerCloseModal::Confirm { id } => match self.modal_close_action(*id)
-            {
+            PickerCloseModal::Confirm { id } => match self.modal_close_action(*id) {
                 PickerCloseAction::Stop => Some(format!(
                     "y confirm · n/Esc keep · Stop exact {id}? Ends its Tether workload."
                 )),
-                PickerCloseAction::Remove if self.current_legacy_id() == Some(*id) => Some(format!(
-                    "y confirm · n/Esc keep · Remove legacy record {id}? Metadata only; any same-named tmux session is untouched."
-                )),
+                PickerCloseAction::Remove if self.current_legacy_id() == Some(*id) => {
+                    Some(format!(
+                        "y confirm · n/Esc keep · Remove legacy record {id}? Metadata only; any same-named tmux session is untouched."
+                    ))
+                }
                 PickerCloseAction::Remove => Some(format!(
                     "y confirm · n/Esc keep · Remove ended {id}? Metadata only; no live workload is touched."
                 )),
@@ -2081,7 +2084,8 @@ impl PickerState {
                 PickerCloseAction::Stop => "Confirm Stop".to_owned(),
                 PickerCloseAction::Remove => "Confirm Remove".to_owned(),
             },
-            (_, _, Some(PickerCloseModal::Failed { id, .. })) => match self.modal_close_action(*id) {
+            (_, _, Some(PickerCloseModal::Failed { id, .. })) => match self.modal_close_action(*id)
+            {
                 PickerCloseAction::Stop => "Stop failed".to_owned(),
                 PickerCloseAction::Remove => "Remove failed".to_owned(),
             },
@@ -2137,30 +2141,29 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
-                let (primary_hint, destructive_hint) =
-                    if self.stage == PickerStage::Resource {
-                        if self.current_legacy_id().is_some() {
-                            ("", " · x Remove")
-                        } else {
-                            match self.current_owned_action() {
-                                Some((_, false)) => ("Enter Open", " · x Stop"),
-                                Some((_, true)) => ("Enter Restart", " · x Remove"),
-                                None => match self.current_resource_identity() {
-                                    Some(ResourceIdentity::External(_))
-                                    | Some(ResourceIdentity::Create)
-                                        if !self.current_host_unreachable() =>
-                                    {
-                                        ("Enter select", "")
-                                    }
-                                    _ => ("", ""),
-                                },
-                            }
-                        }
-                    } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
-                        ("", "")
+                let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
+                    if self.current_legacy_id().is_some() {
+                        ("", " · x Remove")
                     } else {
-                        ("Enter select", "")
-                    };
+                        match self.current_owned_action() {
+                            Some((_, false)) => ("Enter Open", " · x Stop"),
+                            Some((_, true)) => ("Enter Restart", " · x Remove"),
+                            None => match self.current_resource_identity() {
+                                Some(ResourceIdentity::External(_))
+                                | Some(ResourceIdentity::Create)
+                                    if !self.current_host_unreachable() =>
+                                {
+                                    ("Enter select", "")
+                                }
+                                _ => ("", ""),
+                            },
+                        }
+                    }
+                } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
+                    ("", "")
+                } else {
+                    ("Enter select", "")
+                };
                 let primary_hint = if primary_hint.is_empty() {
                     String::new()
                 } else {

@@ -199,14 +199,15 @@ class SmokeEnvironmentTests(unittest.TestCase):
                     smoke.cleanup()
 
                 commands = [call.args[0] for call in run.call_args_list]
-                tether_close_commands = [
+                tether_stop_commands = [
                     command
                     for command in commands
-                    if command[1:3] == ["session", "close"]
+                    if command[:3] == [str(smoke.tether), "session", "stop"]
+                    and len(command) == 4
                 ]
                 self.assertEqual(
-                    tether_close_commands,
-                    [[str(smoke.tether), "session", "close", valid_id]],
+                    tether_stop_commands,
+                    [[str(smoke.tether), "session", "stop", valid_id]],
                 )
                 self.assertFalse(
                     any(

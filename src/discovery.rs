@@ -536,11 +536,7 @@ fn remote_spec(
     if let Some(port) = target.port {
         ssh_args.extend(["-p".to_owned(), port.to_string()]);
     }
-    ssh_args.extend([
-        "--".to_owned(),
-        target.destination,
-        remote_command,
-    ]);
+    ssh_args.extend(["--".to_owned(), target.destination, remote_command]);
     Ok(CommandSpec::new(binaries.ssh().to_path_buf(), ssh_args))
 }
 

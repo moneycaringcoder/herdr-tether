@@ -413,8 +413,7 @@ fn every_state_schema_rejects_unknown_fields() {
     let path = temp.path().join("state.json");
     let store = StateStore::new(path.clone());
     let id = "tether-0197f198000070008000000000000001";
-    let timestamps =
-        r#""created_at":"2026-07-10T12:00:00Z","last_used_at":"2026-07-10T12:00:00Z""#;
+    let timestamps = r#""created_at":"2026-07-10T12:00:00Z","last_used_at":"2026-07-10T12:00:00Z""#;
     let sources = [
         r#"{"version":0,"sessions":[],"unknown":true}"#.to_owned(),
         format!(

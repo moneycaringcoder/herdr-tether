@@ -99,11 +99,7 @@ impl TmuxBackend {
                 if let Some(port) = target.port {
                     ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
                 }
-                ssh_arguments.extend([
-                    "--".to_owned(),
-                    target.destination.clone(),
-                    remote_command,
-                ]);
+                ssh_arguments.extend(["--".to_owned(), target.destination.clone(), remote_command]);
                 Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
@@ -125,11 +121,7 @@ impl TmuxBackend {
                 if let Some(port) = target.port {
                     ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
                 }
-                ssh_arguments.extend([
-                    "--".to_owned(),
-                    target.destination.clone(),
-                    remote_command,
-                ]);
+                ssh_arguments.extend(["--".to_owned(), target.destination.clone(), remote_command]);
                 Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }

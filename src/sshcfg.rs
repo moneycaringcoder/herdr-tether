@@ -68,10 +68,7 @@ pub(crate) fn openssh_target(target: &str) -> Result<OpenSshTarget> {
             .split_once(':')
             .map_or((host_and_port, None), |(host, port)| (host, Some(port)))
     };
-    let destination = user.map_or_else(
-        || host.to_owned(),
-        |user| format!("{user}@{host}"),
-    );
+    let destination = user.map_or_else(|| host.to_owned(), |user| format!("{user}@{host}"));
     Ok(OpenSshTarget {
         destination,
         port: port.map(|port| {
