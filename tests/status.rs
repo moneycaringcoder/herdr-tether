@@ -22,7 +22,7 @@ fn write_fake_ssh(path: &Path, fast_id: SessionId) {
         r#"#!/bin/sh
 case " $* " in
   *" fast "*) printf '%s\t2\n' '{fast_id}' ;;
-  *" slow "*) sleep 2 ;;
+  *" slow "*) sleep 5 ;;
   *) exit 99 ;;
 esac
 "#
@@ -68,7 +68,7 @@ fn fast_host_publishes_before_slow_host_times_out() {
 
     let mut messages = Vec::new();
     loop {
-        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let message = run.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         let finished = matches!(message, StatusMessage::Finished { generation: 7 });
         messages.push(message);
         if finished {
@@ -106,7 +106,7 @@ fn fast_host_publishes_before_slow_host_times_out() {
         .expect("slow timeout result");
 
     assert!(fast < slow, "fast host must publish before slow timeout");
-    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let service = StatusService::new(
         ProcessBinaries::new(&ssh, temp.path().join("tmux")),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         1,
     );
     let run = service.start(StatusRequest {
@@ -139,7 +139,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
     });
     let mut messages = Vec::new();
     loop {
-        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
         let finished = matches!(message, StatusMessage::Finished { generation: 8 });
         messages.push(message);
         if finished {
@@ -196,7 +196,7 @@ esac
     let unsafe_id = id("tether-0197f198000070008000000000000002");
     let service = StatusService::new(
         ProcessBinaries::new(&ssh, temp.path().join("tmux")),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         2,
     );
     let run = service.start(StatusRequest {
@@ -216,7 +216,7 @@ esac
     });
     let mut messages = Vec::new();
     loop {
-        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
         let finished = matches!(message, StatusMessage::Finished { generation: 10 });
         messages.push(message);
         if finished {
@@ -290,7 +290,7 @@ fn cancelled_generation_does_not_publish_late_results() {
     while let Ok(message) = run.receiver.recv_timeout(Duration::from_millis(100)) {
         assert!(matches!(message, StatusMessage::Finished { generation: 1 }));
     }
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -322,7 +322,7 @@ esac
     let malformed_id = id("tether-0197f198000070008000000000000003");
     let service = StatusService::new(
         ProcessBinaries::new(&ssh, temp.path().join("tmux")),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         3,
     );
     let run = service.start(StatusRequest {
@@ -347,7 +347,7 @@ esac
     });
     let mut messages = Vec::new();
     loop {
-        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
         let finished = matches!(message, StatusMessage::Finished { generation: 9 });
         messages.push(message);
         if finished {

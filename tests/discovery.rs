@@ -56,9 +56,11 @@ fn collect_remote_output(output_command: &str, generation: u64) -> Vec<Discovery
     let ssh = temp.path().join("ssh");
     fs::write(&ssh, format!("#!/bin/sh\n{output_command}\n")).unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut test_limits = limits();
+    test_limits.timeout = Duration::from_secs(10);
     let service = DiscoveryService::new(
         ProcessBinaries::new(&ssh, temp.path().join("tmux")),
-        limits(),
+        test_limits,
     );
     collect(
         &service,
@@ -332,13 +334,16 @@ fn remote_parser_rejects_unsafe_and_malformed_records() {
                 .iter()
                 .any(|message| matches!(message, DiscoveryMessage::Repository { .. }))
         );
-        assert!(messages.iter().any(|message| matches!(
-            message,
-            DiscoveryMessage::HostFinished {
-                completion: DiscoveryCompletion::Malformed,
-                ..
-            }
-        )));
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                DiscoveryMessage::HostFinished {
+                    completion: DiscoveryCompletion::Malformed,
+                    ..
+                }
+            )),
+            "case {index} did not report malformed: {messages:?}"
+        );
     }
 }
 

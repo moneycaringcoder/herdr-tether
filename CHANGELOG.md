@@ -13,6 +13,7 @@
 - Added case-insensitive directory filtering with `/` and literal direct-path entry with `p`. Refresh now restarts both status and discovery generations while rejecting stale results.
 - Added version-2 TOML discovery roots/limits and retention defaults. Existing v0/v1 config and v0 state now migrate under the same advisory lock as normal transactions; recent picker directories no longer silently widen repository scan scope.
 - Expanded idempotent setup with effective-default/prerequisite/next-step guidance, and made doctor classify required config/state/tmux/SSH/Cargo/Herdr failures with bounded deadlines/output while continuing the complete report. Explicit prune age continues to override configured retention.
+- Added owned-only explorer close: press-only `c` opens a red exact-ID confirmation, `y` starts a bounded asynchronous close that cannot be abandoned through picker exit, and external/Create rows cannot enter the destructive type. Success removes the exact row and refreshes; failure shows a sanitized cause chain with in-place retry. CLI and explorer share a lock-minimizing two-phase lifecycle with three-second transport deadlines, process-group cleanup, idempotent peer finalization, and recoverable `closing` semantics.
 
 ## [0.1.0] - 2026-07-10
 

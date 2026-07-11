@@ -10,7 +10,7 @@ Implemented and covered by the current command/test surface:
 
 - durable local and SSH-backed `tmux` create, inspect, attach, and explicit close;
 - configured hosts plus literal aliases read from `~/.ssh/config`;
-- a unified host → Tether-owned/external/create explorer with exact resume of owned workloads and non-owning attachment to safely discovered existing tmux sessions;
+- a unified host → Tether-owned/external/create explorer with exact resume and explicitly confirmed close of owned workloads plus non-owning attachment to safely discovered existing tmux sessions;
 - progressive local/remote reachability, owned-workload status, and external tmux catalog discovery with independent three-second probe deadlines and explicit `r` refresh;
 - bounded local and BatchMode-SSH repository discovery from configured per-host scan roots plus the local `HOME`/remote `~` fallback, with configurable depth/entry/result/deadline/worker bounds, progressive results, deterministic local ordering, and no symlink traversal;
 - case-insensitive directory filtering and literal direct-path entry from the explorer;
@@ -21,7 +21,7 @@ Implemented and covered by the current command/test surface:
 
 Important limitations:
 
-- Closing a Herdr pane, losing SSH, or a failed attach does not close the `tmux` workload. Use `session close` explicitly.
+- Closing a Herdr pane, losing SSH, or a failed attach does not close the `tmux` workload. Close an owned Resources row with `c`, then explicit `y`, or use `session close <ID>`.
 - Existing non-Tether tmux sessions are discovered and may be attached, but Tether never adopts, persists, renames, closes, kills, or prunes them. All `tether-*` names remain reserved and non-actionable unless they match an owned active record.
 - Explorer observations are point-in-time and cached only while that overlay remains open. Refresh marks prior owned/external results visibly stale until each host completes; timeout, offline, invalid-response, error, unknown, running, and missing are distinct.
 - `session prune` removes only sufficiently old records already marked `closed`; it does not kill workloads or probe/reconnect to hosts.
@@ -31,7 +31,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 79 automated tests and a locked release build. Coverage includes lock-safe v0/v1 config and v0 state migration, concurrent config/state updates, configurable discovery/retention precedence, bounded actionable doctor probes, bounded repository discovery and adversarial remote responses, bounded external tmux catalogs, reserved-name collision handling, exact non-owning external attachment, explorer search/direct-path behavior, progressive multi-host status, timeout/cancellation/process cleanup, refresh generations/stale labels, exact owned resume IDs, and the v0.1 lifecycle suite. Tmux-hosted interactive smokes selected a newly discovered repository for creation, resumed an owned workload, and attached an external session without creating, killing, or persisting it.
+The current branch passes 97 automated tests and a locked release build. Coverage includes lock-safe config/state migration and concurrency, configurable discovery/retention, bounded doctor probes, repository/external catalog discovery, exact non-owning external attach, explorer search/direct paths, progressive status/refresh, exact owned resume, and confirmed owned close. Close tests cover owned-only confirmation, red/narrow layout, pending-exit suppression, full sanitized errors, exact local/SSH argv, lock release, three-second transport deadlines/process cleanup, unknown byte identity, recoverable failure, retry, peer finalization, and external exclusion. Tmux-hosted smokes selected a discovered repository, resumed owned work, attached an external session without mutation, and confirmed no kill before `y` followed by one exact-ID kill and Closed metadata.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -103,7 +103,7 @@ Open the interactive explorer:
 herdr-tether open
 ```
 
-Choose a host, then select an active Tether workload, a safely discovered **external** tmux session, or **Create new Tether workload**. Owned and external rows are always labeled; external attached-client counts are observations, not ownership. Repository scans append creation directories progressively. Host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; owned workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh status, external catalogs, and repositories. Existing external rows remain visibly stale and attachable during refresh; an exact attach may safely fail if the session disappeared. Freshly missing owned workloads cannot be resumed. Closing and closed Tether records are not resumable, and reserved `tether-*` collisions are hidden and non-actionable.
+Choose a host, then select an active Tether workload, a safely discovered **external** tmux session, or **Create new Tether workload**. Owned and external rows are always labeled; external attached-client counts are observations, not ownership. On an owned row, `c` opens a red exact-ID close confirmation and only `y` starts close; `n`/`Esc` keeps it. Once confirmed, the bounded close completes before exit while navigation/status/discovery remain responsive. Success removes only that row and refreshes; failure keeps it selected as `[close failed · c retry]` with a sanitized, bounded cause chain and in-place retry/dismiss controls. External/Create rows have no close action. Repository scans append creation directories progressively. Host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; owned workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh status, external catalogs, and repositories. Existing external rows remain visibly stale and attachable during refresh; an exact attach may safely fail if the session disappeared. Freshly missing owned workloads cannot be resumed. Closing and closed Tether records are not resumable, and reserved `tether-*` collisions are hidden and non-actionable.
 
 Or create a local session without the explorer:
 
@@ -177,7 +177,7 @@ herdr-tether session prune [--dry-run] [--older-than-days <DAYS>]
 
 - `list` shows persisted metadata; JSON includes the complete records.
 - `resume` refuses closed, missing, or indeterminate workloads; a valid attempt updates `last_used_at` before attaching.
-- `close` is the only lifecycle command allowed to invoke `tmux kill-session`. It inspects first: a workload proven missing is marked closed without a kill; a running workload is first marked `closing`, then killed by exact session ID and finalized as closed. A failed kill or final state write leaves the recoverable `closing` marker for a later `close` retry; an indeterminate workload is left unchanged.
+- `close` and the explorer's confirmed owned close share one exact-ID lifecycle service. Exact inspect and close transports each have a three-second deadline, 64 KiB stream caps, and process-group cleanup. Inspection runs without the state lock and leaves an indeterminate active record unchanged; known results are revalidated before `closing`, transport runs unlocked, and finalization revalidates before `closed`. Failed/timed-out kill or final state write leaves the recoverable `closing` marker for retry; matching peer finalization is idempotent.
 - `prune` prints eligible IDs and removes only closed metadata at least `retention.closed_days` old (30 days in a migrated/default config). `--older-than-days` overrides the configured value; `--dry-run` only prints. An explicit `--older-than-days 0` makes every already-closed record eligible.
 
 ```text
@@ -198,7 +198,7 @@ The explorer proceeds through:
 4. built-in shell or a host preset for creation;
 5. split right, split down, or new tab.
 
-Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. On the directory stage, `/` filters and `p` enters a literal path; while editing, printable keys insert text, `Backspace` deletes, `Enter` applies, and `Esc` returns to the list. The default placement is split right.
+Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. On an owned Resources row, press-only `c` opens the red close confirmation; `y` confirms and `n`/`Esc` dismisses. On the directory stage, `/` filters and `p` enters a literal path; while editing, printable keys insert text, `Backspace` deletes, `Enter` applies, and `Esc` returns to the list. The default placement is split right.
 
 Plugin actions first open `picker` or `setup` as a managed overlay. After selection, Tether asks Herdr to create exactly one split or tab and runs either exact-ID owned resume or exact-name external attach in the returned pane. The tmux session remains independent of that Herdr view. External attachment invokes only `attach-session -t =<name>`; it cannot enter Tether create/close/prune or persistence paths.
 
@@ -238,7 +238,7 @@ Configured `timeout_seconds` must be between 1 and 3600.
 State stores IDs, resolved target, host label, directory, preset name, lifecycle status, and timestamps—not terminal output or credentials. If state persistence fails after creating a workload, Tether attempts to close that newly created workload. Failed attach/resume does not implicitly kill it.
 External tmux sessions are never written to state. Their validated names and attached-client counts exist only in the current explorer invocation.
 
-Cleanup is intentionally conservative. Only `session close` marks a record closed, either after inspection proves the workload missing or after exact-session `kill-session` succeeds. `session prune` assumes such a closed workload is already absent and removes old metadata without reconnecting. Active, unknown, and recently closed records are retained.
+Cleanup is intentionally conservative. Only explicit owned close—red `c`/`y` explorer confirmation or `session close`—marks a record closed, either after inspection proves the workload missing or after exact-session `kill-session` succeeds. `session prune` assumes such a closed workload is already absent and removes old metadata without reconnecting. Active, unknown, and recently closed records are retained.
 
 ## Security model
 

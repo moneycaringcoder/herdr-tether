@@ -12,7 +12,7 @@ use crate::{
     config::{CommandPreset, Config, ConfigStore, HostConfig},
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
-    lifecycle::{CleanupEligibility, cleanup_eligibility},
+    lifecycle::{CleanupEligibility, LifecycleService, cleanup_eligibility},
     model::{ExternalSessionName, Placement, SessionId},
     paths::AppPaths,
     sshcfg::discover_aliases,
@@ -387,7 +387,7 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         PickerSelection::Create(selection_from_args(&config, &aliases, args)?)
     } else {
         let state = state_store.load()?;
-        selection_from_picker(&config, &aliases, &state, args)?
+        selection_from_picker(&config, &aliases, &state_store, &state, args)?
             .context("session selection was cancelled")?
     };
 
@@ -426,6 +426,7 @@ fn selection_from_args(
 fn selection_from_picker(
     config: &Config,
     aliases: &[String],
+    state_store: &StateStore,
     state: &State,
     args: OpenArgs,
 ) -> Result<Option<PickerSelection>> {
@@ -462,7 +463,15 @@ fn selection_from_picker(
             workers: config.discovery.workers,
         },
     );
-    let Some(selection) = run_picker(options, status_service, discovery_service)? else {
+    let lifecycle_service =
+        LifecycleService::new(state_store.clone(), ProcessBinaries::new("ssh", "tmux"));
+    let Some(selection) = run_picker(
+        options,
+        status_service,
+        discovery_service,
+        lifecycle_service,
+    )?
+    else {
         return Ok(None);
     };
 
@@ -666,38 +675,8 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             run_attach(backend.attach_external_command(&name)?)
         }
         SessionCommand::Close { id } => {
-            store.exclusive(|store| {
-                let mut state = store.load()?;
-                let index = state
-                    .sessions
-                    .iter()
-                    .position(|record| record.id == id)
-                    .with_context(|| format!("unknown session `{id}`"))?;
-                let status = state.sessions[index].status;
-                if status == SessionStatus::Closed {
-                    bail!("session `{id}` is already closed");
-                }
-                let backend = backend_for(&state.sessions[index].target)?;
-                match backend.inspect(&id)? {
-                    crate::backend::WorkloadState::Missing => {}
-                    crate::backend::WorkloadState::Running { .. } => {
-                        if status == SessionStatus::Active {
-                            state.sessions[index].status = SessionStatus::Closing;
-                            store.save(&state)?;
-                        }
-                        backend.close(&id)?;
-                    }
-                    crate::backend::WorkloadState::Unknown => {
-                        bail!("could not determine whether session `{id}` exists")
-                    }
-                }
-                let now = Utc::now();
-                let record = &mut state.sessions[index];
-                record.status = SessionStatus::Closed;
-                record.last_used_at = now;
-                record.closed_at = Some(now);
-                store.save(&state)
-            })?;
+            LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+                .close_owned(id)?;
             println!("closed {id}");
             Ok(())
         }
