@@ -666,10 +666,18 @@ class Smoke:
         refused_ids = {
             item.get("id") for item in self.state_records()
         } - before_ids
-        if refused_ids:
-            fail(f"refused replacement leaked owned metadata: {refused_ids}")
-        if self.tmux_sessions() != before_tmux:
-            fail("refused replacement leaked or removed a tmux session")
+        if len(refused_ids) != 1:
+            fail(f"refused replacement did not retain one recoverable record: {refused_ids}")
+        refused_id = next(iter(refused_ids))
+        if not isinstance(refused_id, str) or not re.fullmatch(
+            r"tether-[0-9a-f]{32}", refused_id
+        ):
+            fail(f"refused replacement produced a non-Tether ID: {refused_id!r}")
+        if self.tmux_sessions() - before_tmux != {refused_id}:
+            fail("refused replacement did not retain exactly its created workload")
+        self.owned_ids.add(refused_id)
+        self.run([str(self.tether), "session", "stop", refused_id])
+        self.owned_ids.discard(refused_id)
 
         before_panes = self.pane_ids()
         before_ids = {item.get("id") for item in self.state_records()}
@@ -690,7 +698,7 @@ class Smoke:
             fail("confirmed replacement left the exact source pane open")
         self.verify_owned_tmux_contract(replacement_id, self.root / "work")
         self.close_pane(destination)
-        self.run([str(self.tether), "session", "close", replacement_id])
+        self.run([str(self.tether), "session", "stop", replacement_id])
         self.owned_ids.discard(replacement_id)
 
     def workspace_and_pane(self) -> tuple[str, str]:
@@ -1104,8 +1112,8 @@ class Smoke:
             )
         self.verify_placement(placement, invoking_pane, pane_id)
         records = [item for item in self.state_records() if item.get("id") == session_id]
-        if len(records) != 1 or str(records[0].get("status", "")).lower() != "active":
-            fail(f"Tether did not persist one active record for {session_id}: {records}")
+        if len(records) != 1 or str(records[0].get("status", "")).lower() != "running":
+            fail(f"Tether did not persist one running record for {session_id}: {records}")
         return session_id, pane_id, str(tmux_created)
 
     def remote_cwd_contract(self, workspace_id: str, invoking_pane: str) -> None:
@@ -1174,7 +1182,7 @@ class Smoke:
         if remote_tmux("show-options", "-v", "-t", session_id, "mouse") != "on":
             fail(f"remote owned session {session_id} did not enable mouse")
         self.close_pane(pane)
-        self.run([str(self.tether), "session", "close", session_id])
+        self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
 
     def product_lifecycle(self) -> None:
@@ -1248,10 +1256,10 @@ class Smoke:
         if not resumed_ids:
             fail(f"Herdr did not return the resumed pane identity: {split}")
         resumed_pane = resumed_ids[-1]
-        resume_command = (
-            self._shell_quote(str(self.tether)) + " session resume " + self._shell_quote(first_id)
+        open_command = (
+            self._shell_quote(str(self.tether)) + " session open " + self._shell_quote(first_id)
         )
-        self.herdr_run("pane", "run", resumed_pane, resume_command)
+        self.herdr_run("pane", "run", resumed_pane, open_command)
         self.wait_until(
             "resumed tmux attachment",
             lambda: self.tmux_attached(first_id) > 0,
@@ -1301,7 +1309,7 @@ class Smoke:
         )
 
         for session_id in (first_id, second_id, third_id, symlink_id):
-            self.run([str(self.tether), "session", "close", session_id])
+            self.run([str(self.tether), "session", "stop", session_id])
         self.wait_until(
             "all Tether tmux sessions to close",
             lambda: not ({first_id, second_id, third_id, symlink_id} & self.tmux_sessions()),
@@ -1309,8 +1317,8 @@ class Smoke:
         records = {item.get("id"): item for item in self.state_records()}
         for session_id in (first_id, second_id, third_id, symlink_id):
             status = str(records.get(session_id, {}).get("status", "")).lower()
-            if status != "closed":
-                fail(f"exact close did not persist closed status for {session_id}: {status!r}")
+            if status != "ended":
+                fail(f"exact Stop did not persist ended status for {session_id}: {status!r}")
         self.replacement_contract(workspace_id, initial_pane)
         self.remote_cwd_contract(workspace_id, initial_pane)
 
@@ -1350,7 +1358,7 @@ class Smoke:
         ):
             try:
                 self.run(
-                    [str(self.tether), "session", "close", session_id],
+                    [str(self.tether), "session", "stop", session_id],
                     check=False,
                     timeout=5.0,
                 )

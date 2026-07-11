@@ -454,6 +454,16 @@ impl LifecycleService {
                 status: record.status,
             });
         }
+        if !matches!(
+            record.status,
+            SessionStatus::Ended | SessionStatus::Creating
+        ) {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "restarted",
+                status: record.status,
+            });
+        }
         let command = record
             .command
             .clone()
@@ -491,16 +501,6 @@ impl LifecycleService {
             }
             WorkloadState::Missing => {}
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
-        }
-        if !matches!(
-            record.status,
-            SessionStatus::Ended | SessionStatus::Creating
-        ) {
-            return Err(CloseOwnedError::InvalidStatus {
-                id,
-                operation: "restarted",
-                status: record.status,
-            });
         }
         self.store
             .update(|state| {

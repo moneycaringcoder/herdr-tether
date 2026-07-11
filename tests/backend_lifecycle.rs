@@ -1455,6 +1455,23 @@ fn stop_guard_rejects_identity_reuse_after_final_inspection() {
 }
 
 #[test]
+fn restart_rejects_running_metadata_before_backend_transport() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let (_temp, _store, service, log) = lifecycle_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002\n",
+    );
+
+    assert!(matches!(
+        service.restart_owned(id()),
+        Err(CloseOwnedError::InvalidStatus {
+            status: SessionStatus::Running,
+            ..
+        })
+    ));
+    assert!(!log.exists(), "invalid Restart must not inspect the backend");
+}
+
+#[test]
 fn creating_recovery_refuses_same_name_with_wrong_ownership_proof() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let (_temp, store, service, log) = lifecycle_fixture(
