@@ -28,6 +28,10 @@ LC_ALL=C
 export LC_ALL
 entries=0
 results=0
+listing_index=0
+state_dir=${TMPDIR:-/tmp}/tether-discovery.$$
+(umask 077 && mkdir "$state_dir") || exit 1
+trap 'rm -rf "$state_dir"' 0 1 2 3 15
 
 scan() {
   if [ "$entries" -ge "$entry_limit" ]; then
@@ -50,7 +54,15 @@ scan() {
   if [ "$2" -ge "$max_depth" ]; then
     return
   fi
-  for child in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+
+  remaining=$((entry_limit - entries))
+  listing_index=$((listing_index + 1))
+  listing=$state_dir/$listing_index
+  find_root=$1
+  case "$find_root" in -*) find_root=./$find_root ;; esac
+  find "$find_root" -mindepth 1 -maxdepth 1 -print |
+    head -n "$((remaining + 1))" > "$listing"
+  while IFS= read -r child; do
     if [ ! -e "$child" ] && [ ! -L "$child" ]; then
       continue
     fi
@@ -61,7 +73,8 @@ scan() {
       next=$name
     fi
     scan "$child" "$(($2 + 1))" "$next" "$4"
-  done
+  done < "$listing"
+  rm -f "$listing"
 }
 
 index=0

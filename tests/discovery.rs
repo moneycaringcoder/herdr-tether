@@ -475,3 +475,57 @@ fn remote_scanner_enforces_the_filesystem_entry_limit() {
         }
     )));
 }
+
+#[cfg(unix)]
+#[test]
+fn remote_entry_limit_stops_directory_enumeration_incrementally() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("child"), "").unwrap();
+    let find = temp.path().join("find");
+    fs::write(
+        &find,
+        "#!/bin/sh\nwhile :; do printf '%s\\n' \"$1/child\"; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&find, fs::Permissions::from_mode(0o700)).unwrap();
+    let ssh = temp.path().join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nPATH='{}':$PATH\nexport PATH\nfor argument do command=$argument; done\nexec /bin/sh -c \"$command\"\n",
+            temp.path().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut bounded = limits();
+    bounded.max_entries = 2;
+    let service = DiscoveryService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        bounded,
+    );
+    let messages = collect(
+        &service,
+        DiscoveryRequest {
+            generation: 6,
+            locations: vec![DiscoveryLocation {
+                host: "dev".into(),
+                target: Some("dev.example".into()),
+                roots: vec![root.to_string_lossy().into_owned()],
+            }],
+        },
+    );
+
+    assert!(
+        messages.iter().any(|message| matches!(
+            message,
+            DiscoveryMessage::HostFinished {
+                completion: DiscoveryCompletion::EntriesLimit,
+                ..
+            }
+        )),
+        "remote enumeration did not stop at the entry bound: {messages:?}"
+    );
+}
