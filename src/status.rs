@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Read},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -16,7 +16,7 @@ use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 use crate::{
     backend::{CommandSpec, ProcessBinaries},
-    model::SessionId,
+    model::{ExternalSessionName, SessionId},
     tmux::TmuxBackend,
 };
 
@@ -39,6 +39,20 @@ pub enum WorkloadStatus {
     Unknown,
     TimedOut,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalCatalogStatus {
+    Available,
+    Unavailable,
+    TimedOut,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalSession {
+    pub name: ExternalSessionName,
+    pub attached: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +83,15 @@ pub enum StatusMessage {
         status: WorkloadStatus,
         checked_at: SystemTime,
     },
+    Catalog {
+        generation: u64,
+        host: String,
+        status: ExternalCatalogStatus,
+        sessions: Vec<ExternalSession>,
+        hidden_reserved: usize,
+        hidden_unsafe: usize,
+        checked_at: SystemTime,
+    },
     Finished {
         generation: u64,
     },
@@ -79,6 +102,7 @@ impl StatusMessage {
         match self {
             Self::Host { generation, .. }
             | Self::Workload { generation, .. }
+            | Self::Catalog { generation, .. }
             | Self::Finished { generation } => *generation,
         }
     }
@@ -195,19 +219,34 @@ fn probe_host(
     }
 
     let checked_at = SystemTime::now();
-    let (reachability, workloads) = classify_result(&host, result);
+    let classified = classify_result(&host, result);
     if sender
         .send(StatusMessage::Host {
             generation,
-            host: host.name,
-            status: reachability,
+            host: host.name.clone(),
+            status: classified.reachability,
             checked_at,
         })
         .is_err()
     {
         return;
     }
-    for (id, status) in workloads {
+    if cancelled.load(Ordering::Acquire)
+        || sender
+            .send(StatusMessage::Catalog {
+                generation,
+                host: host.name,
+                status: classified.catalog_status,
+                sessions: classified.external,
+                hidden_reserved: classified.hidden_reserved,
+                hidden_unsafe: classified.hidden_unsafe,
+                checked_at,
+            })
+            .is_err()
+    {
+        return;
+    }
+    for (id, status) in classified.workloads {
         if cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -225,62 +264,110 @@ fn probe_host(
     }
 }
 
-fn classify_result(
-    host: &StatusHost,
-    result: BoundedOutput,
-) -> (HostReachability, Vec<(SessionId, WorkloadStatus)>) {
+struct ClassifiedResult {
+    reachability: HostReachability,
+    workloads: Vec<(SessionId, WorkloadStatus)>,
+    catalog_status: ExternalCatalogStatus,
+    external: Vec<ExternalSession>,
+    hidden_reserved: usize,
+    hidden_unsafe: usize,
+}
+
+fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult {
     match result {
         BoundedOutput::Completed {
             status,
             stdout,
             stdout_truncated: false,
         } if status.success() => match parse_sessions(&stdout) {
-            Some(sessions) => (
-                HostReachability::Reachable,
-                host.workloads
+            Some(catalog) => ClassifiedResult {
+                reachability: HostReachability::Reachable,
+                workloads: host
+                    .workloads
                     .iter()
                     .map(|id| {
-                        let status = sessions
-                            .get(id)
-                            .map_or(WorkloadStatus::Missing, |attached| {
-                                WorkloadStatus::Running {
-                                    attached: *attached,
-                                }
-                            });
+                        let status =
+                            catalog
+                                .owned
+                                .get(id)
+                                .map_or(WorkloadStatus::Missing, |attached| {
+                                    WorkloadStatus::Running {
+                                        attached: *attached,
+                                    }
+                                });
                         (*id, status)
                     })
                     .collect(),
-            ),
-            None => (
+                catalog_status: ExternalCatalogStatus::Available,
+                external: catalog.external,
+                hidden_reserved: catalog.hidden_reserved
+                    + catalog
+                        .owned
+                        .keys()
+                        .filter(|id| !host.workloads.contains(id))
+                        .count(),
+                hidden_unsafe: catalog.unsafe_names,
+            },
+            None => classified_failure(
+                host,
                 HostReachability::Reachable,
-                uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
+                WorkloadStatus::Unknown,
+                ExternalCatalogStatus::Error,
             ),
         },
-        BoundedOutput::Completed { status, .. } if status.success() => (
+        BoundedOutput::Completed { status, .. } if status.success() => classified_failure(
+            host,
             HostReachability::Reachable,
-            uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
+            WorkloadStatus::Unknown,
+            ExternalCatalogStatus::Error,
         ),
-        BoundedOutput::Completed { status, .. } if status.code() == Some(1) => (
-            HostReachability::Reachable,
-            uniform_workloads(&host.workloads, WorkloadStatus::Missing),
-        ),
+        BoundedOutput::Completed { status, .. } if status.code() == Some(1) => ClassifiedResult {
+            reachability: HostReachability::Reachable,
+            workloads: uniform_workloads(&host.workloads, WorkloadStatus::Missing),
+            catalog_status: ExternalCatalogStatus::Available,
+            external: Vec::new(),
+            hidden_reserved: 0,
+            hidden_unsafe: 0,
+        },
         BoundedOutput::Completed { status, .. }
             if host.target.is_some() && status.code() == Some(255) =>
         {
-            (
+            classified_failure(
+                host,
                 HostReachability::Unreachable,
-                uniform_workloads(&host.workloads, WorkloadStatus::Unknown),
+                WorkloadStatus::Unknown,
+                ExternalCatalogStatus::Unavailable,
             )
         }
-        BoundedOutput::TimedOut => (
+        BoundedOutput::TimedOut => classified_failure(
+            host,
             HostReachability::TimedOut,
-            uniform_workloads(&host.workloads, WorkloadStatus::TimedOut),
+            WorkloadStatus::TimedOut,
+            ExternalCatalogStatus::TimedOut,
         ),
-        BoundedOutput::Error | BoundedOutput::Completed { .. } => (
+        BoundedOutput::Error | BoundedOutput::Completed { .. } => classified_failure(
+            host,
             HostReachability::Error,
-            uniform_workloads(&host.workloads, WorkloadStatus::Error),
+            WorkloadStatus::Error,
+            ExternalCatalogStatus::Error,
         ),
         BoundedOutput::Cancelled => unreachable!("cancelled probes do not publish"),
+    }
+}
+
+fn classified_failure(
+    host: &StatusHost,
+    reachability: HostReachability,
+    workload_status: WorkloadStatus,
+    catalog_status: ExternalCatalogStatus,
+) -> ClassifiedResult {
+    ClassifiedResult {
+        reachability,
+        workloads: uniform_workloads(&host.workloads, workload_status),
+        catalog_status,
+        external: Vec::new(),
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
     }
 }
 
@@ -291,23 +378,51 @@ fn uniform_workloads(
     workloads.iter().map(|id| (*id, status)).collect()
 }
 
-fn parse_sessions(stdout: &[u8]) -> Option<HashMap<SessionId, u32>> {
+struct ParsedSessions {
+    owned: HashMap<SessionId, u32>,
+    external: Vec<ExternalSession>,
+    hidden_reserved: usize,
+    unsafe_names: usize,
+}
+
+fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
+    const MAX_SESSIONS: usize = 256;
+
     let text = std::str::from_utf8(stdout).ok()?;
-    let mut sessions = HashMap::new();
+    let mut names = HashSet::new();
+    let mut owned = HashMap::new();
+    let mut external = Vec::new();
+    let mut hidden_reserved = 0;
+    let mut unsafe_names = 0;
     for line in text.lines().filter(|line| !line.is_empty()) {
-        let (name, attached) = line.split_once('\t')?;
-        let Ok(id) = name.parse::<SessionId>() else {
-            if name.starts_with("tether-") {
-                return None;
-            }
-            continue;
-        };
-        let attached = attached.parse::<u32>().ok()?;
-        if sessions.insert(id, attached).is_some() {
+        if names.len() >= MAX_SESSIONS {
             return None;
         }
+        let (name, attached) = line.split_once('\t')?;
+        if attached.contains('\t') || !names.insert(name.to_owned()) {
+            return None;
+        }
+        let attached = attached.parse::<u32>().ok()?;
+        if name.starts_with("tether-") {
+            if let Ok(id) = name.parse::<SessionId>() {
+                owned.insert(id, attached);
+            } else {
+                hidden_reserved += 1;
+            }
+            continue;
+        }
+        match name.parse() {
+            Ok(name) => external.push(ExternalSession { name, attached }),
+            Err(_) => unsafe_names += 1,
+        }
     }
-    Some(sessions)
+    external.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(ParsedSessions {
+        owned,
+        external,
+        hidden_reserved,
+        unsafe_names,
+    })
 }
 
 pub(crate) enum BoundedOutput {

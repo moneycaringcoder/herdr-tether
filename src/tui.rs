@@ -26,11 +26,11 @@ use crate::{
         DiscoveryCompletion, DiscoveryLocation, DiscoveryMessage, DiscoveryRequest, DiscoveryRun,
         DiscoveryService,
     },
-    model::{Placement, SessionId},
+    model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
     status::{
-        HostReachability, StatusHost, StatusMessage, StatusRequest, StatusRun, StatusService,
-        WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
+        StatusRequest, StatusRun, StatusService, WorkloadStatus,
     },
 };
 
@@ -66,6 +66,12 @@ pub struct PickerWorkload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PickerExternalSession {
+    name: ExternalSessionName,
+    label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PickerHost {
     pub name: String,
     pub label: String,
@@ -73,6 +79,7 @@ pub struct PickerHost {
     pub directories: Vec<String>,
     pub commands: Vec<PickerCommand>,
     pub workloads: Vec<PickerWorkload>,
+    pub allow_existing: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +115,7 @@ impl PickerOptions {
                 directories,
                 commands: vec![PickerCommand::Shell],
                 workloads: active_workloads(state, "local"),
+                allow_existing: true,
             });
         }
 
@@ -138,6 +146,7 @@ impl PickerOptions {
                 directories,
                 commands,
                 workloads: active_workloads(state, &host.name),
+                allow_existing: true,
             });
         }
 
@@ -186,7 +195,10 @@ fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
             let command = session.preset.as_deref().unwrap_or("Shell");
             let id = session.id.to_string();
             let short_id = &id[id.len().saturating_sub(8)..];
-            let label = format!("Resume …{} · {} · {}", short_id, command, session.directory);
+            let label = format!(
+                "Tether · Resume …{} · {} · {}",
+                short_id, command, session.directory
+            );
             PickerWorkload {
                 id: session.id,
                 base_label: label.clone(),
@@ -214,7 +226,16 @@ pub struct OpenSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerSelection {
     Create(OpenSelection),
-    Resume { id: SessionId, placement: Placement },
+    Resume {
+        id: SessionId,
+        placement: Placement,
+    },
+    AttachExternal {
+        host: String,
+        target: Option<String>,
+        name: ExternalSessionName,
+        placement: Placement,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +285,68 @@ enum DiscoveryView {
     RootError,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CatalogCell {
+    sessions: Vec<PickerExternalSession>,
+    status: Option<ExternalCatalogStatus>,
+    hidden_reserved: usize,
+    hidden_unsafe: usize,
+    stale: bool,
+    loading: bool,
+}
+
+impl CatalogCell {
+    fn begin_refresh(&mut self) {
+        self.stale = !self.sessions.is_empty();
+        self.loading = true;
+        if self.stale {
+            for session in &mut self.sessions {
+                if !session.label.starts_with("[stale] ") {
+                    session.label = format!("[stale] {}", session.label);
+                }
+            }
+        }
+    }
+
+    fn apply(
+        &mut self,
+        status: ExternalCatalogStatus,
+        sessions: Vec<ExternalSession>,
+        hidden_reserved: usize,
+        hidden_unsafe: usize,
+    ) {
+        if status == ExternalCatalogStatus::Available || !sessions.is_empty() {
+            self.sessions = sessions
+                .into_iter()
+                .map(|session| {
+                    let attached = if session.attached == 0 {
+                        "running".to_owned()
+                    } else {
+                        format!("running · {} attached", session.attached)
+                    };
+                    PickerExternalSession {
+                        label: format!("[external · {attached}] {}", session.name),
+                        name: session.name,
+                    }
+                })
+                .collect();
+            self.stale = false;
+        } else {
+            self.stale = !self.sessions.is_empty();
+        }
+        self.status = Some(status);
+        self.hidden_reserved = hidden_reserved;
+        self.hidden_unsafe = hidden_unsafe;
+        self.loading = false;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResourceIdentity {
+    Owned(SessionId),
+    External(ExternalSessionName),
+    Create,
+}
 #[derive(Clone, Debug)]
 struct StatusCell<T> {
     value: Option<T>,
@@ -344,9 +427,11 @@ pub struct PickerState {
     command_index: usize,
     placement_index: usize,
     resume_id: Option<SessionId>,
+    external_name: Option<ExternalSessionName>,
     generation: u64,
     host_status: HashMap<String, StatusCell<HostReachability>>,
     workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
+    catalogs: HashMap<String, CatalogCell>,
     discovery_generation: u64,
     base_directories: HashMap<String, Vec<String>>,
     discovery: HashMap<String, DiscoveryView>,
@@ -384,9 +469,11 @@ impl PickerState {
             command_index: 0,
             placement_index,
             resume_id: None,
+            external_name: None,
             generation: 0,
             host_status: HashMap::new(),
             workload_status: HashMap::new(),
+            catalogs: HashMap::new(),
             discovery_generation: 0,
             base_directories,
             discovery: HashMap::new(),
@@ -527,6 +614,24 @@ impl PickerState {
             .map(|workload| workload.label.as_str())
     }
 
+    pub fn resource_labels(&self, host: &str) -> Option<Vec<String>> {
+        let host = self
+            .options
+            .hosts
+            .iter()
+            .find(|candidate| candidate.name == host)?;
+        let mut labels = host
+            .workloads
+            .iter()
+            .map(|workload| workload.label.clone())
+            .collect::<Vec<_>>();
+        if let Some(catalog) = self.catalogs.get(&host.name) {
+            labels.extend(catalog.sessions.iter().map(|session| session.label.clone()));
+        }
+        labels.push("Create new Tether workload".to_owned());
+        Some(labels)
+    }
+
     pub fn begin_refresh(&mut self, generation: u64) {
         self.generation = generation;
         for host in &self.options.hosts {
@@ -540,6 +645,12 @@ impl PickerState {
                     .or_default()
                     .begin_refresh();
             }
+            if host.allow_existing {
+                self.catalogs
+                    .entry(host.name.clone())
+                    .or_default()
+                    .begin_refresh();
+            }
         }
         self.rebuild_status_labels();
     }
@@ -548,6 +659,7 @@ impl PickerState {
         if message.generation() != self.generation {
             return false;
         }
+        let selected_resource = self.current_resource_identity();
         let applied = match message {
             StatusMessage::Host {
                 host,
@@ -567,12 +679,75 @@ impl PickerState {
                 cell.apply(status, checked_at);
                 true
             }),
+            StatusMessage::Catalog {
+                host,
+                status,
+                sessions,
+                hidden_reserved,
+                hidden_unsafe,
+                ..
+            } => self.catalogs.get_mut(&host).is_some_and(|cell| {
+                cell.apply(status, sessions, hidden_reserved, hidden_unsafe);
+                true
+            }),
             StatusMessage::Finished { .. } => false,
         };
         if applied {
             self.rebuild_status_labels();
+            if let Some(identity) = selected_resource {
+                self.restore_resource_identity(&identity);
+            }
         }
         applied
+    }
+
+    fn current_resource_identity(&self) -> Option<ResourceIdentity> {
+        let host = &self.options.hosts[self.host_index];
+        if let Some(workload) = host.workloads.get(self.resource_index) {
+            return Some(ResourceIdentity::Owned(workload.id));
+        }
+        let external_index = self.resource_index.saturating_sub(host.workloads.len());
+        if let Some(session) = self
+            .catalogs
+            .get(&host.name)
+            .and_then(|catalog| catalog.sessions.get(external_index))
+        {
+            return Some(ResourceIdentity::External(session.name.clone()));
+        }
+        Some(ResourceIdentity::Create)
+    }
+
+    fn restore_resource_identity(&mut self, identity: &ResourceIdentity) {
+        let host = &self.options.hosts[self.host_index];
+        self.resource_index = match identity {
+            ResourceIdentity::Owned(id) => host
+                .workloads
+                .iter()
+                .position(|workload| workload.id == *id)
+                .unwrap_or(0),
+            ResourceIdentity::External(name) => self
+                .catalogs
+                .get(&host.name)
+                .and_then(|catalog| {
+                    catalog
+                        .sessions
+                        .iter()
+                        .position(|session| &session.name == name)
+                })
+                .map(|index| host.workloads.len() + index)
+                .unwrap_or_else(|| self.resource_len().saturating_sub(1)),
+            ResourceIdentity::Create => self.resource_len().saturating_sub(1),
+        };
+    }
+
+    fn resource_len(&self) -> usize {
+        let host = &self.options.hosts[self.host_index];
+        host.workloads.len()
+            + self
+                .catalogs
+                .get(&host.name)
+                .map_or(0, |catalog| catalog.sessions.len())
+            + 1
     }
 
     fn status_request(&self) -> StatusRequest {
@@ -708,15 +883,15 @@ impl PickerState {
         self.stage = match self.stage {
             PickerStage::Host => return PickerOutcome::Cancelled,
             PickerStage::Resource => PickerStage::Host,
-            PickerStage::Directory if self.options.hosts[self.host_index].workloads.is_empty() => {
-                PickerStage::Host
-            }
             PickerStage::Directory => PickerStage::Resource,
             PickerStage::Command => PickerStage::Directory,
-            PickerStage::Placement if self.resume_id.is_some() => PickerStage::Resource,
+            PickerStage::Placement if self.resume_id.is_some() || self.external_name.is_some() => {
+                PickerStage::Resource
+            }
             PickerStage::Placement => PickerStage::Command,
         };
         self.resume_id = None;
+        self.external_name = None;
         PickerOutcome::Continue
     }
 
@@ -727,13 +902,10 @@ impl PickerState {
                 self.directory_index = 0;
                 self.command_index = 0;
                 self.resume_id = None;
+                self.external_name = None;
                 self.selected_directory = None;
                 self.directory_filter.clear();
-                self.stage = if self.options.hosts[self.host_index].workloads.is_empty() {
-                    PickerStage::Directory
-                } else {
-                    PickerStage::Resource
-                };
+                self.stage = PickerStage::Resource;
                 PickerOutcome::Continue
             }
             PickerStage::Resource => {
@@ -746,9 +918,22 @@ impl PickerState {
                         return PickerOutcome::Continue;
                     }
                     self.resume_id = Some(workload.id);
+                    self.external_name = None;
+                    self.stage = PickerStage::Placement;
+                    return PickerOutcome::Continue;
+                }
+                let external_index = self.resource_index.saturating_sub(host.workloads.len());
+                if let Some(session) = self
+                    .catalogs
+                    .get(&host.name)
+                    .and_then(|catalog| catalog.sessions.get(external_index))
+                {
+                    self.resume_id = None;
+                    self.external_name = Some(session.name.clone());
                     self.stage = PickerStage::Placement;
                 } else {
                     self.resume_id = None;
+                    self.external_name = None;
                     self.selected_directory = None;
                     self.directory_filter.clear();
                     self.stage = PickerStage::Directory;
@@ -778,6 +963,15 @@ impl PickerState {
         if let Some(id) = self.resume_id {
             return PickerSelection::Resume { id, placement };
         }
+        if let Some(name) = &self.external_name {
+            let host = &self.options.hosts[self.host_index];
+            return PickerSelection::AttachExternal {
+                host: host.name.clone(),
+                target: host.target.clone(),
+                name: name.clone(),
+                placement,
+            };
+        }
 
         let host = &self.options.hosts[self.host_index];
         let (preset, command) = host.commands[self.command_index].selection_parts();
@@ -796,7 +990,7 @@ impl PickerState {
     fn current_len(&self) -> usize {
         match self.stage {
             PickerStage::Host => self.options.hosts.len(),
-            PickerStage::Resource => self.options.hosts[self.host_index].workloads.len() + 1,
+            PickerStage::Resource => self.resource_len(),
             PickerStage::Directory => self.visible_directory_indices().len(),
             PickerStage::Command => self.options.hosts[self.host_index].commands.len(),
             PickerStage::Placement => PLACEMENTS.len(),
@@ -826,7 +1020,7 @@ impl PickerState {
     fn title(&self) -> &'static str {
         match self.stage {
             PickerStage::Host => "Hosts",
-            PickerStage::Resource => "Workloads",
+            PickerStage::Resource => "Resources",
             PickerStage::Directory => "Directory",
             PickerStage::Command => "Shell or preset",
             PickerStage::Placement => "Placement",
@@ -846,7 +1040,14 @@ impl PickerState {
                 host.workloads
                     .iter()
                     .map(|workload| workload.label.as_str())
-                    .chain(std::iter::once("Create new workload"))
+                    .chain(
+                        self.catalogs
+                            .get(&host.name)
+                            .into_iter()
+                            .flat_map(|catalog| &catalog.sessions)
+                            .map(|session| session.label.as_str()),
+                    )
+                    .chain(std::iter::once("Create new Tether workload"))
                     .collect()
             }
             PickerStage::Directory => {
@@ -898,6 +1099,50 @@ impl PickerState {
         }
     }
 
+    fn catalog_label(&self, host: &str) -> Option<String> {
+        let catalog = self.catalogs.get(host)?;
+        if catalog.loading {
+            return Some(if catalog.stale {
+                "Refreshing external sessions · stale rows remain attachable".to_owned()
+            } else {
+                "Discovering external tmux sessions…".to_owned()
+            });
+        }
+        let mut notices = Vec::new();
+        match catalog.status {
+            Some(ExternalCatalogStatus::Available) if catalog.sessions.is_empty() => {
+                notices.push("No attachable external tmux sessions".to_owned());
+            }
+            Some(ExternalCatalogStatus::Available) => {}
+            Some(ExternalCatalogStatus::Unavailable) => {
+                notices.push("External sessions unavailable · r retry".to_owned());
+            }
+            Some(ExternalCatalogStatus::TimedOut) => {
+                notices.push("External session probe timed out · r retry".to_owned());
+            }
+            Some(ExternalCatalogStatus::Error) if catalog.stale => {
+                notices.push("External refresh error · stale rows remain attachable".to_owned());
+            }
+            Some(ExternalCatalogStatus::Error) => {
+                notices.push("External session response invalid · r retry".to_owned());
+            }
+            None => {}
+        }
+        if catalog.hidden_reserved > 0 {
+            notices.push(format!(
+                "{} reserved Tether-like session(s) hidden",
+                catalog.hidden_reserved
+            ));
+        }
+        if catalog.hidden_unsafe > 0 {
+            notices.push(format!(
+                "{} unsafe/unrenderable session name(s) hidden",
+                catalog.hidden_unsafe
+            ));
+        }
+        (!notices.is_empty()).then(|| notices.join(" · "))
+    }
+
     fn footer_text(&self) -> String {
         match &self.input {
             PickerInput::Filter(query) => {
@@ -916,6 +1161,12 @@ impl PickerState {
                         self.discovery_label(&self.options.hosts[self.host_index].name)
                 {
                     parts.push(label.to_owned());
+                }
+                if self.stage == PickerStage::Resource
+                    && let Some(label) =
+                        self.catalog_label(&self.options.hosts[self.host_index].name)
+                {
+                    parts.push(label);
                 }
                 parts.push(
                     "↑/↓ navigate · Enter select · / filter · p path · r refresh · ← back · Esc cancel"

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::SessionId,
+    model::{ExternalSessionName, SessionId},
     quote::posix_quote,
     sshcfg::validate_ssh_target,
 };
@@ -84,6 +84,17 @@ impl TmuxBackend {
                 "#{session_name}\t#{session_attached}".to_owned(),
             ],
             false,
+        )
+    }
+
+    pub fn attach_external_command(&self, name: &ExternalSessionName) -> Result<CommandSpec> {
+        self.tmux_spec(
+            vec![
+                "attach-session".to_owned(),
+                "-t".to_owned(),
+                format!("={}", name.as_str()),
+            ],
+            true,
         )
     }
 
