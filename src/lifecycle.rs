@@ -6,7 +6,7 @@ use thiserror::Error;
 use chrono::{DateTime, Duration, Utc};
 
 use crate::{
-    backend::{ProcessBinaries, WorkloadState},
+    backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     model::{SessionId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, StateStore},
     status::{BoundedOutput, run_bounded},
@@ -32,6 +32,18 @@ pub struct CloseOwnedResult {
     pub id: SessionId,
     pub workload: ClosedWorkload,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartOwnedResult {
+    pub id: SessionId,
+    pub identity: TmuxSessionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoveOwnedResult {
+    pub id: SessionId,
+    pub workload: ClosedWorkload,
+}
+
 
 #[derive(Debug, Error)]
 pub enum CloseOwnedError {
@@ -59,6 +71,20 @@ pub enum CloseOwnedError {
     },
     #[error("close session `{id}`")]
     Close {
+        id: SessionId,
+        #[source]
+        source: AnyError,
+    },
+    #[error("session `{0}` has no retained command and cannot be restarted")]
+    MissingCommand(SessionId),
+    #[error("session `{id}` cannot be {operation} while it is {status:?}")]
+    InvalidStatus {
+        id: SessionId,
+        operation: &'static str,
+        status: SessionStatus,
+    },
+    #[error("create session `{id}`")]
+    Create {
         id: SessionId,
         #[source]
         source: AnyError,
@@ -276,6 +302,290 @@ impl LifecycleService {
             })
     }
 
+    /// Returns an attach command only after proving the exact live incarnation.
+    pub fn open_owned(&self, id: SessionId) -> Result<CommandSpec, CloseOwnedError> {
+        let record = self
+            .owned_record(id)?
+            .ok_or(CloseOwnedError::UnknownSession(id))?;
+        if record.status != SessionStatus::Running {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "opened",
+                status: record.status,
+            });
+        }
+        let backend = self.backend_for(&id, &record.target)?;
+        let WorkloadState::Running { identity, .. } = self.inspect_exact(&backend, &id)? else {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "opened",
+                status: SessionStatus::Ended,
+            });
+        };
+        if record
+            .tmux_session_id
+            .is_some_and(|expected| expected != identity)
+        {
+            return Err(CloseOwnedError::ConcurrentModification(id));
+        }
+        self.store
+            .update(|state| {
+                let current = state
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == id)
+                    .ok_or_else(|| anyhow!("session disappeared"))?;
+                if current != &record {
+                    return Err(anyhow!("session changed"));
+                }
+                current.tmux_session_id = Some(identity);
+                current.last_used_at = Utc::now();
+                Ok(())
+            })
+            .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+        backend
+            .attach_command(identity)
+            .map_err(|source| CloseOwnedError::Inspect { id, source })
+    }
+
+    /// Reconciles persisted metadata with a truthful exact tmux observation.
+    pub fn observe_owned(&self, id: SessionId) -> Result<WorkloadState, CloseOwnedError> {
+        let record = self
+            .owned_record(id)?
+            .ok_or(CloseOwnedError::UnknownSession(id))?;
+        let backend = self.backend_for(&id, &record.target)?;
+        let observed = self.inspect_exact(&backend, &id)?;
+        match observed {
+            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+            WorkloadState::Running { identity, .. } => {
+                if record
+                    .tmux_session_id
+                    .is_some_and(|expected| expected != identity)
+                {
+                    return Err(CloseOwnedError::ConcurrentModification(id));
+                }
+                if matches!(record.status, SessionStatus::Creating | SessionStatus::Running) {
+                    self.store
+                        .update(|state| {
+                            let current = state
+                                .sessions
+                                .iter_mut()
+                                .find(|current| current.id == id)
+                                .ok_or_else(|| anyhow!("session disappeared"))?;
+                            if current != &record {
+                                return Err(anyhow!("session changed"));
+                            }
+                            current.status = SessionStatus::Running;
+                            current.tmux_session_id = Some(identity);
+                            current.closed_at = None;
+                            current.exit_status = None;
+                            Ok(())
+                        })
+                        .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+                }
+            }
+            WorkloadState::Ended {
+                identity,
+                exit_status,
+            } => {
+                if record
+                    .tmux_session_id
+                    .is_some_and(|expected| expected != identity)
+                {
+                    return Err(CloseOwnedError::ConcurrentModification(id));
+                }
+                self.mark_ended(&record, Some(identity), exit_status)?;
+            }
+            WorkloadState::Missing => self.mark_ended(&record, None, None)?,
+        }
+        Ok(observed)
+    }
+
+    /// Restarts an ended workload from its privately retained exact command.
+    ///
+    /// A `Creating` reservation survives every failure. Retrying promotes an
+    /// already-created exact session instead of creating a duplicate.
+    pub fn restart_owned(&self, id: SessionId) -> Result<RestartOwnedResult, CloseOwnedError> {
+        let record = self
+            .owned_record(id)?
+            .ok_or(CloseOwnedError::UnknownSession(id))?;
+        if record.status == SessionStatus::Removed {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "restarted",
+                status: record.status,
+            });
+        }
+        let command = record
+            .command
+            .clone()
+            .ok_or(CloseOwnedError::MissingCommand(id))?;
+        let backend = self.backend_for(&id, &record.target)?;
+        match self.inspect_exact(&backend, &id)? {
+            WorkloadState::Running { identity, .. } => {
+                if record.status != SessionStatus::Creating
+                    && record.tmux_session_id != Some(identity)
+                {
+                    return Err(CloseOwnedError::ConcurrentModification(id));
+                }
+                self.promote_running(&record, identity)?;
+                return Ok(RestartOwnedResult { id, identity });
+            }
+            WorkloadState::Ended { identity, .. } => {
+                if record
+                    .tmux_session_id
+                    .is_some_and(|expected| expected != identity)
+                {
+                    return Err(CloseOwnedError::ConcurrentModification(id));
+                }
+                self.close_exact(&backend, id, identity)?;
+            }
+            WorkloadState::Missing => {}
+            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+        }
+        if !matches!(record.status, SessionStatus::Ended | SessionStatus::Creating) {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "restarted",
+                status: record.status,
+            });
+        }
+        self.store
+            .update(|state| {
+                let current = state
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == id)
+                    .ok_or_else(|| anyhow!("session disappeared"))?;
+                if current != &record {
+                    return Err(anyhow!("session changed"));
+                }
+                current.status = SessionStatus::Creating;
+                current.tmux_session_id = None;
+                current.closed_at = None;
+                current.exit_status = None;
+                Ok(())
+            })
+            .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+        let reservation = self
+            .owned_record(id)?
+            .ok_or(CloseOwnedError::UnknownSession(id))?;
+        let identity = backend
+            .create(&LaunchSpec {
+                id,
+                directory: reservation.directory.clone(),
+                command,
+            })
+            .map_err(|source| CloseOwnedError::Create { id, source })?;
+        self.promote_running(&reservation, identity)?;
+        Ok(RestartOwnedResult { id, identity })
+    }
+
+    /// Finalizes ended metadata and removes only an exact dead tmux incarnation.
+    pub fn remove_owned(&self, id: SessionId) -> Result<RemoveOwnedResult, CloseOwnedError> {
+        let record = self
+            .owned_record(id)?
+            .ok_or(CloseOwnedError::UnknownSession(id))?;
+        if record.status == SessionStatus::Removed {
+            return Ok(RemoveOwnedResult {
+                id,
+                workload: ClosedWorkload::Missing,
+            });
+        }
+        if record.status != SessionStatus::Ended {
+            return Err(CloseOwnedError::InvalidStatus {
+                id,
+                operation: "removed",
+                status: record.status,
+            });
+        }
+        let backend = self.backend_for(&id, &record.target)?;
+        let workload = match self.inspect_exact(&backend, &id)? {
+            WorkloadState::Ended { identity, .. }
+                if record.tmux_session_id.is_none()
+                    || record.tmux_session_id == Some(identity) =>
+            {
+                self.close_exact(&backend, id, identity)?;
+                ClosedWorkload::Terminated
+            }
+            WorkloadState::Missing => ClosedWorkload::Missing,
+            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+            _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+        };
+        self.store
+            .update(|state| {
+                let current = state
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == id)
+                    .ok_or_else(|| anyhow!("session disappeared"))?;
+                if current != &record {
+                    return Err(anyhow!("session changed"));
+                }
+                current.status = SessionStatus::Removed;
+                current.last_used_at = Utc::now();
+                current.closed_at.get_or_insert(current.last_used_at);
+                Ok(())
+            })
+            .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+        Ok(RemoveOwnedResult { id, workload })
+    }
+
+    fn mark_ended(
+        &self,
+        snapshot: &SessionRecord,
+        identity: Option<TmuxSessionId>,
+        exit_status: Option<i32>,
+    ) -> Result<(), CloseOwnedError> {
+        if snapshot.status == SessionStatus::Removed {
+            return Ok(());
+        }
+        self.store
+            .update(|state| {
+                let current = state
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == snapshot.id)
+                    .ok_or_else(|| anyhow!("session disappeared"))?;
+                if current != snapshot {
+                    return Err(anyhow!("session changed"));
+                }
+                let now = Utc::now();
+                current.status = SessionStatus::Ended;
+                current.tmux_session_id = identity.or(current.tmux_session_id);
+                current.last_used_at = now;
+                current.closed_at.get_or_insert(now);
+                current.exit_status = exit_status;
+                Ok(())
+            })
+            .map_err(|_| CloseOwnedError::ConcurrentModification(snapshot.id))
+    }
+
+    fn promote_running(
+        &self,
+        snapshot: &SessionRecord,
+        identity: TmuxSessionId,
+    ) -> Result<(), CloseOwnedError> {
+        self.store
+            .update(|state| {
+                let current = state
+                    .sessions
+                    .iter_mut()
+                    .find(|current| current.id == snapshot.id)
+                    .ok_or_else(|| anyhow!("session disappeared"))?;
+                if current != snapshot {
+                    return Err(anyhow!("session changed"));
+                }
+                current.status = SessionStatus::Running;
+                current.tmux_session_id = Some(identity);
+                current.closed_at = None;
+                current.exit_status = None;
+                current.last_used_at = Utc::now();
+                Ok(())
+            })
+            .map_err(|_| CloseOwnedError::ConcurrentModification(snapshot.id))
+    }
+
     fn backend_for(&self, id: &SessionId, target: &str) -> Result<TmuxBackend, CloseOwnedError> {
         if target == "local" {
             Ok(TmuxBackend::local(self.binaries.clone()))
@@ -395,6 +705,9 @@ pub struct PruneResult {
     pub removed_ids: Vec<SessionId>,
     pub skipped_ids: Vec<SessionId>,
 }
+/// Finalized removed metadata is retained for this many days by default.
+pub const DEFAULT_RETENTION_DAYS: u64 = 30;
+
 
 #[derive(Debug, Error)]
 pub enum PruneError {
@@ -488,6 +801,43 @@ impl PruneService {
                     removed_ids,
                     skipped_ids,
                 })
+            })
+            .map_err(PruneError::State)
+    }
+    /// Automatically removes only finalized `Removed` metadata after retention.
+    ///
+    /// This path performs no backend operation and therefore cannot terminate
+    /// or otherwise mutate any workload.
+    pub fn automatic_cleanup(&self) -> Result<Vec<SessionId>, PruneError> {
+        self.automatic_cleanup_at(Utc::now())
+    }
+
+    pub fn automatic_cleanup_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<SessionId>, PruneError> {
+        let retention = retention_duration(DEFAULT_RETENTION_DAYS)?;
+        self.store
+            .update(|state| {
+                let removed = state
+                    .sessions
+                    .iter()
+                    .filter(|record| {
+                        record.status == SessionStatus::Removed
+                            && cleanup_eligibility(
+                                record,
+                                WorkloadState::Missing,
+                                now,
+                                retention,
+                            ) == CleanupEligibility::RemoveMetadata
+                    })
+                    .map(|record| record.id)
+                    .collect::<Vec<_>>();
+                let removed_set = removed.iter().copied().collect::<HashSet<_>>();
+                state
+                    .sessions
+                    .retain(|record| !removed_set.contains(&record.id));
+                Ok(removed)
             })
             .map_err(PruneError::State)
     }

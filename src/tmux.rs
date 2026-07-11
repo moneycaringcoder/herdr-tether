@@ -158,7 +158,8 @@ impl TmuxBackend {
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_attached}".to_owned(),
+                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}"
+                    .to_owned(),
             ],
             false,
         )

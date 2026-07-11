@@ -372,10 +372,13 @@ fn state_round_trips_and_migrates_v0() {
             target: "builder@example.test".into(),
             directory: "/srv/code".into(),
             preset: Some("shell".into()),
-            status: SessionStatus::Active,
+            command: Some("exec shell".into()),
+            tmux_session_id: Some("$7".parse().unwrap()),
+            status: SessionStatus::Running,
             created_at: now,
             last_used_at: now,
             closed_at: None,
+            exit_status: None,
         }],
     };
 
@@ -394,9 +397,9 @@ fn state_round_trips_and_migrates_v0() {
     .unwrap();
     let migrated = store.load().unwrap();
     assert_eq!(migrated.version, State::CURRENT_VERSION);
-    assert_eq!(migrated.sessions[0].status, SessionStatus::Active);
+    assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
     assert!(migrated.sessions[0].preset.is_none());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
 }
 
 #[test]
@@ -410,7 +413,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
 }
 
 #[test]
@@ -437,10 +440,13 @@ fn concurrent_state_updates_preserve_both_records() {
                         target: "local".into(),
                         directory: "/tmp".into(),
                         preset: None,
+                        command: Some("exec shell".into()),
+                        tmux_session_id: None,
                         status: SessionStatus::Running,
                         created_at: now,
                         last_used_at: now,
                         closed_at: None,
+                        exit_status: None,
                     });
                     Ok(())
                 })

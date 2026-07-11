@@ -2908,7 +2908,7 @@ mod close_render_tests {
                 workloads: vec![PickerWorkload {
                     id,
                     base_label: label.clone(),
-                    status: SessionStatus::Active,
+                    status: SessionStatus::Running,
                     last_used_at: chrono::Utc::now(),
                     label,
                 }],
@@ -3014,10 +3014,13 @@ mod close_render_tests {
                     target: "old.example".to_owned(),
                     directory: "/old".to_owned(),
                     preset: None,
-                    status: SessionStatus::Closed,
+                    command: Some("exec shell".to_owned()),
+                    tmux_session_id: None,
+                    status: SessionStatus::Ended,
                     created_at: now - chrono::Duration::days(40),
                     last_used_at: now - chrono::Duration::days(40),
                     closed_at: Some(now - chrono::Duration::days(40)),
+                    exit_status: None,
                 }],
             })
             .unwrap();
