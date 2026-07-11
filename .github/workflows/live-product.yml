@@ -1,0 +1,94 @@
+name: Live product smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "herdr-plugin.toml"
+      - "src/**"
+      - "tools/live_product_smoke.py"
+      - "tools/test_live_product_smoke.py"
+      - ".github/workflows/live-product.yml"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "herdr-plugin.toml"
+      - "src/**"
+      - "tools/live_product_smoke.py"
+      - "tools/test_live_product_smoke.py"
+      - ".github/workflows/live-product.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-live-product:
+    name: Herdr 0.7.3 / tmux / macOS 14
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      HERDR_VERSION: "0.7.3"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install tmux
+        run: |
+          brew install tmux
+          tmux -V
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version --verbose
+          cargo --version
+
+      - name: Download verified official Herdr binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64)
+              asset="herdr-macos-aarch64"
+              sha256="b31345392d004ec1f1b2c821e1ad601019fa8385fe1e4c6931321eb58a920773"
+              ;;
+            x86_64)
+              asset="herdr-macos-x86_64"
+              sha256="9b5f35d283b0877eeda0cf66ba1ef1d95ae40f32e858a04da0041f3a20df027c"
+              ;;
+            *)
+              echo "unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          destination="$RUNNER_TEMP/herdr-${HERDR_VERSION}"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$destination" \
+            "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/${asset}"
+          printf '%s  %s\n' "$sha256" "$destination" | shasum --algorithm 256 --check
+          chmod 0755 "$destination"
+          "$destination" --version
+          printf 'HERDR_BIN=%s\n' "$destination" >> "$GITHUB_ENV"
+
+      - name: Build locked release artifact
+        run: cargo build --release --locked
+
+      - name: Verify parent tmux isolation
+        run: python3 tools/test_live_product_smoke.py
+
+      - name: Run disposable live product smoke
+        run: |
+          python3 tools/live_product_smoke.py \
+            --herdr "$HERDR_BIN" \
+            --tether target/release/herdr-tether \
+            --repo-root "$GITHUB_WORKSPACE"

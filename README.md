@@ -1,16 +1,98 @@
 # Tether for Herdr
 
-Tether keeps a terminal workload alive when its visible Herdr pane or SSH connection goes away. Version 0.1 creates a named `tmux` session either locally or on an SSH host, records enough metadata to find it again, and lets Herdr open the attach command in a split or tab.
+Tether keeps terminal workloads alive when the Herdr pane or SSH connection viewing them goes away. It gives local and SSH-backed `tmux` work a durable identity, discovers repositories and existing sessions, reports status without attaching, and resumes work in a Herdr split or tab.
 
-> **Scope of v0.1:** remote sessions are `tmux` over ordinary OpenSSH. Tether does **not** federate Herdr instances, synchronize remote workspaces, or use a native remote Herdr protocol. See [the architecture](docs/architecture.md).
+Tether complements [Herdr](https://github.com/ogulcancelik/herdr) and `herdr-mirror`: Herdr owns the local terminal surface, `herdr-mirror` streams remote Herdr workspaces, and Tether manages ordinary local or SSH-backed `tmux` workloads. Remote Tether sessions use OpenSSH and `tmux`; Tether does not federate Herdr instances or stream remote Herdr panes.
 
-## What Tether makes easier
+## Install
 
-Tether complements Herdr and herdr-mirror rather than replacing either one. Herdr owns the terminal surface. herdr-mirror is the stronger tool for continuously streaming and driving an already-running remote Herdr workspace. Tether handles a different layer: finding machines and repositories, giving tmux work a durable identity, checking its status without attaching, and resuming or closing the exact selected workload.
+### Prerequisites
 
-### 1. Discover a repository, launch work, leave, and resume
+- Linux or macOS.
+- [Herdr](https://github.com/ogulcancelik/herdr) 0.7.3 or newer.
+- Git, Rust 1.88 or newer, and Cargo. Herdr clones the repository and Cargo builds the plugin from source.
+- `tmux` locally and on every remote target used by Tether.
+- OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes` under your normal keys, agent, and `known_hosts` policy.
+- Network access to GitHub and Cargo's configured registry during installation, unless both sources and dependencies are already cached.
 
-Configure a scan root and a trusted command once:
+Install the pinned v0.2.0 release tag through Herdr:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
+herdr plugin action list --plugin moneycaringcoder.tether
+```
+
+Herdr uses its managed checkout for plugin actions; it does not add the built binary to `PATH`. Install the same tagged source with Cargo when you also want the standalone `herdr-tether` commands used below:
+
+```sh
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.2.0 --locked herdr-tether
+```
+
+Run **Tether: Setup** once from Herdr, or invoke it explicitly:
+
+```sh
+herdr plugin action invoke setup --plugin moneycaringcoder.tether
+```
+
+`setup` creates private configuration and state files but does not modify Herdr or SSH configuration. A suitable Herdr keybinding action is:
+
+```text
+plugin_action moneycaringcoder.tether.open
+```
+
+### Update, reinstall, uninstall, and rollback
+
+Installing the same pinned ref again rebuilds and reinstalls the plugin. Reinstall the standalone binary with `--force` after repairing a toolchain or dependency cache:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
+cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.2.0 --locked herdr-tether
+```
+
+To update, replace `v0.2.0` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.1.0 --yes
+cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.1.0 --locked herdr-tether
+```
+
+Configuration and state are retained independently of the plugin checkout. Back them up before moving to an older release because migrated data may not be understood by that release.
+
+Uninstall the plugin with:
+
+```sh
+herdr plugin uninstall moneycaringcoder.tether
+```
+
+Remove the standalone binary, if installed, with `cargo uninstall herdr-tether`.
+
+Uninstalling does not intentionally terminate `tmux` workloads. Close owned workloads first if you no longer need them. Remove the configuration and state files shown by `herdr-tether setup --yes` (and their parent `herdr-tether` directories) separately if you also want to discard metadata.
+
+Installing from mutable `main` is development-only and may contain unreleased changes:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
+```
+
+For local development, clone the repository, run `cargo build --release --locked`, and use `herdr plugin link "$(pwd)"`; remove that link with `herdr plugin unlink moneycaringcoder.tether`.
+
+## Quick start
+
+Open **Tether: Open** in Herdr. Choose a host, then an owned workload, a safely discovered **external** `tmux` session, or **Create new Tether workload**. Creation proceeds through directory, command, and split-right/split-down/new-tab placement.
+
+Herdr injects plugin-owned configuration and state directories into actions. Point the standalone CLI at those same Linux/macOS directories before configuring data that **Tether: Open** must read:
+
+```sh
+export HERDR_PLUGIN_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/moneycaringcoder.tether"
+export HERDR_PLUGIN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/moneycaringcoder.tether"
+herdr-tether setup --yes
+herdr-tether doctor
+```
+
+Without those exports, standalone commands intentionally use their separate `herdr-tether` configuration and state directories. With the plugin directories still exported, add and verify a remote target:
 
 ```sh
 herdr-tether host add build build.example.net \
@@ -19,267 +101,104 @@ herdr-tether host add build build.example.net \
 herdr-tether host check build
 ```
 
-Invoke **Tether: Open** in Herdr, then choose:
+Tether can also use literal aliases from the primary `~/.ssh/config` without copying them into its configuration. It does not traverse OpenSSH `Include` directives; add an included alias explicitly if it is not listed by `herdr-tether host list`.
+
+## Three workflows Tether makes easier
+
+### 1. Discover a repository, launch work, leave, and resume
+
+After configuring the `build` host above, invoke **Tether: Open** and choose:
 
 ```text
 build → Create new Tether workload → <discovered repository> → editor → Split right
 ```
 
-Tether finds repositories beneath the configured root, creates a uniquely named tmux session in the selected directory, records its exact host and SSH target, asks Herdr for the split, and attaches there. Replace `editor` with any trusted shell or agent command installed on that host. Close the Herdr view or detach from tmux; the workload continues. On the next invocation, choose the same host and its `[active]` Tether row to resume it in any placement.
+Tether scans configured roots within bounded limits, creates a uniquely named detached `tmux` session in the selected directory, records its exact host and target, creates the requested Herdr view, and attaches there. Closing that view or losing SSH leaves the workload running. Reopen Tether and select its `[active]` row to resume it in any placement.
 
-Without Tether, this flow requires remembering the SSH destination and repository path, choosing and later recovering a tmux session name, creating the Herdr pane separately, and composing the attach command. herdr-mirror can mirror a remote Herdr pane, but it does not discover arbitrary tmux-backed work or give it Tether's owned close and metadata-cleanup workflow.
+Manually, this requires remembering the SSH destination and directory, naming and later finding the `tmux` session, opening the Herdr pane, and composing the exact attach command. `herdr-mirror` can mirror a remote Herdr pane, but it does not discover arbitrary `tmux` work or provide Tether's owned lifecycle and metadata cleanup.
 
 ### 2. Inspect local and remote work without attaching
 
-Invoke **Tether: Open** and pause on Hosts or Resources. Hosts finish independently as `online`, `offline`, `timeout`, or `error`; `[loading]` and `[stale: …]` make an in-progress check explicit. Selecting one host shows its owned workloads and safely discovered external tmux sessions. Press `r` to re-check; old results stay marked stale until fresh results arrive.
+Pause on the explorer's Hosts or Resources stage. Hosts complete independently as `online`, `offline`, `timeout`, or `error`; loading and stale results remain explicit. Press `r` to refresh.
 
-For scripts, answer the same question with the read-only snapshot and optional `jq`:
+For automation, use the read-only snapshot:
 
 ```sh
-herdr-tether snapshot | jq '
-  .hosts[] |
-  {host: .name,
-   reachability: .reachability.status,
-   owned: [.owned_sessions[] | {id, status: .workload_status}],
-   external: [.external_catalog.sessions[] | {name, attached}]}'
+herdr-tether snapshot --pretty
 ```
 
-A result such as `"host":"build"`, `"reachability":"reachable"`, and `"status":"running"` answers whether the host and its owned work are alive without opening an SSH attachment. An unreachable or slow host appears as labeled partial data instead of hanging the explorer or hiding results from faster hosts.
+Snapshot schema version 1 joins host reachability, effective discovery roots and repositories, complete owned metadata and live Active status, and safe external catalogs. Expected degradation is typed partial data rather than a fabricated empty result. It never includes preset command bodies, child output, raw backend errors, or private storage paths, and it has no lifecycle or persistence-mutation capability.
 
-The manual equivalent is a host-by-host sequence of SSH connectivity checks, `tmux list-sessions`, repository searches, and hand-maintained joins. herdr-mirror provides live status for remote Herdr workspaces; Tether adds local and ordinary tmux workloads, repository discovery, remembered owned work, and operation without a remote Herdr server.
+The manual equivalent is a host-by-host sequence of SSH checks, `tmux list-sessions`, repository scans, and hand-maintained joins. `herdr-mirror` reports remote Herdr workspace state; Tether also covers local and ordinary SSH-backed `tmux` without requiring a remote Herdr server.
 
 ### 3. Find and attach an existing tmux session safely
 
-Invoke **Tether: Open**, select a host, and choose an `[external · running]` or `[external · running · N attached]` row followed by split right, split down, or new tab. Tether validates the session name, creates the Herdr view, and issues one exact-name `tmux attach-session`. It does not adopt the session, write it to Tether state, rename it, close it, or expose it to metadata cleanup.
+Select an `[external · running]` row, then choose split right, split down, or new tab. Tether validates the name and attaches by exact target. It never adopts, persists, renames, closes, kills, marks, or prunes an external session; closing its Herdr view only detaches that client.
 
-The manual equivalent requires SSH, listing and interpreting tmux sessions, carefully quoting the exact target, and opening and focusing the desired Herdr pane. Tether turns those steps into one searchable selection while preserving non-ownership.
-
-### Capability boundary
+Manually, this requires listing and interpreting sessions, carefully quoting the exact target, and creating and focusing the Herdr view. Tether combines those steps while preserving the ownership boundary.
 
 | Need | Manual SSH + tmux | herdr-mirror | Tether |
 | --- | --- | --- | --- |
 | Remote prerequisite | SSH and tmux | SSH and a remote Herdr server | SSH and tmux |
-| Find repositories | Hand-written commands | Not its purpose | Configured-root scans, filter, and direct path |
-| Inspect without attaching | Per-host commands | Live remote Herdr workspace and agent status | Local/remote reachability, owned status, and external tmux sessions in one view |
-| Durable identity | User-managed tmux names | Remote Herdr pane/workspace identity | Tether-generated ID and history for owned work |
-| Existing tmux sessions | Manual list and attach | Only when represented by remote Herdr | Validated discovery and exact attach without taking ownership |
-| Close behavior | Entirely manual | Configurable mirror/remote close coupling | Select owned work, press `c`, confirm with `y`; external rows have no close action |
-| Herdr presentation | User creates and focuses panes | Continuously mirrored remote workspaces | One explorer overlay; focused split-right, split-down, or new tab |
+| Find repositories | Hand-written commands | Not its purpose | Bounded configured-root scans, filtering, and direct paths |
+| Inspect without attaching | Per-host commands | Remote Herdr workspace status | Local/remote reachability, owned status, and external catalogs |
+| Durable identity | User-managed names | Herdr pane/workspace identity | Generated ID and retained history for owned work |
+| Existing tmux sessions | Manual list and attach | Only through remote Herdr | Validated exact attach without ownership |
+| Close behavior | Manual | Configurable mirror/remote coupling | Confirmed exact close for owned work only |
+| Presentation | User creates panes | Continuously mirrored workspace | One overlay; focused right/down split or new tab |
 
-## Status and limitations
+## Explorer and lifecycle
 
-Implemented and covered by the current command/test surface:
+The explorer stages are host → resource; creation continues through directory → command → placement. Current targets show Active, Closing, and Closed owned records, safe external sessions, and the create row. Records retained from a removed or retargeted host appear in explicit owned-only groups and are never contacted by background status or discovery.
 
-- durable local and SSH-backed `tmux` create, inspect, attach, and explicit close;
-- configured hosts plus literal aliases read from `~/.ssh/config`;
-- a unified host → Tether-owned/external/create explorer with exact resume and explicitly confirmed close of owned workloads plus non-owning attachment to safely discovered existing tmux sessions;
-- progressive local/remote reachability, owned-workload status, and external tmux catalog discovery with independent three-second probe deadlines and explicit `r` refresh;
-- bounded local and BatchMode-SSH repository discovery from configured per-host scan roots plus the local `HOME`/remote `~` fallback, with configurable depth/entry/result/deadline/worker bounds, progressive results, deterministic local ordering, and no symlink traversal;
-- case-insensitive directory filtering and literal direct-path entry from the explorer;
-- Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
-- versioned, private, advisory-locked, atomic configuration and session-state persistence, including lock-safe v0.1 migration;
-- list, resume, close, age-based closed-metadata pruning, legacy JSON lists, and a versioned bounded live JSON snapshot;
-- Linux and macOS declared by the plugin manifest.
+- **Active:** resumable and closeable.
+- **Closing:** non-resumable; exact close may be retried.
+- **Closed:** metadata only; eligible for pruning after the retention period.
+- **External:** attachable but never owned or destructively managed by Tether.
 
-Important limitations:
+On an Active or Closing row, press `c`, then `y` to confirm exact close. Press uppercase `P`, then `y` to prune eligible Closed metadata globally. Prune has no SSH or `tmux` capability and removes only unchanged records from the confirmed preview. Closing cannot be started from external rows, and prune never affects external sessions or running workloads.
 
-- Closing a Herdr pane, losing SSH, or a failed attach does not close the `tmux` workload. Close an owned Resources row with `c`, then explicit `y`, or use `session close <ID>`.
-- Existing non-Tether tmux sessions are discovered and may be attached, but Tether never adopts, persists, renames, closes, kills, or prunes them. All `tether-*` names remain reserved and non-actionable unless they match an owned active record.
-- Explorer observations are point-in-time and cached only while that overlay remains open. Refresh marks prior owned/external results visibly stale until each host completes; timeout, offline, invalid-response, error, unknown, running, and missing are distinct.
-- `session prune` and the explorer's global `P` flow remove only sufficiently old records already marked `closed`; they do not kill workloads or probe/reconnect to hosts.
-- Commands and presets intentionally run through `/bin/sh -lc` on the selected machine. Configure only commands you trust.
-- Remote Herdr is not required. `host check` reports a remote `herdr` binary when present, but v0.1 does not use it for session transport.
-- Herdr 0.7.3 does not expose native non-terminal plugin UI or sidebar extensions. Tether therefore uses the supported manifest-declared terminal overlay.
+Explorer keys: `↑`/`k`/`Shift-Tab`, `↓`/`j`/`Tab`, `Enter`/`→`, `Backspace`/`←`, `r` refresh, and `Esc`/`Ctrl-C` cancel. On the directory stage, `/` filters and lowercase `p` accepts a literal path.
 
-### Verification status for this run
-
-The current branch passes the complete automated suite and a locked release build. Coverage includes lock-safe config/state migration and concurrency, configurable discovery/retention, bounded doctor probes, repository/external catalog discovery, exact non-owning external attach, explorer search/direct paths, progressive status/refresh, exact owned resume, confirmed owned close/prune, retained removed/retargeted host-target groups, Active/Closing/Closed explorer actions, authoritative close reconciliation, host-scoped filtering, stable destructive-result selection, Herdr 0.7.3 success/error response handling, invoking-context validation, exact placed-command environment forwarding, and the versioned live snapshot. Snapshot tests cover schema/help/pretty and legacy compatibility, local/configured/SSH-alias precedence, complete owned/external joins, deterministic ordering, typed limits/degradation, retained state groups, no wrong-target/lifecycle mutation, config/state byte identity, preset/child-output privacy, bounded cancellation, and descendant cleanup. Tmux-hosted smokes selected a discovered repository, resumed owned work, attached an external session without mutation, and confirmed no kill before close `y` followed by one exact-ID kill and Closed metadata.
-
-For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Current-branch live Herdr 0.7.3 verification invoked the installed action from an ordinary workspace, rendered the managed overlay, created/resumed a durable local workload, closed its Herdr view without killing tmux, and confirmed focused split-right, split-down, and new-tab attachment through Herdr's returned pane/root identities. The macOS live lifecycle remains an acceptance check.
-
-## Prerequisites
-
-- Linux or macOS.
-- [Herdr](https://github.com/ogulcancelik/herdr) 0.7.3 or newer for plugin actions and pane placement.
-- Rust 1.88 or newer and Cargo to build from source.
-- `tmux` on the local machine, and on every remote target used by Tether.
-- OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes`, using your normal OpenSSH keys/agent and `known_hosts` policy.
-
-Tether does not collect passwords or private keys. Establish and verify SSH access yourself before adding a target.
-
-## Install
-
-Install through Herdr from the repository:
-
-```sh
-herdr plugin install moneycaringcoder/herdr-tether --yes
-herdr plugin action list --plugin moneycaringcoder.tether
-```
-
-For a source checkout without installing it as a plugin:
-
-```sh
-git clone https://github.com/moneycaringcoder/herdr-tether.git
-cd herdr-tether
-cargo build --release --locked
-./target/release/herdr-tether setup --yes
-```
-
-### Development link
-
-From the repository root:
-
-```sh
-cargo build --release --locked
-herdr plugin link "$(pwd)"
-herdr plugin action list --plugin moneycaringcoder.tether
-herdr plugin action invoke setup --plugin moneycaringcoder.tether
-```
-
-Unlink the development checkout with:
-
-```sh
-herdr plugin unlink moneycaringcoder.tether
-```
-
-`setup` creates Tether's files but deliberately does not modify Herdr configuration. A suggested Herdr keybinding action is:
-
-```text
-plugin_action moneycaringcoder.tether.open
-```
-
-Add that action using the keybinding syntax appropriate to your Herdr configuration; Tether will not edit it for you.
-
-## Quick start
-
-Initialize private config/state files and check local dependencies:
-
-```sh
-herdr-tether setup --yes
-herdr-tether doctor
-```
-
-Open the interactive explorer:
-
-```sh
-herdr-tether open
-```
-
-Choose a host, then select a Tether workload, a safely discovered **external** tmux session, or **Create new Tether workload**. Current targets appear first; removed or retargeted state groups remain visible as explicit `<host> · retained · <target>` hosts and are never contacted by background status or discovery. Owned rows label durable `active`, `closing`, or `closed` metadata. Active rows can resume or close; closing rows are non-resumable but support exact close retry; closed rows are non-resumable and prune-only. External attached-client counts are observations, not ownership. On an active or closing row, `c` opens a red exact-ID close confirmation and only `y` starts close; `n`/`Esc` keeps it. Once confirmed, bounded close completes before exit and rereads the exact persisted record. Success retains that row as closed metadata; failure reflects authoritative active/closing state and remains recoverable. Closed, external, and Create rows have no close action. From any normal explorer stage, uppercase `P` asynchronously previews old closed metadata using configured retention. The red confirmation shows the exact count and states **No host contact**; only `y` applies it. Preview can be cancelled before confirmation; confirmed apply completes before exit. Success removes only confirmed closed rows reported removed, preserves concurrent skips, and never probes hosts or refreshes workload catalogs; failures are sanitized, bounded, and retryable. Repository scans append creation directories progressively. Current host rows progress from `loading` to `online`, `offline`, `timeout`, or `error`; current active workload rows distinguish `running`, `missing`, `unknown`, `timeout`, and `error`. Press `r` to refresh current-target status, external catalogs, and repositories. Existing external rows remain visibly stale and attachable during refresh; an exact attach may safely fail if the session disappeared. Freshly missing active workloads cannot be resumed. Reserved `tether-*` collisions are hidden and non-actionable.
-
-Or create a local session without the explorer:
-
-```sh
-herdr-tether open \
-  --host local \
-  --directory "$HOME" \
-  --command 'exec ${SHELL:-/bin/sh}'
-```
-
-Add and check a remote target, then open it:
-
-```sh
-herdr-tether host add dev dev@example.com \
-  --root /srv/project \
-  --preset 'shell=exec ${SHELL:-/bin/sh}'
-herdr-tether host check dev
-herdr-tether open --host dev --directory /srv/project --preset shell
-```
-
-Use a literal `Host` alias from `~/.ssh/config` without adding it first:
-
-```sh
-herdr-tether host list
-herdr-tether open --host my-ssh-alias --directory '~' --command 'exec ${SHELL:-/bin/sh}'
-```
-
-Tether prints the generated session ID. Detach normally from `tmux`; later:
-
-```sh
-herdr-tether session list
-herdr-tether session resume tether-…
-herdr-tether session close tether-…
-```
+Herdr actions initially open a manifest-declared terminal overlay. Herdr 0.7.3 does not provide native non-terminal plugin UI or sidebar extensions, so the explorer cannot be embedded as a native panel. After selection, Tether focuses the invoking pane's requested split or new tab and starts the exact resume/attach command there. The `tmux` workload remains independent of that Herdr view.
 
 ## Command reference
 
 ```text
 herdr-tether setup [--yes]
-```
-
-Creates or validates the versioned config and state, then prints their paths, effective discovery/retention/placement defaults, configured-target count, required prerequisites, binding guidance, and the next doctor command. `--yes` is required when standard input is not a terminal. Setup is idempotent, does not probe remote targets, and never edits Herdr or SSH configuration.
-
-```text
+herdr-tether doctor
 herdr-tether host add <NAME> <TARGET> [--root <DIR>]... [--preset <NAME=COMMAND>]...
 herdr-tether host list [--json]
 herdr-tether host remove <NAME>
 herdr-tether host check <NAME>
-```
-
-- `add` saves an explicit OpenSSH target, optional picker roots, and optional command presets. Targets may be a literal host/alias, `user@host`, or an `ssh://` authority with optional user and port; SSH options, whitespace, paths, queries, fragments, and shell punctuation are rejected. Names and preset names must be unique; `local` is reserved.
-- `list` emits `local`, configured hosts, and non-duplicated literal aliases discovered from `~/.ssh/config`. Text fields are tab-separated; `--json` emits objects with `name`, `target`, and `source`.
-  Discovery reads literal `Host` entries from the primary file only; it does not traverse `Include` directives. Add an included alias explicitly with `host add` if it is not listed.
-- `remove` removes only the host configuration. Existing session records retain their resolved target and remain addressable.
-- `check` runs local `tmux -V`, or remote `tmux -V` through BatchMode OpenSSH. A remote Herdr version probe is optional.
-
-```text
-herdr-tether snapshot [--pretty]
-```
-
-`snapshot` always emits schema-version-1 JSON for automation. It starts the same bounded status/catalog and repository-discovery services concurrently and returns one deterministic read-only document containing builtin local, configured, literal SSH-alias, and retained-state-only hosts; effective roots and flat repository results; complete owned metadata with live status for active records; and safe external tmux catalogs. Closing/closed records are `not_checked`; missing stream data is `not_collected`. Expected unreachable, timeout, malformed, output/entry/result-limit, and removed-host conditions are represented as `completion: "partial"` with typed per-field states and exit 0. Fatal local config/state/alias/serialization errors exit nonzero. `--pretty` indents output; compact output is one line. Arrays retain explorer host precedence and deterministic nested ordering. Snapshot never runs create, attach, close, or prune; it does not expose preset command bodies or child stdout/stderr.
-
-```text
 herdr-tether open [--host <NAME>] [--directory <DIR>]
                   [--command <COMMAND> | --preset <NAME>]
                   [--placement split-right|split-down|new-tab]
-```
-
-Supplying host, directory, and exactly one command source bypasses the explorer. Otherwise the explorer returns a typed create or resume intent and applies supplied arguments as overrides. On the directory stage, `/` opens a case-insensitive filter and lowercase `p` opens literal direct-path entry; uppercase `P` is the global closed-metadata prune preview. `Enter` applies text input and `Esc` closes it without cancelling the explorer. Outside Herdr, Tether runs the attach command in the current terminal. In Herdr plugin context, it creates the chosen split/tab and runs `session resume <ID>` there.
-
-```text
 herdr-tether session list [--json]
 herdr-tether session resume <ID>
 herdr-tether session close <ID>
 herdr-tether session prune [--dry-run] [--older-than-days <DAYS>]
+herdr-tether snapshot [--pretty]
 ```
 
-- `list` shows persisted metadata; JSON includes the complete records.
-- `resume` refuses closed, missing, or indeterminate workloads; a valid attempt updates `last_used_at` before attaching.
-- `close` and the explorer's confirmed owned close share one exact-ID lifecycle service. Exact inspect and close transports each have a three-second deadline, 64 KiB stream caps, and process-group cleanup. Inspection runs without the state lock and leaves an indeterminate active record unchanged; known results are revalidated before `closing`, transport runs unlocked, and finalization revalidates before `closed`. Failed/timed-out kill or final state write leaves the recoverable `closing` marker for retry; matching peer finalization is idempotent.
-- `prune` and explorer `P` preview closed metadata at least `retention.closed_days` old (30 days in a migrated/default config). The explorer carries an immutable exact-record preview through confirmation; apply revalidates it in one advisory-locked transaction, removes only unchanged/still-eligible previewed records, reports concurrent changes as skipped, and never removes newly eligible non-preview records. It has no SSH/tmux transport capability. CLI `--older-than-days` overrides config; `--dry-run` only prints. Explicit `--older-than-days 0` makes every already-closed record eligible.
+A fully specified `open` request bypasses the explorer. Outside Herdr, its attachment runs in the current terminal. Commands and presets are trusted code executed with `/bin/sh -lc` on the selected machine.
 
-```text
-herdr-tether doctor
-```
+`session close` inspects and closes only the exact owned ID. An indeterminate inspection leaves Active metadata unchanged. A recoverable `closing` marker prevents a failed or timed-out kill/save from masquerading as Active; rerun close to reconcile it. Closing a Herdr pane or a failed attachment never implicitly kills the workload.
 
-Reports config/state presence and usability, then probes required `tmux`, `ssh`, Cargo, and the selected Herdr executable with three-second deadlines and 64 KiB output caps. Missing, permission-denied, nonzero, timeout, unusable-file, and incomplete Herdr plugin-context failures are actionable and make doctor exit nonzero without suppressing later checks. An unrelated standalone `PANE_ID` does not imply plugin context. This is a local health report; use `host check <NAME>` for an end-to-end SSH target test.
+`session prune` removes sufficiently old Closed metadata (30 days by default), not workloads. `--older-than-days` overrides the configured retention and `--dry-run` changes nothing.
 
-The hidden `plugin open` and `plugin setup` commands are manifest action entrypoints. They require Herdr-provided pane/workspace/binary environment and open the corresponding managed overlay; they are not normal standalone commands.
+## Configuration and persistence
 
-## Picker and Herdr placement
-
-The explorer proceeds through:
-
-1. host (`local`, configured hosts, then discovered SSH aliases);
-2. Active, Closing, and Closed Tether metadata for the exact current or retained target, safely discovered external tmux sessions on current targets, then **Create new Tether workload** where creation is allowed;
-3. directory for creation (most recently used first, configured roots, then repositories discovered asynchronously beneath those roots);
-4. built-in shell or a host preset for creation;
-5. split right, split down, or new tab.
-
-Keys: `↑`/`k`/`Shift-Tab` previous, `↓`/`j`/`Tab` next, `Enter`/`→` confirm, `Backspace`/`←` back, `r` refresh, and `Esc`/`Ctrl-C` cancel. On an owned Resources row, press-only `c` opens the red close confirmation; `y` confirms and `n`/`Esc` dismisses. On the directory stage, `/` filters and `p` enters a literal path; while editing, printable keys insert text, `Backspace` deletes, `Enter` applies, and `Esc` returns to the list. The default placement is split right.
-
-Plugin actions first open `picker` or `setup` as a managed overlay. The manifest pane command resolves the built binary from Herdr's authoritative `HERDR_PLUGIN_ROOT`. After selection, Tether targets the invoking pane from `HERDR_PLUGIN_CONTEXT_JSON`, asks Herdr to create and focus exactly one split or tab, accepts Herdr 0.7.3's real `pane_info`/`tab_created` response shapes, and runs either exact-ID owned resume or exact-name external attach in the returned pane. The placed command removes inherited `HERDR_BIN_PATH` to attach in that pane rather than recursively creating another view, while forwarding Herdr's authoritative plugin config/state directories. The tmux session remains independent of that Herdr view. External attachment invokes only `attach-session -t =<name>`; it cannot enter Tether create/close/prune or persistence paths.
-
-## Persistence and cleanup
-
-Default paths outside plugin context:
+Outside plugin context, default paths are:
 
 - config: `${XDG_CONFIG_HOME:-$HOME/.config}/herdr-tether/config.toml`
 - state: `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tether/state.json`
 
-Inside a plugin, `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR` independently take precedence. Missing files load as version-2 config and version-1 state defaults. Existing v0/v1 config and v0 state migrate and rewrite while holding the same per-file advisory lock used by save/update transactions. On Unix, parent directories are forced to mode `0700`; data, temporary, and advisory-lock files are mode `0600`. Writes use a same-directory temporary file, file sync, atomic rename, and directory sync.
+Herdr's authoritative plugin config and state directories take precedence in plugin context. Config schema version 2 stores hosts, presets, UI placement, bounded discovery settings, and closed-record retention. State schema version 1 stores owned session IDs, resolved targets, directories, preset labels, lifecycle status, and timestamps—not terminal output or credentials.
 
-The generated TOML config is the settings source; JSON state never needs hand editing. Host roots/presets can also be managed with `host add`.
+Existing version-0/version-1 config and version-0 state are migrated under the same advisory lock used for normal writes. Writes use private Unix permissions, a same-directory temporary file, synchronization, and atomic rename. Recent directories remain picker suggestions but never silently widen configured discovery roots.
+
+A minimal generated config is:
 
 ```toml
 version = 2
@@ -300,136 +219,19 @@ workers = 4
 closed_days = 30
 ```
 
-An empty `local_roots` uses `HOME`; `~` and `~/…` entries expand against `HOME`. Remote hosts scan their configured `roots`, or `~` when none are configured. Recent session directories remain picker suggestions but do not silently expand the configured scan scope.
-Configured `timeout_seconds` must be between 1 and 3600.
+## Security and troubleshooting
 
-State stores IDs, resolved target, host label, directory, preset name, lifecycle status, and timestamps—not terminal output or credentials. If state persistence fails after creating a workload, Tether attempts to close that newly created workload. Failed attach/resume does not implicitly kill it.
-External tmux sessions are never written to state. Their validated names and attached-client counts exist only in the current explorer invocation.
+OpenSSH owns authentication, proxies, and host-key verification. Tether passes `BatchMode=yes`, never weakens strict host-key checking, and does not collect passwords, private keys, tokens, or telemetry. Explicit targets and external session names are validated, exact tmux targets are used, and argv is preserved or POSIX-quoted at process boundaries. See the [security policy](SECURITY.md) and [architecture](docs/architecture.md) for the complete trust boundary.
 
-Cleanup is intentionally conservative. Only explicit owned close—red `c`/`y` explorer confirmation or `session close`—marks a record closed, either after inspection proves the workload missing or after exact-session `kill-session` succeeds. CLI prune and the explorer's red global `P`/`y` confirmation assume such a closed workload is already absent and remove only previewed old metadata without reconnecting. Active, closing, unknown, recent, changed, external, and non-preview records are retained.
-
-## Security model
-
-- SSH authentication, agent use, proxying, and host-key verification are OpenSSH's responsibility. Tether passes `BatchMode=yes`; it does not weaken `StrictHostKeyChecking`, auto-accept host keys, or prompt/store credentials.
-- Remote interactive attaches request a TTY and use `ServerAliveInterval=15` plus `ServerAliveCountMax=3`. Losing that connection does not kill `tmux`.
-- Explicit targets are validated to reject option-like, whitespace/control, and shell-injection forms. `tmux` arguments and Herdr pane commands are kept as argv and POSIX-quoted at process boundaries.
-- Session IDs are exact `tmux` targets, so a close cannot prefix-match a different session.
-- Configured commands are trusted code and run under `/bin/sh -lc`. Tether provides transport quoting, not a command sandbox.
-- Tether contains no telemetry and has no secret store. Its network activity is the OpenSSH traffic requested by host checks and remote lifecycle operations; Herdr integration invokes the local Herdr executable.
-
-## Troubleshooting
-
-### `Host key verification failed`
-
-Tether preserves strict OpenSSH behavior. Verify the host and add its key through your organization's trusted process, then prove BatchMode access before retrying:
+If a host key or authentication check fails, establish trusted non-interactive access yourself before retrying:
 
 ```sh
-ssh -o BatchMode=yes -- dev@example.com 'tmux -V'
-herdr-tether host check dev
+ssh -o BatchMode=yes -- build.example.net 'tmux -V'
+herdr-tether host check build
 ```
 
-Do not work around this with a global `StrictHostKeyChecking=no`.
+Do not work around failures with global `StrictHostKeyChecking=no`. If Active metadata refers to a missing or indeterminate workload, diagnose SSH/`tmux` access first; prune is intentionally not a repair command for Active records.
 
-### `Permission denied` or an authentication prompt is needed
+## License and influence
 
-Tether uses `BatchMode=yes`. Load the correct key into your agent or configure a non-interactive `IdentityFile`, `ProxyJump`, and related options in `~/.ssh/config`; then rerun the direct probe above.
-
-### `setup requires --yes when standard input is not a terminal`
-
-Use `herdr-tether setup --yes` from scripts and plugin automation.
-
-### `session … no longer exists` / `could not determine whether … exists`
-
-The metadata is active but the backing `tmux` session is missing or could not be inspected. Tether will not silently rewrite or prune that active record. Diagnose SSH/tmux access first. `prune` is intentionally not an active-record repair command.
-
-### Picker cancellation reports an error
-
-`Esc` and `Ctrl-C` cancel without creating a session. The CLI reports `session selection was cancelled`; this is expected and should leave state unchanged.
-
-### Plugin context is not available
-
-Run plugin actions through Herdr, not `herdr-tether plugin …` directly. Check:
-
-```sh
-herdr plugin action list --plugin moneycaringcoder.tether
-herdr plugin action invoke open --plugin moneycaringcoder.tether
-```
-
-### A pane closed but the workload is still running
-
-That is the durability contract. Reopen with `session resume <ID>` or intentionally terminate it with `session close <ID>`.
-
-## Independent Hermes verification
-
-The following is the reproducible verification checklist. Items 1–3 and 7 were completed under real TTYs with strict host-key checking where applicable; items 4–6 and 8 remain release/user acceptance checks. Use disposable SSH targets and directories when repeating it:
-
-```sh
-export TARGET=dev@example.com
-ssh -- "$TARGET" 'tmux -V'
-ssh -o BatchMode=yes -- "$TARGET" 'tmux -V'
-herdr-tether host add hermes-live "$TARGET" --root '/tmp/tether dir with spaces'
-herdr-tether host check hermes-live
-```
-
-Then record evidence for every item:
-
-1. **Adversarial remote quoting, with no injected file.** Prepare the exact directory and sentinel, then open a command containing shell metacharacters only as literal data:
-   ```sh
-   ssh -o BatchMode=yes -- "$TARGET" \
-     "rm -f /tmp/tether-injected; mkdir -p -- '/tmp/tether dir with spaces'"
-   herdr-tether open --host hermes-live \
-     --directory '/tmp/tether dir with spaces' \
-     --command 'printf "%s\n" "literal ; touch /tmp/tether-injected"; exec ${SHELL:-/bin/sh}'
-   ssh -o BatchMode=yes -- "$TARGET" \
-     'test ! -e /tmp/tether-injected && printf "no injected file\n"'
-   ```
-   Confirm the literal text is printed, `pwd` is the exact directory, and the sentinel remains absent.
-2. **Remote PID/counter continuity after pane close or network loss.** Start this workload and retain the printed Tether ID:
-   ```sh
-   herdr-tether open --host hermes-live \
-     --directory '/tmp/tether dir with spaces' \
-     --command 'printf "%s\n" "$$" > /tmp/tether-hermes.pid; n=0; while :; do n=$((n+1)); printf "%s\n" "$n" > /tmp/tether-hermes.counter; sleep 1; done'
-   ssh -o BatchMode=yes -- "$TARGET" \
-     'printf "pid="; cat /tmp/tether-hermes.pid; printf "counter="; cat /tmp/tether-hermes.counter'
-   ```
-   Close only the Herdr pane or interrupt the SSH client, wait at least five seconds, and rerun the SSH read. The PID must be identical and the counter larger. `herdr-tether session resume <ID>` must attach to that same workload.
-3. **Close/prune isolation.** On the remote target, create an unrelated exact-name control session:
-   ```sh
-   ssh -o BatchMode=yes -- "$TARGET" \
-     'tmux new-session -d -s tether-unrelated -- sleep 600'
-   herdr-tether session close <ID>
-   ssh -o BatchMode=yes -- "$TARGET" \
-     'tmux has-session -t =tether-unrelated'
-   herdr-tether session prune --dry-run --older-than-days 0
-   herdr-tether session prune --older-than-days 0
-   ssh -o BatchMode=yes -- "$TARGET" \
-     'tmux has-session -t =tether-unrelated'
-   ```
-   Closing must remove only the exact Tether session; dry-run must not change metadata; real prune must remove only the closed Tether record; the unrelated session must survive every step.
-4. **Herdr overlay, all placements, and mixed locality.** Run `herdr plugin action invoke open --plugin moneycaringcoder.tether` for three separate selections and choose split right, split down, and new tab. Leave at least one local and one remote Tether pane open together. Verify each resume command runs in the pane Herdr just returned, then close those panes and confirm their `tmux` workloads remain resumable.
-5. **Cancel is side-effect free.** Locate the state path printed by `herdr-tether setup --yes`. Save both `sha256sum <state.json>` (or `shasum -a 256` on macOS) and `herdr-tether session list --json`. Invoke the picker and press `Esc` at host, directory, command, and placement in four separate runs. Both saved values must remain identical after every cancellation.
-6. **Setup does not edit Herdr config.** Save a checksum of the actual Herdr config, run `herdr-tether setup --yes`, then run `herdr plugin action invoke setup --plugin moneycaringcoder.tether`. Recompute after each operation; the Herdr config checksum must remain identical.
-7. **Local real-TTY attach (completed on Hermes).** From an interactive terminal, open a local workload, verify attachment succeeds, detach, resume the same ID, and explicitly close it. Keep an unrelated local `tmux` session throughout and verify exact-session isolation.
-8. **macOS build/action smoke.** On supported macOS run `cargo build --release --locked`, `herdr plugin link "$(pwd)"`, `herdr plugin action list --plugin moneycaringcoder.tether`, both action invocations, local create/detach/resume/close, and split-right/split-down/new-tab placement. Unlink after evidence collection.
-
-After verification, remove the disposable host entry and sessions. Do not report native Herdr placement or macOS live behavior until the corresponding checks above succeed.
-
-Post-verification publishing actions, not performed on this branch:
-
-- add the GitHub repository topic `herdr-plugin`;
-- verify `herdr plugin install moneycaringcoder/herdr-tether` and the installed Open/Setup action listing against the published repository.
-
-## Roadmap
-
-Future work, not v0.1 behavior:
-
-- a `RemoteHerdrBackend` that implements the durable backend contract through native Herdr federation rather than SSH-launched remote `tmux`;
-- remote workspace discovery, identity, capability negotiation, and failure semantics suitable for that backend;
-- explicit reconciliation tools for active metadata whose workloads are missing;
-- release/distribution hardening and broader Linux/macOS live matrices.
-
-The architecture keeps this path open without pretending it already exists.
-
-## Influence and license
-
-Tether is MIT licensed. `herdr-mirror` v0.1.6 (MIT) was inspected as product/design influence only; Tether copies neither its topology nor its code.
+Tether is [MIT licensed](LICENSE). `herdr-mirror` v0.1.6 (MIT) was inspected as product and design influence only; Tether copies neither its topology nor its code.

@@ -1,30 +1,56 @@
 # Security Policy
 
+## Supported versions
+
+Security fixes are provided for the latest released version.
+
+| Version | Supported |
+| --- | --- |
+| 0.2.x | Yes |
+| 0.1.x and development snapshots | No |
+
+Users should reproduce a suspected issue on the latest release when it is safe to do so. A report affecting an older version is still useful when the same behavior may remain current.
+
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/moneycaringcoder/herdr-tether/security/advisories/new). Do not include exploit details, credentials, hostnames, or other sensitive data in a public issue. Include the affected version, platform, reproduction steps, impact, and any suggested mitigation. Maintainers will acknowledge the report and coordinate disclosure and remediation through the private advisory.
+Report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/moneycaringcoder/herdr-tether/security/advisories/new). Do not disclose exploit details, credentials, hostnames, repository paths, terminal output, or other sensitive data in a public issue.
 
-## Security model
+A useful report includes:
 
-Tether 0.1 supports macOS and Linux and manages durable `tmux` sessions locally or over ordinary OpenSSH connections. Remote operation is not native Herdr federation or remote pane streaming. Herdr integration opens a local plugin overlay and places resume commands in a split or tab.
+- the affected Tether, Herdr, operating-system, OpenSSH, and `tmux` versions;
+- impact and the security boundary crossed;
+- minimal reproduction steps using disposable data;
+- whether exploitation requires trusted configuration, local account access, or control of a remote host;
+- any known mitigation.
 
-Tether:
+Maintainers aim to acknowledge a complete report within seven days and provide an initial assessment or request for more information within fourteen days. These are response goals, not guarantees. Remediation and release timing depend on severity, complexity, and maintainer availability. Please allow time for a fix and supported-version release before public disclosure. Maintainers will coordinate an advisory, credit, and a disclosure date with the reporter when appropriate; urgent user protection may require earlier disclosure.
 
-- invokes the system `ssh` client directly, with the remote target as a separate argument, and relies on OpenSSH authentication and the user's `known_hosts` and strict host-key policy;
-- performs one explorer tmux catalog probe per host non-interactively with null stdin, a three-second deadline, fixed concurrency, 64 KiB output caps, cancellation, and process-group cleanup; the validated catalog derives both owned status and attachable external rows, while remote probes preserve OpenSSH host-key policy and classify uncertainty conservatively;
-- scans configured per-host roots plus the local `HOME`/remote `~` fallback with validated configurable depth, filesystem-entry, result, wall-clock, and worker bounds and a fixed 64 KiB output cap; local and remote scans never follow symlinks, while remote scans use validated BatchMode SSH targets, POSIX-quoted root arguments, a fixed portable scanner, and a NUL-framed result protocol that rejects unsafe paths and malformed output;
-- treats all `tether-*` names as reserved ownership space; only validated nonreserved names can enter the external attach type, duplicate/structurally malformed catalogs fail closed, and every external attach uses separated argv plus exact `=<name>` tmux targeting;
-- does not collect or persist passwords, private keys, tokens, or telemetry;
-- writes and migrates configuration/session metadata through advisory-locked, atomic transactions, with private directory/file permissions on Unix; migration load/validate/rewrite holds the same lock as normal saves and updates;
-- emits the versioned scriptable snapshot through presentation-only DTOs over the same bounded read-only catalog/discovery services; whole-run cancellation is drained for process cleanup, retained targets are never probed through changed configuration, and JSON excludes preset command bodies, child stdout/stderr, raw backend errors, and storage paths;
-- if initial metadata persistence fails after creation, attempts to kill only the just-created exact workload and reports both failures plus its exact ID when rollback also fails;
-- routes CLI and red-confirmed explorer close through one exact-owned-ID lifecycle service; the explorer groups metadata by persisted `(host,target)`, never submits retained removed/retargeted groups or non-Active records to background status/discovery, and rereads the exact record after every close result without transport. Active is resumable/closeable, Closing is close-retry-only, and Closed is prune-only. Exact inspect/close transports use independent three-second deadlines, 64 KiB stream caps, terminal-sanitized bounded failure detail, cancellation, and process-group cleanup without holding the state lock. Indeterminate active workloads remain byte-identical; exact ID/target/status are revalidated under short locks before `closing` and `closed`, matching peer finalization is idempotent, and kill/timeout/final-save failure remains recoverable as `closing`;
-- routes CLI and red-confirmed global explorer prune through one state-only service with no SSH/tmux capability; confirmation carries private exact record snapshots, and one advisory-locked apply removes only unchanged, still-eligible previewed Closed records. Concurrently changed/missing candidates are skipped, non-preview records are never added, and no prune path probes, reconnects, closes, or kills;
-- limits discovered external sessions to non-destructive catalog management and non-owning interactive attach; Tether never adopts, persists, renames, closes, kills, marks, or prunes them, and closing their Herdr view only detaches that client;
-- resolves managed pane binaries through a fixed `sh -c` wrapper that expands only Herdr's quoted authoritative `HERDR_PLUGIN_ROOT`; placed resume/attach commands are generated as POSIX-quoted argv, remove inherited `HERDR_BIN_PATH` to prevent recursive placement, and forward only Herdr's authoritative plugin config/state directories before invoking the exact built executable;
+## Threat and trust boundary
 
-The trust boundary includes the local user account, the installed `ssh`, `tmux`, and Herdr executables, user-controlled configuration and command presets, and any selected remote host. Tether does not sandbox commands, secure a compromised endpoint, configure SSH trust, rotate credentials, or replace host authorization. Configuration can contain command presets; session metadata contains host targets, working directories, preset labels, identifiers, and timestamps. Protect the user account and backups accordingly.
+Tether manages local or SSH-backed `tmux` workloads and integrates with a local Herdr 0.7.3-or-newer installation. Its remote transport is ordinary OpenSSH, not Herdr federation or remote pane streaming.
 
-Live strict-BatchMode verification from Hermes to `dev` covered remote create, real-TTY attach, detach, same-PID continuity, resume, exact close, prune isolation, and adversarial quoting without sentinel creation. Native Herdr placement interaction and macOS live lifecycle remain acceptance checks.
+The trusted computing base includes:
 
-Security fixes are provided for the latest release. Older development snapshots are unsupported.
+- the local user account and filesystem;
+- the installed Tether, Herdr, `ssh`, `tmux`, `/bin/sh`, Git, Rust, and Cargo executables;
+- user-controlled Tether configuration and command presets;
+- OpenSSH configuration, keys, agent, proxies, and `known_hosts` policy;
+- every selected remote host and its user account.
+
+Tether does not sandbox configured commands, secure a compromised local or remote endpoint, configure SSH trust, rotate credentials, or replace host authorization. Presets are trusted code executed by `/bin/sh -lc`. Configuration may contain command bodies and targets; session state contains host targets, directories, preset labels, identifiers, lifecycle status, and timestamps. Protect the user account, configuration, state, and backups accordingly.
+
+Within that boundary, Tether:
+
+- invokes the system OpenSSH client with validated targets and `BatchMode=yes` while preserving the user's strict host-key policy;
+- preserves separated argv and POSIX-quotes values only where a remote shell or Herdr pane command requires a command line;
+- uses exact `tmux` targets for owned lifecycle actions;
+- reserves `tether-*` names for owned work and permits only validated nonreserved external names through a non-owning attach path;
+- never adopts, persists, renames, closes, kills, marks, or prunes discovered external sessions;
+- performs bounded status and repository-discovery work with deadlines, output caps, cancellation, and child-process cleanup;
+- records lifecycle transitions so an interrupted close remains recoverable as Closing rather than appearing Active or Closed;
+- gives prune no SSH, `tmux`, probe, or close capability and revalidates the exact confirmed Closed records before removal;
+- migrates and writes configuration/state with advisory locks, private Unix permissions, and atomic replacement;
+- excludes configured command bodies, child output, raw backend errors, and storage paths from the scriptable snapshot;
+- stores no SSH passwords, private keys, access tokens, terminal contents, or telemetry.
+
+The detailed component and lifecycle boundaries are documented in [Tether architecture](docs/architecture.md).
