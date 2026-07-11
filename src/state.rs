@@ -28,6 +28,7 @@ pub enum SessionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRecord {
     pub id: SessionId,
     pub host: String,
@@ -55,6 +56,7 @@ pub struct SessionRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     pub version: u32,
     pub sessions: Vec<SessionRecord>,
@@ -286,6 +288,7 @@ fn require_nonempty(value: &str, field: &str) -> Result<()> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StateV1 {
     #[allow(dead_code)]
     version: u32,
@@ -294,6 +297,7 @@ struct StateV1 {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionRecordV1 {
     id: SessionId,
     host: String,
@@ -349,6 +353,7 @@ impl StateV1 {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StateV0 {
     #[allow(dead_code)]
     version: u32,
@@ -357,6 +362,7 @@ struct StateV0 {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionRecordV0 {
     id: SessionId,
     host: String,

@@ -408,6 +408,39 @@ fn state_round_trips_and_migrates_v0() {
 }
 
 #[test]
+fn every_state_schema_rejects_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let store = StateStore::new(path.clone());
+    let id = "tether-0197f198000070008000000000000001";
+    let timestamps =
+        r#""created_at":"2026-07-10T12:00:00Z","last_used_at":"2026-07-10T12:00:00Z""#;
+    let sources = [
+        r#"{"version":0,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":0,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp",{timestamps},"unknown":true}}]}}"#
+        ),
+        r#"{"version":1,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":1,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp","preset":null,"status":"active",{timestamps},"closed_at":null,"unknown":true}}]}}"#
+        ),
+        r#"{"version":2,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":2,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp","preset":null,"command":null,"tmux_session_id":null,"ownership_proof":null,"status":"running",{timestamps},"closed_at":null,"exit_status":null,"unknown":true}}]}}"#
+        ),
+    ];
+
+    for source in sources {
+        fs::write(&path, source).unwrap();
+        let error = store.load().unwrap_err().to_string();
+        assert!(
+            error.contains("decode state version"),
+            "unexpected strict-schema error: {error}"
+        );
+    }
+}
+
+#[test]
 fn state_load_time_migration_holds_the_advisory_lock() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
