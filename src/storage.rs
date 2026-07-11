@@ -83,11 +83,6 @@ pub(crate) enum AtomicWriteError {
     PostCommitDurability(#[source] io::Error),
 }
 
-impl AtomicWriteError {
-    pub(crate) fn committed(&self) -> bool {
-        matches!(self, Self::PostCommitDurability(_))
-    }
-}
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     atomic_write_mode(path, contents, true)
