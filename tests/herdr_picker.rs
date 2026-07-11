@@ -25,18 +25,18 @@ use std::os::unix::fs::PermissionsExt;
 
 static FAKE_HERDR_LOCK: Mutex<()> = Mutex::new(());
 
-fn write_fake_herdr(path: &Path, log: &Path) {
+fn write_fake_herdr(path: &Path, log: &Path, pane_run: &str) {
     let script = format!(
         r#"#!/bin/sh
 printf 'CALL' >> '{log}'
 for arg do printf '\t%s' "$arg" >> '{log}'; done
 printf '\n' >> '{log}'
 if [ "$1 $2" = "pane split" ]; then
-  printf '%s' '{{"id":"cli-1","result":{{"type":"pane_split","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
+  printf '%s' '{{"id":"cli-1","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
 elif [ "$1 $2" = "tab create" ]; then
   printf '%s' '{{"id":"cli-2","result":{{"type":"tab_created","tab":{{"tab_id":"w1:t9","workspace_id":"w1"}},"root_pane":{{"pane_id":"w1:p10","workspace_id":"w1","tab_id":"w1:t9"}}}}}}'
 elif [ "$1 $2" = "pane run" ]; then
-  printf '%s' '{{"id":"cli-3","result":{{"type":"pane_ran","pane_id":"'$3'"}}}}'
+  {pane_run}
 elif [ "$1 $2 $3" = "plugin pane open" ]; then
   printf '%s' '{{"id":"cli-4","result":{{"type":"plugin_pane_opened","plugin_pane":{{"pane":{{"pane_id":"w1:p11"}}}}}}}}'
 else
@@ -44,7 +44,8 @@ else
   exit 2
 fi
 "#,
-        log = log.display()
+        log = log.display(),
+        pane_run = pane_run,
     );
     let mut file = fs::File::create(path).unwrap();
     file.write_all(script.as_bytes()).unwrap();
@@ -70,7 +71,7 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
-    write_fake_herdr(&binary, &log);
+    write_fake_herdr(&binary, &log, ":");
     let client = HerdrClient::new(context(&binary));
     let command = CommandSpec {
         program: "/tmp/plugin root/herdr-tether".into(),
@@ -91,10 +92,41 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
     let transcript = fs::read_to_string(log).unwrap();
     assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright\t--focus"));
     assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tdown\t--focus"));
-    assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1"));
+    assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1\t--focus"));
+    assert!(transcript.contains("CALL\tpane\trun\tw1:p9\t'env' '-u' 'HERDR_BIN_PATH'"));
     assert!(transcript.contains(
-        "CALL\tpane\trun\tw1:p9\t'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
+        "'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
     ));
+}
+
+#[test]
+fn placement_rejects_failed_or_mismatched_pane_run() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (pane_run, expected) in [
+        ("exit 9", "failed with status"),
+        (
+            r#"printf '%s' '{"id":"cli-3","result":{"type":"pane_ran","pane_id":"w1:pX"}}'"#,
+            "not newly created pane",
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let binary = temp.path().join("herdr");
+        let log = temp.path().join("herdr.log");
+        write_fake_herdr(&binary, &log, pane_run);
+        let error = HerdrClient::new(context(&binary))
+            .place(
+                &CommandSpec::new("/plugin/herdr-tether", vec!["resume".into()]),
+                Placement::SplitRight,
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected placement error: {error:#}"
+        );
+    }
 }
 
 #[test]
@@ -105,7 +137,7 @@ fn plugin_action_opens_the_declared_overlay_entrypoint() {
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
-    write_fake_herdr(&binary, &log);
+    write_fake_herdr(&binary, &log, ":");
     let client = HerdrClient::new(context(&binary));
 
     client.open_plugin_pane("picker").unwrap();
@@ -113,6 +145,30 @@ fn plugin_action_opens_the_declared_overlay_entrypoint() {
     assert!(fs::read_to_string(log).unwrap().contains(
         "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\toverlay"
     ));
+}
+
+#[test]
+fn plugin_action_surfaces_real_stderr_error_envelope() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf '%s' '{\"error\":{\"message\":\"invoking pane vanished\"}}' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = HerdrClient::new(context(&binary))
+        .open_plugin_pane("picker")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Herdr open plugin pane failed: invoking pane vanished"
+    );
 }
 
 fn picker_fixture() -> (Config, State) {

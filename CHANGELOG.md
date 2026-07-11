@@ -18,6 +18,10 @@
 - Added `snapshot [--pretty]`, a schema-version-1 deterministic JSON view of explorer hosts, effective roots, repositories, complete owned metadata/live Active status, and safe external catalogs. It reuses concurrent bounded status/discovery services, reports degradation and retained state-only targets as typed partial data, preserves legacy JSON shapes, drains cancelled probes before return, exposes no preset commands or child output, and has no lifecycle or persistence-mutation capability.
 - Added exact current/retained explorer inventory: state is grouped by persisted `(host,target)`, current targets keep status/catalog/discovery/create capabilities, and removed or retargeted groups expose owned lifecycle metadata only. Retained targets and non-Active records are never background-probed or scanned. Active rows resume and close, Closing rows retry close, Closed rows are prune-only, close results reconcile exact authoritative state, and prune apply removes only confirmed IDs reported removed while preserving concurrent skips.
 
+### Fixed
+
+- Fixed installed Herdr 0.7.3 action/placement interoperability: managed pane commands now resolve the built executable through `HERDR_PLUGIN_ROOT`; split responses use the actual `pane_info` contract; successful `pane run` accepts Herdr's empty stdout; placement targets the invoking pane rather than the temporary overlay; placed attach commands retain authoritative plugin config/state paths without recursively opening another pane; and new tabs are explicitly focused.
+
 ## [0.1.0] - 2026-07-10
 
 ### Added

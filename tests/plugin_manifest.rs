@@ -49,10 +49,23 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     assert_eq!(
         panes[0]["command"].as_array().unwrap(),
         &[
-            toml::Value::String("target/release/herdr-tether".into()),
-            toml::Value::String("open".into()),
+            toml::Value::String("sh".into()),
+            toml::Value::String("-c".into()),
+            toml::Value::String(
+                "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" open".into(),
+            ),
         ]
     );
     assert_eq!(panes[1]["id"].as_str(), Some("setup"));
     assert_eq!(panes[1]["placement"].as_str(), Some("overlay"));
+    assert_eq!(
+        panes[1]["command"].as_array().unwrap(),
+        &[
+            toml::Value::String("sh".into()),
+            toml::Value::String("-c".into()),
+            toml::Value::String(
+                "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup".into(),
+            ),
+        ]
+    );
 }

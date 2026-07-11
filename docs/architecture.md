@@ -106,13 +106,14 @@ Schema version 1 is deterministic presentation data: explorer host precedence; s
 
 ### `HerdrClient`
 
-`src/herdr.rs` is a local Herdr CLI adapter, not a durable backend. It consumes Herdr's executable, pane ID, and workspace ID from plugin context. It can:
+`src/herdr.rs` is a local Herdr 0.7.3 CLI adapter, not a durable backend. A managed overlay's own `HERDR_PANE_ID` identifies the overlay, so placement instead reads the invoking `focused_pane_id` from Herdr's authoritative plugin context, falling back to the ordinary pane ID outside plugin panes. It can:
 
 - open a manifest-declared `picker` or `setup` plugin pane as an overlay;
-- split and focus the invoking pane right or down;
-- create a tab and extract its root pane ID;
-- run one POSIX-quoted `CommandSpec` in the newly returned pane;
-- validate Herdr's JSON result type and returned pane identity.
+- split and focus the invoking pane right or down, accepting the real `pane_info` response and extracting its returned ID;
+- create and focus a tab, then extract its returned root pane ID from `tab_created`;
+- run one POSIX-quoted `CommandSpec` in the newly returned pane; Herdr 0.7.3 reports successful `pane run` with empty stdout;
+- remove inherited `HERDR_BIN_PATH` from the placed command so Tether attaches in that pane instead of recursively placing another pane, while forwarding authoritative plugin config/state directories;
+- validate every JSON-returning Herdr result type and returned pane identity.
 
 `HerdrClient` never creates, inspects, or kills the durable workload. Conversely, `TmuxBackend` knows nothing about Herdr panes. The CLI is the orchestration layer joining these boundaries.
 
@@ -183,11 +184,11 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise parsing/state, locked migrations/concurrency, host/repository/external discovery, bounded process cleanup, exact local/SSH argv, lifecycle recovery, Herdr placement, explorer transitions, status generations, exact current/retained host-target grouping, host-scoped filtering, Active/Closing/Closed action gating, authoritative close reconciliation, stable close/prune selection, confirmed close/prune, and scriptable snapshot collection. Snapshot coverage includes schema/legacy compatibility, host-origin precedence, deterministic joins, typed partial states, retained removed/retargeted targets, wrong-target exclusion, state/config immutability, output privacy, bounded cancellation, and process-tree cleanup. The current run reported 124 passing tests and a locked release build.
+Automated tests exercise parsing/state, locked migrations/concurrency, host/repository/external discovery, bounded process cleanup, exact local/SSH argv, lifecycle recovery, actual Herdr 0.7.3 split/tab/run success and stderr-error contracts, invoking-context validation, exact placed-command environment forwarding, returned-identity mismatch rejection, explorer transitions, status generations, exact current/retained host-target grouping, host-scoped filtering, Active/Closing/Closed action gating, authoritative close reconciliation, stable close/prune selection, confirmed close/prune, and scriptable snapshot collection. Snapshot coverage includes schema/legacy compatibility, host-origin precedence, deterministic joins, typed partial states, retained removed/retargeted targets, wrong-target exclusion, state/config immutability, output privacy, bounded cancellation, and process-tree cleanup. The current run passed the complete automated suite and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 
-The same run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. A separate real-TTY run on Hermes verified the equivalent local create/attach/detach/resume/close lifecycle and unrelated-session isolation. Native Herdr action/overlay interaction, all three placements with mixed local/remote panes, picker Esc state immutability, setup's non-modification of Herdr config, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's **Independent Hermes verification** section.
+The same strict-BatchMode run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. A separate real-TTY run on Hermes verified the equivalent local create/attach/detach/resume/close lifecycle and unrelated-session isolation. Current-branch live Herdr 0.7.3 verification exposed and then covered installed-pane executable resolution, actual CLI response shapes, invoking-pane targeting, plugin-state forwarding, recursion prevention, focused right/down splits, focused new-tab root placement, attachment in the returned pane, and view-close durability. Mixed local/remote coexistence, picker Esc state immutability, setup's non-modification of Herdr config, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's verification sections.
 
 ## Future native federation path
 
