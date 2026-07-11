@@ -2,7 +2,8 @@ use std::{
     env,
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Command,
+    process::Output,
+    sync::atomic::AtomicBool,
     thread,
     time::Duration,
 };
@@ -10,9 +11,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::{backend::CommandSpec, model::Placement, quote::posix_quote};
+use crate::{
+    backend::CommandSpec,
+    model::Placement,
+    quote::posix_quote,
+    status::{BoundedOutput, run_bounded},
+};
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.tether";
+const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Herdr process and placement context supplied to a plugin action.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -457,16 +464,38 @@ fn is_attach_process(process: &ForegroundProcess, expected: &CommandSpec) -> boo
         decode_response(self.execute(operation, arguments)?, operation)
     }
 
-    fn execute(&self, operation: &str, arguments: &[String]) -> Result<std::process::Output> {
-        Command::new(&self.context.binary)
-            .args(arguments)
-            .output()
-            .with_context(|| {
-                format!(
-                    "run Herdr {operation} via `{}`",
-                    self.context.binary.display()
-                )
-            })
+    fn execute(&self, operation: &str, arguments: &[String]) -> Result<Output> {
+        let spec = CommandSpec::new(&self.context.binary, arguments.to_vec());
+        match run_bounded(
+            &spec,
+            HERDR_COMMAND_TIMEOUT,
+            &AtomicBool::new(false),
+        ) {
+            BoundedOutput::Completed {
+                status,
+                stdout,
+                stdout_truncated: false,
+                stderr,
+                stderr_truncated: false,
+            } => Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            BoundedOutput::Completed { .. } => {
+                bail!("Herdr {operation} response exceeded the safe capture limit")
+            }
+            BoundedOutput::TimedOut => bail!(
+                "Herdr {operation} timed out after {} seconds",
+                HERDR_COMMAND_TIMEOUT.as_secs()
+            ),
+            BoundedOutput::SpawnError(kind) => bail!(
+                "run Herdr {operation} via `{}` ({kind:?})",
+                self.context.binary.display()
+            ),
+            BoundedOutput::Error => bail!("read Herdr {operation} process output"),
+            BoundedOutput::Cancelled => unreachable!("direct Herdr executions are not cancelled"),
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use crate::{
     sshcfg::validate_ssh_target,
     status::{BoundedOutput, run_bounded},
 };
+const MAX_DISCOVERY_WORKERS: usize = 16;
 
 const REMOTE_SCAN_SCRIPT: &str = r#"max_depth=$1
 result_limit=$2
@@ -151,7 +152,8 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
-    pub fn new(binaries: ProcessBinaries, limits: DiscoveryLimits) -> Self {
+    pub fn new(binaries: ProcessBinaries, mut limits: DiscoveryLimits) -> Self {
+        limits.workers = limits.workers.clamp(1, MAX_DISCOVERY_WORKERS);
         Self { binaries, limits }
     }
 
@@ -162,7 +164,6 @@ impl DiscoveryService {
         let worker_count = self
             .limits
             .workers
-            .max(1)
             .min(jobs.lock().expect("discovery jobs lock").len().max(1));
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -605,6 +606,19 @@ fn safe_relative(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_worker_count_has_an_internal_ceiling() {
+        let limits = DiscoveryLimits {
+            max_depth: 1,
+            max_entries: 1,
+            max_results: 1,
+            timeout: Duration::from_secs(1),
+            workers: usize::MAX,
+        };
+        let service = DiscoveryService::new(ProcessBinaries::new("ssh", "tmux"), limits);
+        assert_eq!(service.limits.workers, MAX_DISCOVERY_WORKERS);
+    }
 
     #[test]
     fn malformed_remote_records_fail_closed_without_a_process_harness() {

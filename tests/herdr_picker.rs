@@ -1924,3 +1924,24 @@ fn prune_and_close_modal_inputs_never_cross_route() {
     );
     assert!(prune_picker.prune_modal().is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn herdr_inspection_rejects_oversized_process_output() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = HerdrClient::new(context(&binary))
+        .inspect_replacement_source()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("safe capture limit"));
+}

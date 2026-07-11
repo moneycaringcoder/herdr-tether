@@ -24,6 +24,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_DRAIN_BYTES_PER_TICK: usize = MAX_CAPTURE_BYTES + 8192;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_STATUS_WORKERS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostReachability {
@@ -122,7 +123,7 @@ impl StatusService {
         Self {
             binaries,
             timeout,
-            workers: workers.max(1),
+            workers: workers.clamp(1, MAX_STATUS_WORKERS),
         }
     }
 
@@ -694,5 +695,20 @@ fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Resul
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_worker_count_has_an_internal_ceiling() {
+        let service = StatusService::new(
+            ProcessBinaries::new("ssh", "tmux"),
+            Duration::from_secs(1),
+            usize::MAX,
+        );
+        assert_eq!(service.workers, MAX_STATUS_WORKERS);
     }
 }

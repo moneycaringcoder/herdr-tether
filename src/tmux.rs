@@ -1,6 +1,13 @@
-use std::process::{Command, Output};
+use std::{
+    io,
+    path::PathBuf,
+    process::Output,
+    sync::atomic::AtomicBool,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
+use thiserror::Error;
 
 use crate::{
     backend::{
@@ -10,10 +17,35 @@ use crate::{
     model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
     sshcfg::validate_ssh_target,
+    status::{BoundedOutput, run_bounded},
 };
 
 const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
 const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+enum BoundedExecutionError {
+    #[error(
+        "start `{program}` ({kind:?}); install the tool or make it executable (Tether also searches /usr/bin, /bin, /opt/homebrew/bin, and /usr/local/bin)"
+    )]
+    Spawn {
+        program: PathBuf,
+        kind: io::ErrorKind,
+    },
+    #[error("process timed out after {} seconds", TMUX_COMMAND_TIMEOUT.as_secs())]
+    TimedOut,
+    #[error("process response exceeded the safe capture limit")]
+    OutputLimit,
+    #[error("process failed while reading its output")]
+    Output,
+}
+
+impl BoundedExecutionError {
+    fn outcome_uncertain(&self) -> bool {
+        !matches!(self, Self::Spawn { .. })
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Location {
@@ -99,16 +131,32 @@ impl TmuxBackend {
         }
     }
 
+    fn bounded_output(&self, spec: &CommandSpec) -> Result<Output, BoundedExecutionError> {
+        match run_bounded(spec, TMUX_COMMAND_TIMEOUT, &AtomicBool::new(false)) {
+            BoundedOutput::Completed {
+                status,
+                stdout,
+                stdout_truncated: false,
+                stderr,
+                stderr_truncated: false,
+            } => Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            BoundedOutput::Completed { .. } => Err(BoundedExecutionError::OutputLimit),
+            BoundedOutput::TimedOut => Err(BoundedExecutionError::TimedOut),
+            BoundedOutput::SpawnError(kind) => Err(BoundedExecutionError::Spawn {
+                program: spec.program.clone(),
+                kind,
+            }),
+            BoundedOutput::Error => Err(BoundedExecutionError::Output),
+            BoundedOutput::Cancelled => unreachable!("direct tmux executions are not cancelled"),
+        }
+    }
+
     fn output(&self, spec: &CommandSpec) -> Result<Output> {
-        Command::new(&spec.program)
-            .args(&spec.args)
-            .output()
-            .with_context(|| {
-                format!(
-                    "start `{}`; install the tool or make it executable (Tether also searches /usr/bin, /bin, /opt/homebrew/bin, and /usr/local/bin)",
-                    spec.program.display()
-                )
-            })
+        self.bounded_output(spec).map_err(Into::into)
     }
 
     pub(crate) fn inspect_exact_spec(
@@ -342,7 +390,13 @@ impl DurableBackend for TmuxBackend {
             ],
             false,
         )?;
-        let output = self.output(&spec)?;
+        let output = match self.bounded_output(&spec) {
+            Ok(output) => output,
+            Err(error) if error.outcome_uncertain() => {
+                return Err(CreateOutcomeUncertain::new(error.into()).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -492,7 +546,7 @@ fn remote_command(program: &str, arguments: &[String]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{env, fs, process::Command};
 
     use super::*;
 

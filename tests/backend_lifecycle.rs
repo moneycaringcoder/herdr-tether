@@ -1476,3 +1476,22 @@ fn command_spec_quotes_program_and_arguments_for_herdr_pane_run() {
         "'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn direct_backend_inspection_rejects_oversized_process_output() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend =
+        TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let error = backend.inspect(&id(), &proof()).unwrap_err();
+    assert!(error.to_string().contains("safe capture limit"));
+}
