@@ -68,6 +68,13 @@ def main() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     if f"--ref {args.tag}" not in readme:
         fail(f"README.md does not pin the primary install to --ref {args.tag}")
+    cargo_install = re.search(
+        r"cargo install[\s\S]{0,200}?--tag (v[0-9]+\.[0-9]+\.[0-9]+)",
+        readme,
+    )
+    if not cargo_install or cargo_install.group(1) != args.tag:
+        found = cargo_install.group(1) if cargo_install else None
+        fail(f"README.md primary Cargo install tag {found!r} != {args.tag!r}")
 
     print(f"release identity verified: {args.tag}")
 

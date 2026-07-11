@@ -83,15 +83,16 @@ For local development, clone the repository, run `cargo build --release --locked
 
 Open **Tether: Open** in Herdr. Choose a host, then an owned workload, a safely discovered **external** `tmux` session, or **Create new Tether workload**. Creation proceeds through directory, command, and split-right/split-down/new-tab placement.
 
-The standalone binary exposes the same setup and diagnostic path:
+Herdr injects plugin-owned configuration and state directories into actions. Point the standalone CLI at those same Linux/macOS directories before configuring data that **Tether: Open** must read:
 
 ```sh
+export HERDR_PLUGIN_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/moneycaringcoder.tether"
+export HERDR_PLUGIN_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/moneycaringcoder.tether"
 herdr-tether setup --yes
 herdr-tether doctor
-herdr-tether open
 ```
 
-Add and verify a remote target:
+Without those exports, standalone commands intentionally use their separate `herdr-tether` configuration and state directories. With the plugin directories still exported, add and verify a remote target:
 
 ```sh
 herdr-tether host add build build.example.net \
