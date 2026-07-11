@@ -284,7 +284,7 @@ fn remote_discovery_quotes_roots_and_parses_framed_results() {
             generation: 3,
             locations: vec![DiscoveryLocation {
                 host: "dev".into(),
-                target: Some("dev.example".into()),
+                target: Some("ssh://builder@dev.example:2222".into()),
                 roots: vec![malicious_root.into()],
             }],
         },
@@ -303,7 +303,12 @@ fn remote_discovery_quotes_roots_and_parses_framed_results() {
     assert!(
         arguments
             .windows(2)
-            .any(|pair| pair[0] == b"--" && pair[1] == b"dev.example")
+            .any(|pair| pair[0] == b"-p" && pair[1] == b"2222")
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair[0] == b"--" && pair[1] == b"builder@dev.example")
     );
     assert_eq!(
         arguments

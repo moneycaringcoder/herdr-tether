@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     backend::{CommandSpec, ProcessBinaries},
-    sshcfg::validate_ssh_target,
+    sshcfg::openssh_target,
     status::{BoundedOutput, run_bounded},
 };
 const MAX_DISCOVERY_WORKERS: usize = 16;
@@ -501,7 +501,7 @@ fn remote_spec(
     binaries: &ProcessBinaries,
     limits: DiscoveryLimits,
 ) -> anyhow::Result<CommandSpec> {
-    validate_ssh_target(target)?;
+    let target = openssh_target(target)?;
     let mut remote_args = vec![
         "-c".to_owned(),
         REMOTE_SCAN_SCRIPT.to_owned(),
@@ -512,20 +512,23 @@ fn remote_spec(
     ];
     remote_args.extend(roots.iter().cloned());
     let remote_command = CommandSpec::new("/bin/sh", remote_args).posix_command_line()?;
-    Ok(CommandSpec::new(
-        binaries.ssh().to_path_buf(),
-        vec![
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveInterval=15".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveCountMax=3".to_owned(),
-            "--".to_owned(),
-            target.to_owned(),
-            remote_command,
-        ],
-    ))
+    let mut ssh_args = vec![
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
+    ];
+    if let Some(port) = target.port {
+        ssh_args.extend(["-p".to_owned(), port.to_string()]);
+    }
+    ssh_args.extend([
+        "--".to_owned(),
+        target.destination,
+        remote_command,
+    ]);
+    Ok(CommandSpec::new(binaries.ssh().to_path_buf(), ssh_args))
 }
 
 fn parse_remote(
