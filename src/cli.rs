@@ -13,7 +13,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::{
-    backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries},
+    backend::{
+        CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, create_outcome_is_uncertain,
+    },
     config::{
         CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
         HostConfig,
@@ -725,18 +727,19 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         state.sessions.push(record);
         Ok(())
     })?;
-
     let identity = match backend.create(&launch) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = store.update(|state| {
-                state.sessions.retain(|record| {
-                    record.id != id
-                        || record.status != SessionStatus::Creating
-                        || record.tmux_session_id.is_some()
+            if !create_outcome_is_uncertain(&error) {
+                let _ = store.update(|state| {
+                    state.sessions.retain(|record| {
+                        record.id != id
+                            || record.status != SessionStatus::Creating
+                            || record.tmux_session_id.is_some()
+                    });
+                    Ok(())
                 });
-                Ok(())
-            });
+            }
             return Err(error).context(format!("create reserved session `{id}`"));
         }
     };
@@ -899,7 +902,16 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
         SessionCommand::List(args) => {
             let state = store.load()?;
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&state.sessions)?);
+                let mut sessions = serde_json::to_value(&state.sessions)?;
+                if let Some(records) = sessions.as_array_mut() {
+                    for record in records {
+                        record
+                            .as_object_mut()
+                            .expect("serialized session record is an object")
+                            .remove("ownership_proof");
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else {
                 for session in state.sessions {
                     println!(

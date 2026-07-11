@@ -3,7 +3,10 @@ use std::process::{Command, Output};
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
+    backend::{
+        CommandSpec, CreateOutcomeUncertain, DurableBackend, LaunchSpec, ProcessBinaries,
+        WorkloadState,
+    },
     model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
     sshcfg::validate_ssh_target,
@@ -306,9 +309,10 @@ impl TmuxBackend {
             .and_then(|spec| self.require_success("rollback created session", &spec));
         match rollback {
             Ok(()) => cause,
-            Err(rollback) => cause.context(format!(
+            Err(rollback) => CreateOutcomeUncertain::new(cause.context(format!(
                 "also failed to roll back exact owned session `{id}`: {rollback:#}"
-            )),
+            )))
+            .into(),
         }
     }
 }
@@ -348,7 +352,8 @@ impl DurableBackend for TmuxBackend {
             );
         }
         let created = std::str::from_utf8(&output.stdout)
-            .context("tmux returned non-UTF-8 created session identities")?
+            .context("tmux returned non-UTF-8 created session identities")
+            .map_err(CreateOutcomeUncertain::new)?
             .trim_end_matches(['\r', '\n']);
         let identities = (|| {
             let (session_target, pane_target) = created
@@ -360,9 +365,10 @@ impl DurableBackend for TmuxBackend {
         })();
         let (session_target, pane_target) = match identities {
             Ok(identities) => identities,
-            // Creation may already be committed, but without a trustworthy
-            // internal identity destructive compensation would be unsafe.
-            Err(error) => return Err(error),
+            // Creation is committed, but malformed output does not provide a
+            // trustworthy internal target. Preserve the reservation so a
+            // proof-based retry can reconcile it.
+            Err(error) => return Err(CreateOutcomeUncertain::new(error).into()),
         };
         self.enable_remain_on_exit(&pane_target)
             .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
@@ -516,12 +522,16 @@ mod tests {
         let id = "tether-0197f198000070008000000000000001"
             .parse()
             .unwrap();
+        let proof = "0197f198000070008000000000000002"
+            .parse()
+            .unwrap();
 
         assert_eq!(
             classify_exact_inspect(
                 &id,
+                &proof,
                 Some(0),
-                b"tether-0197f198000070008000000000000001:$7:2:0:\n",
+                b"tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002\n",
                 false,
             ),
             WorkloadState::Running {
@@ -532,8 +542,9 @@ mod tests {
         assert_eq!(
             classify_exact_inspect(
                 &id,
+                &proof,
                 Some(0),
-                b"tether-0197f198000070008000000000000001:$7:0:1:130\n",
+                b"tether-0197f198000070008000000000000001:$7:0:1:130:0197f198000070008000000000000002\n",
                 false,
             ),
             WorkloadState::Ended {

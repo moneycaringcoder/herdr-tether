@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 
 use crate::{
     model::{OwnershipProof, SessionId, TmuxSessionId},
@@ -107,6 +108,27 @@ fn is_executable(path: &Path) -> bool {
     {
         true
     }
+}
+
+/// Creation reached tmux successfully, but Tether could not prove whether the
+/// incarnation still exists. Callers must preserve the Creating reservation.
+#[derive(Debug, Error)]
+#[error("tmux creation outcome is uncertain")]
+pub struct CreateOutcomeUncertain {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl CreateOutcomeUncertain {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+pub fn create_outcome_is_uncertain(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<CreateOutcomeUncertain>())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

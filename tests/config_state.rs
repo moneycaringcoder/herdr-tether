@@ -399,6 +399,7 @@ fn state_round_trips_and_migrates_v0() {
     let migrated = store.load().unwrap();
     assert_eq!(migrated.version, State::CURRENT_VERSION);
     assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
+    assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
     assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
 }
@@ -649,6 +650,23 @@ fn herdr_keybinding_rollback_refuses_to_overwrite_later_edits() {
     assert!(error.contains("changed after Tether installed"));
     assert_eq!(fs::read(&path).unwrap(), edited);
     assert!(HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn state_lock_refuses_symlink_without_touching_victim() {
+    let temp = tempdir().unwrap();
+    let state = temp.path().join("state.json");
+    let lock = temp.path().join(".state.json.lock");
+    let victim = temp.path().join("victim");
+    fs::write(&victim, b"do not touch").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+    let error = StateStore::new(state).load().unwrap_err().to_string();
+    assert!(error.contains("open storage lock"));
+    assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+    assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o644);
 }
 
 #[test]

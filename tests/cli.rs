@@ -633,6 +633,53 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
 }
 
 #[test]
+fn legacy_record_without_proof_fails_closed_before_transport() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let legacy = active_state(SESSION_ID)
+        .replace(r#""version": 2"#, r#""version": 1"#)
+        .replace(r#"    "command": "true",
+"#, "")
+        .replace(r#"    "tmux_session_id": 7,
+"#, "")
+        .replace(r#"    "ownership_proof": "0197f198000070008000000000000099",
+"#, "")
+        .replace(r#""status": "running""#, r#""status": "active""#);
+    fs::write(sandbox.state_file(), legacy).unwrap();
+    let log = sandbox.path("tmux.log");
+    let body = format!("printf invoked > '{}'\nexit 99", log.display());
+    let (path, _) = install_tmux_script(&sandbox, &body);
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args(["session", "close", SESSION_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no private ownership proof"));
+    assert!(!log.exists(), "legacy ownership must not invoke tmux");
+    let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(migrated.contains(r#""version": 2"#));
+    assert!(!migrated.contains("ownership_proof"));
+}
+
+#[test]
+fn session_list_json_never_exposes_private_ownership_proof() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
+
+    sandbox
+        .command()
+        .args(["session", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(SESSION_ID))
+        .stdout(predicate::str::contains("ownership_proof").not())
+        .stdout(predicate::str::contains("0197f198000070008000000000000099").not());
+}
+
+#[test]
 fn external_attach_is_exact_and_does_not_mutate_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
@@ -701,6 +748,42 @@ fn open_rejects_whitespace_directory_and_command_before_backend_create() {
 
         assert!(!log.exists(), "backend must not be invoked");
     }
+}
+
+#[test]
+fn uncertain_backend_creation_preserves_private_creating_reservation() {
+    let sandbox = Sandbox::new();
+    let log = sandbox.path("tmux.log");
+    let body = format!(
+        "printf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in new-session) printf 'committed-but-malformed';; esac\nexit 0",
+        log.display()
+    );
+    let (path, _) = install_tmux_script(&sandbox, &body);
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args([
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            "/tmp",
+            "--command",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outcome is uncertain"));
+
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sandbox.state_file()).unwrap()).unwrap();
+    let sessions = document["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["status"], "creating");
+    assert!(sessions[0]["tmux_session_id"].is_null());
+    assert!(sessions[0]["ownership_proof"].as_str().is_some());
+    assert!(!fs::read_to_string(log).unwrap().contains("kill-session"));
 }
 
 #[test]
