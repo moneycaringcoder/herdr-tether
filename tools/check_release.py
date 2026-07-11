@@ -16,6 +16,30 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 
+PUBLIC_RELEASE_FILES = (
+    Path("README.md"),
+    Path("CHANGELOG.md"),
+    Path("SECURITY.md"),
+    Path("docs/architecture.md"),
+    Path("herdr-plugin.toml"),
+)
+
+FORBIDDEN_PUBLIC_PATTERNS = {
+    "release-candidate bookkeeping": re.compile(r"release candidate", re.IGNORECASE),
+    "acceptance-hold bookkeeping": re.compile(
+        r"acceptance hold|pending human|awaiting explicit .* acceptance",
+        re.IGNORECASE,
+    ),
+    "private mission references": re.compile(
+        r"\.omp/mission|START_PROMPT|OPERATING_LOOP|mission evidence|mission complete",
+        re.IGNORECASE,
+    ),
+    "machine-specific details": re.compile(
+        r"/home/amadeo|napoleon-pantone|\blap1\b|\bAtlas Core\b",
+        re.IGNORECASE,
+    ),
+}
+
 
 def load_toml(path: Path) -> dict:
     with path.open("rb") as handle:
@@ -75,6 +99,13 @@ def main() -> None:
     if not cargo_install or cargo_install.group(1) != args.tag:
         found = cargo_install.group(1) if cargo_install else None
         fail(f"README.md primary Cargo install tag {found!r} != {args.tag!r}")
+
+    for relative_path in PUBLIC_RELEASE_FILES:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        for label, pattern in FORBIDDEN_PUBLIC_PATTERNS.items():
+            if match := pattern.search(text):
+                line = text.count("\n", 0, match.start()) + 1
+                fail(f"{relative_path}:{line} contains {label}")
 
     print(f"release identity verified: {args.tag}")
 

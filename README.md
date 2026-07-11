@@ -15,10 +15,10 @@ Tether complements [Herdr](https://github.com/ogulcancelik/herdr) and `herdr-mir
 - OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes` under your normal keys, agent, and `known_hosts` policy.
 - Network access to GitHub and Cargo's configured registry during installation, unless both sources and dependencies are already cached.
 
-Install the pinned v0.2.0 release tag through Herdr:
+Install the pinned v0.2.1 release tag through Herdr:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.1 --yes
 herdr plugin action list --plugin moneycaringcoder.tether
 ```
 
@@ -26,7 +26,7 @@ Herdr uses its managed checkout for plugin actions; it does not add the built bi
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.2.0 --locked herdr-tether
+  --tag v0.2.1 --locked herdr-tether
 ```
 
 Run **Tether: Install prefix+t launcher** once from Herdr, or invoke the action explicitly:
@@ -56,12 +56,12 @@ Plain standalone `herdr-tether setup` and normal install/open remain non-mutatin
 Installing the same pinned ref again rebuilds and reinstalls the plugin. Reinstall the standalone binary with `--force` after repairing a toolchain or dependency cache:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.1 --yes
 cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.2.0 --locked herdr-tether
+  --tag v0.2.1 --locked herdr-tether
 ```
 
-To update, replace `v0.2.0` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
+To update, replace `v0.2.1` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.1.0 --yes
@@ -88,10 +88,6 @@ herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
 ```
 
 For local development, clone the repository, run `cargo build --release --locked`, and use `herdr plugin link "$(pwd)"`; remove that link with `herdr plugin unlink moneycaringcoder.tether`.
-
-### v0.2.1 release candidate
-
-The branch metadata is v0.2.1, but v0.2.0 remains the pinned stable install above until v0.2.1 is accepted and tagged. The candidate adds explicit keybinding installation and rollback, Replace current pane, more reliable executable and working-directory handling, stable in-picker retry/cancel errors, and session-scoped mouse support for Tether-owned sessions.
 
 ## Quick start
 
@@ -176,7 +172,7 @@ Explorer keys: `↑`/`k`/`Shift-Tab`, `↓`/`j`/`Tab`, `Enter` to select, `Backs
 
 Herdr actions initially open a manifest-declared terminal overlay. After selection, Tether focuses the invoking pane's requested split or tab and starts the exact resume/attach command there. **Replace current pane** first inspects foreground processes and requires interactive confirmation before terminating any it finds. It then creates a destination, dispatches the attachment, waits for foreground-process readiness, and only then closes the captured source pane. Dispatch or readiness failure cleans up the destination and preserves the source; a source-close failure preserves the running destination. Non-interactive replacement refuses when foreground processes require confirmation, and cancelling preserves the source.
 
-Herdr 0.7.3 does expose public semantic reporting commands (`pane report-agent`, `report-agent-session`, `release-agent`, and `report-metadata`), but those APIs are assertions about a known agent lifecycle rather than generic nested-workload registration. Tether knows its outer `tmux` identity and attach lifetime; it cannot truthfully infer a nested OMP or Hermes lifecycle or native session identity, and tmux detach is not agent completion. Tether therefore uses honestly titled terminal panes as its fallback and does not fabricate native sidebar or Agents support. A native inner hook must make any OMP or Hermes report itself.
+Nested tools running behind SSH and `tmux` may not appear in Herdr's Agents sidebar because Herdr 0.7.3 has no generic nested-workload registration API. Tether uses clearly titled panes and does not fabricate agent state.
 
 ## Command reference
 
