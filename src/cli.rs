@@ -20,7 +20,7 @@ use crate::{
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
-    tui::{OpenSelection, PickerOptions, PickerSelection, run_picker},
+    tui::{OpenSelection, PickerHostOrigin, PickerOptions, PickerSelection, run_picker},
 };
 
 #[derive(Debug, Parser)]
@@ -480,7 +480,11 @@ fn selection_from_picker(
     }
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
+    retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
+        options
+            .hosts
+            .retain(|host| host.origin == PickerHostOrigin::Effective);
         for host in &mut options.hosts {
             host.workloads.clear();
             host.allow_existing = false;
@@ -551,6 +555,12 @@ fn selection_from_picker(
             name,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
+    }
+}
+
+fn retain_requested_host_groups(options: &mut PickerOptions, requested_host: Option<&str>) {
+    if let Some(requested_host) = requested_host {
+        options.hosts.retain(|host| host.name == requested_host);
     }
 }
 
@@ -1091,5 +1101,39 @@ mod tests {
                 "-work 'quoted'"
             ]
         );
+    }
+
+    #[test]
+    fn requested_host_scope_keeps_only_matching_effective_and_retained_groups() {
+        use crate::tui::{PickerCommand, PickerHost};
+
+        let host = |name: &str, target: &str, origin: PickerHostOrigin| PickerHost {
+            name: name.into(),
+            label: name.into(),
+            target: Some(target.into()),
+            origin,
+            directories: vec!["/repo".into()],
+            scan_roots: vec!["/repo".into()],
+            commands: vec![PickerCommand::Shell],
+            workloads: Vec::new(),
+            allow_existing: origin == PickerHostOrigin::Effective,
+            allow_create: origin == PickerHostOrigin::Effective,
+        };
+        let mut options = PickerOptions {
+            hosts: vec![
+                host("build", "new.example", PickerHostOrigin::Effective),
+                host("build", "old.example", PickerHostOrigin::Retained),
+                host("foreign", "foreign.example", PickerHostOrigin::Retained),
+                host("local", "local", PickerHostOrigin::Retained),
+            ],
+            default_placement: Placement::SplitRight,
+        };
+
+        retain_requested_host_groups(&mut options, Some("build"));
+
+        assert_eq!(options.hosts.len(), 2);
+        assert!(options.hosts.iter().all(|host| host.name == "build"));
+        assert_eq!(options.hosts[0].origin, PickerHostOrigin::Effective);
+        assert_eq!(options.hosts[1].origin, PickerHostOrigin::Retained);
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::PathBuf,
     sync::mpsc,
@@ -62,9 +62,17 @@ impl PickerCommand {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickerHostOrigin {
+    Effective,
+    Retained,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PickerWorkload {
     pub id: SessionId,
+    pub status: SessionStatus,
+    pub last_used_at: chrono::DateTime<chrono::Utc>,
     pub base_label: String,
     pub label: String,
 }
@@ -80,11 +88,13 @@ pub struct PickerHost {
     pub name: String,
     pub label: String,
     pub target: Option<String>,
+    pub origin: PickerHostOrigin,
     pub directories: Vec<String>,
     pub scan_roots: Vec<String>,
     pub commands: Vec<PickerCommand>,
     pub workloads: Vec<PickerWorkload>,
     pub allow_existing: bool,
+    pub allow_create: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,9 +104,8 @@ pub struct PickerOptions {
 }
 
 impl PickerOptions {
-    /// Builds picker data with recent session directories first, followed by
-    /// configured roots. Duplicate hosts and directories retain their first,
-    /// highest-precedence occurrence.
+    /// Builds effective hosts in configuration precedence order, followed by
+    /// retained exact `(host, target)` state groups in deterministic order.
     pub fn from_config_state(
         config: &Config,
         state: &State,
@@ -105,9 +114,11 @@ impl PickerOptions {
     ) -> Self {
         let mut hosts = Vec::with_capacity(config.hosts.len() + usize::from(include_local));
         let mut host_names = HashSet::with_capacity(hosts.capacity());
+        let mut effective_keys = HashSet::with_capacity(hosts.capacity());
 
         if include_local {
             host_names.insert("local".to_owned());
+            effective_keys.insert(("local".to_owned(), "local".to_owned()));
             let mut scan_roots = config
                 .discovery
                 .local_roots
@@ -117,7 +128,7 @@ impl PickerOptions {
             if scan_roots.is_empty() {
                 scan_roots.push(local_directory.to_owned());
             }
-            let mut directories = recent_directories(state, "local");
+            let mut directories = recent_directories(state, "local", "local");
             for root in &scan_roots {
                 push_unique(&mut directories, root);
             }
@@ -125,11 +136,13 @@ impl PickerOptions {
                 name: "local".to_owned(),
                 label: "local".to_owned(),
                 target: None,
+                origin: PickerHostOrigin::Effective,
                 directories,
                 scan_roots,
                 commands: vec![PickerCommand::Shell],
-                workloads: active_workloads(state, "local"),
+                workloads: owned_workloads(state, "local", "local"),
                 allow_existing: true,
+                allow_create: true,
             });
         }
 
@@ -137,15 +150,15 @@ impl PickerOptions {
             if !host_names.insert(host.name.clone()) {
                 continue;
             }
+            effective_keys.insert((host.name.clone(), host.target.clone()));
             let mut scan_roots = host.roots.clone();
             if scan_roots.is_empty() {
                 scan_roots.push("~".to_owned());
             }
-            let mut directories = recent_directories(state, &host.name);
+            let mut directories = recent_directories(state, &host.name, &host.target);
             for root in &scan_roots {
                 push_unique(&mut directories, root);
             }
-
             let mut commands = Vec::with_capacity(host.presets.len() + 1);
             commands.push(PickerCommand::Shell);
             commands.extend(host.presets.iter().map(|preset| PickerCommand::Preset {
@@ -156,11 +169,36 @@ impl PickerOptions {
                 name: host.name.clone(),
                 label: host.name.clone(),
                 target: Some(host.target.clone()),
+                origin: PickerHostOrigin::Effective,
                 directories,
                 scan_roots,
                 commands,
-                workloads: active_workloads(state, &host.name),
+                workloads: owned_workloads(state, &host.name, &host.target),
                 allow_existing: true,
+                allow_create: true,
+            });
+        }
+
+        let mut retained = BTreeMap::<(String, String), ()>::new();
+        for record in &state.sessions {
+            let key = (record.host.clone(), record.target.clone());
+            if !effective_keys.contains(&key) {
+                retained.insert(key, ());
+            }
+        }
+        for ((name, target), ()) in retained {
+            let directories = recent_directories(state, &name, &target);
+            hosts.push(PickerHost {
+                label: format!("{name} · retained · {target}"),
+                workloads: owned_workloads(state, &name, &target),
+                name,
+                target: (target != "local").then_some(target),
+                origin: PickerHostOrigin::Retained,
+                directories,
+                scan_roots: Vec::new(),
+                commands: vec![PickerCommand::Shell],
+                allow_existing: false,
+                allow_create: false,
             });
         }
 
@@ -184,11 +222,11 @@ fn expand_local_root(root: &str, home: &str) -> String {
     root.to_owned()
 }
 
-fn recent_directories(state: &State, host: &str) -> Vec<String> {
+fn recent_directories(state: &State, host: &str, target: &str) -> Vec<String> {
     let mut sessions: Vec<&SessionRecord> = state
         .sessions
         .iter()
-        .filter(|session| session.host == host)
+        .filter(|session| session.host == host && session.target == target)
         .collect();
     sessions.sort_by(|left, right| {
         right
@@ -203,11 +241,11 @@ fn recent_directories(state: &State, host: &str) -> Vec<String> {
     }
     directories
 }
-fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
+fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkload> {
     let mut sessions: Vec<&SessionRecord> = state
         .sessions
         .iter()
-        .filter(|session| session.host == host && session.status == SessionStatus::Active)
+        .filter(|session| session.host == host && session.target == target)
         .collect();
     sessions.sort_by(|left, right| {
         right
@@ -219,20 +257,31 @@ fn active_workloads(state: &State, host: &str) -> Vec<PickerWorkload> {
     sessions
         .into_iter()
         .map(|session| {
-            let command = session.preset.as_deref().unwrap_or("Shell");
-            let id = session.id.to_string();
-            let short_id = &id[id.len().saturating_sub(8)..];
-            let label = format!(
-                "Tether · Resume …{} · {} · {}",
-                short_id, command, session.directory
-            );
+            let label = workload_label(session);
             PickerWorkload {
                 id: session.id,
+                status: session.status,
+                last_used_at: session.last_used_at,
                 base_label: label.clone(),
                 label,
             }
         })
         .collect()
+}
+
+fn workload_label(session: &SessionRecord) -> String {
+    let command = session.preset.as_deref().unwrap_or("Shell");
+    let id = session.id.to_string();
+    let short_id = &id[id.len().saturating_sub(8)..];
+    let (lifecycle, action) = match session.status {
+        SessionStatus::Active => ("active", "Resume"),
+        SessionStatus::Closing => ("closing · c retry", "Metadata"),
+        SessionStatus::Closed => ("closed · metadata", "Metadata"),
+    };
+    format!(
+        "[{lifecycle}] Tether · {action} …{} · {} · {}",
+        short_id, command, session.directory
+    )
 }
 
 fn push_unique(values: &mut Vec<String>, candidate: &str) {
@@ -334,6 +383,7 @@ pub struct PickerCloseResult {
     pub id: SessionId,
     pub generation: u64,
     pub error: Option<String>,
+    pub record: Option<SessionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,6 +620,7 @@ impl PickerState {
         let base_directories = options
             .hosts
             .iter()
+            .filter(|host| host.origin == PickerHostOrigin::Effective)
             .map(|host| (host.name.clone(), host.directories.clone()))
             .collect();
         let placement_index = placement_index(options.default_placement);
@@ -745,6 +796,21 @@ impl PickerState {
                     removed_ids.len(),
                     skipped_ids.len()
                 ));
+                let selected_host = self.selected_host_identity();
+                let selected_resource = self.current_resource_identity();
+                let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
+                for host in &mut self.options.hosts {
+                    host.workloads
+                        .retain(|workload| !removed.contains(&workload.id));
+                }
+                self.options.hosts.retain(|host| {
+                    host.origin == PickerHostOrigin::Effective || !host.workloads.is_empty()
+                });
+                for id in &removed_ids {
+                    self.workload_status.remove(id);
+                    self.close_failed.remove(id);
+                }
+                self.restore_selection(selected_host, selected_resource);
                 true
             }
         }
@@ -757,6 +823,22 @@ impl PickerState {
             return false;
         }
         self.pending_close = None;
+        let authoritative_absent = result.record.is_none() && result.error.is_none();
+        if let Some(record) = &result.record {
+            self.reconcile_owned_record(record);
+        } else if authoritative_absent {
+            let selected_host = self.selected_host_identity();
+            let selected_resource = self.current_resource_identity();
+            for host in &mut self.options.hosts {
+                host.workloads.retain(|workload| workload.id != result.id);
+            }
+            self.options.hosts.retain(|host| {
+                host.origin == PickerHostOrigin::Effective || !host.workloads.is_empty()
+            });
+            self.workload_status.remove(&result.id);
+            self.close_failed.remove(&result.id);
+            self.restore_selection(selected_host, selected_resource);
+        }
         if let Some(error) = result.error {
             let error = bounded_error_text(&sanitize_terminal_text(&error));
             self.close_failed.insert(result.id, error.clone());
@@ -764,34 +846,147 @@ impl PickerState {
                 id: result.id,
                 error,
             });
-            self.rebuild_status_labels();
-            return true;
+        } else {
+            self.close_failed.remove(&result.id);
+            self.close_modal = None;
         }
-
-        self.close_failed.remove(&result.id);
-        self.close_modal = None;
-        for host_index in 0..self.options.hosts.len() {
-            let Some(workload_index) = self.options.hosts[host_index]
-                .workloads
-                .iter()
-                .position(|workload| workload.id == result.id)
-            else {
-                continue;
-            };
-            self.options.hosts[host_index]
-                .workloads
-                .remove(workload_index);
-            self.workload_status.remove(&result.id);
-            if host_index == self.host_index {
-                if self.resource_index > workload_index {
-                    self.resource_index -= 1;
-                } else if self.resource_index == workload_index {
-                    self.resource_index = workload_index.min(self.resource_len().saturating_sub(1));
-                }
-            }
-            return true;
-        }
+        self.rebuild_status_labels();
         true
+    }
+
+    fn selected_host_identity(&self) -> Option<(PickerHostOrigin, String, String)> {
+        self.options.hosts.get(self.host_index).map(|host| {
+            (
+                host.origin,
+                host.name.clone(),
+                host.target.clone().unwrap_or_else(|| "local".to_owned()),
+            )
+        })
+    }
+
+    fn restore_host_identity(&mut self, identity: Option<(PickerHostOrigin, String, String)>) {
+        if let Some((origin, name, target)) = identity
+            && let Some(index) = self.options.hosts.iter().position(|host| {
+                host.origin == origin
+                    && host.name == name
+                    && host.target.as_deref().unwrap_or("local") == target
+            })
+        {
+            self.host_index = index;
+            return;
+        }
+        self.host_index = self
+            .host_index
+            .min(self.options.hosts.len().saturating_sub(1));
+    }
+
+    fn restore_selection(
+        &mut self,
+        host_identity: Option<(PickerHostOrigin, String, String)>,
+        resource_identity: Option<ResourceIdentity>,
+    ) {
+        if let Some(ResourceIdentity::Owned(selected_id)) = &resource_identity
+            && let Some((host_index, resource_index)) = self
+                .options
+                .hosts
+                .iter()
+                .enumerate()
+                .find_map(|(host_index, host)| {
+                    host.workloads
+                        .iter()
+                        .position(|workload| workload.id == *selected_id)
+                        .map(|resource_index| (host_index, resource_index))
+                })
+        {
+            self.host_index = host_index;
+            self.resource_index = resource_index;
+            return;
+        }
+        self.restore_host_identity(host_identity);
+        if self.options.hosts.is_empty() {
+            self.resource_index = 0;
+            self.stage = PickerStage::Host;
+            self.resume_id = None;
+            self.external_name = None;
+            self.selected_directory = None;
+            return;
+        }
+        match resource_identity {
+            Some(identity @ (ResourceIdentity::External(_) | ResourceIdentity::Create)) => {
+                self.restore_resource_identity(&identity);
+            }
+            _ => {
+                self.resource_index = self
+                    .resource_index
+                    .min(self.resource_len().saturating_sub(1));
+            }
+        }
+    }
+
+    fn reconcile_owned_record(&mut self, record: &SessionRecord) {
+        let selected_host = self.selected_host_identity();
+        let selected_resource = self.current_resource_identity();
+        for host in &mut self.options.hosts {
+            host.workloads.retain(|workload| workload.id != record.id);
+        }
+        self.options.hosts.retain(|host| {
+            host.origin == PickerHostOrigin::Effective || !host.workloads.is_empty()
+        });
+
+        if !self.options.hosts.iter().any(|host| {
+            host.name == record.host && host.target.as_deref().unwrap_or("local") == record.target
+        }) {
+            self.options.hosts.push(PickerHost {
+                name: record.host.clone(),
+                label: format!("{} · retained · {}", record.host, record.target),
+                target: (record.target != "local").then(|| record.target.clone()),
+                origin: PickerHostOrigin::Retained,
+                directories: vec![record.directory.clone()],
+                scan_roots: Vec::new(),
+                commands: vec![PickerCommand::Shell],
+                workloads: Vec::new(),
+                allow_existing: false,
+                allow_create: false,
+            });
+            let first_retained = self
+                .options
+                .hosts
+                .iter()
+                .position(|host| host.origin == PickerHostOrigin::Retained)
+                .unwrap_or(self.options.hosts.len());
+            self.options.hosts[first_retained..].sort_by(|left, right| {
+                (&left.name, left.target.as_deref().unwrap_or("local"))
+                    .cmp(&(&right.name, right.target.as_deref().unwrap_or("local")))
+            });
+        }
+        let host_index = self
+            .options
+            .hosts
+            .iter()
+            .position(|host| {
+                host.name == record.host
+                    && host.target.as_deref().unwrap_or("local") == record.target
+            })
+            .expect("reconciled host group exists");
+        let label = workload_label(record);
+        self.options.hosts[host_index]
+            .workloads
+            .push(PickerWorkload {
+                id: record.id,
+                status: record.status,
+                last_used_at: record.last_used_at,
+                base_label: label.clone(),
+                label,
+            });
+        self.options.hosts[host_index]
+            .workloads
+            .sort_by(|left, right| {
+                right
+                    .last_used_at
+                    .cmp(&left.last_used_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        self.restore_selection(selected_host, selected_resource);
     }
 
     pub fn directory_paths(&self, host: &str) -> Option<Vec<&str>> {
@@ -812,7 +1007,12 @@ impl PickerState {
     pub fn begin_discovery(&mut self, generation: u64) {
         self.discovery_generation = generation;
         self.discovery.clear();
-        for host in &mut self.options.hosts {
+        for host in self
+            .options
+            .hosts
+            .iter_mut()
+            .filter(|host| host.origin == PickerHostOrigin::Effective)
+        {
             if let Some(base) = self.base_directories.get(&host.name) {
                 host.directories.clone_from(base);
             }
@@ -828,12 +1028,9 @@ impl PickerState {
         }
         match message {
             DiscoveryMessage::Repository { host, path, .. } => {
-                let Some(host) = self
-                    .options
-                    .hosts
-                    .iter_mut()
-                    .find(|candidate| candidate.name == host)
-                else {
+                let Some(host) = self.options.hosts.iter_mut().find(|candidate| {
+                    candidate.origin == PickerHostOrigin::Effective && candidate.name == host
+                }) else {
                     return false;
                 };
                 push_unique(&mut host.directories, &path);
@@ -870,6 +1067,7 @@ impl PickerState {
                 .options
                 .hosts
                 .iter()
+                .filter(|host| host.origin == PickerHostOrigin::Effective)
                 .map(|host| DiscoveryLocation {
                     host: host.name.clone(),
                     target: host.target.clone(),
@@ -924,10 +1122,14 @@ impl PickerState {
             .iter()
             .map(|workload| workload.label.clone())
             .collect::<Vec<_>>();
-        if let Some(catalog) = self.catalogs.get(&host.name) {
+        if host.allow_existing
+            && let Some(catalog) = self.catalogs.get(&host.name)
+        {
             labels.extend(catalog.sessions.iter().map(|session| session.label.clone()));
         }
-        labels.push("Create new Tether workload".to_owned());
+        if host.allow_create {
+            labels.push("Create new Tether workload".to_owned());
+        }
         Some(labels)
     }
 
@@ -940,12 +1142,21 @@ impl PickerState {
         {
             self.pending_close = None;
         }
-        for host in &self.options.hosts {
+        for host in self
+            .options
+            .hosts
+            .iter()
+            .filter(|host| host.origin == PickerHostOrigin::Effective)
+        {
             self.host_status
                 .entry(host.name.clone())
                 .or_default()
                 .begin_refresh();
-            for workload in &host.workloads {
+            for workload in host
+                .workloads
+                .iter()
+                .filter(|workload| workload.status == SessionStatus::Active)
+            {
                 self.workload_status
                     .entry(workload.id)
                     .or_default()
@@ -1013,14 +1224,15 @@ impl PickerState {
             return Some(ResourceIdentity::Owned(workload.id));
         }
         let external_index = self.resource_index.saturating_sub(host.workloads.len());
-        if let Some(session) = self
-            .catalogs
-            .get(&host.name)
-            .and_then(|catalog| catalog.sessions.get(external_index))
+        if host.allow_existing
+            && let Some(session) = self
+                .catalogs
+                .get(&host.name)
+                .and_then(|catalog| catalog.sessions.get(external_index))
         {
             return Some(ResourceIdentity::External(session.name.clone()));
         }
-        Some(ResourceIdentity::Create)
+        host.allow_create.then_some(ResourceIdentity::Create)
     }
 
     fn restore_resource_identity(&mut self, identity: &ResourceIdentity) {
@@ -1049,11 +1261,14 @@ impl PickerState {
     fn resource_len(&self) -> usize {
         let host = &self.options.hosts[self.host_index];
         host.workloads.len()
-            + self
-                .catalogs
-                .get(&host.name)
-                .map_or(0, |catalog| catalog.sessions.len())
-            + 1
+            + if host.allow_existing {
+                self.catalogs
+                    .get(&host.name)
+                    .map_or(0, |catalog| catalog.sessions.len())
+            } else {
+                0
+            }
+            + usize::from(host.allow_create)
     }
 
     fn status_request(&self) -> StatusRequest {
@@ -1063,10 +1278,16 @@ impl PickerState {
                 .options
                 .hosts
                 .iter()
+                .filter(|host| host.origin == PickerHostOrigin::Effective)
                 .map(|host| StatusHost {
                     name: host.name.clone(),
                     target: host.target.clone(),
-                    workloads: host.workloads.iter().map(|workload| workload.id).collect(),
+                    workloads: host
+                        .workloads
+                        .iter()
+                        .filter(|workload| workload.status == SessionStatus::Active)
+                        .map(|workload| workload.id)
+                        .collect(),
                 })
                 .collect(),
         }
@@ -1074,17 +1295,23 @@ impl PickerState {
 
     fn rebuild_status_labels(&mut self) {
         for host in &mut self.options.hosts {
-            host.label = format_status_label(
-                &host.name,
-                self.host_status.get(&host.name),
-                host_status_text,
-            );
-            for workload in &mut host.workloads {
-                workload.label = format_status_label(
-                    &workload.base_label,
-                    self.workload_status.get(&workload.id),
-                    workload_status_text,
+            if host.origin == PickerHostOrigin::Effective {
+                host.label = format_status_label(
+                    &host.name,
+                    self.host_status.get(&host.name),
+                    host_status_text,
                 );
+            }
+            for workload in &mut host.workloads {
+                workload.label = if workload.status == SessionStatus::Active {
+                    format_status_label(
+                        &workload.base_label,
+                        self.workload_status.get(&workload.id),
+                        workload_status_text,
+                    )
+                } else {
+                    workload.base_label.clone()
+                };
                 if self
                     .pending_close
                     .as_ref()
@@ -1233,6 +1460,18 @@ impl PickerState {
         let Some(ResourceIdentity::Owned(id)) = self.current_resource_identity() else {
             return PickerOutcome::Continue;
         };
+        let Some(workload) = self
+            .options
+            .hosts
+            .iter()
+            .flat_map(|host| &host.workloads)
+            .find(|workload| workload.id == id)
+        else {
+            return PickerOutcome::Continue;
+        };
+        if workload.status == SessionStatus::Closed {
+            return PickerOutcome::Continue;
+        }
         self.close_modal = Some(PickerCloseModal::Confirm { id });
         PickerOutcome::Continue
     }
@@ -1246,12 +1485,11 @@ impl PickerState {
         }) else {
             return PickerOutcome::Continue;
         };
-        if !self
-            .options
-            .hosts
-            .iter()
-            .any(|host| host.workloads.iter().any(|workload| workload.id == id))
-        {
+        if !self.options.hosts.iter().any(|host| {
+            host.workloads
+                .iter()
+                .any(|workload| workload.id == id && workload.status != SessionStatus::Closed)
+        }) {
             self.close_modal = None;
             return PickerOutcome::Continue;
         }
@@ -1335,6 +1573,9 @@ impl PickerState {
     fn confirm(&mut self) -> PickerOutcome {
         match self.stage {
             PickerStage::Host => {
+                if self.options.hosts.is_empty() {
+                    return PickerOutcome::Continue;
+                }
                 self.resource_index = 0;
                 self.directory_index = 0;
                 self.command_index = 0;
@@ -1348,11 +1589,12 @@ impl PickerState {
             PickerStage::Resource => {
                 let host = &self.options.hosts[self.host_index];
                 if let Some(workload) = host.workloads.get(self.resource_index) {
-                    if self
-                        .pending_close
-                        .as_ref()
-                        .is_some_and(|(id, _)| *id == workload.id)
+                    if workload.status != SessionStatus::Active
                         || self.close_failed.contains_key(&workload.id)
+                        || self
+                            .pending_close
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == workload.id)
                     {
                         return PickerOutcome::Continue;
                     }
@@ -1368,15 +1610,18 @@ impl PickerState {
                     return PickerOutcome::Continue;
                 }
                 let external_index = self.resource_index.saturating_sub(host.workloads.len());
-                if let Some(session) = self
-                    .catalogs
-                    .get(&host.name)
-                    .and_then(|catalog| catalog.sessions.get(external_index))
+                if host.allow_existing
+                    && let Some(session) = self
+                        .catalogs
+                        .get(&host.name)
+                        .and_then(|catalog| catalog.sessions.get(external_index))
                 {
                     self.resume_id = None;
                     self.external_name = Some(session.name.clone());
                     self.stage = PickerStage::Placement;
-                } else {
+                    return PickerOutcome::Continue;
+                }
+                if host.allow_create {
                     self.resume_id = None;
                     self.external_name = None;
                     self.selected_directory = None;
@@ -1482,18 +1727,25 @@ impl PickerState {
                 .collect(),
             PickerStage::Resource => {
                 let host = &self.options.hosts[self.host_index];
-                host.workloads
+                let mut labels = host
+                    .workloads
                     .iter()
                     .map(|workload| workload.label.as_str())
-                    .chain(
-                        self.catalogs
-                            .get(&host.name)
-                            .into_iter()
-                            .flat_map(|catalog| &catalog.sessions)
+                    .collect::<Vec<_>>();
+                if host.allow_existing
+                    && let Some(catalog) = self.catalogs.get(&host.name)
+                {
+                    labels.extend(
+                        catalog
+                            .sessions
+                            .iter()
                             .map(|session| session.label.as_str()),
-                    )
-                    .chain(std::iter::once("Create new Tether workload"))
-                    .collect()
+                    );
+                }
+                if host.allow_create {
+                    labels.push("Create new Tether workload");
+                }
+                labels
             }
             PickerStage::Directory => {
                 let host = &self.options.hosts[self.host_index];
@@ -1669,16 +1921,23 @@ impl PickerState {
                     parts.push(label.to_owned());
                 }
                 if self.stage == PickerStage::Resource
+                    && self.options.hosts[self.host_index].allow_existing
                     && let Some(label) =
                         self.catalog_label(&self.options.hosts[self.host_index].name)
                 {
                     parts.push(label);
                 }
                 let close_hint = if self.stage == PickerStage::Resource
-                    && matches!(
-                        self.current_resource_identity(),
-                        Some(ResourceIdentity::Owned(_))
-                    ) {
+                    && self
+                        .current_resource_identity()
+                        .is_some_and(|identity| match identity {
+                            ResourceIdentity::Owned(id) => self.options.hosts[self.host_index]
+                                .workloads
+                                .iter()
+                                .find(|workload| workload.id == id)
+                                .is_some_and(|workload| workload.status != SessionStatus::Closed),
+                            _ => false,
+                        }) {
                     " · c close"
                 } else {
                     ""
@@ -1688,8 +1947,27 @@ impl PickerState {
                 } else {
                     ""
                 };
+                let select_hint = if self.stage == PickerStage::Resource
+                    && self
+                        .current_resource_identity()
+                        .is_some_and(|identity| match identity {
+                            ResourceIdentity::Owned(id) => self.options.hosts[self.host_index]
+                                .workloads
+                                .iter()
+                                .find(|workload| workload.id == id)
+                                .is_some_and(|workload| workload.status == SessionStatus::Active),
+                            ResourceIdentity::External(_) | ResourceIdentity::Create => true,
+                        }) {
+                    " · Enter select"
+                } else if self.stage == PickerStage::Resource
+                    || (self.stage == PickerStage::Host && self.options.hosts.is_empty())
+                {
+                    ""
+                } else {
+                    " · Enter select"
+                };
                 parts.push(format!(
-                    "↑/↓ navigate · Enter select{close_hint}{path_hint} · P prune closed · r refresh · ← back · Esc cancel"
+                    "↑/↓ navigate{select_hint}{close_hint}{path_hint} · P prune closed metadata · r refresh · ← back · Esc cancel"
                 ));
                 parts.join(" · ")
             }
@@ -1908,11 +2186,27 @@ fn run_terminal_picker(
                 let service = lifecycle_service.clone();
                 let sender = close_sender.clone();
                 thread::spawn(move || {
-                    let error = service.close_owned(id).err().map(format_close_error);
+                    let mut error = service.close_owned(id).err().map(format_close_error);
+                    let record = match service.owned_record(id) {
+                        Ok(record) => record,
+                        Err(read_error) => {
+                            let read_error = format_close_error(read_error);
+                            error = Some(match error {
+                                Some(close_error) => {
+                                    format!(
+                                        "{close_error}; authoritative state reread failed: {read_error}"
+                                    )
+                                }
+                                None => format!("authoritative state reread failed: {read_error}"),
+                            });
+                            None
+                        }
+                    };
                     let _ = sender.send(PickerCloseResult {
                         id,
                         generation,
                         error,
+                        record,
                     });
                 });
             }
@@ -2375,6 +2669,7 @@ mod close_render_tests {
             hosts: vec![PickerHost {
                 name: "build-box".to_owned(),
                 label: "build-box".to_owned(),
+                origin: PickerHostOrigin::Effective,
                 target: None,
                 directories: vec!["/srv/app".to_owned()],
                 scan_roots: Vec::new(),
@@ -2382,9 +2677,12 @@ mod close_render_tests {
                 workloads: vec![PickerWorkload {
                     id,
                     base_label: label.clone(),
+                    status: SessionStatus::Active,
+                    last_used_at: chrono::Utc::now(),
                     label,
                 }],
                 allow_existing: true,
+                allow_create: true,
             }],
             default_placement: Placement::SplitRight,
         };
@@ -2449,6 +2747,7 @@ mod close_render_tests {
             id,
             generation: 9,
             error: Some(format!("backend source {}", "x".repeat(500))),
+            record: None,
         }));
         let Some(PickerCloseModal::Failed { error, .. }) = picker.close_modal() else {
             panic!("failed close modal missing");

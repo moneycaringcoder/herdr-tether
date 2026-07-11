@@ -85,6 +85,13 @@ impl LifecycleService {
         Self { store, binaries }
     }
 
+    /// Reads the exact persisted record without configuring or invoking transport.
+    pub fn owned_record(&self, id: SessionId) -> Result<Option<SessionRecord>, CloseOwnedError> {
+        self.store
+            .load()
+            .map(|state| state.sessions.into_iter().find(|record| record.id == id))
+            .map_err(CloseOwnedError::State)
+    }
     pub fn close_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
         let (target, initial_status) = self.lookup_owned(&id)?;
         let backend = self.backend_for(&id, &target)?;
