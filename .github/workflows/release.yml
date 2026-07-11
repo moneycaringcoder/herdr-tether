@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Verify tag and public version surfaces
-        run: python3 tools/check_release.py --tag "${GITHUB_REF_NAME}"
+        run: python3 tools/check_release.py --release --tag "${GITHUB_REF_NAME}"
 
   gates:
     name: ${{ matrix.os }} release

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tomllib
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ REQUIRED_FILES = {
 }
 REQUIRED_PREFIXES = ("docs/", "src/")
 FORBIDDEN_PREFIXES = (".git", ".github/", ".omp/", "tools/")
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PackageError(RuntimeError):
@@ -42,6 +46,23 @@ def validate_entries(entries: set[str], required_assets: set[str]) -> None:
     )
     if forbidden:
         raise PackageError(f"package exposes non-product files: {', '.join(forbidden)}")
+
+
+def validate_lock_packages(packages: list[dict[str, object]]) -> None:
+    local = [package for package in packages if "source" not in package]
+    if len(local) != 1 or local[0].get("name") != "herdr-tether":
+        names = ", ".join(str(package.get("name", "<unnamed>")) for package in local)
+        raise PackageError(f"unexpected local/path packages in Cargo.lock: {names}")
+    for package in packages:
+        source = package.get("source")
+        if source is None:
+            continue
+        name = str(package.get("name", "<unnamed>"))
+        if source != CRATES_IO_SOURCE:
+            raise PackageError(f"locked dependency {name} uses unapproved source {source!r}")
+        checksum = package.get("checksum")
+        if not isinstance(checksum, str) or not CHECKSUM_RE.fullmatch(checksum):
+            raise PackageError(f"locked registry dependency {name} has no SHA-256 checksum")
 
 
 def public_assets(root: Path) -> set[str]:
@@ -90,6 +111,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         entries = package_entries(args.cargo, args.allow_dirty)
         validate_entries(entries, public_assets(ROOT))
+        with (ROOT / "Cargo.lock").open("rb") as lock_file:
+            lock_data = tomllib.load(lock_file)
+        validate_lock_packages(lock_data.get("package", []))
     except PackageError as error:
         print(f"package contents error: {error}", file=sys.stderr)
         return 1

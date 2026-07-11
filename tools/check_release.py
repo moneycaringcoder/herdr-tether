@@ -46,6 +46,32 @@ def load_toml(path: Path) -> dict:
         return tomllib.load(handle)
 
 
+class ReleaseIdentityError(ValueError):
+    pass
+
+
+def validate_readme_install(readme: str, tag: str, release: bool) -> None:
+    herdr_tag = f"--ref {tag}"
+    cargo_tag = re.search(
+        rf"cargo install[\s\S]{{0,200}}?--tag {re.escape(tag)}(?:\s|$)",
+        readme,
+    )
+    if release:
+        if herdr_tag not in readme:
+            raise ReleaseIdentityError(
+                f"README.md does not pin the primary install to {herdr_tag}"
+            )
+        if not cargo_tag:
+            raise ReleaseIdentityError(
+                f"README.md does not pin the primary Cargo install to --tag {tag}"
+            )
+    elif herdr_tag in readme or cargo_tag:
+        raise ReleaseIdentityError(
+            f"README.md advertises nonexistent candidate tag {tag}; "
+            "use main or full-commit-SHA candidate guidance"
+        )
+
+
 def fail(message: str) -> None:
     print(f"release identity error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -58,12 +84,23 @@ def main() -> None:
         default=os.environ.get("GITHUB_REF_NAME"),
         help="release tag to verify (defaults to GITHUB_REF_NAME)",
     )
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help="enforce tagged release install instructions (candidate mode is the default)",
+    )
     args = parser.parse_args()
     if not args.tag:
         fail("provide --tag v<version> or set GITHUB_REF_NAME")
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", args.tag):
         fail(f"tag {args.tag!r} is not v<major>.<minor>.<patch>")
     version = args.tag[1:]
+    if args.release and os.environ.get("GITHUB_ACTIONS") == "true":
+        if (
+            os.environ.get("GITHUB_REF_TYPE") != "tag"
+            or os.environ.get("GITHUB_REF_NAME") != args.tag
+        ):
+            fail("--release must run from the exact GitHub tag being validated")
 
     cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
     cargo_version = cargo_package["version"]
@@ -83,22 +120,21 @@ def main() -> None:
         if actual != version:
             fail(f"{surface} version {actual!r} != {version!r}")
     documentation = cargo_package.get("documentation", "")
-    if f"/blob/{args.tag}/" not in documentation:
-        fail(f"Cargo.toml documentation URL {documentation!r} is not pinned to {args.tag}")
+    expected_documentation_ref = args.tag if args.release else "main"
+    if f"/blob/{expected_documentation_ref}/" not in documentation:
+        fail(
+            f"Cargo.toml documentation URL {documentation!r} is not pinned to "
+            f"{expected_documentation_ref}"
+        )
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     if not re.search(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", changelog, re.MULTILINE):
         fail(f"CHANGELOG.md has no dated [{version}] release heading")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    if f"--ref {args.tag}" not in readme:
-        fail(f"README.md does not pin the primary install to --ref {args.tag}")
-    cargo_install = re.search(
-        r"cargo install[\s\S]{0,200}?--tag (v[0-9]+\.[0-9]+\.[0-9]+)",
-        readme,
-    )
-    if not cargo_install or cargo_install.group(1) != args.tag:
-        found = cargo_install.group(1) if cargo_install else None
-        fail(f"README.md primary Cargo install tag {found!r} != {args.tag!r}")
+    try:
+        validate_readme_install(readme, args.tag, args.release)
+    except ReleaseIdentityError as error:
+        fail(str(error))
 
     for relative_path in PUBLIC_RELEASE_FILES:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
@@ -107,7 +143,8 @@ def main() -> None:
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative_path}:{line} contains {label}")
 
-    print(f"release identity verified: {args.tag}")
+    identity = "release" if args.release else "candidate"
+    print(f"{identity} identity verified: {args.tag}")
 
 
 if __name__ == "__main__":

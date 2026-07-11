@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import unittest
 
-from check_package import PackageError, validate_entries
+from check_package import PackageError, validate_entries, validate_lock_packages
 
 
 class PackageContentsTests(unittest.TestCase):
@@ -62,6 +62,39 @@ class PackageContentsTests(unittest.TestCase):
         with self.assertRaises(PackageError):
             validate_entries(baseline, {"assets/tether-mark.svg"})
 
+
+    def test_locked_registry_dependencies_require_checksums(self) -> None:
+        packages = [
+            {"name": "herdr-tether", "version": "0.3.0"},
+            {
+                "name": "serde",
+                "version": "1.0.228",
+                "source": "registry+https://github.com/rust-lang/crates.io-index",
+                "checksum": "a" * 64,
+            },
+        ]
+        validate_lock_packages(packages)
+        for mutation in (
+            {"source": "git+https://example.invalid/repository", "checksum": "a" * 64},
+            {
+                "source": "registry+https://github.com/rust-lang/crates.io-index",
+                "checksum": None,
+            },
+        ):
+            changed = [dict(package) for package in packages]
+            changed[1].update(mutation)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(PackageError):
+                    validate_lock_packages(changed)
+
+    def test_only_the_root_package_may_have_no_source(self) -> None:
+        with self.assertRaises(PackageError):
+            validate_lock_packages(
+                [
+                    {"name": "herdr-tether", "version": "0.3.0"},
+                    {"name": "local-dependency", "version": "1.0.0"},
+                ]
+            )
 
 if __name__ == "__main__":
     unittest.main()
