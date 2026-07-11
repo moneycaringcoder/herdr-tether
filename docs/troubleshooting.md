@@ -25,7 +25,7 @@ Errors in the Tether picker stay visible until `Enter` retries the same operatio
 3. If setup reports a conflict, inspect your Herdr configuration and choose which `prefix+t` binding should own the key. Tether refuses to overwrite another action.
 4. Restart or reload Herdr if its configuration reload was interrupted.
 
-Setup keeps an exact sibling backup before changing the Herdr configuration. `herdr-tether setup keybinding --rollback` restores and consumes that backup only when the current config still matches Tether's installed version; it refuses to overwrite later edits.
+Setup keeps an exact sibling backup before changing the Herdr configuration. While the plugin is installed, `herdr plugin action invoke moneycaringcoder.tether.rollback` restores and consumes that backup only when the current configuration still matches Tether's installed version; check the reported action log for success. The synchronous standalone equivalent is `herdr-tether setup keybinding --rollback`. Both refuse to overwrite later edits.
 
 ## A remote host is unreachable
 

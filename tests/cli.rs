@@ -132,6 +132,37 @@ fn every_scriptable_surface_has_help() {
 }
 
 #[test]
+fn help_uses_the_same_lifecycle_vocabulary_as_the_picker() {
+    let sandbox = Sandbox::new();
+
+    sandbox
+        .command()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Open the Tether picker, or create and open a workload with options",
+        ))
+        .stdout(predicate::str::contains(
+            "Inspect and manage Tether-owned workloads",
+        ));
+
+    sandbox
+        .command()
+        .args(["session", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Open an existing running workload",
+        ))
+        .stdout(predicate::str::contains("Restart an ended workload"))
+        .stdout(predicate::str::contains(
+            "Stop the exact Tether-owned workload",
+        ))
+        .stdout(predicate::str::contains("Remove an ended workload"));
+}
+
+#[test]
 fn host_commands_persist_explicit_hosts_and_surface_ssh_aliases() {
     let sandbox = Sandbox::new();
     let ssh_dir = sandbox.path("home/.ssh");

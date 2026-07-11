@@ -37,12 +37,13 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 - Git and Rust 1.88 or newer
 - OpenSSH with non-interactive access already configured for remote hosts
 
-Install the plugin from a reviewed revision, then run the setup action once. Until
-`v0.3.0` is tagged, `main` is the public development line; replace `main` with a
-full commit SHA when you need a reproducible install.
+Install from a revision you have reviewed, then run the setup action once. Until
+`v0.3.0` is tagged, `main` is the public development line—not a release. Replace
+`main` with a full commit SHA for a reproducible install. Herdr shows the source
+and build commands for review before you confirm:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref main
 herdr plugin action invoke moneycaringcoder.tether.setup
 ```
 

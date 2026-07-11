@@ -17,12 +17,13 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 ## 2. Install the plugin
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref main
 herdr plugin action list --plugin moneycaringcoder.tether
 ```
 
-Until `v0.3.0` is tagged, `main` is the public development line. Replace `main`
-with a full reviewed commit SHA for a reproducible install.
+Until `v0.3.0` is tagged, `main` is the public development line, not a release.
+Herdr previews the source and build commands before confirmation. Review them;
+replace `main` with a full reviewed commit SHA for a reproducible install.
 
 Herdr keeps the plugin binary in its managed checkout; it does not add `herdr-tether` to your shell's `PATH`.
 
@@ -41,11 +42,17 @@ The action initializes Tether's private configuration and state, adds `prefix+t`
 - refuses invalid or unmergeable configuration; and
 - saves the exact prior configuration to a sibling backup before changing it.
 
-The backup is consumed when rollback succeeds. Rollback also refuses to overwrite configuration that changed after setup:
+The backup is consumed when rollback succeeds. Rollback also refuses to
+overwrite configuration changed after setup. While the plugin is still
+installed, invoke its rollback action and check the reported action log for
+success:
 
 ```sh
-herdr-tether setup keybinding --rollback
+herdr plugin action invoke moneycaringcoder.tether.rollback
 ```
+
+If the standalone CLI is installed, the equivalent synchronous command is
+`herdr-tether setup keybinding --rollback`.
 
 Herdr 0.7.3 does not expose a generic plugin-action menu, so this explicit one-time setup action is required. Normal plugin install and open actions do not silently change the keybinding.
 
@@ -93,23 +100,29 @@ Tether also discovers literal aliases in the primary `~/.ssh/config`. It does no
 
 ## Update or remove Tether
 
-Reinstall the desired revision to update both managed checkout and build:
+Reinstall the desired reviewed revision to update both managed checkout and
+build. Herdr previews it again before confirmation:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref main
 ```
 
 Before installing an older version, back up Tether's configuration and state. A newer schema may not be understood by older code.
 
-Uninstall the plugin with:
+Stop any workloads you do not want to keep. Then remove the launcher while its
+rollback action is still installed, check the reported action log for success,
+and uninstall:
 
 ```sh
+herdr plugin action invoke moneycaringcoder.tether.rollback
 herdr plugin uninstall moneycaringcoder.tether
 ```
 
 If installed, remove the standalone binary with `cargo uninstall herdr-tether`.
 
-Uninstalling does not intentionally stop workloads and does not remove configuration or state. Stop workloads you no longer need first, then remove retained data separately if desired.
+Uninstalling does not intentionally stop workloads and does not remove
+configuration or state. Running workloads continue under `tmux`; retained data
+must be removed separately if desired.
 
 ## Next steps
 

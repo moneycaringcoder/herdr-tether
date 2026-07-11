@@ -59,9 +59,9 @@ enum TopLevel {
     /// the command exits successfully. Fatal local load/serialization errors
     /// retain the normal nonzero command error.
     Snapshot(SnapshotArgs),
-    /// Create a durable terminal session.
+    /// Open the Tether picker, or create and open a workload with options.
     Open(OpenArgs),
-    /// Inspect and manage durable sessions.
+    /// Inspect and manage Tether-owned workloads.
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -191,11 +191,11 @@ fn placement_name(placement: Placement) -> &'static str {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// List persisted session metadata.
+    /// List persisted workload metadata.
     List(OutputArgs),
-    /// Open an existing running session without creating it.
+    /// Open an existing running workload without creating it.
     Open { id: SessionId },
-    /// Restart an ended session and open it.
+    /// Restart an ended workload and open it.
     Restart {
         id: SessionId,
         /// Placement used when invoked from a Herdr plugin pane.

@@ -11,7 +11,7 @@ artifacts = ["target/release/herdr-tether"]
 [[actions]]
 id = "open"
 title = "Tether: Open workloads"
-description = "Open or resume local and remote workloads. Run Tether: Set up first."
+description = "Create, open, or restart local and remote workloads. Run Tether: Set up first."
 command = ["target/release/herdr-tether", "plugin", "open"]
 
 [[actions]]
@@ -19,6 +19,12 @@ id = "setup"
 title = "Tether: Set up (start here)"
 description = "Create Tether's private files and safely add the prefix+t shortcut."
 command = ["target/release/herdr-tether", "plugin", "setup"]
+
+[[actions]]
+id = "rollback"
+title = "Tether: Remove prefix+t shortcut"
+description = "Restore the exact Herdr configuration saved by Tether setup."
+command = ["target/release/herdr-tether", "setup", "keybinding", "--rollback"]
 
 [[panes]]
 id = "picker"

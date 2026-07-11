@@ -29,12 +29,12 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     );
 
     let actions = value["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 2);
+    assert_eq!(actions.len(), 3);
     assert_eq!(actions[0]["id"].as_str(), Some("open"));
     assert_eq!(actions[0]["title"].as_str(), Some("Tether: Open workloads"));
     assert_eq!(
         actions[0]["description"].as_str(),
-        Some("Open or resume local and remote workloads. Run Tether: Set up first.")
+        Some("Create, open, or restart local and remote workloads. Run Tether: Set up first.")
     );
     assert_eq!(
         actions[0]["command"].as_array().unwrap(),
@@ -49,6 +49,24 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     assert_eq!(
         actions[1]["description"].as_str(),
         Some("Create Tether's private files and safely add the prefix+t shortcut.")
+    );
+    assert_eq!(actions[2]["id"].as_str(), Some("rollback"));
+    assert_eq!(
+        actions[2]["title"].as_str(),
+        Some("Tether: Remove prefix+t shortcut")
+    );
+    assert_eq!(
+        actions[2]["description"].as_str(),
+        Some("Restore the exact Herdr configuration saved by Tether setup.")
+    );
+    assert_eq!(
+        actions[2]["command"].as_array().unwrap(),
+        &[
+            toml::Value::String("target/release/herdr-tether".into()),
+            toml::Value::String("setup".into()),
+            toml::Value::String("keybinding".into()),
+            toml::Value::String("--rollback".into()),
+        ]
     );
 
     let panes = value["panes"].as_array().unwrap();
