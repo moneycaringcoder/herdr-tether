@@ -6,9 +6,10 @@ use std::{
 
 use herdr_tether::{
     backend::ProcessBinaries,
-    model::SessionId,
+    model::{ExternalSessionName, SessionId},
     status::{
-        HostReachability, StatusHost, StatusMessage, StatusRequest, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
+        StatusRequest, StatusService, WorkloadStatus,
     },
 };
 use tempfile::tempdir;
@@ -106,6 +107,162 @@ fn fast_host_publishes_before_slow_host_times_out() {
 
     assert!(fast < slow, "fast host must publish before slow timeout");
     assert!(started.elapsed() < Duration::from_millis(1500));
+}
+
+#[test]
+fn catalog_publishes_only_safe_non_tether_sessions() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let owned = id("tether-0197f198000070008000000000000001");
+    let collision = id("tether-0197f198000070008000000000000002");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\t0\\n%s\\t2\\n%s\\t0\\ntether-malformed\\t0\\n' 'work box' '{owned}' '{collision}'\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(1),
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 8,
+        hosts: vec![StatusHost {
+            name: "dev".into(),
+            target: Some("dev".into()),
+            workloads: vec![owned],
+        }],
+    });
+    let mut messages = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { generation: 8 });
+        messages.push(message);
+        if finished {
+            break;
+        }
+    }
+
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Catalog {
+            host,
+            status: ExternalCatalogStatus::Available,
+            sessions,
+            hidden_reserved: 2,
+            ..
+        } if host == "dev"
+            && sessions == &[ExternalSession {
+                name: "work box".parse::<ExternalSessionName>().unwrap(),
+                attached: 0,
+            }]
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Workload {
+            id,
+            status: WorkloadStatus::Running { attached: 2 },
+            ..
+        } if *id == owned
+    )));
+}
+
+#[test]
+fn catalog_fails_closed_on_duplicates_and_skips_unsafe_names() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    fs::write(
+        &ssh,
+        r#"#!/bin/sh
+target=
+for argument do
+  case "$argument" in duplicate|unsafe) target=$argument ;; esac
+done
+case "$target" in
+  duplicate) printf 'work\t0\nwork\t1\n' ;;
+  unsafe) printf 'good\t0\nbad:name\t0\n' ;;
+  *) exit 99 ;;
+esac
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let duplicate_id = id("tether-0197f198000070008000000000000001");
+    let unsafe_id = id("tether-0197f198000070008000000000000002");
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(1),
+        2,
+    );
+    let run = service.start(StatusRequest {
+        generation: 10,
+        hosts: vec![
+            StatusHost {
+                name: "duplicate".into(),
+                target: Some("duplicate".into()),
+                workloads: vec![duplicate_id],
+            },
+            StatusHost {
+                name: "unsafe".into(),
+                target: Some("unsafe".into()),
+                workloads: vec![unsafe_id],
+            },
+        ],
+    });
+    let mut messages = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { generation: 10 });
+        messages.push(message);
+        if finished {
+            break;
+        }
+    }
+
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Catalog {
+            host,
+            status: ExternalCatalogStatus::Error,
+            sessions,
+            ..
+        } if host == "duplicate" && sessions.is_empty()
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Workload {
+            id,
+            status: WorkloadStatus::Unknown,
+            ..
+        } if *id == duplicate_id
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Catalog {
+            host,
+            status: ExternalCatalogStatus::Available,
+            sessions,
+            hidden_unsafe: 1,
+            ..
+        } if host == "unsafe"
+            && sessions == &[ExternalSession {
+                name: "good".parse().unwrap(),
+                attached: 0,
+            }]
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Workload {
+            id,
+            status: WorkloadStatus::Missing,
+            ..
+        } if *id == unsafe_id
+    )));
 }
 
 #[test]
@@ -234,8 +391,17 @@ esac
         message,
         StatusMessage::Workload {
             id,
-            status: WorkloadStatus::Unknown,
+            status: WorkloadStatus::Missing,
             ..
         } if *id == malformed_id
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        StatusMessage::Catalog {
+            host,
+            status: ExternalCatalogStatus::Available,
+            hidden_reserved: 1,
+            ..
+        } if host == "malformed"
     )));
 }

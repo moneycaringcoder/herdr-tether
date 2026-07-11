@@ -6,9 +6,11 @@ use herdr_tether::{
     config::{CommandPreset, Config, HostConfig, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext},
-    model::{Placement, SessionId},
+    model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
-    status::{HostReachability, StatusMessage, WorkloadStatus},
+    status::{
+        ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
+    },
     tui::{
         PickerEvent, PickerInput, PickerOptions, PickerOutcome, PickerSelection, PickerStage,
         PickerState,
@@ -226,7 +228,7 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
     assert!(
         build_box.workloads[0]
             .label
-            .starts_with("Resume …00000002 · Shell · ")
+            .starts_with("Tether · Resume …00000002 · Shell · ")
     );
     assert!(
         build_box
@@ -258,7 +260,7 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
 }
 
 #[test]
-fn explorer_skips_empty_workload_stage_for_create() {
+fn explorer_uses_resource_stage_for_empty_catalog_create() {
     let (config, state) = picker_fixture();
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let mut explorer = PickerState::new(options).unwrap();
@@ -267,9 +269,177 @@ fn explorer_skips_empty_workload_stage_for_create() {
         explorer.handle(PickerEvent::Confirm),
         PickerOutcome::Continue
     );
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+    assert_eq!(
+        explorer.resource_labels("local").unwrap(),
+        ["Create new Tether workload"]
+    );
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
     assert_eq!(explorer.stage(), PickerStage::Directory);
     assert_eq!(explorer.handle(PickerEvent::Back), PickerOutcome::Continue);
+    assert_eq!(explorer.stage(), PickerStage::Resource);
+    assert_eq!(explorer.handle(PickerEvent::Back), PickerOutcome::Continue);
     assert_eq!(explorer.stage(), PickerStage::Host);
+}
+
+#[test]
+fn explorer_orders_owned_external_create_and_returns_exact_external_intent() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.begin_refresh(1);
+    assert!(explorer.apply_status(StatusMessage::Catalog {
+        generation: 1,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: vec![
+            ExternalSession {
+                name: "alpha".parse().unwrap(),
+                attached: 0,
+            },
+            ExternalSession {
+                name: "work box".parse().unwrap(),
+                attached: 2,
+            },
+        ],
+        hidden_reserved: 1,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+
+    let labels = explorer.resource_labels("build-box").unwrap();
+    assert!(labels[0].contains("Resume …00000002"));
+    assert!(labels[1].contains("Resume …00000001"));
+    assert_eq!(labels[2], "[external · running] alpha");
+    assert_eq!(labels[3], "[external · running · 2 attached] work box");
+    assert_eq!(labels[4], "Create new Tether workload");
+
+    explorer.handle(PickerEvent::Confirm);
+    explorer.handle(PickerEvent::Next);
+    explorer.handle(PickerEvent::Next);
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Placement);
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::AttachExternal {
+            host: "build-box".into(),
+            target: Some("builder@example.test".into()),
+            name: "alpha".parse::<ExternalSessionName>().unwrap(),
+            placement: Placement::SplitRight,
+        })
+    );
+}
+
+#[test]
+fn external_selection_survives_rebuild_and_failed_refresh_stays_stale() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut explorer = PickerState::new(options).unwrap();
+    explorer.begin_refresh(1);
+    assert!(explorer.apply_status(StatusMessage::Catalog {
+        generation: 1,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: vec![ExternalSession {
+            name: "zeta".parse().unwrap(),
+            attached: 0,
+        }],
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    explorer.handle(PickerEvent::Confirm);
+    explorer.handle(PickerEvent::Next);
+    explorer.handle(PickerEvent::Next);
+
+    assert!(explorer.apply_status(StatusMessage::Catalog {
+        generation: 1,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: vec![
+            ExternalSession {
+                name: "alpha".parse().unwrap(),
+                attached: 0,
+            },
+            ExternalSession {
+                name: "zeta".parse().unwrap(),
+                attached: 0,
+            },
+        ],
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(explorer.stage(), PickerStage::Placement);
+    explorer.begin_refresh(2);
+    assert!(explorer.apply_status(StatusMessage::Catalog {
+        generation: 2,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: vec![
+            ExternalSession {
+                name: "aardvark".parse().unwrap(),
+                attached: 0,
+            },
+            ExternalSession {
+                name: "alpha".parse().unwrap(),
+                attached: 0,
+            },
+            ExternalSession {
+                name: "zeta".parse().unwrap(),
+                attached: 0,
+            },
+        ],
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    explorer.handle(PickerEvent::Back);
+
+    explorer.begin_refresh(3);
+    assert!(explorer.resource_labels("build-box").unwrap()[4].starts_with("[stale] [external"));
+    assert!(!explorer.apply_status(StatusMessage::Catalog {
+        generation: 2,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: Vec::new(),
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(explorer.apply_status(StatusMessage::Catalog {
+        generation: 3,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::TimedOut,
+        sessions: Vec::new(),
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(explorer.resource_labels("build-box").unwrap()[4].starts_with("[stale] [external"));
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(
+        explorer.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::AttachExternal {
+            host: "build-box".into(),
+            target: Some("builder@example.test".into()),
+            name: "zeta".parse().unwrap(),
+            placement: Placement::SplitRight,
+        })
+    );
 }
 
 #[test]
@@ -313,7 +483,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         explorer
             .workload_label(workload_id)
             .unwrap()
-            .starts_with("[running · 2 attached] Resume …00000002")
+            .starts_with("[running · 2 attached] Tether · Resume …00000002")
     );
 
     explorer.begin_refresh(2);
@@ -371,6 +541,7 @@ fn refresh_event_requests_work_without_resetting_navigation() {
     let (config, state) = picker_fixture();
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let mut explorer = PickerState::new(options).unwrap();
+    explorer.handle(PickerEvent::Confirm);
     explorer.handle(PickerEvent::Confirm);
     assert_eq!(explorer.stage(), PickerStage::Directory);
 

@@ -77,6 +77,47 @@ impl FromStr for SessionId {
     }
 }
 
+/// A validated, non-Tether tmux session name that may only be attached.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExternalSessionName(String);
+
+impl ExternalSessionName {
+    pub const MAX_BYTES: usize = 256;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExternalSessionName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("unsafe external tmux session name")]
+pub struct ExternalSessionNameError;
+
+impl FromStr for ExternalSessionName {
+    type Err = ExternalSessionNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > Self::MAX_BYTES
+            || value.starts_with("tether-")
+            || value.starts_with('$')
+            || !value
+                .bytes()
+                .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+            || value.bytes().any(|byte| matches!(byte, b':' | b'.'))
+        {
+            return Err(ExternalSessionNameError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
 impl Serialize for SessionId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

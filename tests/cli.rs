@@ -510,6 +510,38 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
 }
 
 #[test]
+fn external_attach_is_exact_and_does_not_mutate_state() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
+    let before = fs::read(sandbox.state_file()).unwrap();
+    let log = sandbox.path("tmux.log");
+    let body = format!("printf '%s\\n' \"$*\" >> '{}'\nexit 0", log.display());
+    let (path, _) = install_tmux_script(&sandbox, &body);
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args([
+            "session",
+            "attach-external",
+            "--target",
+            "local",
+            "--",
+            "work box",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(sandbox.state_file()).unwrap(), before);
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("attach-session -t =work box"));
+    assert!(!transcript.contains("new-session"));
+    assert!(!transcript.contains("kill-session"));
+    assert!(!transcript.contains("list-sessions"));
+}
+
+#[test]
 fn open_rejects_whitespace_directory_and_command_before_backend_create() {
     for arguments in [
         [

@@ -12,7 +12,8 @@ The implementation preserves these invariants:
 4. only explicit close may invoke `kill-session`; before killing a running workload it persists a recoverable `closing` marker, then finalizes metadata only after the workload is proven missing or exact-session kill succeeds;
 5. config and state mutations hold per-file advisory locks across load, mutation, and atomic save;
 6. pruning removes only old closed metadata and never kills or probes workloads;
-7. every `tmux` operation uses an exact session target derived from a generated Tether ID.
+7. every attachment uses an exact tmux target derived from either an owned `SessionId` or a validated non-Tether external name;
+8. external sessions are cataloged and attached only; their type has no create, persist, rename, close, kill, or prune operation.
 
 Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is not native remote Herdr federation.
 
@@ -20,7 +21,7 @@ Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is
 
 ```mermaid
 flowchart LR
-    CLI[CLI / explorer] --> Intent{create or resume?}
+    CLI[CLI / explorer] --> Intent{create, owned resume, or external attach?}
     CLI --> Status[StatusService]
     CLI --> Discovery[DiscoveryService]
     Discovery --> Roots[bounded local / SSH root scans]
@@ -32,6 +33,7 @@ flowchart LR
     Tmux -->|BatchMode SSH + quoted remote argv| Remote[remote tmux]
     Select --> Store[ConfigStore / StateStore]
     Intent -->|resume exact ID| Context
+    Intent -->|attach exact external name| Context
     Select --> Context{Herdr context?}
     Context -->|no| Attach[run attach command in current terminal]
     Context -->|yes| Herdr[HerdrClient]
@@ -40,7 +42,7 @@ flowchart LR
     Resume --> Durable
 ```
 
-For `open`, the CLI resolves a host before creating or loading state when an explicit host was supplied. A fully specified create request bypasses the explorer. Otherwise, the explorer returns a typed intent: create obtains directory, command, and placement before creating and atomically recording a new workload; resume carries an existing active record's exact ID directly to attachment. In Herdr context, both paths place this executable's `session resume <ID>` command in the exact returned pane. Outside Herdr, attachment runs in the current terminal.
+For `open`, the CLI resolves hosts before creating or loading state when an explicit host was supplied. A fully specified create request bypasses the explorer. Otherwise, the explorer returns one of three typed intents: create obtains directory, command, and placement before creating and atomically recording a workload; owned resume carries an active record's exact `SessionId`; external attach carries the current host target and a validated non-Tether name. In Herdr context, create/owned paths place `session resume <ID>` while external paths place the hidden, attach-only `session attach-external --target … -- <name>` command. Outside Herdr, attachment runs in the current terminal.
 
 ## Actual boundaries
 
@@ -72,17 +74,21 @@ Local operations execute `tmux` with separated argv. Remote operations build one
 - attach: `tmux attach-session` for the exact target;
 - close: `tmux kill-session` for the exact target.
 
+External attachment is an inherent, non-destructive `TmuxBackend` operation rather than part of `DurableBackend`: it accepts only `ExternalSessionName` and emits `attach-session -t =<name>`. `ExternalSessionName` accepts bounded printable ASCII only and rejects empty, leading-`$`, tmux-delimiter, and reserved `tether-*` values. Leading `$` is excluded because tmux resolves server session IDs before exact-name matching. The owned trait remains the only API with create/inspect/close.
+
 All SSH operations use `BatchMode=yes`. Interactive attach additionally requests a TTY. Server-alive probes are configured for backend operations; no setting weakens OpenSSH host-key verification. OpenSSH configuration, authentication, proxies, and `known_hosts` remain outside Tether.
 
 The remote target validator prevents values that could become SSH options or shell syntax. The remote command builder POSIX-quotes every `tmux` argument. Session targeting uses `=<ID>` rather than a prefix.
 
 ### `StatusService`
 
-`src/status.rs` owns ephemeral, non-destructive explorer observations. It snapshots hosts and active Tether IDs without holding a state lock, then runs one `tmux list-sessions` probe per host through a fixed four-worker pool. Results are published independently, so one slow host does not delay completed hosts.
+`src/status.rs` owns one ephemeral, non-destructive tmux catalog observation per host. It snapshots hosts and active Tether IDs without holding a state lock, then runs `tmux list-sessions` through a fixed four-worker pool. One validated snapshot derives both owned workload status and attachable external rows, avoiding duplicate probes or inconsistent ownership views. Results publish independently, so one slow host does not delay completed hosts.
 
 Each probe has a three-second monotonic deadline. Probe stdin is null, stdout/stderr are drained without blocking and capped at 64 KiB, and Linux/macOS probes run in their own process group. Timeout, refresh cancellation, or receiver drop kills and reaps the active group. Remote probes retain `BatchMode=yes`, target validation, separated SSH argv, normal host-key checking, and POSIX-quoted remote tmux argv.
 
-Generation-tagged messages distinguish host `reachable`, `unreachable`, `timed out`, and `error` from workload `running`, `missing`, `unknown`, `timed out`, and `error`. Exit 255 is remote-unreachable; tmux exit 1 is reachable-with-no-session; malformed or truncated successful output is never treated as missing. These observations never rewrite durable session metadata.
+The catalog parser requires UTF-8 rows shaped as exact `name<TAB>attached-count`, rejects duplicate/structurally malformed catalogs and caps rows at 256. Safe non-`tether-*` names become external rows. Every `tether-*` name is reserved: active persisted IDs derive owned status; unmatched valid IDs and malformed reserved names are hidden and counted, never offered through the external path. A structurally valid reserved collision does not make an unrelated exact owned ID indeterminate. Unsafe or unrenderable external names are skipped and counted without poisoning valid owned/external rows.
+
+Generation-tagged messages distinguish host reachability, owned running/missing/unknown/timeout/error state, and external available/unavailable/timeout/error catalogs. Exit 255 is remote-unreachable; tmux exit 1 is a reachable empty catalog. Structural malformation or truncation yields owned `unknown` plus catalog error, never a false empty snapshot. These observations never rewrite durable session metadata.
 
 ### `DiscoveryService`
 
@@ -118,16 +124,16 @@ Discovery is overlay-local and never rewrites configuration or session state. Re
 
 - local first when included;
 - configured hosts and then discovered non-duplicate SSH aliases;
-- active Tether workload records newest-use first, excluding closing and closed records;
+- active Tether workload records newest-use first, followed by validated external tmux sessions, with **Create new Tether workload** last;
 - recent session directories newest-use first, configured roots, then repositories discovered progressively beneath those roots;
 - built-in shell first, followed by configured presets;
 - configured UI placement, split right by default.
 
-The state machine is host → workload/create when active workloads exist. An active workload proceeds directly to placement and returns a typed exact-ID resume intent; **Create new workload** proceeds through directory → command → placement and returns a create intent. Hosts with no active workloads skip the one-item workload stage and go directly to directory; Back returns to the host list. The directory stage supports case-insensitive filtering and verbatim direct-path entry without introducing a second modal widget. Cancellation returns no selection. The state machine does not create a backend or save state. Partial create CLI arguments suppress workload choices so those arguments cannot be silently ignored; a fully specified host/directory/command or preset bypasses the explorer.
+The state machine is always host → resource. The resource list contains active owned records, current external catalog rows, and **Create new Tether workload**. Owned or external selection proceeds directly to placement and returns a distinct exact-ID resume or exact-name attach intent; Create proceeds through directory → command → placement. This stable stage also presents loading, empty, unavailable, timeout, invalid-response, and reserved-collision state without making Create wait for probes. Back returns through the same resource row. The directory stage supports case-insensitive filtering and verbatim direct-path entry. Partial create CLI arguments suppress both owned and external choices so they cannot be silently ignored.
 
-The terminal loop polls input at 50 ms while draining both status and discovery messages; it does not block on a host probe or root scan. The first generation renders status `loading` and repository `scanning` states. Pressing `r` starts new generations and cancels the previous runs. Status retains previous values as visibly `stale`; discovery retains only configured/recent seeds and repopulates found repositories. Both reducers reject late prior-generation messages. A current fresh `missing` status disables resume. Cache lifetime is one explorer invocation; reopening starts from truthful loading/scanning states rather than presenting persisted observations as live.
+The terminal loop polls input at 50 ms while draining status/catalog and repository-discovery messages. External catalog rows replace atomically per host; selection is preserved by typed identity rather than numeric index when earlier-sorting rows arrive. Refresh keeps prior external rows visibly stale and attachable while a new bounded probe runs; an exact stale attach may safely fail if the session disappeared. Late generations are rejected. Fresh absence removes external rows without mutating persisted state, and a fresh owned `missing` result disables resume.
 
-Placement is meaningful only when Herdr context is available. In an ordinary terminal the selected placement is retained but attachment happens in that terminal. In Herdr, placement creates and focuses the requested split/tab and starts exact-ID `session resume`. Newly created workloads are already durable before pane creation; existing workloads remain owned by tmux when their Herdr view closes.
+Placement is meaningful only when Herdr context is available. In an ordinary terminal attachment happens in that terminal. In Herdr, placement focuses the requested split/tab and starts either exact-ID owned resume or the narrow exact external attach command. External attachment reads no state and invokes no lifecycle mutation. All tmux sessions remain independent of the Herdr view.
 
 ## Lifecycle and failure semantics
 
@@ -159,6 +165,7 @@ Prune computes eligibility from record status, `closed_at`, current time, and re
 The storage layer creates parent directories and persistent sibling advisory-lock files, enforcing Unix mode `0700` on directories and `0600` on lock/data/temporary files. Mutating CLI operations serialize load → mutation → save under the per-file lock. The atomic writer writes and syncs a unique sibling temporary file, atomically renames it over the destination, then syncs the parent directory. Config/state validation occurs before save. Missing files yield empty current-version values; supported legacy version 0 data migrates on load.
 
 Stored metadata includes targets and trusted preset names/commands in config plus session location/lifecycle data in state. It does not include SSH passwords, private keys, terminal contents, or telemetry identifiers. There is no telemetry subsystem.
+External session names and attached-client counts are overlay-local observations and are never stored. A name matching the reserved `tether-*` namespace cannot be coerced into the attach-only external type.
 
 Security is deliberately delegated at clear boundaries:
 
@@ -170,7 +177,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, bounded local/remote repository discovery, adversarial root quoting, malformed/unsafe response rejection, local/remote backend argv and exact targeting, lifecycle cleanup eligibility and recoverable close failure paths, adversarial POSIX quoting, Herdr response parsing/focused placement, explorer transitions/filter/direct-path/cancellation, and bounded progressive status including timeout, process cleanup, conservative error mapping, refresh generations, and stale labels. The current run reported 59 passing tests and a locked release build.
+Automated tests exercise command parsing and state behavior, config migration/private writes, concurrent state transactions, host discovery and validation, bounded repository discovery, malformed/unsafe response rejection, exact local/remote argv, owned lifecycle recovery, adversarial quoting, Herdr placement, explorer create/resume/external transitions, stable external selection and stale refresh, reserved-name collision handling, state-immutable exact external attachment, and bounded progressive status/catalog behavior. The current run reported 67 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 

@@ -4,10 +4,11 @@
 
 ### Added
 
-- The managed terminal overlay now lists active Tether workloads beneath each host, resumes the selected exact session ID without traversing creation fields, and retains **Create new workload** as a sibling action. Hosts without active workloads proceed directly to creation.
-- Explorer resume and create intents share the existing focused split-right, split-down, and new-tab placement boundary. Closing and closed records are excluded from resumable choices.
+- The managed terminal overlay now presents one stable resource stage per host: active Tether workloads, safely discovered external tmux sessions, then **Create new Tether workload**. Owned resume and external attach both use the existing focused split-right, split-down, and new-tab placement boundary.
+- Added exact non-owning attachment for validated external names. External sessions are visibly labeled and never adopted, persisted, renamed, closed, killed, or pruned; reserved `tether-*` collisions are hidden and non-actionable.
 - Added progressive, non-destructive host and Tether workload status to the explorer. Four bounded workers isolate slow hosts; each local/SSH probe has a three-second deadline, cancellation and process-group cleanup, null stdin, and capped output.
 - Added explicit `r` refresh with generation-safe stale/fresh presentation. Host rows distinguish online/offline/timeout/error; workload rows distinguish running/missing/unknown/timeout/error, and freshly missing workloads cannot be resumed.
+- Expanded the bounded per-host status probe into one validated tmux catalog snapshot that derives both owned workload state and external rows. Duplicate/structurally malformed catalogs fail closed; refresh keeps prior external rows visibly stale and selected by stable identity.
 - Added asynchronous bounded repository discovery beneath recent workload directories, configured roots, and the local `HOME`/remote `~` fallback. Local traversal is deterministic and does not follow symlinks; remote scans use BatchMode SSH, quoted root argv, fixed depth/entry/result/deadline/output limits, and a validated NUL-framed protocol.
 - Added case-insensitive directory filtering with `/` and literal direct-path entry with `p`. Refresh now restarts both status and discovery generations while rejecting stale results.
 

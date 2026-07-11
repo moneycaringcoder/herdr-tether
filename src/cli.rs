@@ -16,7 +16,7 @@ use crate::{
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
     lifecycle::{CleanupEligibility, cleanup_eligibility},
-    model::{Placement, SessionId},
+    model::{ExternalSessionName, Placement, SessionId},
     paths::AppPaths,
     sshcfg::discover_aliases,
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -144,6 +144,13 @@ enum SessionCommand {
     List(OutputArgs),
     /// Attach to an existing durable session without creating it.
     Resume { id: SessionId },
+    /// Attach to a discovered non-owned external tmux session.
+    #[command(hide = true)]
+    AttachExternal {
+        #[arg(long)]
+        target: String,
+        name: ExternalSessionName,
+    },
     /// Kill a durable session and mark its metadata closed.
     Close { id: SessionId },
     /// Remove old, closed metadata whose workload was killed.
@@ -360,6 +367,12 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     match selection {
         PickerSelection::Create(selection) => create_and_attach(paths, &config, selection),
         PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
+        PickerSelection::AttachExternal {
+            target,
+            name,
+            placement,
+            ..
+        } => attach_external(target, name, placement),
     }
 }
 
@@ -404,6 +417,7 @@ fn selection_from_picker(
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
         for host in &mut options.hosts {
             host.workloads.clear();
+            host.allow_existing = false;
         }
     }
     let status_service = StatusService::new(
@@ -447,6 +461,17 @@ fn selection_from_picker(
         }
         PickerSelection::Resume { id, placement } => Ok(Some(PickerSelection::Resume {
             id,
+            placement: args.placement.map(Placement::from).unwrap_or(placement),
+        })),
+        PickerSelection::AttachExternal {
+            host,
+            target,
+            name,
+            placement,
+        } => Ok(Some(PickerSelection::AttachExternal {
+            host,
+            target,
+            name,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
     }
@@ -525,6 +550,42 @@ fn resume_command(executable: PathBuf, id: SessionId) -> CommandSpec {
     )
 }
 
+fn external_attach_command(
+    executable: PathBuf,
+    target: &str,
+    name: &ExternalSessionName,
+) -> CommandSpec {
+    CommandSpec::new(
+        executable,
+        vec![
+            "session".to_owned(),
+            "attach-external".to_owned(),
+            "--target".to_owned(),
+            target.to_owned(),
+            "--".to_owned(),
+            name.to_string(),
+        ],
+    )
+}
+
+fn attach_external(
+    target: Option<String>,
+    name: ExternalSessionName,
+    placement: Placement,
+) -> Result<()> {
+    let target = target.unwrap_or_else(|| "local".to_owned());
+    if env::var_os("HERDR_BIN_PATH").is_some() {
+        let context = HerdrContext::from_env()?;
+        let executable = env::current_exe().context("locate the Tether executable")?;
+        let attach = external_attach_command(executable, &target, &name);
+        HerdrClient::new(context).place(&attach, placement)?;
+        Ok(())
+    } else {
+        let backend = backend_for(&target)?;
+        run_attach(backend.attach_external_command(&name)?)
+    }
+}
+
 fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
     let store = StateStore::new(paths.state_file.clone());
     match command {
@@ -572,6 +633,10 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 backend.attach_command(&id)
             })?;
             run_attach(attach)
+        }
+        SessionCommand::AttachExternal { target, name } => {
+            let backend = backend_for(&target)?;
+            run_attach(backend.attach_external_command(&name)?)
         }
         SessionCommand::Close { id } => {
             store.exclusive(|store| {
@@ -822,6 +887,26 @@ mod tests {
                 "session",
                 "resume",
                 "tether-0197f198000070008000000000000001"
+            ]
+        );
+    }
+
+    #[test]
+    fn external_attach_command_preserves_target_and_name_as_arguments() {
+        let name = "-work 'quoted'".parse::<ExternalSessionName>().unwrap();
+        let command =
+            external_attach_command(PathBuf::from("/plugin/herdr-tether"), "user@dev", &name);
+
+        assert_eq!(command.program, PathBuf::from("/plugin/herdr-tether"));
+        assert_eq!(
+            command.args,
+            [
+                "session",
+                "attach-external",
+                "--target",
+                "user@dev",
+                "--",
+                "-work 'quoted'"
             ]
         );
     }

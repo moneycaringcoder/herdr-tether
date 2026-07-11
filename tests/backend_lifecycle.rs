@@ -9,7 +9,7 @@ use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     lifecycle::{CleanupEligibility, cleanup_eligibility},
-    model::SessionId,
+    model::{ExternalSessionName, SessionId},
     quote::posix_quote,
     state::{SessionRecord, SessionStatus},
     tmux::TmuxBackend,
@@ -145,6 +145,59 @@ fn attach_only_attaches_and_close_is_the_only_kill_path() {
     assert_eq!(
         close_argv.last().unwrap(),
         "'tmux' 'kill-session' '-t' '=tether-0197f198000070008000000000000001'"
+    );
+}
+
+#[test]
+fn external_attach_is_exact_and_has_no_lifecycle_operation() {
+    let name = "-work '$(touch nope)'`echo`"
+        .parse::<ExternalSessionName>()
+        .unwrap();
+    let binaries = ProcessBinaries::new("ssh", "tmux");
+    let local = TmuxBackend::local(binaries.clone())
+        .attach_external_command(&name)
+        .unwrap();
+    assert_eq!(
+        local.args,
+        ["attach-session", "-t", "=-work '$(touch nope)'`echo`"]
+    );
+
+    let remote = TmuxBackend::remote("build-box", binaries)
+        .unwrap()
+        .attach_external_command(&name)
+        .unwrap();
+    let expected_target = posix_quote(&format!("={name}")).unwrap();
+    assert_eq!(
+        remote.args.last().unwrap(),
+        &format!("'tmux' 'attach-session' '-t' {expected_target}")
+    );
+    assert!(remote.args.iter().any(|argument| argument == "-t"));
+    assert!(!remote.args.iter().any(|argument| {
+        argument.contains("kill-session")
+            || argument.contains("new-session")
+            || argument.contains("rename")
+    }));
+}
+
+#[test]
+fn unsafe_or_reserved_external_names_are_rejected() {
+    for name in [
+        "",
+        "tether-manual",
+        "bad\tname",
+        "bad\nname",
+        "bad:name",
+        "bad.name",
+        "$0",
+        "bidi\u{202e}name",
+        "café",
+    ] {
+        assert!(name.parse::<ExternalSessionName>().is_err(), "{name:?}");
+    }
+    assert!(
+        "x".repeat(ExternalSessionName::MAX_BYTES + 1)
+            .parse::<ExternalSessionName>()
+            .is_err()
     );
 }
 
