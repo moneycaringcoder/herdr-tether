@@ -188,7 +188,7 @@ fn replacement_inspects_source_then_closes_it_only_after_destination_is_running(
     write_fake_replace_herdr(
         &binary,
         &log,
-        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session"],"cwd":"/tmp"}]}}}'"#,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session","-t","=tether-id"],"cwd":"/tmp"}]}}}'"#,
         CLOSE_OK,
     );
     let client = HerdrClient::new(context(&binary));
@@ -231,7 +231,7 @@ fn replacement_close_failure_warns_without_invalidating_running_destination() {
     write_fake_replace_herdr(
         &binary,
         &log,
-        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","foreground_processes":[{"pid":404,"name":"tmux"}]}}}'"#,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session","-t","=tether-id"]}]}}}'"#,
         "exit 9",
     );
 
@@ -249,7 +249,7 @@ fn replacement_close_failure_warns_without_invalidating_running_destination() {
 }
 
 #[test]
-fn replacement_preserves_source_when_destination_cannot_be_verified() {
+fn replacement_preserves_source_when_destination_reports_unrelated_process() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -259,7 +259,7 @@ fn replacement_preserves_source_when_destination_cannot_be_verified() {
     write_fake_replace_herdr(
         &binary,
         &log,
-        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[]}}}'"#,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"sh","argv":["sh","-c","exit 1"]}]}}}'"#,
         CLOSE_OK,
     );
     let error = HerdrClient::new(context(&binary))
