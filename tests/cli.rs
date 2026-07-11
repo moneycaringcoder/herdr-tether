@@ -64,14 +64,15 @@ const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
 fn active_state(id: &str) -> String {
     format!(
         r#"{{
-  "version": 1,
+  "version": 2,
   "sessions": [{{
     "id": "{id}",
     "host": "local",
     "target": "local",
     "directory": "/tmp",
     "preset": null,
-    "status": "active",
+    "command": "exec true",
+    "status": "running",
     "created_at": "2026-01-01T00:00:00Z",
     "last_used_at": "2026-01-01T00:00:00Z",
     "closed_at": null
@@ -322,7 +323,7 @@ fn keybinding_reload_failure_reports_written_state_and_rollback_without_leaking_
 
 fn write_fake_tmux(path: &Path, log: &Path) {
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) printf '$7:%%3' ;;\n  list-sessions) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) printf '$7:%%3' ;;\n  list-sessions) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7:0:0:' \"$id\" ;; *) printf '%s:$7:0:0:' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
         log = log.display()
     );
     fs::write(path, script).unwrap();
@@ -515,7 +516,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
     assert!(transcript.contains("list-sessions"));
     assert!(!transcript.contains("kill-session"));
     let persisted = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(persisted.contains(r#""status": "closed""#));
+    assert!(persisted.contains(r#""status": "ended""#));
     assert!(!persisted.contains(r#""closed_at": null"#));
 }
 
@@ -528,7 +529,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
         ),
         (
             "failed-running-close",
-            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0:'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -555,7 +556,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
         } else {
             let persisted = String::from_utf8(after).unwrap();
             assert!(
-                persisted.contains(r#""status": "closing""#),
+                persisted.contains(r#""status": "stopping""#),
                 "failed close must persist a recoverable closing marker"
             );
             let document: serde_json::Value = serde_json::from_str(&persisted).unwrap();
@@ -577,7 +578,7 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
             "missing",
             active_state(SESSION_ID),
             "case \"$1\" in list-sessions) exit 0;; esac\nexit 0",
-            "no longer exists",
+            "has ended; restart it",
         ),
         (
             "unknown",
@@ -587,20 +588,20 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
         ),
         (
             "closing",
-            active_state(SESSION_ID).replace(r#""status": "active""#, r#""status": "closing""#),
+            active_state(SESSION_ID).replace(r#""status": "running""#, r#""status": "stopping""#),
             "exit 99",
-            "is closing",
+            "is stopping",
         ),
         (
             "closed",
             active_state(SESSION_ID)
-                .replace(r#""status": "active""#, r#""status": "closed""#)
+                .replace(r#""status": "running""#, r#""status": "ended""#)
                 .replace(
                     r#""closed_at": null"#,
                     r#""closed_at": "2026-01-01T00:00:01Z""#,
                 ),
             "exit 99",
-            "is closed",
+            "has ended; restart it",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -697,14 +698,14 @@ fn open_rejects_whitespace_directory_and_command_before_backend_create() {
 }
 
 #[test]
-fn open_reloads_state_after_backend_creation_before_persisting() {
+fn open_fails_safely_when_concurrent_state_replaces_its_reservation() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    fs::write(sandbox.state_file(), r#"{"version":1,"sessions":[]}"#).unwrap();
+    fs::write(sandbox.state_file(), r#"{"version":2,"sessions":[]}"#).unwrap();
     let concurrent_id = "tether-0197f198000070008000000000000002";
     let concurrent_state = active_state(concurrent_id);
     let body = format!(
-        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; printf '$7:%%3'; fi\nif [ \"$1\" = display-message ]; then printf '%s' '/tmp'; fi\nif [ \"$1\" = list-sessions ]; then filter=; for arg do filter=$arg; done; id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac; fi\nexit 0",
+        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; printf '$7:%%3'; fi\nif [ \"$1\" = display-message ]; then printf '%s' '/tmp'; fi\nif [ \"$1\" = list-sessions ]; then filter=; for arg do filter=$arg; done; id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7:0:0:' \"$id\" ;; *) printf '%s:$7:0:0:' \"$id\" ;; esac; fi\nexit 0",
         concurrent_state,
         sandbox.state_file().display()
     );
@@ -723,12 +724,14 @@ fn open_reloads_state_after_backend_creation_before_persisting() {
             "true",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("reserved session"))
+        .stderr(predicate::str::contains("disappeared after creation"));
 
     let persisted = fs::read_to_string(sandbox.state_file()).unwrap();
     assert!(persisted.contains(concurrent_id));
     let document: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-    assert_eq!(document["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(document["sessions"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -857,14 +860,14 @@ fn prune_uses_configured_retention_unless_the_flag_explicitly_overrides_it() {
         sandbox.state_file(),
         format!(
             r#"{{
-  "version": 1,
+  "version": 2,
   "sessions": [{{
     "id": "{SESSION_ID}",
     "host": "local",
     "target": "local",
     "directory": "/tmp",
     "preset": null,
-    "status": "closed",
+    "status": "ended",
     "created_at": "2026-07-01T00:00:00Z",
     "last_used_at": "2026-07-01T00:00:00Z",
     "closed_at": "2026-07-01T00:00:00Z"
@@ -968,7 +971,7 @@ fn doctor_classifies_invalid_config_nonzero_and_permission_failures_without_shor
     fs::create_dir_all(sandbox.config_file().parent().unwrap()).unwrap();
     fs::write(sandbox.config_file(), "version = 2\nunknown = true\n").unwrap();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    fs::write(sandbox.state_file(), r#"{"version":1,"sessions":[]}"#).unwrap();
+    fs::write(sandbox.state_file(), r#"{"version":2,"sessions":[]}"#).unwrap();
 
     let bin = sandbox.path("doctor-bin");
     fs::create_dir_all(&bin).unwrap();

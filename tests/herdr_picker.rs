@@ -13,9 +13,9 @@ use herdr_tether::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
     },
     tui::{
-        PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin, PickerInput,
-        PickerOptions, PickerOutcome, PickerPruneModal, PickerPrunePhase, PickerPruneResult,
-        PickerSelection, PickerStage, PickerState, format_close_error,
+        PickerCloseAction, PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin,
+        PickerInput, PickerOptions, PickerOutcome, PickerPruneModal, PickerPrunePhase,
+        PickerPruneResult, PickerSelection, PickerStage, PickerState, format_close_error,
     },
 };
 use tempfile::tempdir;
@@ -358,10 +358,13 @@ fn picker_fixture() -> (Config, State) {
                 target: "builder@example.test".into(),
                 directory: "/srv/shared".into(),
                 preset: Some("agent".into()),
-                status: SessionStatus::Active,
+                command: Some("exec ${SHELL:-/bin/sh}".into()),
+                tmux_session_id: None,
+                status: SessionStatus::Running,
                 created_at: now - Duration::days(2),
                 last_used_at: now - Duration::hours(2),
                 closed_at: None,
+                exit_status: None,
             },
             SessionRecord {
                 id: "tether-0197f198000070008000000000000002"
@@ -371,10 +374,13 @@ fn picker_fixture() -> (Config, State) {
                 target: "builder@example.test".into(),
                 directory: "/srv/recent".into(),
                 preset: None,
-                status: SessionStatus::Active,
+                command: Some("exec ${SHELL:-/bin/sh}".into()),
+                tmux_session_id: None,
+                status: SessionStatus::Running,
                 created_at: now - Duration::days(1),
                 last_used_at: now - Duration::hours(1),
                 closed_at: None,
+                exit_status: None,
             },
         ],
     };
@@ -392,10 +398,13 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
         target: "removed@example.test".into(),
         directory: "/srv/removed".into(),
         preset: None,
+        command: Some("exec ${SHELL:-/bin/sh}".into()),
+        tmux_session_id: None,
         status: SessionStatus::Running,
         created_at: now,
         last_used_at: now,
         closed_at: None,
+        exit_status: None,
     });
     state.sessions[0].status = SessionStatus::Stopping;
     state.sessions[1].status = SessionStatus::Ended;
@@ -423,7 +432,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
             .iter()
             .map(|workload| workload.status)
             .collect::<Vec<_>>(),
-        vec![SessionStatus::Closed, SessionStatus::Closing]
+        vec![SessionStatus::Ended, SessionStatus::Stopping]
     );
     assert!(
         options.hosts[1]
@@ -432,16 +441,22 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
             .all(|workload| !workload.label.contains("Resume"))
     );
     assert_eq!(options.hosts[2].name, "removed-box");
-    assert_eq!(options.hosts[2].workloads[0].status, SessionStatus::Active);
+    assert_eq!(options.hosts[2].workloads[0].status, SessionStatus::Running);
 
-    let closing_id = options.hosts[1].workloads[1].id;
     let removed_id = options.hosts[2].workloads[0].id;
     let mut picker = PickerState::new(options).unwrap();
     picker.begin_refresh(4);
-    assert!(!picker.apply_status(StatusMessage::Workload {
+    assert!(picker.apply_status(StatusMessage::Workload {
         generation: 4,
         id: removed_id,
         status: WorkloadStatus::Running { attached: 0 },
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 4,
+        host: "removed-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
         checked_at: SystemTime::UNIX_EPOCH,
     }));
     picker.begin_discovery(4);
@@ -452,24 +467,10 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
     }));
 
     picker.handle(PickerEvent::Next);
-    picker.handle(PickerEvent::Confirm);
-    assert!(!picker.footer_text().contains("Enter select"));
-    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
-    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
-    assert!(picker.close_modal().is_none());
-    picker.handle(PickerEvent::Next);
-    assert!(!picker.footer_text().contains("Enter select"));
-    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
-    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
-    assert_eq!(
-        picker.close_modal(),
-        Some(&PickerCloseModal::Confirm { id: closing_id })
-    );
-    picker.handle(PickerEvent::DismissClose);
-    picker.handle(PickerEvent::Back);
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Confirm);
-    picker.handle(PickerEvent::Confirm);
+    assert!(picker.footer_text().contains("Enter Open"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
     assert_eq!(picker.stage(), PickerStage::Placement);
     assert_eq!(
         picker.handle(PickerEvent::Confirm),
@@ -581,15 +582,29 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
     assert!(
         build_box.workloads[0]
             .label
-            .starts_with("[active] Tether · Resume …00000002 · Shell · ")
+            .starts_with("[running] Tether · Open …00000002 · Shell · ")
     );
     assert!(build_box.workloads.iter().any(|workload| {
         workload.id.to_string() == "tether-0197f198000070008000000000000003"
-            && workload.status == SessionStatus::Closed
+            && workload.status == SessionStatus::Ended
     }));
 
     let expected_id = build_box.workloads[0].id;
     let mut explorer = PickerState::new(options).unwrap();
+    explorer.begin_refresh(1);
+    assert!(explorer.apply_status(StatusMessage::Host {
+        generation: 1,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(explorer.apply_status(StatusMessage::Workload {
+        generation: 1,
+        id: expected_id,
+        status: WorkloadStatus::Running { attached: 0 },
+        checked_at: SystemTime::now(),
+    }));
     assert_eq!(
         explorer.handle(PickerEvent::Confirm),
         PickerOutcome::Continue
@@ -662,8 +677,8 @@ fn explorer_orders_owned_external_create_and_returns_exact_external_intent() {
     }));
 
     let labels = explorer.resource_labels("build-box").unwrap();
-    assert!(labels[0].contains("Resume …00000002"));
-    assert!(labels[1].contains("Resume …00000001"));
+    assert!(labels[0].contains("Open …00000002"));
+    assert!(labels[1].contains("Open …00000001"));
     assert_eq!(labels[2], "[external · running] alpha");
     assert_eq!(labels[3], "[external · running · 2 attached] work box");
     assert_eq!(labels[4], "Create new Tether workload");
@@ -835,7 +850,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         explorer
             .workload_label(workload_id)
             .unwrap()
-            .starts_with("[running · 2 attached] [active] Tether · Resume …00000002")
+            .starts_with("[running · 2 attached] [running] Tether · Open …00000002")
     );
 
     explorer.begin_refresh(2);
@@ -1000,6 +1015,21 @@ fn owned_close_picker() -> (PickerState, SessionId, SessionId) {
         .collect::<Vec<_>>();
     let mut picker = PickerState::new(options).unwrap();
     picker.begin_refresh(7);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 7,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    for id in &ids {
+        assert!(picker.apply_status(StatusMessage::Workload {
+            generation: 7,
+            id: *id,
+            status: WorkloadStatus::Running { attached: 0 },
+            checked_at: SystemTime::now(),
+        }));
+    }
     assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
     (picker, ids[0], ids[1])
 }
@@ -1013,7 +1043,7 @@ fn owned_close_requires_explicit_confirmation_and_pending_close_cannot_be_abando
         picker.close_modal(),
         Some(&PickerCloseModal::Confirm { id: selected_id })
     );
-    assert_eq!(picker.frame_title(), "Confirm close");
+    assert_eq!(picker.frame_title(), "Confirm Stop");
     assert!(picker.footer_text().starts_with("y confirm · n/Esc keep"));
     assert!(picker.footer_text().contains(&selected_id.to_string()));
     assert_eq!(
@@ -1029,10 +1059,11 @@ fn owned_close_requires_explicit_confirmation_and_pending_close_cannot_be_abando
         PickerOutcome::CloseOwnedRequested {
             id: selected_id,
             generation: 7,
+            action: PickerCloseAction::Stop,
         }
     );
     assert!(picker.close_busy());
-    assert_eq!(picker.frame_title(), "Closing workload");
+    assert_eq!(picker.frame_title(), "Applying lifecycle action");
     assert!(picker.footer_text().contains("wait"));
     assert_eq!(picker.handle(PickerEvent::Cancel), PickerOutcome::Continue);
     assert_eq!(picker.handle(PickerEvent::Back), PickerOutcome::Continue);
@@ -1051,6 +1082,84 @@ fn owned_close_requires_explicit_confirmation_and_pending_close_cannot_be_abando
 }
 
 #[test]
+fn contextual_actions_survive_refresh_and_never_attach_ended_or_unreachable_workloads() {
+    let (config, mut state) = picker_fixture();
+    state.sessions[0].status = SessionStatus::Ended;
+    state.sessions[0].closed_at = Some(state.sessions[0].last_used_at);
+    let ended_id = state.sessions[0].id;
+    let running_id = state.sessions[1].id;
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(7);
+    picker.handle(PickerEvent::Confirm);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 7,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    picker.handle(PickerEvent::Next);
+
+    assert!(picker.footer_text().contains("Enter Restart"));
+    assert!(picker.footer_text().contains("x Remove"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(
+        picker.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::Restart {
+            id: ended_id,
+            placement: Placement::SplitRight,
+        })
+    );
+
+    picker.handle(PickerEvent::Back);
+    picker.handle(PickerEvent::Previous);
+    assert!(picker.apply_status(StatusMessage::Workload {
+        generation: 7,
+        id: running_id,
+        status: WorkloadStatus::Missing,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(picker.footer_text().contains("Enter Restart"));
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: running_id })
+    );
+    picker.begin_refresh(8);
+    assert!(picker.close_modal().is_some());
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested {
+            id: running_id,
+            generation: 8,
+            action: PickerCloseAction::Remove,
+        }
+    );
+
+    let mut unreachable = PickerState::new(PickerOptions::from_config_state(
+        &config,
+        &picker_fixture().1,
+        "/home/user",
+        false,
+    ))
+    .unwrap();
+    unreachable.begin_refresh(3);
+    unreachable.handle(PickerEvent::Confirm);
+    assert!(unreachable.apply_status(StatusMessage::Host {
+        generation: 3,
+        host: "build-box".into(),
+        status: HostReachability::Unreachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    assert_eq!(unreachable.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(unreachable.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(unreachable.close_modal().is_none());
+    assert!(unreachable.footer_text().contains("r Retry"));
+}
+
+#[test]
 fn close_is_owned_only_and_cached_status_never_skips_confirmation() {
     let (mut picker, owned_id, _) = owned_close_picker();
     assert!(picker.apply_status(StatusMessage::Workload {
@@ -1064,15 +1173,13 @@ fn close_is_owned_only_and_cached_status_never_skips_confirmation() {
         picker.close_modal(),
         Some(&PickerCloseModal::Confirm { id: owned_id })
     );
+    assert_eq!(picker.frame_title(), "Confirm Remove");
     picker.handle(PickerEvent::DismissClose);
 
     picker.begin_refresh(8);
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
-    assert_eq!(
-        picker.close_modal(),
-        Some(&PickerCloseModal::Confirm { id: owned_id })
-    );
-    picker.handle(PickerEvent::DismissClose);
+    assert!(picker.close_modal().is_none());
+    assert!(picker.footer_text().contains("r Retry"));
 
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Next);
@@ -1097,6 +1204,7 @@ fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
         PickerOutcome::CloseOwnedRequested {
             id: first_id,
             generation: 7,
+            action: PickerCloseAction::Stop,
         }
     );
     assert!(picker.apply_close_result(PickerCloseResult {
@@ -1108,10 +1216,14 @@ fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
 
     let labels = picker.resource_labels("build-box").unwrap();
     assert_eq!(labels.len(), 3);
-    assert!(labels.iter().any(|label| label.contains("closed")));
+    assert!(labels.iter().any(|label| label.contains("ended")));
     assert!(labels[0].contains("00000002"));
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
-    assert!(picker.close_modal().is_none());
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: first_id })
+    );
+    picker.handle(PickerEvent::DismissClose);
     picker.handle(PickerEvent::Next);
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert_eq!(
@@ -1139,12 +1251,25 @@ fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
     let mut picker = PickerState::new(options).unwrap();
     picker.begin_refresh(7);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 7,
+        host: "removed-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(picker.apply_status(StatusMessage::Workload {
+        generation: 7,
+        id,
+        status: WorkloadStatus::Running { attached: 0 },
+        checked_at: SystemTime::now(),
+    }));
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Confirm);
     picker.handle(PickerEvent::Close);
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
-        PickerOutcome::CloseOwnedRequested { id, generation: 7 }
+        PickerOutcome::CloseOwnedRequested { id, generation: 7, action: PickerCloseAction::Stop }
     );
 
     assert!(picker.apply_close_result(PickerCloseResult {
@@ -1209,16 +1334,11 @@ fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() 
             .resource_labels("build-box")
             .unwrap()
             .iter()
-            .any(|label| label.starts_with("[close failed · c retry]"))
+            .any(|label| label.starts_with("[action failed · x retry]"))
     );
-    picker.handle(PickerEvent::DismissClose);
-    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
-    assert_eq!(picker.stage(), PickerStage::Resource);
-
-    picker.handle(PickerEvent::Close);
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
-        PickerOutcome::CloseOwnedRequested { id, generation: 7 }
+        PickerOutcome::CloseOwnedRequested { id, generation: 7, action: PickerCloseAction::Stop }
     );
 }
 
@@ -1238,18 +1358,18 @@ fn close_error_formatter_includes_source_chain_and_sanitizes_terminal_text() {
 }
 
 #[test]
-fn refresh_rejects_late_close_generation() {
+fn refresh_accepts_confirmed_close_result_from_its_original_generation() {
     let (mut picker, id, _) = owned_close_picker();
     picker.handle(PickerEvent::Close);
     picker.handle(PickerEvent::ConfirmClose);
     picker.begin_refresh(8);
-    assert!(!picker.apply_close_result(PickerCloseResult {
+    assert!(picker.apply_close_result(PickerCloseResult {
         id,
         generation: 7,
         error: None,
         record: None,
     }));
-    assert_eq!(picker.resource_labels("build-box").unwrap().len(), 3);
+    assert_eq!(picker.resource_labels("build-box").unwrap().len(), 2);
 }
 
 #[test]
@@ -1295,10 +1415,13 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
             target: "nobody@example.test".into(),
             directory: "/closed".into(),
             preset: None,
+            command: Some("exec ${SHELL:-/bin/sh}".into()),
+            tmux_session_id: None,
             status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
+            exit_status: None,
         })
         .collect();
     store
@@ -1323,10 +1446,13 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
             target: "removed@example.test".into(),
             directory: "/closed".into(),
             preset: None,
+            command: Some("exec ${SHELL:-/bin/sh}".into()),
+            tmux_session_id: None,
             status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
+            exit_status: None,
         })
         .collect::<Vec<_>>();
     let state = State {
@@ -1370,8 +1496,8 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
     let mut records = Vec::new();
     for (suffix, status, age) in [
         (200, SessionStatus::Ended, 40),
-        (201, SessionStatus::Stopping, 41),
-        (202, SessionStatus::Running, 42),
+        (201, SessionStatus::Running, 41),
+        (202, SessionStatus::Stopping, 42),
     ] {
         records.push(SessionRecord {
             id: format!("tether-0197f198000070008000000000000{suffix:03}")
@@ -1381,10 +1507,13 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
             target: "removed@example.test".into(),
             directory: "/closed".into(),
             preset: None,
+            command: Some("exec ${SHELL:-/bin/sh}".into()),
+            tmux_session_id: None,
             status,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(age),
             closed_at: (status == SessionStatus::Ended).then_some(now - Duration::days(age)),
+            exit_status: None,
         });
     }
     let state = State {
@@ -1398,6 +1527,19 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
     let mut picker = PickerState::with_retention(options, 14).unwrap();
     picker.begin_refresh(11);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 11,
+        host: "archived".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    assert!(picker.apply_status(StatusMessage::Workload {
+        generation: 11,
+        id: records[1].id,
+        status: WorkloadStatus::Running { attached: 0 },
+        checked_at: SystemTime::now(),
+    }));
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Confirm);
     picker.handle(PickerEvent::Next);
@@ -1477,7 +1619,7 @@ fn prune_picker() -> PickerState {
 fn global_prune_preview_is_selection_independent_and_requires_explicit_confirmation() {
     let mut picker = prune_picker();
     let before = picker.footer_text();
-    assert!(before.contains("P prune closed"));
+    assert!(!before.contains("prune"));
     assert_eq!(
         picker.handle(PickerEvent::BeginPrune),
         PickerOutcome::PrunePreviewRequested {

@@ -518,6 +518,9 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     }
 
     let mut operation_error = None;
+    PruneService::new(state_store.clone())
+        .automatic_cleanup()
+        .context("automatically clear expired removed session history")?;
     loop {
         let state = state_store.load()?;
         let Some(selection) = selection_from_picker(
@@ -544,6 +547,7 @@ fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelecti
     match selection {
         PickerSelection::Create(selection) => create_and_attach(paths, config, selection),
         PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
+        PickerSelection::Restart { id, placement } => restart_and_attach(paths, id, placement),
         PickerSelection::AttachExternal {
             target,
             name,
@@ -658,6 +662,10 @@ fn selection_from_picker(
             id,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
+        PickerSelection::Restart { id, placement } => Ok(Some(PickerSelection::Restart {
+            id,
+            placement: args.placement.map(Placement::from).unwrap_or(placement),
+        })),
         PickerSelection::AttachExternal {
             host,
             target,
@@ -767,6 +775,32 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         run_attach(backend.attach_command(identity)?)
     }
 }
+fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
+    let service = LifecycleService::new(
+        StateStore::new(paths.state_file.clone()),
+        ProcessBinaries::new("ssh", "tmux"),
+    );
+    let record = service
+        .owned_record(id)?
+        .with_context(|| format!("unknown Tether session `{id}`"))?;
+    match record.status {
+        SessionStatus::Ended | SessionStatus::Creating => {
+            service
+                .restart_owned(id)
+                .with_context(|| format!("restart ended session `{id}`"))?;
+        }
+        SessionStatus::Running => {
+            service
+                .observe_owned(id)
+                .with_context(|| format!("verify restarted session `{id}`"))?;
+        }
+        SessionStatus::Stopping | SessionStatus::Removed => {
+            bail!("session `{id}` cannot be restarted while it is {:?}", record.status);
+        }
+    }
+    resume_and_attach(paths, id, placement)
+}
+
 fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
