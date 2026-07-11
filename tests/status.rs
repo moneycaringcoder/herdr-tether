@@ -530,3 +530,57 @@ fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
     assert!(!detail.contains("private.example"));
     assert!(!detail.contains('\u{1b}'));
 }
+
+#[cfg(unix)]
+#[test]
+fn successful_probe_does_not_leave_background_descendants_running() {
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let pid_path = temp.path().join("descendant.pid");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 1\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 12,
+        hosts: vec![StatusHost {
+            name: "local".into(),
+            target: None,
+            workloads: Vec::new(),
+        }],
+    });
+
+    while !matches!(
+        run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        StatusMessage::Finished { generation: 12 }
+    ) {}
+    let pid = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: signal 0 performs existence/permission checking without
+        // delivering a signal, and `pid` came from the child shell.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        if !exists {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "successful bounded probe left descendant {pid} running"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

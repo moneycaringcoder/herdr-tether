@@ -602,6 +602,10 @@ pub(crate) fn run_bounded(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                // The direct child may have successfully forked descendants
+                // into its fresh process group. End them before returning so a
+                // completed bounded command cannot leave orphaned work behind.
+                kill_process_group(child.id());
                 let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
                 let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
                 return BoundedOutput::Completed {
