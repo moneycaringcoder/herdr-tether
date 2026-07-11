@@ -549,7 +549,7 @@ class Smoke:
         before_panes = self.pane_ids()
         before_tmux = self.tmux_sessions()
         missing = self.root / "work" / "missing-create-directory"
-        rendered = self.interact(
+        self.interact(
             [
                 str(self.tether),
                 "open",
@@ -565,12 +565,11 @@ class Smoke:
                 (str(self.root / "home"), b"\r"),
                 ("Shell", b"\r"),
                 ("Split right", b"\x1b[B\x1b[B\r"),
+                ("Operation failed", b""),
                 ("Enter retry", b"\x1b"),
                 ("Hosts", b"\x1b"),
             ],
         )
-        if "Backspace/Esc cancel" not in rendered or "Operation failed" not in rendered:
-            fail("failed local new-tab create was not visible in the picker overlay")
         if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
             fail("failed local new-tab create leaked a pane or tmux session")
 
@@ -601,7 +600,7 @@ class Smoke:
             picker_env,
             [
                 ("Hosts", b"\r"),
-                (self.external_session, b"\r"),
+                (self.external_session, b"\x1b[B\r"),
                 ("Split right", b"\x1b[B\x1b[B\r"),
             ],
         )

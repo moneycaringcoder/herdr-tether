@@ -10,7 +10,7 @@ use crate::{
     },
     model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
-    sshcfg::validate_ssh_target,
+    sshcfg::{OpenSshTarget, openssh_target},
     status::{BoundedOutput, run_bounded},
 };
 
@@ -45,7 +45,7 @@ impl BoundedExecutionError {
 #[derive(Clone, Debug)]
 enum Location {
     Local,
-    Remote(String),
+    Remote(OpenSshTarget),
 }
 
 /// Durable local or OpenSSH-backed tmux sessions.
@@ -64,8 +64,7 @@ impl TmuxBackend {
     }
 
     pub fn remote(target: impl Into<String>, binaries: ProcessBinaries) -> Result<Self> {
-        let target = target.into();
-        validate_ssh_target(&target)?;
+        let target = openssh_target(&target.into())?;
         Ok(Self {
             location: Location::Remote(target),
             binaries,
@@ -97,7 +96,14 @@ impl TmuxBackend {
                         "ServerAliveCountMax=3".to_owned(),
                     ]
                 };
-                ssh_arguments.extend(["--".to_owned(), target.clone(), remote_command]);
+                if let Some(port) = target.port {
+                    ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
+                }
+                ssh_arguments.extend([
+                    "--".to_owned(),
+                    target.destination.clone(),
+                    remote_command,
+                ]);
                 Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
@@ -108,20 +114,23 @@ impl TmuxBackend {
             Location::Local => Ok(CommandSpec::new("/bin/sh", arguments)),
             Location::Remote(target) => {
                 let remote_command = remote_command("/bin/sh", &arguments)?;
-                Ok(CommandSpec::new(
-                    self.binaries.ssh(),
-                    vec![
-                        "-o".to_owned(),
-                        "BatchMode=yes".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveInterval=15".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveCountMax=3".to_owned(),
-                        "--".to_owned(),
-                        target.clone(),
-                        remote_command,
-                    ],
-                ))
+                let mut ssh_arguments = vec![
+                    "-o".to_owned(),
+                    "BatchMode=yes".to_owned(),
+                    "-o".to_owned(),
+                    "ServerAliveInterval=15".to_owned(),
+                    "-o".to_owned(),
+                    "ServerAliveCountMax=3".to_owned(),
+                ];
+                if let Some(port) = target.port {
+                    ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
+                }
+                ssh_arguments.extend([
+                    "--".to_owned(),
+                    target.destination.clone(),
+                    remote_command,
+                ]);
+                Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
     }
@@ -246,8 +255,7 @@ impl TmuxBackend {
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}"
-                    .to_owned(),
+                "#{session_name}:#{session_attached}".to_owned(),
             ],
             false,
         )
