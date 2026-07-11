@@ -16,7 +16,7 @@ Implemented and covered by the current command/test surface:
 - case-insensitive directory filtering and literal direct-path entry from the explorer;
 - Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
 - versioned, private, advisory-locked, atomic configuration and session-state persistence, including lock-safe v0.1 migration;
-- list, resume, close, age-based closed-metadata pruning, and JSON output;
+- list, resume, close, age-based closed-metadata pruning, legacy JSON lists, and a versioned bounded live JSON snapshot;
 - Linux and macOS declared by the plugin manifest.
 
 Important limitations:
@@ -31,7 +31,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 110 automated tests and a locked release build. Coverage includes lock-safe config/state migration and concurrency, configurable discovery/retention, bounded doctor probes, repository/external catalog discovery, exact non-owning external attach, explorer search/direct paths, progressive status/refresh, exact owned resume, confirmed owned close, and confirmed metadata prune. Prune tests cover exact cutoff/zero/overflow, immutable previews, atomic unchanged-candidate revalidation, concurrent skips, non-preview preservation, no transport capability, global press-only `P`, read-only preview cancellation, non-abandonable confirmed apply, red narrow-terminal guidance, sanitized retryable errors, typed close/prune isolation, and no status/discovery restart. Tmux-hosted smokes selected a discovered repository, resumed owned work, attached an external session without mutation, and confirmed no kill before close `y` followed by one exact-ID kill and Closed metadata.
+The current branch passes 116 automated tests and a locked release build. Coverage includes lock-safe config/state migration and concurrency, configurable discovery/retention, bounded doctor probes, repository/external catalog discovery, exact non-owning external attach, explorer search/direct paths, progressive status/refresh, exact owned resume, confirmed owned close/prune, and the versioned live snapshot. Snapshot tests cover schema/help/pretty and legacy compatibility, local/configured/SSH-alias precedence, complete owned/external joins, deterministic ordering, typed limits/degradation, retained removed/retargeted state groups, no wrong-target/lifecycle mutation, config/state byte identity, preset/child-output privacy, bounded cancellation, and descendant cleanup. Tmux-hosted smokes selected a discovered repository, resumed owned work, attached an external session without mutation, and confirmed no kill before close `y` followed by one exact-ID kill and Closed metadata.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -159,6 +159,12 @@ herdr-tether host check <NAME>
   Discovery reads literal `Host` entries from the primary file only; it does not traverse `Include` directives. Add an included alias explicitly with `host add` if it is not listed.
 - `remove` removes only the host configuration. Existing session records retain their resolved target and remain addressable.
 - `check` runs local `tmux -V`, or remote `tmux -V` through BatchMode OpenSSH. A remote Herdr version probe is optional.
+
+```text
+herdr-tether snapshot [--pretty]
+```
+
+`snapshot` always emits schema-version-1 JSON for automation. It starts the same bounded status/catalog and repository-discovery services concurrently and returns one deterministic read-only document containing builtin local, configured, literal SSH-alias, and retained-state-only hosts; effective roots and flat repository results; complete owned metadata with live status for active records; and safe external tmux catalogs. Closing/closed records are `not_checked`; missing stream data is `not_collected`. Expected unreachable, timeout, malformed, output/entry/result-limit, and removed-host conditions are represented as `completion: "partial"` with typed per-field states and exit 0. Fatal local config/state/alias/serialization errors exit nonzero. `--pretty` indents output; compact output is one line. Arrays retain explorer host precedence and deterministic nested ordering. Snapshot never runs create, attach, close, or prune; it does not expose preset command bodies or child stdout/stderr.
 
 ```text
 herdr-tether open [--host <NAME>] [--directory <DIR>]

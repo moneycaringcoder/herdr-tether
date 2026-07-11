@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod model;
 pub mod paths;
 pub mod quote;
+pub mod snapshot;
 pub mod sshcfg;
 pub mod state;
 pub mod status;

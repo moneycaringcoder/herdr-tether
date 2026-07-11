@@ -101,6 +101,21 @@ impl Config {
         Ok(())
     }
 
+    /// Appends discovered SSH aliases after configured hosts without allowing
+    /// aliases to shadow a configured host name.
+    pub(crate) fn append_alias_hosts(&mut self, aliases: &[String]) {
+        for alias in aliases {
+            if !self.hosts.iter().any(|host| host.name == *alias) {
+                self.hosts.push(HostConfig {
+                    name: alias.clone(),
+                    target: alias.clone(),
+                    roots: Vec::new(),
+                    presets: Vec::new(),
+                });
+            }
+        }
+    }
+
     pub fn remove_host(&mut self, name: &str) -> bool {
         let Some(index) = self.hosts.iter().position(|host| host.name == name) else {
             return false;

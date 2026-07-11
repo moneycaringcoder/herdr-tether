@@ -104,6 +104,7 @@ fn every_scriptable_surface_has_help() {
         &["host", "remove", "--help"],
         &["host", "check", "--help"],
         &["open", "--help"],
+        &["snapshot", "--help"],
         &["session", "--help"],
         &["session", "list", "--help"],
         &["session", "resume", "--help"],

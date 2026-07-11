@@ -15,6 +15,7 @@ use crate::{
     lifecycle::{LifecycleService, PruneError, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
     paths::AppPaths,
+    snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, StatusService, run_bounded},
@@ -38,6 +39,13 @@ enum TopLevel {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Print a bounded read-only JSON view of hosts, repositories, and sessions.
+    ///
+    /// Output uses schema version 1. Expected host/probe/scan degradation is
+    /// represented by `completion: "partial"` and typed status values while
+    /// the command exits successfully. Fatal local load/serialization errors
+    /// retain the normal nonzero command error.
+    Snapshot(SnapshotArgs),
     /// Create a durable terminal session.
     Open(OpenArgs),
     /// Inspect and manage durable sessions.
@@ -60,6 +68,13 @@ struct SetupArgs {
     /// Accept defaults without prompting.
     #[arg(long)]
     yes: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct SnapshotArgs {
+    /// Indent the JSON output for human readability.
+    #[arg(long)]
+    pretty: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,10 +206,33 @@ fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
         TopLevel::Setup(args) => setup(paths, args),
         TopLevel::Host { command } => host_command(paths, command),
         TopLevel::Open(args) => open(paths, args),
+        TopLevel::Snapshot(args) => snapshot(paths, args),
         TopLevel::Session { command } => session_command(paths, command),
         TopLevel::Doctor => doctor(paths),
         TopLevel::Plugin { command } => plugin_command(command),
     }
+}
+
+fn snapshot(paths: &AppPaths, args: SnapshotArgs) -> Result<()> {
+    let config = ConfigStore::new(paths.config_file.clone()).load()?;
+    let state = StateStore::new(paths.state_file.clone()).load()?;
+    let aliases = discover_aliases(&paths.ssh_config_file)?;
+    let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
+    let snapshot = collect_snapshot(
+        &config,
+        &state,
+        &aliases,
+        &home,
+        ProcessBinaries::new("ssh", "tmux"),
+    );
+    let json = if args.pretty {
+        serde_json::to_string_pretty(&snapshot)
+    } else {
+        serde_json::to_string(&snapshot)
+    }
+    .context("serialize snapshot JSON")?;
+    println!("{json}");
+    Ok(())
 }
 
 fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
@@ -432,7 +470,7 @@ fn selection_from_picker(
 ) -> Result<Option<PickerSelection>> {
     let requested_host = args.host.as_deref();
     let mut picker_config = config.clone();
-    append_alias_hosts(&mut picker_config, aliases);
+    picker_config.append_alias_hosts(aliases);
     let include_local = match requested_host {
         Some("local") | None => true,
         Some(_) => false,
@@ -955,19 +993,6 @@ fn resolve_host_from(config: &Config, aliases: &[String], name: &str) -> Result<
         });
     }
     bail!("unknown host `{name}`")
-}
-
-fn append_alias_hosts(config: &mut Config, aliases: &[String]) {
-    for alias in aliases {
-        if !config.hosts.iter().any(|host| host.name == *alias) {
-            config.hosts.push(HostConfig {
-                name: alias.clone(),
-                target: alias.clone(),
-                roots: Vec::new(),
-                presets: Vec::new(),
-            });
-        }
-    }
 }
 
 fn resolve_command(

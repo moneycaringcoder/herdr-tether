@@ -98,6 +98,12 @@ Local traversal is lexical, bounded by validated configured depth/entry/result/t
 
 Discovery is overlay-local and never rewrites configuration or session state. Refresh cancels both status and discovery generations, removes old discovered rows, preserves configured/recent picker suggestions, and rejects late messages.
 
+### `Snapshot`
+
+`src/snapshot.rs` is a presentation DTO and one-shot collector, not persistence serialization. It derives the explorer-equivalent local/configured/literal-SSH-alias host list through the shared alias merge, then starts `StatusService` and `DiscoveryService` concurrently with one generation. A whole-run deadline is the greater validated worker-wave budget; on expiry it cancels both runs and drains a separate bounded shutdown window so probe process groups are cleaned before return. Matching `Finished` messages are barriers, while each expected host/catalog/active-workload/discovery terminal is validated independently. Broken, cancelled, degraded, or incomplete streams yield typed `partial`/`not_collected` data rather than fabricated success.
+
+Schema version 1 is deterministic presentation data: explorer host precedence; sorted/deduplicated repositories, root errors, owned IDs, and external names; complete owned metadata; live probes only for Active records; and no configured command bodies, child output, raw backend errors, or private storage paths. Retained session `(host,target)` groups absent from current config/aliases are appended as `origin: state`, with metadata visible and live fields `not_collected`, so host removal/retargeting cannot erase owned inventory or probe the wrong endpoint. Snapshot invokes no lifecycle/prune/config/state mutation and preserves legacy host/session JSON shapes.
+
 ### `HerdrClient`
 
 `src/herdr.rs` is a local Herdr CLI adapter, not a durable backend. It consumes Herdr's executable, pane ID, and workspace ID from plugin context. It can:
@@ -177,7 +183,7 @@ Security is deliberately delegated at clear boundaries:
 
 ## Capability evidence and manual boundaries
 
-Automated tests exercise parsing/state, locked migrations/concurrency, host/repository/external discovery, bounded process cleanup, exact local/SSH argv, lifecycle recovery, Herdr placement, explorer create/resume/external transitions, status generations, confirmed close, and confirmed prune. Prune coverage includes exact cutoff/zero/overflow, immutable exact previews, atomic candidate revalidation, concurrent skips, non-preview preservation, no transport capability, global press-only key isolation, preview cancellation, non-abandonable confirmed apply, generation/result validation, sanitized retry, red narrow-terminal guidance, typed close/prune separation, and no status/discovery restart. The current run reported 110 passing tests and a locked release build.
+Automated tests exercise parsing/state, locked migrations/concurrency, host/repository/external discovery, bounded process cleanup, exact local/SSH argv, lifecycle recovery, Herdr placement, explorer transitions, status generations, confirmed close/prune, and scriptable snapshot collection. Snapshot coverage includes schema/legacy compatibility, host-origin precedence, deterministic joins, typed partial states, retained removed/retargeted targets, wrong-target exclusion, state/config immutability, output privacy, bounded cancellation, and process-tree cleanup. The current run reported 116 passing tests and a locked release build.
 
 Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
 
