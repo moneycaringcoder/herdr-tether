@@ -238,7 +238,7 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
         let tmux = temp.path().join("tmux");
         let log = temp.path().join("tmux.args");
         let script = format!(
-            "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{stdout}'; exit 0;;\nkill-session) printf '\\033]0;spoof\\007close refused' >&2; exit {status};;\nesac\n",
+            "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{stdout}'; exit 0;;\nif-shell) printf '\\033]0;spoof\\007close refused' >&2; exit {status};;\nesac\n",
             log = log.display(),
         );
         fs::write(&tmux, script).unwrap();
@@ -286,7 +286,7 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  if [ ! -e '{inspect_started}' ]; then\n    case \"$(cat '{state}')\" in *'\"status\": \"running\"'*) : ;; *) exit 70;; esac\n    printf ok > '{inspect_started}'\n    while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  fi\n  printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"stopping\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  if [ ! -e '{inspect_started}' ]; then\n    case \"$(cat '{state}')\" in *'\"status\": \"running\"'*) : ;; *) exit 70;; esac\n    printf ok > '{inspect_started}'\n    while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  fi\n  printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nif-shell)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"stopping\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
         inspect_started = inspect_started.display(),
         inspect_release = inspect_release.display(),
         close_started = close_started.display(),
@@ -325,11 +325,9 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
     );
     let argv = read_argv(&log);
     assert!(argv.iter().any(|argument| argument == "list-sessions"));
-    assert!(argv.ends_with(&[
-        "kill-session".into(),
-        "-t".into(),
-        "$7".into(),
-    ]));
+    assert!(argv.iter().any(|argument| argument == "if-shell"));
+    assert!(argv.iter().any(|argument| argument == "$7"));
+    assert!(argv.iter().any(|argument| argument == "kill-session -t $7"));
 }
 
 #[test]
@@ -393,7 +391,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
         let proceed = temp.path().join("proceed");
         let tmux = temp.path().join("tmux");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nif-shell) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
             ready = ready.display(),
             proceed = proceed.display(),
         );
@@ -447,7 +445,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
     let proceed = temp.path().join("proceed");
     let tmux = temp.path().join("tmux");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nif-shell) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
         ready = ready.display(),
         proceed = proceed.display(),
     );
@@ -567,7 +565,7 @@ fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
     fs::write(
         &tmux,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nif-shell) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
             process_group.display()
         ),
     )
