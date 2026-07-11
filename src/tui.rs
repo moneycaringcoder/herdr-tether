@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -77,6 +78,7 @@ pub struct PickerHost {
     pub label: String,
     pub target: Option<String>,
     pub directories: Vec<String>,
+    pub scan_roots: Vec<String>,
     pub commands: Vec<PickerCommand>,
     pub workloads: Vec<PickerWorkload>,
     pub allow_existing: bool,
@@ -103,16 +105,25 @@ impl PickerOptions {
 
         if include_local {
             host_names.insert("local".to_owned());
+            let mut scan_roots = config
+                .discovery
+                .local_roots
+                .iter()
+                .map(|root| expand_local_root(root, local_directory))
+                .collect::<Vec<_>>();
+            if scan_roots.is_empty() {
+                scan_roots.push(local_directory.to_owned());
+            }
             let mut directories = recent_directories(state, "local");
-            push_unique(&mut directories, local_directory);
-            if directories.is_empty() {
-                directories.push("~".to_owned());
+            for root in &scan_roots {
+                push_unique(&mut directories, root);
             }
             hosts.push(PickerHost {
                 name: "local".to_owned(),
                 label: "local".to_owned(),
                 target: None,
                 directories,
+                scan_roots,
                 commands: vec![PickerCommand::Shell],
                 workloads: active_workloads(state, "local"),
                 allow_existing: true,
@@ -123,14 +134,13 @@ impl PickerOptions {
             if !host_names.insert(host.name.clone()) {
                 continue;
             }
-            let mut directories = recent_directories(state, &host.name);
-            for root in &host.roots {
-                push_unique(&mut directories, root);
+            let mut scan_roots = host.roots.clone();
+            if scan_roots.is_empty() {
+                scan_roots.push("~".to_owned());
             }
-            // SSH config aliases synthesized by the CLI have no configured
-            // roots. `~` keeps them immediately usable without persisting data.
-            if directories.is_empty() {
-                directories.push("~".to_owned());
+            let mut directories = recent_directories(state, &host.name);
+            for root in &scan_roots {
+                push_unique(&mut directories, root);
             }
 
             let mut commands = Vec::with_capacity(host.presets.len() + 1);
@@ -144,6 +154,7 @@ impl PickerOptions {
                 label: host.name.clone(),
                 target: Some(host.target.clone()),
                 directories,
+                scan_roots,
                 commands,
                 workloads: active_workloads(state, &host.name),
                 allow_existing: true,
@@ -155,6 +166,19 @@ impl PickerOptions {
             default_placement: config.ui.placement,
         }
     }
+}
+
+fn expand_local_root(root: &str, home: &str) -> String {
+    if root == "~" {
+        return home.to_owned();
+    }
+    if let Some(rest) = root.strip_prefix("~/") {
+        return PathBuf::from(home)
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
+    }
+    root.to_owned()
 }
 
 fn recent_directories(state: &State, host: &str) -> Vec<String> {
@@ -570,11 +594,7 @@ impl PickerState {
                 .map(|host| DiscoveryLocation {
                     host: host.name.clone(),
                     target: host.target.clone(),
-                    roots: self
-                        .base_directories
-                        .get(&host.name)
-                        .cloned()
-                        .unwrap_or_default(),
+                    roots: host.scan_roots.clone(),
                 })
                 .collect(),
         }

@@ -92,11 +92,11 @@ Generation-tagged messages distinguish host reachability, owned running/missing/
 
 ### `DiscoveryService`
 
-`src/discovery.rs` owns ephemeral repository discovery beneath the same ordered roots already used as seed directories. A fixed worker pool scans hosts independently and publishes generation-tagged repository and completion events, so local results and fast hosts remain usable while another SSH target is slow.
+`src/discovery.rs` owns ephemeral repository discovery beneath explicit scan roots. `PickerOptions` keeps those roots separate from recent-directory suggestions: local scans use configured `discovery.local_roots` or `HOME`, and remote scans use each host's roots or `~`. A configurable bounded worker pool scans hosts independently and publishes generation-tagged repository and completion events, so local results and fast hosts remain usable while another SSH target is slow.
 
-Local traversal is lexical, depth/entry/result/time bounded, prunes at repositories, accepts `.git` directories or files, and uses `symlink_metadata` so it never follows a symlink. Remote traversal runs one fixed portable `/bin/sh` scanner through BatchMode OpenSSH with validated target argv and POSIX-quoted roots; it applies the same depth, entry, result, and no-symlink constraints. Its output is a NUL-framed protocol: malformed framing, invalid root indexes, absolute paths, and parent traversal invalidate the response; an isolated non-UTF-8 path record is skipped while valid records remain available with an error status. The shared bounded process runner supplies the wall-clock deadline, output cap, cancellation, process-group cleanup, and null stdin.
+Local traversal is lexical, bounded by validated configured depth/entry/result/time values, prunes at repositories, accepts `.git` directories or files, and uses `symlink_metadata` so it never follows a symlink. Remote traversal runs one fixed portable `/bin/sh` scanner through BatchMode OpenSSH with validated target argv and POSIX-quoted roots; it applies the same depth, entry, result, and no-symlink constraints. Its output is a NUL-framed protocol: malformed framing, invalid root indexes, absolute paths, and parent traversal invalidate the response; an isolated non-UTF-8 path record is skipped while valid records remain available with an error status. The shared bounded process runner supplies the wall-clock deadline, 64 KiB output cap, cancellation, process-group cleanup, and null stdin.
 
-Discovery is overlay-local and never rewrites configuration or session state. Refresh cancels both status and discovery generations, removes old discovered rows, preserves configured/recent seed directories, and rejects late messages.
+Discovery is overlay-local and never rewrites configuration or session state. Refresh cancels both status and discovery generations, removes old discovered rows, preserves configured/recent picker suggestions, and rejects late messages.
 
 ### `HerdrClient`
 
@@ -112,7 +112,7 @@ Discovery is overlay-local and never rewrites configuration or session state. Re
 
 ### Configuration, state, and discovery
 
-`ConfigStore` owns versioned TOML host, root, preset, and UI-default data. `StateStore` owns versioned JSON session records. `AppPaths` resolves plugin directories first and otherwise follows XDG/HOME defaults. Both stores use the shared atomic writer.
+`ConfigStore` owns strict version-2 TOML host/root/preset, UI placement, discovery-limit/root, and closed-record retention defaults. `StateStore` owns version-1 JSON session records. `AppPaths` resolves plugin directories first and otherwise follows XDG/HOME defaults. Both stores use the shared private atomic writer and serialize public load/save/update operations with a per-file advisory lock; legacy config/state migration read, validation, and rewrite occur inside one lock transaction through private non-reentrant helpers.
 
 `sshcfg` discovers only literal OpenSSH `Host` aliases for picker/list use. OpenSSH itself still interprets the selected alias and the rest of its configuration. An alias is synthesized as an ephemeral host option; it is not copied into Tether config.
 

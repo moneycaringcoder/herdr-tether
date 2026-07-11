@@ -102,25 +102,46 @@ pub struct StateStore {
     path: PathBuf,
 }
 
+pub struct LockedStateStore<'a> {
+    store: &'a StateStore,
+}
+
+impl LockedStateStore<'_> {
+    pub fn load(&self) -> Result<State> {
+        self.store.load_unlocked()
+    }
+
+    pub fn save(&self, state: &State) -> Result<()> {
+        self.store.save_unlocked(state)
+    }
+}
+
 impl StateStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
     pub fn update<T>(&self, operation: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        self.exclusive(|store| {
-            let mut state = store.load()?;
+        with_advisory_lock(&self.path, || {
+            let mut state = self.load_unlocked()?;
             let result = operation(&mut state)?;
-            store.save(&state)?;
+            self.save_unlocked(&state)?;
             Ok(result)
         })
     }
 
-    pub fn exclusive<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        with_advisory_lock(&self.path, || operation(self))
+    pub fn exclusive<T>(
+        &self,
+        operation: impl FnOnce(&LockedStateStore<'_>) -> Result<T>,
+    ) -> Result<T> {
+        with_advisory_lock(&self.path, || operation(&LockedStateStore { store: self }))
     }
 
     pub fn load(&self) -> Result<State> {
+        with_advisory_lock(&self.path, || self.load_unlocked())
+    }
+
+    fn load_unlocked(&self) -> Result<State> {
         let source = match fs::read_to_string(&self.path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
@@ -155,7 +176,7 @@ impl StateStore {
                 })?;
                 let state = legacy.migrate();
                 state.validate()?;
-                self.save(&state)
+                self.save_unlocked(&state)
                     .with_context(|| format!("rewrite migrated state `{}`", self.path.display()))?;
                 Ok(state)
             }
@@ -168,6 +189,10 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &State) -> Result<()> {
+        with_advisory_lock(&self.path, || self.save_unlocked(state))
+    }
+
+    fn save_unlocked(&self, state: &State) -> Result<()> {
         state.validate()?;
         let mut serialized =
             serde_json::to_string_pretty(state).context("serialize state as JSON")?;

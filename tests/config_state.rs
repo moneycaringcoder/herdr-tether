@@ -1,13 +1,17 @@
 use std::{
-    fs,
-    sync::{Arc, Barrier},
+    fs::{self, OpenOptions},
+    sync::{Arc, Barrier, mpsc},
     thread,
     time::Duration as StdDuration,
 };
 
 use chrono::{TimeZone, Utc};
+use fs2::FileExt;
 use herdr_tether::{
-    config::{CommandPreset, Config, ConfigStore, HostConfig, UiDefaults},
+    config::{
+        CommandPreset, Config, ConfigStore, DiscoveryDefaults, HostConfig, RetentionDefaults,
+        UiDefaults,
+    },
     model::Placement,
     state::{SessionRecord, SessionStatus, State, StateStore},
 };
@@ -31,6 +35,8 @@ fn sample_config() -> Config {
         ui: UiDefaults {
             placement: Placement::SplitRight,
         },
+        discovery: DiscoveryDefaults::default(),
+        retention: RetentionDefaults::default(),
     }
 }
 
@@ -45,9 +51,14 @@ fn config_round_trips_atomically_with_private_permissions() {
 
     assert_eq!(store.load().unwrap(), config);
     assert!(path.exists());
-    assert_eq!(
-        fs::read_dir(path.parent().unwrap()).unwrap().count(),
-        1,
+    assert!(
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
         "atomic write must not leave temporary files"
     );
     #[cfg(unix)]
@@ -58,7 +69,7 @@ fn config_round_trips_atomically_with_private_permissions() {
 }
 
 #[test]
-fn config_v0_is_migrated_and_rewritten_as_v1() {
+fn config_v0_is_migrated_and_rewritten_as_v2() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
     fs::write(
@@ -76,11 +87,261 @@ roots = ["/work"]
 
     let migrated = store.load().unwrap();
 
-    assert_eq!(migrated.version, Config::CURRENT_VERSION);
-    assert_eq!(migrated.hosts[0].name, "work");
-    assert!(migrated.hosts[0].presets.is_empty());
-    assert_eq!(migrated.ui.placement, Placement::SplitRight);
-    assert!(fs::read_to_string(path).unwrap().contains("version = 1"));
+    assert_eq!(
+        migrated,
+        Config {
+            version: 2,
+            hosts: vec![HostConfig {
+                name: "work".into(),
+                target: "work.example.test".into(),
+                roots: vec!["/work".into()],
+                presets: Vec::new(),
+            }],
+            ui: UiDefaults::default(),
+            discovery: DiscoveryDefaults::default(),
+            retention: RetentionDefaults::default(),
+        }
+    );
+    assert!(fs::read_to_string(path).unwrap().contains("version = 2"));
+}
+
+#[test]
+fn config_v1_is_migrated_with_exact_v2_defaults() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"version = 1
+
+[[hosts]]
+name = "work"
+target = "work.example.test"
+roots = ["/work"]
+presets = [{ name = "shell", command = "exec /bin/sh" }]
+
+[ui]
+placement = "split-down"
+"#,
+    )
+    .unwrap();
+
+    let migrated = ConfigStore::new(path.clone()).load().unwrap();
+
+    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.hosts[0].roots, ["/work"]);
+    assert_eq!(migrated.hosts[0].presets[0].name, "shell");
+    assert_eq!(migrated.ui.placement, Placement::SplitDown);
+    assert_eq!(
+        migrated.discovery,
+        DiscoveryDefaults {
+            local_roots: Vec::new(),
+            max_depth: 4,
+            max_entries: 4096,
+            max_results: 64,
+            timeout_seconds: 3,
+            workers: 4,
+        }
+    );
+    assert_eq!(migrated.retention, RetentionDefaults { closed_days: 30 });
+    let rewritten = fs::read_to_string(path).unwrap();
+    assert!(rewritten.contains("version = 2"));
+    assert!(rewritten.contains("[discovery]"));
+    assert!(rewritten.contains("[retention]"));
+}
+
+#[test]
+fn every_config_schema_rejects_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let store = ConfigStore::new(path.clone());
+    let sources = [
+        "version = 0\nhosts = []\nunknown = true\n",
+        "version = 1\nhosts = []\nunknown = true\n\n[ui]\nplacement = \"split-right\"\n",
+        "version = 2\nhosts = []\nunknown = true\n\n[ui]\nplacement = \"split-right\"\n\n[discovery]\nlocal_roots = []\nmax_depth = 4\nmax_entries = 4096\nmax_results = 64\ntimeout_seconds = 3\nworkers = 4\n\n[retention]\nclosed_days = 30\n",
+    ];
+
+    for source in sources {
+        fs::write(&path, source).unwrap();
+        let error = store.load().unwrap_err().to_string();
+        assert!(
+            error.contains("decode config version"),
+            "unexpected strict-schema error: {error}"
+        );
+    }
+}
+
+#[test]
+fn config_v2_round_trip_and_limit_validation() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let store = ConfigStore::new(path.clone());
+    let mut config = sample_config();
+    config.discovery.local_roots = vec!["/srv/one".into(), "/srv/two".into()];
+    config.discovery.max_depth = 8;
+    config.discovery.max_entries = 8192;
+    config.discovery.max_results = 128;
+    config.discovery.timeout_seconds = 9;
+    config.discovery.workers = 2;
+    config.retention.closed_days = 45;
+
+    store.save(&config).unwrap();
+    assert_eq!(store.load().unwrap(), config);
+
+    for field in [
+        "max_depth",
+        "max_entries",
+        "max_results",
+        "timeout_seconds",
+        "workers",
+        "closed_days",
+    ] {
+        let mut invalid = config.clone();
+        match field {
+            "max_depth" => invalid.discovery.max_depth = 0,
+            "max_entries" => invalid.discovery.max_entries = 0,
+            "max_results" => invalid.discovery.max_results = 0,
+            "timeout_seconds" => invalid.discovery.timeout_seconds = 0,
+            "workers" => invalid.discovery.workers = 0,
+            "closed_days" => invalid.retention.closed_days = 0,
+            _ => unreachable!(),
+        }
+        assert!(
+            invalid.validate().unwrap_err().to_string().contains(field),
+            "{field} should identify its validation error"
+        );
+    }
+
+    let mut excessive_timeout = config.clone();
+    excessive_timeout.discovery.timeout_seconds = 3601;
+    assert!(
+        excessive_timeout
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("at most 3600"),
+        "operational timeout must not overflow or stall the explorer indefinitely"
+    );
+
+    let mut too_large = config.clone();
+    too_large.discovery.max_depth = usize::MAX;
+    assert!(
+        too_large
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("maximum TOML integer")
+    );
+    too_large.discovery.max_depth = 1;
+    too_large.discovery.timeout_seconds = u64::MAX;
+    assert!(
+        too_large
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("maximum TOML integer")
+    );
+    too_large.discovery.timeout_seconds = 1;
+    too_large.retention.closed_days = u64::MAX;
+    assert!(
+        too_large
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("maximum TOML integer")
+    );
+
+    let mut invalid_root = config;
+    invalid_root.discovery.local_roots.push(" \t".into());
+    assert!(
+        invalid_root
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("local root")
+    );
+}
+
+#[test]
+fn concurrent_config_updates_preserve_both_hosts() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+
+    for name in ["one", "two"] {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            ConfigStore::new(path)
+                .update(|config| {
+                    thread::sleep(StdDuration::from_millis(50));
+                    config.add_host(HostConfig {
+                        name: name.into(),
+                        target: format!("{name}.example.test"),
+                        roots: vec![format!("/{name}")],
+                        presets: Vec::new(),
+                    })
+                })
+                .unwrap();
+        }));
+    }
+
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let config = ConfigStore::new(path).load().unwrap();
+    assert_eq!(config.hosts.len(), 2);
+    assert!(config.hosts.iter().any(|host| host.name == "one"));
+    assert!(config.hosts.iter().any(|host| host.name == "two"));
+}
+
+fn assert_load_waits_for_lock(path: &std::path::Path, load: impl FnOnce() + Send + 'static) {
+    let lock_path = path.parent().unwrap().join(format!(
+        ".{}.lock",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        load();
+        done_tx.send(()).unwrap();
+    });
+
+    assert!(
+        done_rx.recv_timeout(StdDuration::from_millis(100)).is_err(),
+        "load-time migration must wait for the advisory lock"
+    );
+    FileExt::unlock(&lock).unwrap();
+    done_rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn config_load_time_migration_holds_the_advisory_lock() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(
+        &path,
+        "version = 1\nhosts = []\n\n[ui]\nplacement = \"split-right\"\n",
+    )
+    .unwrap();
+    let load_path = path.clone();
+
+    assert_load_waits_for_lock(&path, move || {
+        ConfigStore::new(load_path).load().unwrap();
+    });
+
+    assert!(fs::read_to_string(path).unwrap().contains("version = 2"));
 }
 
 #[test]
@@ -135,6 +396,20 @@ fn state_round_trips_and_migrates_v0() {
     assert_eq!(migrated.version, State::CURRENT_VERSION);
     assert_eq!(migrated.sessions[0].status, SessionStatus::Active);
     assert!(migrated.sessions[0].preset.is_none());
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+}
+
+#[test]
+fn state_load_time_migration_holds_the_advisory_lock() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    fs::write(&path, r#"{"version":0,"sessions":[]}"#).unwrap();
+    let load_path = path.clone();
+
+    assert_load_waits_for_lock(&path, move || {
+        StateStore::new(load_path).load().unwrap();
+    });
+
     assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
 }
 
