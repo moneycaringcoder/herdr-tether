@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-11
+
+### Fixed
+
+- Remote default directories using `~` or `~/...` now expand against the remote login environment before launch and cwd verification.
+- Failed post-create verification now rolls back through the captured internal tmux session identity instead of racing a second name lookup.
+
 ## [0.2.1] - 2026-07-11
 
 ### Added

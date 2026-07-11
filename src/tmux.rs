@@ -9,6 +9,9 @@ use crate::{
     sshcfg::validate_ssh_target,
 };
 
+const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
+const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
+
 #[derive(Clone, Debug)]
 enum Location {
     Local,
@@ -239,7 +242,7 @@ impl TmuxBackend {
     fn paths_refer_to_same_directory(&self, actual: &str, expected: &str) -> Result<bool> {
         let spec = self.shell_spec(vec![
             "-c".to_owned(),
-            "[ \"$1\" -ef \"$2\" ]".to_owned(),
+            SAME_DIRECTORY_SCRIPT.to_owned(),
             "tether-cwd-check".to_owned(),
             actual.to_owned(),
             expected.to_owned(),
@@ -297,9 +300,26 @@ impl TmuxBackend {
         Ok(())
     }
 
-    fn rollback_created(&self, id: &SessionId, cause: anyhow::Error) -> anyhow::Error {
-        let rollback = self
-            .close_exact_spec(id)
+    fn rollback_created(
+        &self,
+        id: &SessionId,
+        internal_target: Option<&str>,
+        cause: anyhow::Error,
+    ) -> anyhow::Error {
+        let rollback = internal_target
+            .map_or_else(
+                || self.close_exact_spec(id),
+                |target| {
+                    self.tmux_spec(
+                        vec![
+                            "kill-session".to_owned(),
+                            "-t".to_owned(),
+                            target.to_owned(),
+                        ],
+                        false,
+                    )
+                },
+            )
             .and_then(|spec| self.require_success("rollback created session", &spec));
         match rollback {
             Ok(()) => cause,
@@ -326,7 +346,7 @@ impl DurableBackend for TmuxBackend {
                 "--".to_owned(),
                 "/bin/sh".to_owned(),
                 "-lc".to_owned(),
-                "cd -- \"$1\" && exec /bin/sh -c \"$2\"".to_owned(),
+                LAUNCH_SCRIPT.to_owned(),
                 "tether-launch".to_owned(),
                 launch.directory.clone(),
                 launch.command.clone(),
@@ -345,19 +365,21 @@ impl DurableBackend for TmuxBackend {
         let created = std::str::from_utf8(&output.stdout)
             .context("tmux returned non-UTF-8 created session identities")?
             .trim_end_matches(['\r', '\n']);
-        let result = (|| {
+        let identities = (|| {
             let (session_target, pane_target) = created
                 .split_once(':')
                 .context("tmux create did not return session and pane identities")?;
             let session_target = validate_tmux_id(session_target, '$', "session")?;
             let pane_target = validate_tmux_id(pane_target, '%', "pane")?;
-            self.verify_created_cwd(&pane_target, &launch.directory)?;
-            self.enable_mouse_for_target(session_target)
+            Ok::<_, anyhow::Error>((session_target, pane_target))
         })();
-        if let Err(error) = result {
-            return Err(self.rollback_created(&launch.id, error));
-        }
-        Ok(())
+        let (session_target, pane_target) = match identities {
+            Ok(identities) => identities,
+            Err(error) => return Err(self.rollback_created(&launch.id, None, error)),
+        };
+        self.verify_created_cwd(&pane_target, &launch.directory)
+            .and_then(|()| self.enable_mouse_for_target(session_target.clone()))
+            .map_err(|error| self.rollback_created(&launch.id, Some(&session_target), error))
     }
 
     fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
@@ -447,4 +469,33 @@ fn remote_command(program: &str, arguments: &[String]) -> Result<String> {
         command.push_str(&posix_quote(argument)?);
     }
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs};
+
+    use super::*;
+
+    #[test]
+    fn shell_scripts_expand_remote_home_shorthand() {
+        let home = env::var("HOME").unwrap();
+        let expected = fs::canonicalize(&home).unwrap();
+
+        for selected in ["~", "~/"] {
+            let output = Command::new("/bin/sh")
+                .args(["-lc", LAUNCH_SCRIPT, "tether-launch", selected, "pwd -P"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{selected}: {output:?}");
+            let actual = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(fs::canonicalize(actual.trim()).unwrap(), expected);
+        }
+
+        let comparison = Command::new("/bin/sh")
+            .args(["-c", SAME_DIRECTORY_SCRIPT, "tether-cwd-check", &home, "~/"])
+            .status()
+            .unwrap();
+        assert!(comparison.success());
+    }
 }

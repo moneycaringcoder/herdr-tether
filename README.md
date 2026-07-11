@@ -15,10 +15,10 @@ Tether complements [Herdr](https://github.com/ogulcancelik/herdr) and `herdr-mir
 - OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes` under your normal keys, agent, and `known_hosts` policy.
 - Network access to GitHub and Cargo's configured registry during installation, unless both sources and dependencies are already cached.
 
-Install the pinned v0.2.1 release tag through Herdr:
+Install the pinned v0.2.2 release tag through Herdr:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.1 --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.2 --yes
 herdr plugin action list --plugin moneycaringcoder.tether
 ```
 
@@ -26,7 +26,7 @@ Herdr uses its managed checkout for plugin actions; it does not add the built bi
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.2.1 --locked herdr-tether
+  --tag v0.2.2 --locked herdr-tether
 ```
 
 Run **Tether: Install prefix+t launcher** once from Herdr, or invoke the action explicitly:
@@ -56,12 +56,12 @@ Plain standalone `herdr-tether setup` and normal install/open remain non-mutatin
 Installing the same pinned ref again rebuilds and reinstalls the plugin. Reinstall the standalone binary with `--force` after repairing a toolchain or dependency cache:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.1 --yes
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.2 --yes
 cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.2.1 --locked herdr-tether
+  --tag v0.2.2 --locked herdr-tether
 ```
 
-To update, replace `v0.2.1` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
+To update, replace `v0.2.2` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.1.0 --yes
