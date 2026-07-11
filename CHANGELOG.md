@@ -22,6 +22,7 @@
 ### Fixed
 
 - Fixed installed Herdr 0.7.3 action/placement interoperability: managed pane commands now resolve the built executable through `HERDR_PLUGIN_ROOT`; split responses use the actual `pane_info` contract; successful `pane run` accepts Herdr's empty stdout; placement targets the invoking pane rather than the temporary overlay; placed attach commands retain authoritative plugin config/state paths without recursively opening another pane; and new tabs are explicitly focused.
+- Serialized independent process-backed tests in CI while preserving each service's worker-concurrency coverage, added in-process malformed-record parser coverage and failure diagnostics, and now gate Rust 1.88 plus the exact locked release build.
 
 ## [0.1.0] - 2026-07-10
 

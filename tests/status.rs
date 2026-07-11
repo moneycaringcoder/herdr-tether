@@ -147,28 +147,34 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
         }
     }
 
-    assert!(messages.iter().any(|message| matches!(
-        message,
-        StatusMessage::Catalog {
-            host,
-            status: ExternalCatalogStatus::Available,
-            sessions,
-            hidden_reserved: 2,
-            ..
-        } if host == "dev"
-            && sessions == &[ExternalSession {
-                name: "work box".parse::<ExternalSessionName>().unwrap(),
-                attached: 0,
-            }]
-    )));
-    assert!(messages.iter().any(|message| matches!(
-        message,
-        StatusMessage::Workload {
-            id,
-            status: WorkloadStatus::Running { attached: 2 },
-            ..
-        } if *id == owned
-    )));
+    assert!(
+        messages.iter().any(|message| matches!(
+            message,
+            StatusMessage::Catalog {
+                host,
+                status: ExternalCatalogStatus::Available,
+                sessions,
+                hidden_reserved: 2,
+                ..
+            } if host == "dev"
+                && sessions == &[ExternalSession {
+                    name: "work box".parse::<ExternalSessionName>().unwrap(),
+                    attached: 0,
+                }]
+        )),
+        "unexpected status messages: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| matches!(
+            message,
+            StatusMessage::Workload {
+                id,
+                status: WorkloadStatus::Running { attached: 2 },
+                ..
+            } if *id == owned
+        )),
+        "unexpected status messages: {messages:?}"
+    );
 }
 
 #[test]
