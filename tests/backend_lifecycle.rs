@@ -238,7 +238,7 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
         let tmux = temp.path().join("tmux");
         let log = temp.path().join("tmux.args");
         let script = format!(
-            "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{stdout}'; exit 0;;\nif-shell) printf '\\033]0;spoof\\007close refused' >&2; exit {status};;\nesac\n",
+            "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{stdout}'; exit 0;;\nif-shell) printf '\\033]0;spoof\\007close refused TETHER_OWNERSHIP_PROOF=0197f198000070008000000000000002' >&2; exit {status};;\nesac\n",
             log = log.display(),
         );
         fs::write(&tmux, script).unwrap();
@@ -268,6 +268,8 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
             assert!(!rendered.contains('\u{1b}'));
             assert!(!rendered.contains("spoof"));
             assert!(rendered.contains("close refused"));
+            assert!(!rendered.contains("0197f198000070008000000000000002"));
+            assert!(!rendered.contains("TETHER_OWNERSHIP_PROOF"));
         }
         assert_eq!(record.closed_at, None);
     }

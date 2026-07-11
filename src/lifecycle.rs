@@ -194,7 +194,7 @@ impl LifecycleService {
             )),
             output => Err(CloseOwnedError::Inspect {
                 id: *id,
-                source: bounded_transport_error(output),
+                source: bounded_transport_error(output, ownership_proof),
             }),
         }
     }
@@ -223,7 +223,7 @@ impl LifecycleService {
             }
             output => Err(CloseOwnedError::Close {
                 id,
-                source: bounded_transport_error(output),
+                source: bounded_transport_error(output, ownership_proof),
             }),
         }
     }
@@ -658,7 +658,7 @@ impl LifecycleService {
     }
 }
 
-fn bounded_transport_error(output: BoundedOutput) -> AnyError {
+fn bounded_transport_error(output: BoundedOutput, ownership_proof: &OwnershipProof) -> AnyError {
     match output {
         BoundedOutput::TimedOut => anyhow!(
             "transport timed out after {} seconds",
@@ -675,7 +675,10 @@ fn bounded_transport_error(output: BoundedOutput) -> AnyError {
             stderr_truncated,
             ..
         } => {
-            let detail = sanitize_transport_detail(&String::from_utf8_lossy(&stderr));
+            let detail = sanitize_transport_detail(
+                &String::from_utf8_lossy(&stderr),
+                ownership_proof,
+            );
             let truncation = if stderr_truncated {
                 " [stderr truncated]"
             } else {
@@ -690,8 +693,16 @@ fn bounded_transport_error(output: BoundedOutput) -> AnyError {
     }
 }
 
-fn sanitize_transport_detail(text: &str) -> String {
+fn sanitize_transport_detail(text: &str, ownership_proof: &OwnershipProof) -> String {
     const MAX_CHARS: usize = 240;
+    let ownership_proof = ownership_proof.to_string();
+    let text = text
+        .replace(
+            &format!("TETHER_OWNERSHIP_PROOF={ownership_proof}"),
+            "[redacted ownership proof]",
+        )
+        .replace(&ownership_proof, "[redacted ownership proof]")
+        .replace("TETHER_OWNERSHIP_PROOF", "[redacted ownership proof]");
     let mut sanitized = String::with_capacity(text.len().min(MAX_CHARS));
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
