@@ -30,12 +30,12 @@ FORBIDDEN_PUBLIC_PATTERNS = {
         r"acceptance hold|pending human|awaiting explicit .* acceptance",
         re.IGNORECASE,
     ),
-    "private mission references": re.compile(
-        r"\.omp/mission|START_PROMPT|OPERATING_LOOP|mission evidence|mission complete",
+    "private planning references": re.compile(
+        r"\.(?:omp|hermes)/(?:mission|plans)|START_PROMPT|OPERATING_LOOP|mission evidence|mission complete",
         re.IGNORECASE,
     ),
     "machine-specific details": re.compile(
-        r"/home/amadeo|napoleon-pantone|\blap1\b|\bAtlas Core\b",
+        r"/(?:home|Users)/[A-Za-z0-9._-]+/(?:repos|src|projects)/|\.ts\.net\b",
         re.IGNORECASE,
     ),
 }

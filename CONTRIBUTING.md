@@ -24,4 +24,4 @@ Do not commit credentials, host details, generated state, or build output. Descr
 
 ## Public documentation boundary
 
-README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep release-candidate status, acceptance checklists, private mission/control files, review transcripts, local usernames/paths, and machine-specific orchestration notes out of tracked documentation. Use pull requests and private working notes for temporary release coordination.
+README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep temporary planning, release coordination, test-machine details, review transcripts, local usernames, and local paths out of tracked product documentation. Use pull requests or untracked working notes for temporary coordination.
