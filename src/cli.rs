@@ -780,9 +780,8 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
-        let executable = env::current_exe().context("locate the Tether executable")?;
-        let resume = resume_command(executable, id);
-        place_in_herdr(HerdrClient::new(context), &resume, selection.placement)
+        let attach = backend.attach_command(&id, &ownership_proof, identity)?;
+        place_in_herdr(HerdrClient::new(context), &attach, selection.placement)
             .with_context(|| {
                 format!(
                     "place newly created session `{id}`; it remains running and recorded for retry"
@@ -824,19 +823,16 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
 fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
-        let executable = env::current_exe().context("locate the Tether executable")?;
-        let resume = resume_command(executable, id);
-        place_in_herdr(HerdrClient::new(context), &resume, placement)?;
+        let service = LifecycleService::new(
+            StateStore::new(paths.state_file.clone()),
+            ProcessBinaries::new("ssh", "tmux"),
+        );
+        let attach = service.open_owned(id)?;
+        place_in_herdr(HerdrClient::new(context), &attach, placement)?;
         Ok(())
     } else {
         session_command(paths, SessionCommand::Open { id })
     }
-}
-fn resume_command(executable: PathBuf, id: SessionId) -> CommandSpec {
-    CommandSpec::new(
-        executable,
-        vec!["session".to_owned(), "open".to_owned(), id.to_string()],
-    )
 }
 
 fn external_attach_command(
@@ -1339,24 +1335,6 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn resume_command_targets_the_exact_selected_session() {
-        let id = "tether-0197f198000070008000000000000001"
-            .parse::<SessionId>()
-            .unwrap();
-
-        let command = resume_command(PathBuf::from("/plugin/herdr-tether"), id);
-
-        assert_eq!(command.program, PathBuf::from("/plugin/herdr-tether"));
-        assert_eq!(
-            command.args,
-            [
-                "session",
-                "open",
-                "tether-0197f198000070008000000000000001"
-            ]
-        );
-    }
 
     #[test]
     fn external_attach_command_preserves_target_and_name_as_arguments() {

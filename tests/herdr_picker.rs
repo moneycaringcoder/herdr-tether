@@ -101,6 +101,37 @@ fi
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn write_fake_reused_source_herdr(path: &Path, log: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+printf 'CALL' >> '{log}'
+for arg do printf '\t%s' "$arg" >> '{log}'; done
+printf '\n' >> '{log}'
+if [ "$1 $2 $3" = "pane process-info --pane" ]; then
+  if [ "$4" = "w1:p1" ]; then
+    count=$(grep -c 'process-info.*w1:p1' '{log}')
+    if [ "$count" -eq 1 ]; then pid=202; name=vim; else pid=909; name=replacement; fi
+    printf '{{"id":"source","result":{{"type":"pane_process_info","process_info":{{"pane_id":"w1:p1","foreground_processes":[{{"pid":%s,"name":"%s","argv":["%s"]}}]}}}}}}' "$pid" "$name" "$name"
+  else
+    printf '%s' '{{"id":"destination","result":{{"type":"pane_process_info","process_info":{{"pane_id":"w1:p9","foreground_processes":[{{"pid":404,"name":"tmux","argv":["/usr/bin/tmux","attach-session","-t","$7"]}}]}}}}}}'
+  fi
+elif [ "$1 $2" = "pane split" ]; then
+  printf '%s' '{{"id":"split","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
+elif [ "$1 $2" = "pane rename" ]; then
+  printf '%s' '{{"id":"rename","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
+elif [ "$1 $2" = "pane run" ]; then
+  printf '%s' '{{"id":"run","result":{{"type":"pane_ran","pane_id":"w1:p9"}}}}'
+elif [ "$1 $2" = "pane close" ]; then
+  printf '%s' '{{"id":"close","result":{{"type":"ok"}}}}'
+fi
+"#,
+        log = log.display(),
+    );
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn context(binary: &Path) -> HerdrContext {
     HerdrContext {
         binary: binary.into(),
@@ -188,7 +219,7 @@ fn replacement_inspects_source_then_closes_it_only_after_destination_is_running(
     write_fake_replace_herdr(
         &binary,
         &log,
-        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session","-t","=tether-id"],"cwd":"/tmp"}]}}}'"#,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"tmux","argv":["/usr/bin/tmux","attach-session","-t","$7"],"cwd":"/tmp"}]}}}'"#,
         CLOSE_OK,
     );
     let client = HerdrClient::new(context(&binary));
@@ -199,8 +230,8 @@ fn replacement_inspects_source_then_closes_it_only_after_destination_is_running(
     assert!(inspection.safe_summary().contains("vim"));
     let pane = client
         .replace_current(&CommandSpec::new(
-            "/plugin/herdr-tether",
-            vec!["session".into(), "resume".into(), "tether-id".into()],
+            "/usr/bin/tmux",
+            vec!["attach-session".into(), "-t".into(), "$7".into()],
         ))
         .unwrap();
     assert_eq!(pane.pane_id, "w1:p9");
@@ -231,14 +262,14 @@ fn replacement_close_failure_warns_without_invalidating_running_destination() {
     write_fake_replace_herdr(
         &binary,
         &log,
-        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session","-t","=tether-id"]}]}}}'"#,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","foreground_processes":[{"pid":404,"name":"tmux","argv":["/usr/bin/tmux","attach-session","-t","$7"]}]}}}'"#,
         "exit 9",
     );
 
     let pane = HerdrClient::new(context(&binary))
         .replace_current(&CommandSpec::new(
-            "/plugin/herdr-tether",
-            vec!["session".into(), "resume".into(), "tether-id".into()],
+            "/usr/bin/tmux",
+            vec!["attach-session".into(), "-t".into(), "$7".into()],
         ))
         .unwrap();
 
@@ -264,8 +295,8 @@ fn replacement_preserves_source_when_destination_reports_unrelated_process() {
     );
     let error = HerdrClient::new(context(&binary))
         .replace_current(&CommandSpec::new(
-            "/plugin/herdr-tether",
-            vec!["session".into(), "resume".into(), "tether-id".into()],
+            "/usr/bin/tmux",
+            vec!["attach-session".into(), "-t".into(), "$7".into()],
         ))
         .unwrap_err();
 
@@ -276,6 +307,33 @@ fn replacement_preserves_source_when_destination_reports_unrelated_process() {
     );
     let transcript = fs::read_to_string(log).unwrap();
     assert!(transcript.contains("CALL\tpane\tclose\tw1:p9"));
+    assert!(!transcript.contains("CALL\tpane\tclose\tw1:p1"));
+}
+
+#[test]
+fn replacement_preserves_reused_source_pane_id() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_reused_source_herdr(&binary, &log);
+
+    let pane = HerdrClient::new(context(&binary))
+        .replace_current(&CommandSpec::new(
+            "/usr/bin/tmux",
+            vec!["attach-session".into(), "-t".into(), "$7".into()],
+        ))
+        .unwrap();
+
+    assert_eq!(pane.pane_id, "w1:p9");
+    assert!(
+        pane.warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("changed during replacement"))
+    );
+    let transcript = fs::read_to_string(log).unwrap();
     assert!(!transcript.contains("CALL\tpane\tclose\tw1:p1"));
 }
 
