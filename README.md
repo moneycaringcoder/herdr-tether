@@ -4,6 +4,68 @@ Tether keeps a terminal workload alive when its visible Herdr pane or SSH connec
 
 > **Scope of v0.1:** remote sessions are `tmux` over ordinary OpenSSH. Tether does **not** federate Herdr instances, synchronize remote workspaces, or use a native remote Herdr protocol. See [the architecture](docs/architecture.md).
 
+## What Tether makes easier
+
+Tether complements Herdr and herdr-mirror rather than replacing either one. Herdr owns the terminal surface. herdr-mirror is the stronger tool for continuously streaming and driving an already-running remote Herdr workspace. Tether handles a different layer: finding machines and repositories, giving tmux work a durable identity, checking its status without attaching, and resuming or closing the exact selected workload.
+
+### 1. Discover a repository, launch work, leave, and resume
+
+Configure a scan root and a trusted command once:
+
+```sh
+herdr-tether host add build build.example.net \
+  --root /srv/repos \
+  --preset 'editor=exec vi'
+herdr-tether host check build
+```
+
+Invoke **Tether: Open** in Herdr, then choose:
+
+```text
+build → Create new Tether workload → <discovered repository> → editor → Split right
+```
+
+Tether finds repositories beneath the configured root, creates a uniquely named tmux session in the selected directory, records its exact host and SSH target, asks Herdr for the split, and attaches there. Replace `editor` with any trusted shell or agent command installed on that host. Close the Herdr view or detach from tmux; the workload continues. On the next invocation, choose the same host and its `[active]` Tether row to resume it in any placement.
+
+Without Tether, this flow requires remembering the SSH destination and repository path, choosing and later recovering a tmux session name, creating the Herdr pane separately, and composing the attach command. herdr-mirror can mirror a remote Herdr pane, but it does not discover arbitrary tmux-backed work or give it Tether's owned close and metadata-cleanup workflow.
+
+### 2. Inspect local and remote work without attaching
+
+Invoke **Tether: Open** and pause on Hosts or Resources. Hosts finish independently as `online`, `offline`, `timeout`, or `error`; `[loading]` and `[stale: …]` make an in-progress check explicit. Selecting one host shows its owned workloads and safely discovered external tmux sessions. Press `r` to re-check; old results stay marked stale until fresh results arrive.
+
+For scripts, answer the same question with the read-only snapshot and optional `jq`:
+
+```sh
+herdr-tether snapshot | jq '
+  .hosts[] |
+  {host: .name,
+   reachability: .reachability.status,
+   owned: [.owned_sessions[] | {id, status: .workload_status}],
+   external: [.external_catalog.sessions[] | {name, attached}]}'
+```
+
+A result such as `"host":"build"`, `"reachability":"reachable"`, and `"status":"running"` answers whether the host and its owned work are alive without opening an SSH attachment. An unreachable or slow host appears as labeled partial data instead of hanging the explorer or hiding results from faster hosts.
+
+The manual equivalent is a host-by-host sequence of SSH connectivity checks, `tmux list-sessions`, repository searches, and hand-maintained joins. herdr-mirror provides live status for remote Herdr workspaces; Tether adds local and ordinary tmux workloads, repository discovery, remembered owned work, and operation without a remote Herdr server.
+
+### 3. Find and attach an existing tmux session safely
+
+Invoke **Tether: Open**, select a host, and choose an `[external · running]` or `[external · running · N attached]` row followed by split right, split down, or new tab. Tether validates the session name, creates the Herdr view, and issues one exact-name `tmux attach-session`. It does not adopt the session, write it to Tether state, rename it, close it, or expose it to metadata cleanup.
+
+The manual equivalent requires SSH, listing and interpreting tmux sessions, carefully quoting the exact target, and opening and focusing the desired Herdr pane. Tether turns those steps into one searchable selection while preserving non-ownership.
+
+### Capability boundary
+
+| Need | Manual SSH + tmux | herdr-mirror | Tether |
+| --- | --- | --- | --- |
+| Remote prerequisite | SSH and tmux | SSH and a remote Herdr server | SSH and tmux |
+| Find repositories | Hand-written commands | Not its purpose | Configured-root scans, filter, and direct path |
+| Inspect without attaching | Per-host commands | Live remote Herdr workspace and agent status | Local/remote reachability, owned status, and external tmux sessions in one view |
+| Durable identity | User-managed tmux names | Remote Herdr pane/workspace identity | Tether-generated ID and history for owned work |
+| Existing tmux sessions | Manual list and attach | Only when represented by remote Herdr | Validated discovery and exact attach without taking ownership |
+| Close behavior | Entirely manual | Configurable mirror/remote close coupling | Select owned work, press `c`, confirm with `y`; external rows have no close action |
+| Herdr presentation | User creates and focuses panes | Continuously mirrored remote workspaces | One explorer overlay; focused split-right, split-down, or new tab |
+
 ## Status and limitations
 
 Implemented and covered by the current command/test surface:
