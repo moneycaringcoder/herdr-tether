@@ -79,6 +79,13 @@ class Smoke:
         # socket. TMUX overrides TMUX_TMPDIR and would make cleanup kill the
         # operator's server instead of this disposable one.
         self.env.pop("TMUX", None)
+        original_home = Path(self.env.get("HOME", str(Path.home())))
+        for variable, directory in (
+            ("CARGO_HOME", original_home / ".cargo"),
+            ("RUSTUP_HOME", original_home / ".rustup"),
+        ):
+            if variable not in self.env and directory.is_dir():
+                self.env[variable] = str(directory)
         self.env.update(
             {
                 "HOME": str(home),
@@ -345,6 +352,7 @@ class Smoke:
         self.herdr_run("pane", "close", pane_id, check=False)
         self.wait_until(f"pane {pane_id} closure", lambda: pane_id not in self.pane_ids())
 
+
     def plugin_contract(self) -> None:
         linked = self.result_object(
             self.decode_json(
@@ -384,8 +392,47 @@ class Smoke:
             )
             if "started" not in json.dumps(response, sort_keys=True).lower():
                 fail(f"{action} action did not report a started command: {response}")
-            pane_id = self.wait_new_pane(before, f"{action} action managed pane")
-            self.close_pane(pane_id)
+            if action == "open":
+                pane_id = self.wait_new_pane(before, "open action managed pane")
+                self.close_pane(pane_id)
+            else:
+                plugin_config = (
+                    self.root
+                    / "config"
+                    / "herdr"
+                    / "plugins"
+                    / "config"
+                    / PLUGIN_ID
+                    / "config.toml"
+                )
+                plugin_state = (
+                    self.root
+                    / "state"
+                    / "herdr"
+                    / "plugins"
+                    / PLUGIN_ID
+                    / "state.json"
+                )
+                self.wait_until(
+                    "setup action plugin files",
+                    lambda: plugin_config.is_file() and plugin_state.is_file(),
+                )
+                try:
+                    json.loads(plugin_state.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    fail(f"setup action state is unreadable or invalid JSON: {error}")
+                plugin_env = self.env.copy()
+                plugin_env.update(
+                    {
+                        "HERDR_PLUGIN_CONFIG_DIR": str(plugin_config.parent),
+                        "HERDR_PLUGIN_STATE_DIR": str(plugin_state.parent),
+                    }
+                )
+                self.run([str(self.tether), "doctor"], env=plugin_env)
+                self.wait_until(
+                    "setup action managed pane exit",
+                    lambda: not (self.pane_ids() - before),
+                )
             logs = self.result_object(
                 self.decode_json(
                     self.herdr_run("plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "20"),
@@ -434,20 +481,27 @@ class Smoke:
         result = self.run(
             [
                 "tmux",
-                "display-message",
-                "-p",
-                "-t",
-                f"={session_id}",
-                "#{session_attached}",
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_attached}",
             ],
             check=False,
         )
-        if result.returncode != 0:
+        if result.returncode == 1:
             return -1
-        try:
-            return int(result.stdout.strip())
-        except ValueError:
-            fail(f"tmux returned an invalid attached count for {session_id}: {result.stdout!r}")
+        if result.returncode != 0:
+            fail(f"isolated tmux attachment list failed: {result.stderr}")
+        for line in result.stdout.splitlines():
+            name, separator, attached = line.rpartition("\t")
+            if separator and name == session_id:
+                try:
+                    return int(attached)
+                except ValueError:
+                    fail(
+                        f"tmux returned an invalid attached count for "
+                        f"{session_id}: {attached!r}"
+                    )
+        return -1
 
     def state_records(self) -> list[dict[str, Any]]:
         payload = self.decode_json(
