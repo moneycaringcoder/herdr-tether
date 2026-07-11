@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -16,12 +16,12 @@ impl AppPaths {
     /// Herdr's per-plugin directories take precedence independently. Outside a
     /// plugin, the XDG variables are honored before their HOME-based defaults.
     pub fn from_env() -> Result<Self> {
-        let home = env::var_os("HOME").map(PathBuf::from);
+        let home = home_path(env::var_os("HOME"));
 
         let config_dir = match env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
             Some(path) => PathBuf::from(path),
-            None => match env::var_os("XDG_CONFIG_HOME") {
-                Some(path) => PathBuf::from(path).join("herdr-tether"),
+            None => match xdg_path(env::var_os("XDG_CONFIG_HOME")) {
+                Some(path) => path.join("herdr-tether"),
                 None => home
                     .as_ref()
                     .context("HOME is not set and neither HERDR_PLUGIN_CONFIG_DIR nor XDG_CONFIG_HOME is available")?
@@ -30,8 +30,8 @@ impl AppPaths {
         };
         let state_dir = match env::var_os("HERDR_PLUGIN_STATE_DIR") {
             Some(path) => PathBuf::from(path),
-            None => match env::var_os("XDG_STATE_HOME") {
-                Some(path) => PathBuf::from(path).join("herdr-tether"),
+            None => match xdg_path(env::var_os("XDG_STATE_HOME")) {
+                Some(path) => path.join("herdr-tether"),
                 None => home
                     .as_ref()
                     .context("HOME is not set and neither HERDR_PLUGIN_STATE_DIR nor XDG_STATE_HOME is available")?
@@ -47,5 +47,40 @@ impl AppPaths {
             state_file: state_dir.join("state.json"),
             ssh_config_file,
         })
+    }
+}
+
+fn home_path(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn xdg_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn home_rejects_empty_value_without_losing_unicode_paths() {
+        assert_eq!(home_path(Some(OsString::new())), None);
+        assert_eq!(
+            home_path(Some(OsString::from("/Users/Space User/工程"))),
+            Some(PathBuf::from("/Users/Space User/工程"))
+        );
+    }
+
+    #[test]
+    fn xdg_roots_must_be_nonempty_absolute_paths() {
+        assert_eq!(xdg_path(Some(OsString::new())), None);
+        assert_eq!(xdg_path(Some(OsString::from("relative/path"))), None);
+        assert_eq!(
+            xdg_path(Some(OsString::from("/tmp/Space Root/工程"))),
+            Some(PathBuf::from("/tmp/Space Root/工程"))
+        );
     }
 }

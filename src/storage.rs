@@ -6,10 +6,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
+use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub(crate) fn with_advisory_lock<T>(
     path: &Path,
@@ -32,6 +33,21 @@ fn with_advisory_lock_mode<T>(
 ) -> Result<T> {
     let parent = usable_parent(path);
     ensure_directory(parent, private_parent)?;
+    #[cfg(unix)]
+    let parent_lock = {
+        let directory = File::open(parent)
+            .with_context(|| format!("open storage directory `{}`", parent.display()))?;
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("inspect storage directory `{}`", parent.display()))?;
+        if !metadata.is_dir() {
+            anyhow::bail!("storage parent `{}` is not a directory", parent.display());
+        }
+        directory
+            .lock_exclusive()
+            .with_context(|| format!("lock storage directory `{}`", parent.display()))?;
+        directory
+    };
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
@@ -40,9 +56,27 @@ fn with_advisory_lock_mode<T>(
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     options.mode(0o600);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let lock = options
         .open(&lock_path)
         .with_context(|| format!("open storage lock `{}`", lock_path.display()))?;
+    let metadata = lock
+        .metadata()
+        .with_context(|| format!("inspect storage lock `{}`", lock_path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "storage lock `{}` is not a regular file",
+            lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        anyhow::bail!(
+            "storage lock `{}` has unexpected hard links",
+            lock_path.display()
+        );
+    }
     #[cfg(unix)]
     lock.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("set private permissions on `{}`", lock_path.display()))?;
@@ -52,27 +86,74 @@ fn with_advisory_lock_mode<T>(
     let result = operation();
     let unlock =
         FileExt::unlock(&lock).with_context(|| format!("unlock storage `{}`", path.display()));
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    #[cfg(unix)]
+    let parent_unlock = FileExt::unlock(&parent_lock)
+        .with_context(|| format!("unlock storage directory `{}`", parent.display()));
+    #[cfg(not(unix))]
+    let parent_unlock: Result<()> = Ok(());
+    match (result, unlock, parent_unlock) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
     }
 }
 
-pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+#[derive(Debug, Error)]
+pub(crate) enum AtomicWriteError {
+    #[error("atomic write failed before rename commit")]
+    PreCommit(#[source] anyhow::Error),
+    #[error("atomic rename committed, but directory durability is uncertain")]
+    PostCommitDurability(#[source] io::Error),
+}
+
+#[cfg(test)]
+impl AtomicWriteError {
+    fn committed(&self) -> bool {
+        matches!(self, Self::PostCommitDurability(_))
+    }
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     atomic_write_mode(path, contents, true)
 }
 
-pub(crate) fn atomic_write_preserving_parent(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_preserving_parent(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), AtomicWriteError> {
     atomic_write_mode(path, contents, false)
 }
+fn atomic_write_mode(
+    path: &Path,
+    contents: &[u8],
+    private_parent: bool,
+) -> Result<(), AtomicWriteError> {
+    atomic_write_mode_with(
+        path,
+        contents,
+        private_parent,
+        || Ok(()),
+        |parent| File::open(parent).and_then(|directory| directory.sync_all()),
+    )
+}
 
-fn atomic_write_mode(path: &Path, contents: &[u8], private_parent: bool) -> Result<()> {
+fn atomic_write_mode_with(
+    path: &Path,
+    contents: &[u8],
+    private_parent: bool,
+    before_rename: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), AtomicWriteError> {
+    let precommit = || -> Result<()> {
+        ensure_directory(usable_parent(path), private_parent)?;
+        Ok(())
+    };
+    precommit().map_err(AtomicWriteError::PreCommit)?;
     let parent = usable_parent(path);
-    ensure_directory(parent, private_parent)?;
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
     let mut temp_path = PathBuf::new();
     let mut temp_file = None;
 
@@ -90,36 +171,43 @@ fn atomic_write_mode(path: &Path, contents: &[u8], private_parent: bool) -> Resu
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("create temporary file beside `{}`", path.display()));
+                return Err(AtomicWriteError::PreCommit(
+                    anyhow::Error::new(error)
+                        .context(format!("create temporary file beside `{}`", path.display())),
+                ));
             }
         }
     }
 
-    let mut temp_file = temp_file.ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not allocate a temporary file beside `{}` after repeated attempts",
-            path.display()
-        )
-    })?;
+    let mut temp_file = temp_file
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not allocate a temporary file beside `{}` after repeated attempts",
+                path.display()
+            )
+        })
+        .map_err(AtomicWriteError::PreCommit)?;
     let mut cleanup = TempFileCleanup::new(temp_path.clone());
 
     temp_file
         .write_all(contents)
-        .with_context(|| format!("write temporary file for `{}`", path.display()))?;
+        .with_context(|| format!("write temporary file for `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
     temp_file
         .sync_all()
-        .with_context(|| format!("sync temporary file for `{}`", path.display()))?;
+        .with_context(|| format!("sync temporary file for `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
     drop(temp_file);
+    before_rename()
+        .with_context(|| format!("prepare rename for `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
 
     fs::rename(&temp_path, path)
-        .with_context(|| format!("atomically replace `{}`", path.display()))?;
+        .with_context(|| format!("atomically replace `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
     cleanup.disarm();
 
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync directory `{}`", parent.display()))?;
-    Ok(())
+    sync_parent(parent).map_err(AtomicWriteError::PostCommitDurability)
 }
 
 fn usable_parent(path: &Path) -> &Path {
@@ -178,5 +266,50 @@ impl Drop for TempFileCleanup {
         if self.armed {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injected_precommit_and_postcommit_failures_have_distinct_safe_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+
+        let precommit = atomic_write_mode_with(
+            &path,
+            b"new",
+            true,
+            || Err(io::Error::other("injected before rename")),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(!precommit.committed());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path() != path)
+                .count(),
+            0,
+            "precommit failure must clean its temporary file"
+        );
+
+        let postcommit = atomic_write_mode_with(
+            &path,
+            b"new",
+            true,
+            || Ok(()),
+            |_| Err(io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+        assert!(postcommit.committed());
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        atomic_write_mode_with(&path, b"new", true, || Ok(()), |_| Ok(())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 }

@@ -197,10 +197,10 @@ workers = 2
 [retention]
 closed_days = 30
 "#;
-    let state = r#"{"version":1,"sessions":[
-{"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/closed","preset":null,"status":"closed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-03T00:00:00Z"},
-{"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/closing","preset":"named","status":"closing","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
-{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/active","preset":null,"status":"active","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null}
+    let state = r#"{"version":2,"sessions":[
+{"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/closed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-03T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/closing","preset":"named","status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
+{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/active","preset":null,"status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null}
 ]}"#;
     fs::write(sandbox.path("xdg-config/herdr-tether/config.toml"), config).unwrap();
     fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();

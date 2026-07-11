@@ -32,6 +32,19 @@ HERDR_VERSION = "0.7.3"
 COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
+OWNED_SESSION_RE = re.compile(r"^tether-[0-9a-f]{32}$")
+SSH_TARGET_RE = re.compile(
+    r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+)
+
+
+def validate_remote_target(target: str) -> str:
+    """Accept one explicit SSH destination, never options, URLs, or extra hosts."""
+    if not SSH_TARGET_RE.fullmatch(target):
+        raise ValueError(
+            "remote target must be a single [user@]hostname or IPv4 address"
+        )
+    return target
 
 
 class SmokeFailure(RuntimeError):
@@ -135,13 +148,19 @@ class Smoke:
         keep: bool,
         remote_target: str | None = None,
         remote_directory: str | None = None,
+        remote_known_hosts: Path | None = None,
     ) -> None:
         self.herdr = herdr.resolve()
         self.tether = tether.resolve()
         self.repo_root = repo_root.resolve()
         self.keep = keep
-        self.remote_target = remote_target
+        self.remote_target = (
+            validate_remote_target(remote_target) if remote_target is not None else None
+        )
         self.remote_directory = remote_directory
+        self.remote_known_hosts = (
+            remote_known_hosts.resolve() if remote_known_hosts is not None else None
+        )
         self.root = Path(tempfile.mkdtemp(prefix="tether-smoke-", dir="/tmp"))
         self.session = f"tether-smoke-{os.getpid()}"
         self.external_session = f"external-smoke-{os.getpid()}"
@@ -154,6 +173,8 @@ class Smoke:
         inherited_path = os.environ.get("PATH", "")
         resolved_tmux = shutil.which("tmux", path=inherited_path)
         self.tmux = Path(resolved_tmux).resolve() if resolved_tmux else Path("tmux")
+        resolved_ssh = shutil.which("ssh", path=inherited_path)
+        self.ssh = Path(resolved_ssh).resolve() if resolved_ssh else Path("ssh")
         home = self.root / "home"
         for directory in (
             home,
@@ -164,6 +185,8 @@ class Smoke:
             self.root / "tmp",
             self.root / "tmux",
             self.root / "work",
+            self.root / "bin",
+            home / ".ssh",
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         # macOS/Linux zsh otherwise blocks the first disposable shell on its
@@ -210,9 +233,56 @@ class Smoke:
         # Herdr's GUI plugin runtime does not inherit an interactive Homebrew
         # PATH. Product commands deliberately run under that same restriction;
         # Tether must resolve standard macOS package-manager locations itself.
-        self.env["PATH"] = os.pathsep.join(
-            ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
-        )
+        restricted_path = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        if self.remote_target is not None:
+            if self.remote_known_hosts is None:
+                fail("remote smoke requires an explicit --remote-known-hosts file")
+            try:
+                known_hosts = self.remote_known_hosts.read_bytes()
+            except OSError as error:
+                fail(f"could not read remote known-hosts file: {error}")
+            if not known_hosts or len(known_hosts) > 1_048_576:
+                fail("remote known-hosts file must contain between 1 byte and 1 MiB")
+            isolated_known_hosts = home / ".ssh" / "known_hosts"
+            isolated_known_hosts.write_bytes(known_hosts)
+            isolated_known_hosts.chmod(0o600)
+            ssh_config = home / ".ssh" / "config"
+            ssh_config.write_text(
+                "Host *\n"
+                "    BatchMode yes\n"
+                "    CanonicalizeHostname no\n"
+                "    GlobalKnownHostsFile /dev/null\n"
+                f"    UserKnownHostsFile {isolated_known_hosts}\n"
+                "    StrictHostKeyChecking yes\n"
+                "    ProxyCommand none\n"
+                "    ProxyJump none\n",
+                encoding="utf-8",
+            )
+            ssh_config.chmod(0o600)
+            ssh_wrapper = self.root / "bin" / "ssh"
+            ssh_wrapper.write_text(
+                "#!/bin/sh\n"
+                "allowed="
+                + self._shell_quote(self.remote_target)
+                + "\n"
+                "found=false\n"
+                "for arg do\n"
+                '    if [ "$arg" = "$allowed" ]; then found=:; fi\n'
+                "done\n"
+                'if ! "$found"; then\n'
+                '    echo "remote smoke refused unspecified SSH destination" >&2\n'
+                "    exit 64\n"
+                "fi\n"
+                "exec "
+                + self._shell_quote(str(self.ssh))
+                + " -F "
+                + self._shell_quote(str(ssh_config))
+                + ' "$@"\n',
+                encoding="utf-8",
+            )
+            ssh_wrapper.chmod(0o700)
+            restricted_path.insert(0, str(self.root / "bin"))
+        self.env["PATH"] = os.pathsep.join(restricted_path)
         # A wrapper gives Tether's Herdr client the exact disposable named
         # session even outside a Herdr-launched plugin process.
         self.herdr_wrapper = self.root / "herdr-session"
@@ -479,7 +549,7 @@ class Smoke:
         before_panes = self.pane_ids()
         before_tmux = self.tmux_sessions()
         missing = self.root / "work" / "missing-create-directory"
-        rendered = self.interact(
+        self.interact(
             [
                 str(self.tether),
                 "open",
@@ -495,12 +565,11 @@ class Smoke:
                 (str(self.root / "home"), b"\r"),
                 ("Shell", b"\r"),
                 ("Split right", b"\x1b[B\x1b[B\r"),
+                ("Operation failed", b""),
                 ("Enter retry", b"\x1b"),
                 ("Hosts", b"\x1b"),
             ],
         )
-        if "Backspace/Esc cancel" not in rendered or "Operation failed" not in rendered:
-            fail("failed local new-tab create was not visible in the picker overlay")
         if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
             fail("failed local new-tab create leaked a pane or tmux session")
 
@@ -531,7 +600,7 @@ class Smoke:
             picker_env,
             [
                 ("Hosts", b"\r"),
-                (self.external_session, b"\r"),
+                (self.external_session, b"\x1b[B\r"),
                 ("Split right", b"\x1b[B\x1b[B\r"),
             ],
         )
@@ -597,10 +666,18 @@ class Smoke:
         refused_ids = {
             item.get("id") for item in self.state_records()
         } - before_ids
-        if refused_ids:
-            fail(f"refused replacement leaked owned metadata: {refused_ids}")
-        if self.tmux_sessions() != before_tmux:
-            fail("refused replacement leaked or removed a tmux session")
+        if len(refused_ids) != 1:
+            fail(f"refused replacement did not retain one recoverable record: {refused_ids}")
+        refused_id = next(iter(refused_ids))
+        if not isinstance(refused_id, str) or not re.fullmatch(
+            r"tether-[0-9a-f]{32}", refused_id
+        ):
+            fail(f"refused replacement produced a non-Tether ID: {refused_id!r}")
+        if self.tmux_sessions() - before_tmux != {refused_id}:
+            fail("refused replacement did not retain exactly its created workload")
+        self.owned_ids.add(refused_id)
+        self.run([str(self.tether), "session", "stop", refused_id])
+        self.owned_ids.discard(refused_id)
 
         before_panes = self.pane_ids()
         before_ids = {item.get("id") for item in self.state_records()}
@@ -621,7 +698,7 @@ class Smoke:
             fail("confirmed replacement left the exact source pane open")
         self.verify_owned_tmux_contract(replacement_id, self.root / "work")
         self.close_pane(destination)
-        self.run([str(self.tether), "session", "close", replacement_id])
+        self.run([str(self.tether), "session", "stop", replacement_id])
         self.owned_ids.discard(replacement_id)
 
     def workspace_and_pane(self) -> tuple[str, str]:
@@ -821,6 +898,7 @@ class Smoke:
                 pane_id = self.wait_new_pane(before, "open action managed pane")
                 self.close_pane(pane_id)
             else:
+                self.wait_new_pane(before, "setup action managed pane")
                 plugin_config = (
                     self.root
                     / "config"
@@ -869,6 +947,9 @@ class Smoke:
                         "plugin doctor did not expose actionable missing-Cargo guidance: "
                         f"{doctor.stdout}"
                     )
+                if self.herdr_master is None:
+                    fail("Herdr PTY is unavailable while dismissing setup result")
+                os.write(self.herdr_master, b"\r")
                 self.wait_until(
                     "setup action managed pane exit",
                     lambda: not (self.pane_ids() - before),
@@ -1031,8 +1112,8 @@ class Smoke:
             )
         self.verify_placement(placement, invoking_pane, pane_id)
         records = [item for item in self.state_records() if item.get("id") == session_id]
-        if len(records) != 1 or str(records[0].get("status", "")).lower() != "active":
-            fail(f"Tether did not persist one active record for {session_id}: {records}")
+        if len(records) != 1 or str(records[0].get("status", "")).lower() != "running":
+            fail(f"Tether did not persist one running record for {session_id}: {records}")
         return session_id, pane_id, str(tmux_created)
 
     def remote_cwd_contract(self, workspace_id: str, invoking_pane: str) -> None:
@@ -1101,7 +1182,7 @@ class Smoke:
         if remote_tmux("show-options", "-v", "-t", session_id, "mouse") != "on":
             fail(f"remote owned session {session_id} did not enable mouse")
         self.close_pane(pane)
-        self.run([str(self.tether), "session", "close", session_id])
+        self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
 
     def product_lifecycle(self) -> None:
@@ -1175,10 +1256,10 @@ class Smoke:
         if not resumed_ids:
             fail(f"Herdr did not return the resumed pane identity: {split}")
         resumed_pane = resumed_ids[-1]
-        resume_command = (
-            self._shell_quote(str(self.tether)) + " session resume " + self._shell_quote(first_id)
+        open_command = (
+            self._shell_quote(str(self.tether)) + " session open " + self._shell_quote(first_id)
         )
-        self.herdr_run("pane", "run", resumed_pane, resume_command)
+        self.herdr_run("pane", "run", resumed_pane, open_command)
         self.wait_until(
             "resumed tmux attachment",
             lambda: self.tmux_attached(first_id) > 0,
@@ -1228,7 +1309,7 @@ class Smoke:
         )
 
         for session_id in (first_id, second_id, third_id, symlink_id):
-            self.run([str(self.tether), "session", "close", session_id])
+            self.run([str(self.tether), "session", "stop", session_id])
         self.wait_until(
             "all Tether tmux sessions to close",
             lambda: not ({first_id, second_id, third_id, symlink_id} & self.tmux_sessions()),
@@ -1236,8 +1317,8 @@ class Smoke:
         records = {item.get("id"): item for item in self.state_records()}
         for session_id in (first_id, second_id, third_id, symlink_id):
             status = str(records.get(session_id, {}).get("status", "")).lower()
-            if status != "closed":
-                fail(f"exact close did not persist closed status for {session_id}: {status!r}")
+            if status != "ended":
+                fail(f"exact Stop did not persist ended status for {session_id}: {status!r}")
         self.replacement_contract(workspace_id, initial_pane)
         self.remote_cwd_contract(workspace_id, initial_pane)
 
@@ -1270,10 +1351,14 @@ class Smoke:
         self._cleaned = True
         # Close exact Tether-owned workloads first. The deliberately external
         # session is cleaned separately and is never passed to Tether close.
-        for session_id in sorted(self.owned_ids):
+        for session_id in sorted(
+            session_id
+            for session_id in self.owned_ids
+            if OWNED_SESSION_RE.fullmatch(session_id)
+        ):
             try:
                 self.run(
-                    [str(self.tether), "session", "close", session_id],
+                    [str(self.tether), "session", "stop", session_id],
                     check=False,
                     timeout=5.0,
                 )
@@ -1281,7 +1366,6 @@ class Smoke:
                 print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
         cleanup_commands = (
             ([str(self.tmux), "kill-session", "-t", f"={self.external_session}"], 5.0),
-            ([str(self.tmux), "kill-server"], 5.0),
             ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
             ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
@@ -1335,18 +1419,36 @@ def parse_args() -> argparse.Namespace:
         "--remote-directory",
         help="existing disposable absolute directory on --remote-target",
     )
+    parser.add_argument(
+        "--remote-known-hosts",
+        type=Path,
+        help="known_hosts file pinning the optional disposable SSH target",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if (args.remote_target is None) != (args.remote_directory is None):
+    remote_values = (
+        args.remote_target,
+        args.remote_directory,
+        args.remote_known_hosts,
+    )
+    if any(value is not None for value in remote_values) and not all(
+        value is not None for value in remote_values
+    ):
         print(
-            "live product smoke FAILED: --remote-target and --remote-directory "
-            "must be supplied together",
+            "live product smoke FAILED: --remote-target, --remote-directory, and "
+            "--remote-known-hosts must be supplied together",
             file=sys.stderr,
         )
         return 2
+    if args.remote_target is not None:
+        try:
+            validate_remote_target(args.remote_target)
+        except ValueError as error:
+            print(f"live product smoke FAILED: {error}", file=sys.stderr)
+            return 2
     smoke = Smoke(
         args.herdr,
         args.tether,
@@ -1354,6 +1456,7 @@ def main() -> int:
         args.keep,
         args.remote_target,
         args.remote_directory,
+        args.remote_known_hosts,
     )
     atexit.register(smoke.cleanup)
 

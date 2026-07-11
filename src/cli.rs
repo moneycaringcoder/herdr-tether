@@ -13,7 +13,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::{
-    backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries},
+    backend::{
+        CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, create_outcome_is_uncertain,
+    },
     config::{
         CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
         HostConfig,
@@ -21,7 +23,7 @@ use crate::{
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
     lifecycle::{LifecycleService, PruneError, PruneService},
-    model::{ExternalSessionName, Placement, SessionId},
+    model::{ExternalSessionName, OwnershipProof, Placement, SessionId},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
@@ -57,9 +59,9 @@ enum TopLevel {
     /// the command exits successfully. Fatal local load/serialization errors
     /// retain the normal nonzero command error.
     Snapshot(SnapshotArgs),
-    /// Create a durable terminal session.
+    /// Open the Tether picker, or create and open a workload with options.
     Open(OpenArgs),
-    /// Inspect and manage durable sessions.
+    /// Inspect and manage Tether-owned workloads.
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -189,10 +191,17 @@ fn placement_name(placement: Placement) -> &'static str {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// List persisted session metadata.
+    /// List persisted workload metadata.
     List(OutputArgs),
-    /// Attach to an existing durable session without creating it.
-    Resume { id: SessionId },
+    /// Open an existing running workload without creating it.
+    Open { id: SessionId },
+    /// Restart an ended workload and open it.
+    Restart {
+        id: SessionId,
+        /// Placement used when invoked from a Herdr plugin pane.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
+    },
     /// Attach to a discovered non-owned external tmux session.
     #[command(hide = true)]
     AttachExternal {
@@ -200,9 +209,11 @@ enum SessionCommand {
         target: String,
         name: ExternalSessionName,
     },
-    /// Kill a durable session and mark its metadata closed.
-    Close { id: SessionId },
-    /// Remove old, closed metadata whose workload was killed.
+    /// Stop the exact Tether-owned workload and retain its history.
+    Stop { id: SessionId },
+    /// Remove an ended workload or safely forget legacy metadata without contacting it.
+    Remove { id: SessionId },
+    /// Clear old ended or removed history without touching workloads.
     Prune(PruneArgs),
 }
 
@@ -300,9 +311,11 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
     );
     println!("Configured targets: {}", config.hosts.len());
     println!("Prerequisites: Herdr, tmux, SSH, and Cargo must be installed and executable.");
-    println!("Herdr keybindings are not edited automatically.");
-    println!("Suggested binding: plugin_action moneycaringcoder.tether.open");
-    println!("Next: herdr-tether doctor");
+    println!("Herdr keybindings are changed only by the explicit keybinding command.");
+    println!("Binding to install: plugin_action moneycaringcoder.tether.open");
+    println!(
+        "Next: install prefix+t with `herdr-tether setup keybinding`, or run `herdr-tether open` now."
+    );
     Ok(())
 }
 
@@ -327,6 +340,7 @@ fn setup_keybinding(args: KeybindingArgs) -> Result<()> {
             println!("backup: {}", backup.display());
         }
     }
+    println!("Next: press prefix+t in Herdr to open Tether.");
     Ok(())
 }
 
@@ -453,8 +467,9 @@ fn list_hosts(paths: &AppPaths, config: &Config, json: bool) -> Result<()> {
 }
 
 fn check_host(name: &str, target: &str) -> Result<()> {
+    let binaries = ProcessBinaries::new("ssh", "tmux");
     if target == "local" {
-        let output = Command::new("tmux")
+        let output = Command::new(binaries.tmux())
             .arg("-V")
             .output()
             .context("run local tmux version probe")?;
@@ -463,11 +478,12 @@ fn check_host(name: &str, target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let tmux = ssh_probe(target, "tmux -V")?;
+    let tmux = ssh_probe(binaries.ssh(), target, "tmux -V")?;
     require_probe_success("remote tmux", &tmux)?;
     print!("{}", String::from_utf8_lossy(&tmux.stdout));
 
     let herdr = ssh_probe(
+        binaries.ssh(),
         target,
         "command -v herdr >/dev/null 2>&1 && herdr --version",
     )?;
@@ -479,8 +495,8 @@ fn check_host(name: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn ssh_probe(target: &str, remote_command: &str) -> Result<std::process::Output> {
-    Command::new("ssh")
+fn ssh_probe(ssh: &Path, target: &str, remote_command: &str) -> Result<std::process::Output> {
+    Command::new(ssh)
         .args(["-o", "BatchMode=yes", "--", target, remote_command])
         .output()
         .with_context(|| format!("probe SSH target `{target}`"))
@@ -518,6 +534,9 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     }
 
     let mut operation_error = None;
+    PruneService::new(state_store.clone())
+        .automatic_cleanup()
+        .context("automatically clear expired removed session history")?;
     loop {
         let state = state_store.load()?;
         let Some(selection) = selection_from_picker(
@@ -544,6 +563,7 @@ fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelecti
     match selection {
         PickerSelection::Create(selection) => create_and_attach(paths, config, selection),
         PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
+        PickerSelection::Restart { id, placement } => restart_and_attach(paths, id, placement),
         PickerSelection::AttachExternal {
             target,
             name,
@@ -658,6 +678,10 @@ fn selection_from_picker(
             id,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
+        PickerSelection::Restart { id, placement } => Ok(Some(PickerSelection::Restart {
+            id,
+            placement: args.placement.map(Placement::from).unwrap_or(placement),
+        })),
         PickerSelection::AttachExternal {
             host,
             target,
@@ -688,14 +712,14 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let host = resolve_host_from(config, &aliases, &selection.host)?;
     let id = SessionId::new();
+    let ownership_proof = OwnershipProof::new();
     let backend = backend_for(&host.target)?;
     let launch = LaunchSpec {
         id,
+        ownership_proof,
         directory: selection.directory.clone(),
-        command: selection.command,
+        command: selection.command.clone(),
     };
-    backend.create(&launch)?;
-
     let now = Utc::now();
     let record = SessionRecord {
         id,
@@ -703,73 +727,116 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         target: host.target,
         directory: selection.directory,
         preset: selection.preset,
-        status: SessionStatus::Active,
+        command: Some(selection.command),
+        tmux_session_id: None,
+        ownership_proof: Some(ownership_proof),
+        status: SessionStatus::Creating,
         created_at: now,
         last_used_at: now,
         closed_at: None,
+        exit_status: None,
     };
     let store = StateStore::new(paths.state_file.clone());
-    if let Err(error) = store.update(|state| {
+    store.update(|state| {
         state.sessions.push(record);
         Ok(())
-    }) {
-        let cleanup = backend.close(&id);
-        return match cleanup {
-            Ok(()) => Err(error).context("persist newly created session"),
-            Err(cleanup_error) => Err(error).context(format!(
-                "persist newly created session; rollback close for `{id}` also failed: {cleanup_error:#}; the workload may still be running"
-            )),
-        };
-    }
+    })?;
+    let identity = match backend.create(&launch) {
+        Ok(identity) => identity,
+        Err(error) => {
+            if !create_outcome_is_uncertain(&error) {
+                let _ = store.update(|state| {
+                    state.sessions.retain(|record| {
+                        record.id != id
+                            || record.status != SessionStatus::Creating
+                            || record.tmux_session_id.is_some()
+                    });
+                    Ok(())
+                });
+            }
+            return Err(error).context(format!("create reserved session `{id}`"));
+        }
+    };
+    store
+        .update(|state| {
+            let current = state
+                .sessions
+                .iter_mut()
+                .find(|record| record.id == id)
+                .with_context(|| format!("reserved session `{id}` disappeared after creation"))?;
+            if current.status != SessionStatus::Creating || current.tmux_session_id.is_some() {
+                bail!("reserved session `{id}` changed while it was being created");
+            }
+            current.tmux_session_id = Some(identity);
+            current.status = SessionStatus::Running;
+            current.last_used_at = Utc::now();
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "record created session `{id}`; the workload remains safely recoverable from its creating reservation"
+            )
+        })?;
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
-        let placement_result = (|| {
-            let context = HerdrContext::from_env()?;
-            let executable = env::current_exe().context("locate the Tether executable")?;
-            let resume = resume_command(executable, id);
-            place_in_herdr(HerdrClient::new(context), &resume, selection.placement)
-        })();
-        if let Err(error) = placement_result {
-            if let Err(cleanup_error) = backend.close(&id) {
-                return Err(error).context(format!(
-                    "place newly created session `{id}`; rollback close also failed: {cleanup_error:#}; the workload remains recorded and may still be running"
-                ));
-            }
-            if let Err(cleanup_error) = store.update(|state| {
-                state.sessions.retain(|record| record.id != id);
-                Ok(())
-            }) {
-                return Err(error).context(format!(
-                    "place newly created session `{id}`; workload rollback succeeded but metadata cleanup failed: {cleanup_error:#}"
-                ));
-            }
-            return Err(error).context(format!(
-                "place newly created session `{id}`; the failed workload was rolled back"
-            ));
-        }
+        let context = HerdrContext::from_env()?;
+        let attach = backend.attach_command(&id, &ownership_proof, identity)?;
+        place_in_herdr(HerdrClient::new(context), &attach, selection.placement).with_context(
+            || {
+                format!(
+                    "place newly created session `{id}`; it remains running and recorded for retry"
+                )
+            },
+        )?;
         println!("created {id}");
         Ok(())
     } else {
         println!("created {id}");
-        run_attach(backend.attach_command(&id)?)
+        run_attach(backend.attach_command(&id, &ownership_proof, identity)?)
     }
 }
+fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
+    let service = LifecycleService::new(
+        StateStore::new(paths.state_file.clone()),
+        ProcessBinaries::new("ssh", "tmux"),
+    );
+    let record = service
+        .owned_record(id)?
+        .with_context(|| format!("unknown Tether session `{id}`"))?;
+    match record.status {
+        SessionStatus::Ended | SessionStatus::Creating => {
+            service
+                .restart_owned(id)
+                .with_context(|| format!("restart ended session `{id}`"))?;
+        }
+        SessionStatus::Running => {
+            service
+                .observe_owned(id)
+                .with_context(|| format!("verify restarted session `{id}`"))?;
+        }
+        SessionStatus::Stopping | SessionStatus::Removed => {
+            bail!(
+                "session `{id}` cannot be restarted while it is {:?}",
+                record.status
+            );
+        }
+    }
+    resume_and_attach(paths, id, placement)
+}
+
 fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
-        let executable = env::current_exe().context("locate the Tether executable")?;
-        let resume = resume_command(executable, id);
-        place_in_herdr(HerdrClient::new(context), &resume, placement)?;
+        let service = LifecycleService::new(
+            StateStore::new(paths.state_file.clone()),
+            ProcessBinaries::new("ssh", "tmux"),
+        );
+        let attach = service.open_owned(id)?;
+        place_in_herdr(HerdrClient::new(context), &attach, placement)?;
         Ok(())
     } else {
-        session_command(paths, SessionCommand::Resume { id })
+        session_command(paths, SessionCommand::Open { id })
     }
-}
-fn resume_command(executable: PathBuf, id: SessionId) -> CommandSpec {
-    CommandSpec::new(
-        executable,
-        vec!["session".to_owned(), "resume".to_owned(), id.to_string()],
-    )
 }
 
 fn external_attach_command(
@@ -849,7 +916,16 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
         SessionCommand::List(args) => {
             let state = store.load()?;
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&state.sessions)?);
+                let mut sessions = serde_json::to_value(&state.sessions)?;
+                if let Some(records) = sessions.as_array_mut() {
+                    for record in records {
+                        record
+                            .as_object_mut()
+                            .expect("serialized session record is an object")
+                            .remove("ownership_proof");
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else {
                 for session in state.sessions {
                     println!(
@@ -864,7 +940,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             }
             Ok(())
         }
-        SessionCommand::Resume { id } => {
+        SessionCommand::Open { id } => {
             let record = store
                 .load()?
                 .sessions
@@ -872,51 +948,71 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 .find(|record| record.id == id)
                 .with_context(|| format!("unknown session `{id}`"))?;
             match record.status {
-                SessionStatus::Active => {}
-                SessionStatus::Closing => bail!("session `{id}` is closing; retry close"),
-                SessionStatus::Closed => bail!("session `{id}` is closed"),
+                SessionStatus::Running => {}
+                SessionStatus::Creating => bail!(
+                    "session `{id}` creation is incomplete; run `herdr-tether session restart {id}`"
+                ),
+                SessionStatus::Stopping => bail!(
+                    "session `{id}` is stopping; retry `herdr-tether session open {id}` after Stop completes"
+                ),
+                SessionStatus::Ended => {
+                    bail!("session `{id}` has ended; run `herdr-tether session restart {id}`")
+                }
+                SessionStatus::Removed => bail!(
+                    "session `{id}` was removed; run `herdr-tether open` to create a new workload"
+                ),
             }
-            let backend = backend_for(&record.target)?;
-            match backend.inspect(&id)? {
-                crate::backend::WorkloadState::Running { .. } => {}
-                crate::backend::WorkloadState::Missing => {
-                    bail!("session `{id}` no longer exists")
-                }
-                crate::backend::WorkloadState::Unknown => {
-                    bail!("could not determine whether session `{id}` exists")
-                }
-            }
-            let attach = backend.attach_command(&id)?;
-            store.update(|state| {
-                let current = state
-                    .sessions
-                    .iter_mut()
-                    .find(|current| current.id == id)
-                    .with_context(|| {
-                        format!("session `{id}` disappeared while preparing resume")
-                    })?;
-                if current.target != record.target {
-                    bail!("session `{id}` target changed while preparing resume");
-                }
-                match current.status {
-                    SessionStatus::Active => current.last_used_at = Utc::now(),
-                    SessionStatus::Closing => {
-                        bail!("session `{id}` began closing while preparing resume")
-                    }
-                    SessionStatus::Closed => bail!("session `{id}` closed while preparing resume"),
-                }
-                Ok(())
-            })?;
+            let attach = LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+                .open_owned(id)?;
             run_attach(attach)
         }
         SessionCommand::AttachExternal { target, name } => {
             let backend = backend_for(&target)?;
             run_attach(backend.attach_external_command(&name)?)
         }
-        SessionCommand::Close { id } => {
+        SessionCommand::Restart { id, placement } => {
+            let placement = placement.map(Placement::from).unwrap_or(
+                ConfigStore::new(paths.config_file.clone())
+                    .load()?
+                    .ui
+                    .placement,
+            );
+            restart_and_attach(paths, id, placement).with_context(|| {
+                format!(
+                    "restart session `{id}`; retry `herdr-tether session restart {id}` after resolving the reported error"
+                )
+            })
+        }
+        SessionCommand::Stop { id } => {
             LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
-                .close_owned(id)?;
-            println!("closed {id}");
+                .close_owned(id)
+                .with_context(|| {
+                    format!(
+                        "stop session `{id}`; retry `herdr-tether session stop {id}` after resolving the reported error"
+                    )
+                })?;
+            println!("stopped {id}");
+            Ok(())
+        }
+        SessionCommand::Remove { id } => {
+            let legacy = store
+                .load()?
+                .sessions
+                .iter()
+                .find(|record| record.id == id)
+                .is_some_and(|record| record.ownership_proof.is_none());
+            LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+                .remove_owned(id)
+                .with_context(|| {
+                    format!(
+                        "remove session metadata `{id}`; retry `herdr-tether session remove {id}` after resolving the reported error"
+                    )
+                })?;
+            if legacy {
+                println!("removed legacy metadata {id}; no workload was contacted");
+            } else {
+                println!("removed {id}");
+            }
             Ok(())
         }
         SessionCommand::Prune(args) => {
@@ -1252,25 +1348,6 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resume_command_targets_the_exact_selected_session() {
-        let id = "tether-0197f198000070008000000000000001"
-            .parse::<SessionId>()
-            .unwrap();
-
-        let command = resume_command(PathBuf::from("/plugin/herdr-tether"), id);
-
-        assert_eq!(command.program, PathBuf::from("/plugin/herdr-tether"));
-        assert_eq!(
-            command.args,
-            [
-                "session",
-                "resume",
-                "tether-0197f198000070008000000000000001"
-            ]
-        );
-    }
 
     #[test]
     fn external_attach_command_preserves_target_and_name_as_arguments() {

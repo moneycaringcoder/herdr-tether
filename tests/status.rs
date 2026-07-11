@@ -445,3 +445,142 @@ fn local_spawn_error_includes_actionable_tool_locations() {
     assert!(detail.contains("/opt/homebrew/bin"));
     assert!(detail.contains("/usr/local/bin"));
 }
+
+#[test]
+fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::MAX,
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 10,
+        hosts: vec![StatusHost {
+            name: "local".into(),
+            target: None,
+            workloads: Vec::new(),
+        }],
+    });
+
+    let first = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        first,
+        StatusMessage::Host {
+            generation: 10,
+            status: HostReachability::Reachable,
+            ..
+        }
+    ));
+    assert!(matches!(
+        run.receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        StatusMessage::Catalog {
+            generation: 10,
+            status: ExternalCatalogStatus::Available,
+            ..
+        }
+    ));
+    assert!(matches!(
+        run.receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        StatusMessage::Finished { generation: 10 }
+    ));
+}
+
+#[test]
+fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nprintf '\\033[31mssh: connect to host private.example port 22: Connection refused\\033[0m\\n' >&2\nexit 255\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(1),
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 11,
+        hosts: vec![StatusHost {
+            name: "private-alias".into(),
+            target: Some("private.example".into()),
+            workloads: Vec::new(),
+        }],
+    });
+
+    let StatusMessage::Host {
+        status: HostReachability::Unreachable,
+        detail: Some(detail),
+        ..
+    } = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("expected typed unreachable host detail");
+    };
+    assert_eq!(
+        detail,
+        "SSH connection was refused; check that the host is online and SSH is running"
+    );
+    assert!(!detail.contains("private.example"));
+    assert!(!detail.contains('\u{1b}'));
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_probe_does_not_leave_background_descendants_running() {
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let pid_path = temp.path().join("descendant.pid");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 1\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 12,
+        hosts: vec![StatusHost {
+            name: "local".into(),
+            target: None,
+            workloads: Vec::new(),
+        }],
+    });
+
+    while !matches!(
+        run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        StatusMessage::Finished { generation: 12 }
+    ) {}
+    let pid = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // SAFETY: signal 0 performs existence/permission checking without
+        // delivering a signal, and `pid` came from the child shell.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        if !exists {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "successful bounded probe left descendant {pid} running"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

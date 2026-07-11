@@ -4,11 +4,12 @@ import io
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-from live_product_smoke import Smoke, terminal_screen_text
+from live_product_smoke import Smoke, terminal_screen_text, validate_remote_target
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
@@ -81,6 +82,53 @@ class SmokeEnvironmentTests(unittest.TestCase):
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
 
+    def test_remote_target_is_a_single_explicit_ssh_destination(self) -> None:
+        for target in ("host.example", "runner@host.example", "runner@192.0.2.10"):
+            self.assertEqual(validate_remote_target(target), target)
+        for target in (
+            "",
+            "-oProxyCommand=evil",
+            "host.example other.example",
+            "ssh://host.example",
+            "runner@host.example:22",
+            "runner@@host.example",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaises(ValueError):
+                    validate_remote_target(target)
+
+    def test_remote_known_hosts_is_copied_into_isolated_home(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            source = Path(repository) / "known_hosts"
+            contents = "host.example ssh-ed25519 AAAAC3NzaFixtureOnly\n"
+            source.write_text(contents, encoding="utf-8")
+            source.chmod(0o644)
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+                remote_target="runner@host.example",
+                remote_directory="/srv/tether-smoke",
+                remote_known_hosts=source,
+            )
+            try:
+                isolated = Path(smoke.env["HOME"]) / ".ssh" / "known_hosts"
+                self.assertEqual(isolated.read_text(encoding="utf-8"), contents)
+                self.assertEqual(isolated.stat().st_mode & 0o777, 0o600)
+                refused = subprocess.run(
+                    [str(smoke.root / "bin" / "ssh"), "other.example", "true"],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                self.assertEqual(refused.returncode, 64)
+                self.assertIn("refused unspecified SSH destination", refused.stderr)
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
     def test_owned_tmux_contract_queries_exact_id_without_touching_external(self) -> None:
         with tempfile.TemporaryDirectory() as repository:
             smoke = Smoke(
@@ -127,6 +175,66 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 )
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
+    def test_cleanup_targets_only_exact_owned_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            valid_id = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.update(
+                {
+                    valid_id,
+                    "not-a-tether-session",
+                    "tether-0123456789abcdef0123456789abcdef:other",
+                }
+            )
+            try:
+                completed = mock.Mock(returncode=0, stdout="", stderr="")
+                with mock.patch.object(
+                    smoke, "run", return_value=completed
+                ) as run:
+                    smoke.cleanup()
+
+                commands = [call.args[0] for call in run.call_args_list]
+                tether_stop_commands = [
+                    command
+                    for command in commands
+                    if command[:3] == [str(smoke.tether), "session", "stop"]
+                    and len(command) == 4
+                ]
+                self.assertEqual(
+                    tether_stop_commands,
+                    [[str(smoke.tether), "session", "stop", valid_id]],
+                )
+                self.assertFalse(
+                    any(
+                        command[1:] == ["kill-server"]
+                        for command in commands
+                    ),
+                    commands,
+                )
+                kill_targets = [
+                    command
+                    for command in commands
+                    if len(command) > 1 and command[1] == "kill-session"
+                ]
+                self.assertEqual(
+                    kill_targets,
+                    [
+                        [
+                            str(smoke.tmux),
+                            "kill-session",
+                            "-t",
+                            f"={smoke.external_session}",
+                        ]
+                    ],
+                )
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
 
 
 

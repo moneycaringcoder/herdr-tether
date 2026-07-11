@@ -18,7 +18,10 @@ use herdr_tether::{
 use tempfile::tempdir;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::{
+    ffi::CString,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+};
 
 fn sample_config() -> Config {
     Config {
@@ -372,10 +375,14 @@ fn state_round_trips_and_migrates_v0() {
             target: "builder@example.test".into(),
             directory: "/srv/code".into(),
             preset: Some("shell".into()),
-            status: SessionStatus::Active,
+            command: Some("exec shell".into()),
+            tmux_session_id: Some("$7".parse().unwrap()),
+            ownership_proof: None,
+            status: SessionStatus::Running,
             created_at: now,
             last_used_at: now,
             closed_at: None,
+            exit_status: None,
         }],
     };
 
@@ -394,9 +401,42 @@ fn state_round_trips_and_migrates_v0() {
     .unwrap();
     let migrated = store.load().unwrap();
     assert_eq!(migrated.version, State::CURRENT_VERSION);
-    assert_eq!(migrated.sessions[0].status, SessionStatus::Active);
+    assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
+    assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
+}
+
+#[test]
+fn every_state_schema_rejects_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let store = StateStore::new(path.clone());
+    let id = "tether-0197f198000070008000000000000001";
+    let timestamps = r#""created_at":"2026-07-10T12:00:00Z","last_used_at":"2026-07-10T12:00:00Z""#;
+    let sources = [
+        r#"{"version":0,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":0,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp",{timestamps},"unknown":true}}]}}"#
+        ),
+        r#"{"version":1,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":1,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp","preset":null,"status":"active",{timestamps},"closed_at":null,"unknown":true}}]}}"#
+        ),
+        r#"{"version":2,"sessions":[],"unknown":true}"#.to_owned(),
+        format!(
+            r#"{{"version":2,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp","preset":null,"command":null,"tmux_session_id":null,"ownership_proof":null,"status":"running",{timestamps},"closed_at":null,"exit_status":null,"unknown":true}}]}}"#
+        ),
+    ];
+
+    for source in sources {
+        fs::write(&path, source).unwrap();
+        let error = store.load().unwrap_err().to_string();
+        assert!(
+            error.contains("decode state version"),
+            "unexpected strict-schema error: {error}"
+        );
+    }
 }
 
 #[test]
@@ -410,7 +450,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 1"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
 }
 
 #[test]
@@ -437,10 +477,14 @@ fn concurrent_state_updates_preserve_both_records() {
                         target: "local".into(),
                         directory: "/tmp".into(),
                         preset: None,
-                        status: SessionStatus::Active,
+                        command: Some("exec shell".into()),
+                        tmux_session_id: None,
+                        ownership_proof: None,
+                        status: SessionStatus::Running,
                         created_at: now,
                         last_used_at: now,
                         closed_at: None,
+                        exit_status: None,
                     });
                     Ok(())
                 })
@@ -455,6 +499,83 @@ fn concurrent_state_updates_preserve_both_records() {
 
     let state = StateStore::new(path).load().unwrap();
     assert_eq!(state.sessions.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn state_rejects_symlink_and_fifo_storage_paths() {
+    let temp = tempdir().unwrap();
+    let target = temp.path().join("target.json");
+    fs::write(&target, r#"{"version":2,"sessions":[]}"#).unwrap();
+    let symlink_path = temp.path().join("symlink-state.json");
+    std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+    let symlink_error = format!("{:#}", StateStore::new(symlink_path).load().unwrap_err());
+    assert!(
+        symlink_error.contains("symbolic link") || symlink_error.contains("regular file"),
+        "unexpected symlink error: {symlink_error}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        r#"{"version":2,"sessions":[]}"#
+    );
+
+    let fifo_path = temp.path().join("fifo-state.json");
+    let fifo_c_path = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c_path.as_ptr(), 0o600) }, 0);
+    let fifo_error = format!("{:#}", StateStore::new(fifo_path).load().unwrap_err());
+    assert!(
+        fifo_error.contains("regular file"),
+        "unexpected FIFO error: {fifo_error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_lock_path_cannot_split_state_mutual_exclusion() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    StateStore::new(path.clone())
+        .save(&State::default())
+        .unwrap();
+    let lock_path = temp.path().join(".state.json.lock");
+    let displaced_lock_path = temp.path().join(".state.json.lock.displaced");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let update_path = path.clone();
+    let updater = thread::spawn(move || {
+        StateStore::new(update_path)
+            .update(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    entered_rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+    fs::rename(&lock_path, &displaced_lock_path).unwrap();
+
+    let (load_done_tx, load_done_rx) = mpsc::channel();
+    let load_path = path.clone();
+    let loader = thread::spawn(move || {
+        let result = StateStore::new(load_path).load();
+        load_done_tx.send(result).unwrap();
+    });
+    assert!(
+        load_done_rx
+            .recv_timeout(StdDuration::from_millis(100))
+            .is_err(),
+        "replacement lock inode must not allow a concurrent state operation"
+    );
+
+    release_tx.send(()).unwrap();
+    updater.join().unwrap();
+    load_done_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    loader.join().unwrap();
 }
 
 const TETHER_BINDING: &str = r#"[[keys.command]]
@@ -641,6 +762,26 @@ fn herdr_keybinding_rollback_refuses_to_overwrite_later_edits() {
     assert!(error.contains("changed after Tether installed"));
     assert_eq!(fs::read(&path).unwrap(), edited);
     assert!(HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn state_lock_refuses_symlink_without_touching_victim() {
+    let temp = tempdir().unwrap();
+    let state = temp.path().join("state.json");
+    let lock = temp.path().join(".state.json.lock");
+    let victim = temp.path().join("victim");
+    fs::write(&victim, b"do not touch").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+    let error = StateStore::new(state).load().unwrap_err().to_string();
+    assert!(error.contains("open storage lock"));
+    assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
 }
 
 #[test]

@@ -4,8 +4,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 
-use crate::{model::SessionId, quote::posix_quote};
+use crate::{
+    model::{OwnershipProof, SessionId, TmuxSessionId},
+    quote::posix_quote,
+};
 
 /// An executable and its already-separated argument vector.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,9 +110,31 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Creation reached tmux successfully, but Tether could not prove whether the
+/// incarnation still exists. Callers must preserve the Creating reservation.
+#[derive(Debug, Error)]
+#[error("tmux creation outcome is uncertain")]
+pub struct CreateOutcomeUncertain {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl CreateOutcomeUncertain {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+pub fn create_outcome_is_uncertain(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<CreateOutcomeUncertain>())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchSpec {
     pub id: SessionId,
+    pub ownership_proof: OwnershipProof,
     pub directory: String,
     pub command: String,
 }
@@ -116,14 +142,31 @@ pub struct LaunchSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadState {
     Missing,
-    Running { attached: u32 },
+    Running {
+        attached: u32,
+        identity: TmuxSessionId,
+    },
+    Ended {
+        identity: TmuxSessionId,
+        exit_status: Option<i32>,
+    },
     Unknown,
 }
 
 /// Operations required from a durable session backend.
 pub trait DurableBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<()>;
-    fn inspect(&self, id: &SessionId) -> Result<WorkloadState>;
-    fn attach_command(&self, id: &SessionId) -> Result<CommandSpec>;
-    fn close(&self, id: &SessionId) -> Result<()>;
+    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId>;
+    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState>;
+    fn attach_command(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec>;
+    fn close(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<()>;
 }

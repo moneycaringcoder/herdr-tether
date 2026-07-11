@@ -1,21 +1,51 @@
-use std::process::{Command, Output};
+use std::{io, path::PathBuf, process::Output, sync::atomic::AtomicBool, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use thiserror::Error;
 
 use crate::{
-    backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::{ExternalSessionName, SessionId},
+    backend::{
+        CommandSpec, CreateOutcomeUncertain, DurableBackend, LaunchSpec, ProcessBinaries,
+        WorkloadState,
+    },
+    model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
-    sshcfg::validate_ssh_target,
+    sshcfg::{OpenSshTarget, openssh_target},
+    status::{BoundedOutput, run_bounded},
 };
 
 const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
 const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OWNERSHIP_GUARD_REJECTED: &str = "TETHER_OWNERSHIP_GUARD_REJECTED";
+
+#[derive(Debug, Error)]
+enum BoundedExecutionError {
+    #[error(
+        "start `{program}` ({kind:?}); install the tool or make it executable (Tether also searches /usr/bin, /bin, /opt/homebrew/bin, and /usr/local/bin)"
+    )]
+    Spawn {
+        program: PathBuf,
+        kind: io::ErrorKind,
+    },
+    #[error("process timed out after {} seconds", TMUX_COMMAND_TIMEOUT.as_secs())]
+    TimedOut,
+    #[error("process response exceeded the safe capture limit")]
+    OutputLimit,
+    #[error("process failed while reading its output")]
+    Output,
+}
+
+impl BoundedExecutionError {
+    fn outcome_uncertain(&self) -> bool {
+        !matches!(self, Self::Spawn { .. })
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Location {
     Local,
-    Remote(String),
+    Remote(OpenSshTarget),
 }
 
 /// Durable local or OpenSSH-backed tmux sessions.
@@ -34,8 +64,7 @@ impl TmuxBackend {
     }
 
     pub fn remote(target: impl Into<String>, binaries: ProcessBinaries) -> Result<Self> {
-        let target = target.into();
-        validate_ssh_target(&target)?;
+        let target = openssh_target(&target.into())?;
         Ok(Self {
             location: Location::Remote(target),
             binaries,
@@ -67,7 +96,10 @@ impl TmuxBackend {
                         "ServerAliveCountMax=3".to_owned(),
                     ]
                 };
-                ssh_arguments.extend(["--".to_owned(), target.clone(), remote_command]);
+                if let Some(port) = target.port {
+                    ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
+                }
+                ssh_arguments.extend(["--".to_owned(), target.destination.clone(), remote_command]);
                 Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
@@ -78,74 +110,136 @@ impl TmuxBackend {
             Location::Local => Ok(CommandSpec::new("/bin/sh", arguments)),
             Location::Remote(target) => {
                 let remote_command = remote_command("/bin/sh", &arguments)?;
-                Ok(CommandSpec::new(
-                    self.binaries.ssh(),
-                    vec![
-                        "-o".to_owned(),
-                        "BatchMode=yes".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveInterval=15".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveCountMax=3".to_owned(),
-                        "--".to_owned(),
-                        target.clone(),
-                        remote_command,
-                    ],
-                ))
+                let mut ssh_arguments = vec![
+                    "-o".to_owned(),
+                    "BatchMode=yes".to_owned(),
+                    "-o".to_owned(),
+                    "ServerAliveInterval=15".to_owned(),
+                    "-o".to_owned(),
+                    "ServerAliveCountMax=3".to_owned(),
+                ];
+                if let Some(port) = target.port {
+                    ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
+                }
+                ssh_arguments.extend(["--".to_owned(), target.destination.clone(), remote_command]);
+                Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
     }
 
-    fn output(&self, spec: &CommandSpec) -> Result<Output> {
-        Command::new(&spec.program)
-            .args(&spec.args)
-            .output()
-            .with_context(|| {
-                format!(
-                    "start `{}`; install the tool or make it executable (Tether also searches /usr/bin, /bin, /opt/homebrew/bin, and /usr/local/bin)",
-                    spec.program.display()
-                )
-            })
+    fn bounded_output(&self, spec: &CommandSpec) -> Result<Output, BoundedExecutionError> {
+        match run_bounded(spec, TMUX_COMMAND_TIMEOUT, &AtomicBool::new(false)) {
+            BoundedOutput::Completed {
+                status,
+                stdout,
+                stdout_truncated: false,
+                stderr,
+                stderr_truncated: false,
+            } => Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            BoundedOutput::Completed { .. } => Err(BoundedExecutionError::OutputLimit),
+            BoundedOutput::TimedOut => Err(BoundedExecutionError::TimedOut),
+            BoundedOutput::SpawnError(kind) => Err(BoundedExecutionError::Spawn {
+                program: spec.program.clone(),
+                kind,
+            }),
+            BoundedOutput::Error => Err(BoundedExecutionError::Output),
+            BoundedOutput::Cancelled => unreachable!("direct tmux executions are not cancelled"),
+        }
     }
 
-    pub(crate) fn inspect_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
+    fn output(&self, spec: &CommandSpec) -> Result<Output> {
+        self.bounded_output(spec).map_err(Into::into)
+    }
+
+    pub(crate) fn inspect_exact_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+    ) -> Result<CommandSpec> {
         let id_text = id.to_string();
         self.tmux_spec(
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_attached}".to_owned(),
+                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}"
+                    .to_owned(),
                 "-f".to_owned(),
-                format!("#{{==:#{{session_name}},{id_text}}}"),
+                format!(
+                    "#{{&&:#{{==:#{{session_name}},{id_text}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}"
+                ),
             ],
             false,
         )
     }
 
-    pub(crate) fn close_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
-        self.tmux_spec(
-            vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
+    pub(crate) fn close_exact_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec> {
+        self.guarded_spec(
+            id,
+            ownership_proof,
+            identity,
+            format!("kill-session -t {identity}"),
             false,
         )
     }
 
+    fn guarded_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+        guarded_command: String,
+        interactive: bool,
+    ) -> Result<CommandSpec> {
+        let condition = format!(
+            "#{{&&:#{{==:#{{session_id}},{identity}}},#{{&&:#{{==:#{{session_name}},{id}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}}}"
+        );
+        self.tmux_spec(
+            vec![
+                "if-shell".to_owned(),
+                "-t".to_owned(),
+                identity.to_string(),
+                "-F".to_owned(),
+                condition,
+                guarded_command,
+                format!("display-message -p {OWNERSHIP_GUARD_REJECTED} ; run-shell 'exit 75'"),
+            ],
+            interactive,
+        )
+    }
     pub(crate) fn classify_exact_inspect(
         &self,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
         output: &Output,
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, output.status.code(), &output.stdout, stdout_truncated)
+        classify_exact_inspect(
+            id,
+            ownership_proof,
+            output.status.code(),
+            &output.stdout,
+            stdout_truncated,
+        )
     }
 
     pub(crate) fn classify_exact_inspect_parts(
         &self,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
         exit_code: Option<i32>,
         stdout: &[u8],
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, exit_code, stdout, stdout_truncated)
+        classify_exact_inspect(id, ownership_proof, exit_code, stdout, stdout_truncated)
     }
 
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
@@ -176,8 +270,7 @@ impl TmuxBackend {
             return Ok(());
         }
 
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let detail = detail.trim();
+        let detail = sanitize_tmux_detail(&output.stderr, None);
         if detail.is_empty() {
             bail!("tmux {operation} failed with status {}", output.status);
         }
@@ -185,11 +278,6 @@ impl TmuxBackend {
             "tmux {operation} failed with status {}: {detail}",
             output.status
         )
-    }
-
-    fn enable_owned_mouse(&self, id: &SessionId) -> Result<()> {
-        let target = self.owned_session_target(id)?;
-        self.enable_mouse_for_target(target)
     }
 
     fn enable_mouse_for_target(&self, target: String) -> Result<()> {
@@ -206,37 +294,19 @@ impl TmuxBackend {
         self.require_success("enable session mouse support", &spec)
     }
 
-    fn owned_session_target(&self, id: &SessionId) -> Result<String> {
-        let id_text = id.to_string();
+    fn enable_remain_on_exit(&self, pane_target: &str) -> Result<()> {
         let spec = self.tmux_spec(
             vec![
-                "list-sessions".to_owned(),
-                "-F".to_owned(),
-                "#{session_name}:#{session_id}".to_owned(),
-                "-f".to_owned(),
-                format!("#{{==:#{{session_name}},{id_text}}}"),
+                "set-option".to_owned(),
+                "-p".to_owned(),
+                "-t".to_owned(),
+                pane_target.to_owned(),
+                "remain-on-exit".to_owned(),
+                "on".to_owned(),
             ],
             false,
         )?;
-        let output = self.output(&spec)?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "tmux resolve exact owned session ID failed with status {}: {}",
-                output.status,
-                detail.trim()
-            );
-        }
-        let line = std::str::from_utf8(&output.stdout)
-            .context("tmux returned a non-UTF-8 internal session ID")?
-            .trim_end_matches(['\r', '\n']);
-        let (reported_name, target) = line
-            .split_once(':')
-            .context("tmux did not return the exact owned session ID")?;
-        if reported_name != id_text {
-            bail!("tmux returned session `{reported_name}`, not exact owned session `{id}`");
-        }
-        validate_tmux_id(target, '$', "session")
+        self.require_success("retain ended pane status", &spec)
     }
 
     fn paths_refer_to_same_directory(&self, actual: &str, expected: &str) -> Result<bool> {
@@ -252,11 +322,10 @@ impl TmuxBackend {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => {
-                let detail = String::from_utf8_lossy(&output.stderr);
+                let detail = sanitize_tmux_detail(&output.stderr, None);
                 bail!(
-                    "compare created pane cwd with selected directory failed with status {}: {}",
-                    output.status,
-                    detail.trim()
+                    "compare created pane cwd with selected directory failed with status {}: {detail}",
+                    output.status
                 )
             }
         }
@@ -275,8 +344,7 @@ impl TmuxBackend {
         )?;
         let output = self.output(&spec)?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            let detail = detail.trim();
+            let detail = sanitize_tmux_detail(&output.stderr, None);
             if detail.is_empty() {
                 bail!(
                     "tmux verify created cwd failed with status {}",
@@ -303,35 +371,27 @@ impl TmuxBackend {
     fn rollback_created(
         &self,
         id: &SessionId,
-        internal_target: Option<&str>,
+        ownership_proof: &OwnershipProof,
+        internal_target: TmuxSessionId,
         cause: anyhow::Error,
     ) -> anyhow::Error {
-        let rollback = internal_target
-            .map_or_else(
-                || self.close_exact_spec(id),
-                |target| {
-                    self.tmux_spec(
-                        vec![
-                            "kill-session".to_owned(),
-                            "-t".to_owned(),
-                            target.to_owned(),
-                        ],
-                        false,
-                    )
-                },
-            )
-            .and_then(|spec| self.require_success("rollback created session", &spec));
+        let cause = sanitize_tmux_error(cause, ownership_proof);
+        let rollback = self.close(id, ownership_proof, internal_target);
         match rollback {
             Ok(()) => cause,
-            Err(rollback) => cause.context(format!(
-                "also failed to roll back exact owned session `{id}`: {rollback:#}"
-            )),
+            Err(rollback) => {
+                let rollback = sanitize_tmux_error(rollback, ownership_proof);
+                CreateOutcomeUncertain::new(cause.context(format!(
+                    "also failed to roll back exact owned session `{id}`: {rollback:#}"
+                )))
+                .into()
+            }
         }
     }
 }
 
 impl DurableBackend for TmuxBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<()> {
+    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId> {
         let spec = self.tmux_spec(
             vec![
                 "new-session".to_owned(),
@@ -340,6 +400,8 @@ impl DurableBackend for TmuxBackend {
                 launch.id.to_string(),
                 "-c".to_owned(),
                 launch.directory.clone(),
+                "-e".to_owned(),
+                format!("TETHER_OWNERSHIP_PROOF={}", launch.ownership_proof),
                 "-P".to_owned(),
                 "-F".to_owned(),
                 "#{session_id}:#{pane_id}".to_owned(),
@@ -353,61 +415,149 @@ impl DurableBackend for TmuxBackend {
             ],
             false,
         )?;
-        let output = self.output(&spec)?;
+        let output = match self.bounded_output(&spec) {
+            Ok(output) => output,
+            Err(error) if error.outcome_uncertain() => {
+                return Err(CreateOutcomeUncertain::new(error.into()).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "tmux create failed with status {}: {}",
-                output.status,
-                detail.trim()
-            );
+            let detail = sanitize_tmux_detail(&output.stderr, Some(&launch.ownership_proof));
+            bail!("tmux create failed with status {}: {detail}", output.status);
         }
         let created = std::str::from_utf8(&output.stdout)
-            .context("tmux returned non-UTF-8 created session identities")?
+            .context("tmux returned non-UTF-8 created session identities")
+            .map_err(CreateOutcomeUncertain::new)?
             .trim_end_matches(['\r', '\n']);
         let identities = (|| {
             let (session_target, pane_target) = created
                 .split_once(':')
                 .context("tmux create did not return session and pane identities")?;
-            let session_target = validate_tmux_id(session_target, '$', "session")?;
+            let session_target = session_target.parse::<TmuxSessionId>()?;
             let pane_target = validate_tmux_id(pane_target, '%', "pane")?;
             Ok::<_, anyhow::Error>((session_target, pane_target))
         })();
         let (session_target, pane_target) = match identities {
             Ok(identities) => identities,
-            Err(error) => return Err(self.rollback_created(&launch.id, None, error)),
+            // Creation is committed, but malformed output does not provide a
+            // trustworthy internal target. Preserve the reservation so a
+            // proof-based retry can reconcile it.
+            Err(error) => return Err(CreateOutcomeUncertain::new(error).into()),
         };
-        self.verify_created_cwd(&pane_target, &launch.directory)
-            .and_then(|()| self.enable_mouse_for_target(session_target.clone()))
-            .map_err(|error| self.rollback_created(&launch.id, Some(&session_target), error))
+        self.enable_remain_on_exit(&pane_target)
+            .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
+            .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
+            .map_err(|error| {
+                self.rollback_created(&launch.id, &launch.ownership_proof, session_target, error)
+            })?;
+        Ok(session_target)
     }
 
-    fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
-        let spec = self.inspect_exact_spec(id)?;
+    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState> {
+        let spec = self.inspect_exact_spec(id, ownership_proof)?;
         let output = self.output(&spec)?;
-        Ok(self.classify_exact_inspect(id, &output, false))
+        Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
     }
 
-    fn attach_command(&self, id: &SessionId) -> Result<CommandSpec> {
-        self.enable_owned_mouse(id)?;
-        self.tmux_spec(
-            vec![
-                "attach-session".to_owned(),
-                "-t".to_owned(),
-                exact_target(id),
-            ],
+    fn attach_command(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec> {
+        self.guarded_spec(
+            id,
+            ownership_proof,
+            identity,
+            format!("set-option -t {identity} mouse on ; attach-session -t {identity}"),
             true,
         )
     }
 
-    fn close(&self, id: &SessionId) -> Result<()> {
-        let spec = self.close_exact_spec(id)?;
-        self.require_success("close", &spec)
+    fn close(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<()> {
+        let spec = self.close_exact_spec(id, ownership_proof, identity)?;
+        let output = self.output(&spec)?;
+        if output.status.success()
+            && !String::from_utf8_lossy(&output.stdout).contains(OWNERSHIP_GUARD_REJECTED)
+        {
+            return Ok(());
+        }
+        bail!("exact owned tmux identity changed before close")
     }
+}
+
+fn sanitize_tmux_error(error: anyhow::Error, ownership_proof: &OwnershipProof) -> anyhow::Error {
+    anyhow::anyhow!(sanitize_tmux_detail(
+        format!("{error:#}").as_bytes(),
+        Some(ownership_proof),
+    ))
+}
+
+fn sanitize_tmux_detail(stderr: &[u8], ownership_proof: Option<&OwnershipProof>) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut detail = String::from_utf8_lossy(stderr).into_owned();
+    if let Some(ownership_proof) = ownership_proof {
+        let ownership_proof = ownership_proof.to_string();
+        detail = detail.replace(
+            &format!("TETHER_OWNERSHIP_PROOF={ownership_proof}"),
+            "[redacted ownership proof]",
+        );
+        detail = detail.replace(&ownership_proof, "[redacted ownership proof]");
+    }
+    detail = detail.replace("TETHER_OWNERSHIP_PROOF", "[redacted ownership proof]");
+
+    let mut sanitized = String::with_capacity(detail.len().min(MAX_CHARS));
+    let mut characters = detail.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            match characters.next() {
+                Some('[') => {
+                    for sequence_character in characters.by_ref() {
+                        if ('@'..='~').contains(&sequence_character) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(sequence_character) = characters.next() {
+                        if sequence_character == '\u{7}' {
+                            break;
+                        }
+                        if sequence_character == '\u{1b}' {
+                            let _ = characters.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut bounded = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn classify_exact_inspect(
     id: &SessionId,
+    ownership_proof: &OwnershipProof,
     exit_code: Option<i32>,
     stdout: &[u8],
     stdout_truncated: bool,
@@ -423,19 +573,49 @@ fn classify_exact_inspect(
         if line.is_empty() {
             return WorkloadState::Missing;
         }
-        let Some((name, attached)) = line.split_once(':') else {
+        let fields = line.split(':').collect::<Vec<_>>();
+        let [
+            name,
+            identity,
+            attached,
+            pane_dead,
+            exit_status,
+            observed_proof,
+        ] = fields.as_slice()
+        else {
             return WorkloadState::Unknown;
         };
-        if name != id.to_string() {
+        if *name != id.to_string() {
             return WorkloadState::Unknown;
         }
-        return match attached.parse::<u32>() {
-            Ok(attached) => WorkloadState::Running { attached },
-            Err(_) => WorkloadState::Unknown,
+        if observed_proof.parse::<OwnershipProof>().ok() != Some(*ownership_proof) {
+            return WorkloadState::Unknown;
+        }
+        let Ok(identity) = identity.parse::<TmuxSessionId>() else {
+            return WorkloadState::Unknown;
         };
-    }
-
-    if exit_code == Some(1) {
+        let Ok(attached) = attached.parse::<u32>() else {
+            return WorkloadState::Unknown;
+        };
+        match *pane_dead {
+            "0" => WorkloadState::Running { attached, identity },
+            "1" => {
+                let exit_status = if exit_status.is_empty() {
+                    None
+                } else {
+                    match exit_status.parse::<i32>() {
+                        Ok(status) => Some(status),
+                        Err(_) => return WorkloadState::Unknown,
+                    }
+                };
+                WorkloadState::Ended {
+                    identity,
+                    exit_status,
+                }
+            }
+            _ => WorkloadState::Unknown,
+        }
+    } else if exit_code == Some(1) {
         WorkloadState::Missing
     } else {
         WorkloadState::Unknown
@@ -454,10 +634,6 @@ fn validate_tmux_id(value: &str, sigil: char, kind: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn exact_target(id: &SessionId) -> String {
-    format!("={id}")
-}
-
 fn remote_tmux_command(arguments: &[String]) -> Result<String> {
     remote_command("tmux", arguments)
 }
@@ -473,7 +649,7 @@ fn remote_command(program: &str, arguments: &[String]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{env, fs, process::Command};
 
     use super::*;
 
@@ -497,5 +673,37 @@ mod tests {
             .status()
             .unwrap();
         assert!(comparison.success());
+    }
+    #[test]
+    fn exact_inspection_distinguishes_running_and_dead_panes_with_identity() {
+        let id = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let proof = "0197f198000070008000000000000002".parse().unwrap();
+
+        assert_eq!(
+            classify_exact_inspect(
+                &id,
+                &proof,
+                Some(0),
+                b"tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002\n",
+                false,
+            ),
+            WorkloadState::Running {
+                attached: 2,
+                identity: "$7".parse().unwrap(),
+            }
+        );
+        assert_eq!(
+            classify_exact_inspect(
+                &id,
+                &proof,
+                Some(0),
+                b"tether-0197f198000070008000000000000001:$7:0:1:130:0197f198000070008000000000000002\n",
+                false,
+            ),
+            WorkloadState::Ended {
+                identity: "$7".parse().unwrap(),
+                exit_status: Some(130),
+            }
+        );
     }
 }

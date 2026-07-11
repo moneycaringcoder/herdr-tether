@@ -1,11 +1,25 @@
-use std::{env, ffi::OsString, path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Output,
+    sync::atomic::AtomicBool,
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::{backend::CommandSpec, model::Placement};
+use crate::{
+    backend::CommandSpec,
+    model::Placement,
+    quote::posix_quote,
+    status::{BoundedOutput, run_bounded},
+};
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.tether";
+const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Herdr process and placement context supplied to a plugin action.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +104,7 @@ pub struct PlacedPane {
 pub struct ForegroundProcess {
     pub pid: u64,
     pub name: String,
+    argv: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +195,9 @@ impl HerdrClient {
         const VERIFY_INTERVAL: Duration = Duration::from_millis(50);
 
         let source_pane_id = self.context.pane_id.clone();
+        let source_identity = self
+            .process_info(&source_pane_id)
+            .context("capture the exact source pane occupant before replacement")?;
         let destination_pane_id = self.split("right")?;
         // Presentation metadata must never block a working replacement.
         let _ = self.label_pane(&destination_pane_id);
@@ -199,13 +217,18 @@ impl HerdrClient {
         let mut destination_ready = false;
         for attempt in 0..VERIFY_ATTEMPTS {
             match self.process_info(&destination_pane_id) {
-                Ok(destination) if !destination.foreground_processes.is_empty() => {
+                Ok(destination)
+                    if destination
+                        .foreground_processes
+                        .iter()
+                        .any(|process| Self::is_attach_process(process, command)) =>
+                {
                     destination_ready = true;
                     break;
                 }
                 Ok(_) => {
                     last_verification_error =
-                        Some("no foreground attach process was reported".to_owned());
+                        Some("no verified tmux attach process was reported".to_owned());
                 }
                 Err(error) => {
                     last_verification_error = Some(format!("{error:#}"));
@@ -229,11 +252,21 @@ impl HerdrClient {
             );
         }
 
-        let warning = self.close_pane(&source_pane_id).err().map(|error| {
-            format!(
-                "replacement destination `{destination_pane_id}` is running, but source pane `{source_pane_id}` could not be closed: {error:#}"
-            )
-        });
+        let warning = match self.process_info(&source_pane_id) {
+            Ok(current) if current == source_identity => {
+                self.close_pane(&source_pane_id).err().map(|error| {
+                    format!(
+                        "replacement destination `{destination_pane_id}` is running, but source pane `{source_pane_id}` could not be closed: {error:#}"
+                    )
+                })
+            }
+            Ok(_) => Some(format!(
+                "replacement destination `{destination_pane_id}` is running, but source pane `{source_pane_id}` changed during replacement and was preserved"
+            )),
+            Err(error) => Some(format!(
+                "replacement destination `{destination_pane_id}` is running, but source pane `{source_pane_id}` could not be reverified and was preserved: {error:#}"
+            )),
+        };
         Ok(PlacedPane {
             pane_id: placed.pane_id,
             warning,
@@ -346,9 +379,18 @@ impl HerdrClient {
                     .ok_or_else(|| {
                         anyhow::anyhow!("Herdr foreground process did not contain name")
                     })?;
+                let argv = process
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
                 Ok(ForegroundProcess {
                     pid,
                     name: name.to_owned(),
+                    argv,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -356,6 +398,45 @@ impl HerdrClient {
             pane_id: pane_id.to_owned(),
             foreground_processes,
         })
+    }
+
+    fn is_attach_process(process: &ForegroundProcess, expected: &CommandSpec) -> bool {
+        let Some(program) = process
+            .argv
+            .first()
+            .and_then(|value| Path::new(value).file_name())
+        else {
+            return false;
+        };
+        let expected_program = expected.program.file_name();
+        if Some(program) == expected_program && process.argv[1..] == expected.args {
+            return true;
+        }
+
+        let target = match expected.args.as_slice() {
+            [session, attach, target_flag, _, separator, name]
+                if session == "session"
+                    && attach == "attach-external"
+                    && target_flag == "--target"
+                    && separator == "--" =>
+            {
+                format!("={name}")
+            }
+            _ => return false,
+        };
+        if program == "tmux" {
+            return process.argv[1..] == ["attach-session", "-t", target.as_str()];
+        }
+        if program != "ssh" {
+            return false;
+        }
+        let Ok(target) = posix_quote(&target) else {
+            return false;
+        };
+        process
+            .argv
+            .last()
+            .is_some_and(|argument| argument == &format!("'tmux' 'attach-session' '-t' {target}"))
     }
 
     fn label_pane(&self, pane_id: &str) -> Result<()> {
@@ -402,16 +483,34 @@ impl HerdrClient {
         decode_response(self.execute(operation, arguments)?, operation)
     }
 
-    fn execute(&self, operation: &str, arguments: &[String]) -> Result<std::process::Output> {
-        Command::new(&self.context.binary)
-            .args(arguments)
-            .output()
-            .with_context(|| {
-                format!(
-                    "run Herdr {operation} via `{}`",
-                    self.context.binary.display()
-                )
-            })
+    fn execute(&self, operation: &str, arguments: &[String]) -> Result<Output> {
+        let spec = CommandSpec::new(&self.context.binary, arguments.to_vec());
+        match run_bounded(&spec, HERDR_COMMAND_TIMEOUT, &AtomicBool::new(false)) {
+            BoundedOutput::Completed {
+                status,
+                stdout,
+                stdout_truncated: false,
+                stderr,
+                stderr_truncated: false,
+            } => Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            BoundedOutput::Completed { .. } => {
+                bail!("Herdr {operation} response exceeded the safe capture limit")
+            }
+            BoundedOutput::TimedOut => bail!(
+                "Herdr {operation} timed out after {} seconds",
+                HERDR_COMMAND_TIMEOUT.as_secs()
+            ),
+            BoundedOutput::SpawnError(kind) => bail!(
+                "run Herdr {operation} via `{}` ({kind:?})",
+                self.context.binary.display()
+            ),
+            BoundedOutput::Error => bail!("read Herdr {operation} process output"),
+            BoundedOutput::Cancelled => unreachable!("direct Herdr executions are not cancelled"),
+        }
     }
 }
 
@@ -516,7 +615,12 @@ fn placed_command_with_paths(
             command.program.display()
         )
     })?;
-    let mut arguments = vec!["-u".to_owned(), "HERDR_BIN_PATH".to_owned()];
+    let mut arguments = vec![
+        "-u".to_owned(),
+        "HERDR_BIN_PATH".to_owned(),
+        "-u".to_owned(),
+        "TMUX".to_owned(),
+    ];
     arguments.extend(
         plugin_paths
             .iter()
@@ -630,6 +734,8 @@ mod tests {
                 vec![
                     "-u".to_owned(),
                     "HERDR_BIN_PATH".to_owned(),
+                    "-u".to_owned(),
+                    "TMUX".to_owned(),
                     "HERDR_PLUGIN_CONFIG_DIR=/config path/$literal".to_owned(),
                     "HERDR_PLUGIN_STATE_DIR=/state path/$(literal)".to_owned(),
                     "/plugin root/herdr-tether".to_owned(),
@@ -639,5 +745,91 @@ mod tests {
                 ],
             )
         );
+    }
+
+    #[test]
+    fn replacement_readiness_requires_the_expected_attach_target() {
+        let process = |name: &str, argv: &[&str]| ForegroundProcess {
+            pid: 42,
+            name: name.to_owned(),
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+        };
+        let owned = CommandSpec::new(
+            "/usr/bin/tmux",
+            vec![
+                "if-shell".to_owned(),
+                "-t".to_owned(),
+                "$7".to_owned(),
+                "-F".to_owned(),
+                "#{&&:proof-and-identity}".to_owned(),
+                "set-option -t $7 mouse on ; attach-session -t $7".to_owned(),
+                "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'"
+                    .to_owned(),
+            ],
+        );
+        let external = CommandSpec::new(
+            "/plugin/herdr-tether",
+            vec![
+                "session".to_owned(),
+                "attach-external".to_owned(),
+                "--target".to_owned(),
+                "builder".to_owned(),
+                "--".to_owned(),
+                "work box".to_owned(),
+            ],
+        );
+
+        assert!(HerdrClient::is_attach_process(
+            &process(
+                "tmux: client",
+                &[
+                    "/usr/bin/tmux",
+                    "if-shell",
+                    "-t",
+                    "$7",
+                    "-F",
+                    "#{&&:proof-and-identity}",
+                    "set-option -t $7 mouse on ; attach-session -t $7",
+                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'",
+                ],
+            ),
+            &owned,
+        ));
+        assert!(HerdrClient::is_attach_process(
+            &process(
+                "ssh",
+                &[
+                    "/usr/bin/ssh",
+                    "--",
+                    "builder",
+                    "'tmux' 'attach-session' '-t' '=work box'"
+                ]
+            ),
+            &external
+        ));
+        assert!(!HerdrClient::is_attach_process(
+            &process("sh", &["sh", "-c", "echo attach-session"]),
+            &owned
+        ));
+        assert!(!HerdrClient::is_attach_process(
+            &process(
+                "tmux",
+                &[
+                    "tmux",
+                    "if-shell",
+                    "-t",
+                    "$8",
+                    "-F",
+                    "#{&&:proof-and-identity}",
+                    "set-option -t $8 mouse on ; attach-session -t $8",
+                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'",
+                ],
+            ),
+            &owned,
+        ));
+        assert!(!HerdrClient::is_attach_process(
+            &process("tmux", &["tmux"]),
+            &owned
+        ));
     }
 }

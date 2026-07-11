@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     io,
     path::PathBuf,
@@ -72,6 +73,7 @@ pub enum PickerHostOrigin {
 pub struct PickerWorkload {
     pub id: SessionId,
     pub status: SessionStatus,
+    pub legacy: bool,
     pub last_used_at: chrono::DateTime<chrono::Utc>,
     pub base_label: String,
     pub label: String,
@@ -261,6 +263,7 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
             PickerWorkload {
                 id: session.id,
                 status: session.status,
+                legacy: session.ownership_proof.is_none(),
                 last_used_at: session.last_used_at,
                 base_label: label.clone(),
                 label,
@@ -273,10 +276,18 @@ fn workload_label(session: &SessionRecord) -> String {
     let command = session.preset.as_deref().unwrap_or("Shell");
     let id = session.id.to_string();
     let short_id = &id[id.len().saturating_sub(8)..];
+    if session.ownership_proof.is_none() && session.status != SessionStatus::Removed {
+        return format!(
+            "[legacy] Tether · Remove metadata …{} · {} · {}",
+            short_id, command, session.directory
+        );
+    }
     let (lifecycle, action) = match session.status {
-        SessionStatus::Active => ("active", "Resume"),
-        SessionStatus::Closing => ("closing · c retry", "Metadata"),
-        SessionStatus::Closed => ("closed · metadata", "Metadata"),
+        SessionStatus::Creating => ("creating", "Pending"),
+        SessionStatus::Running => ("running", "Open"),
+        SessionStatus::Stopping => ("stopping", "Pending"),
+        SessionStatus::Ended => ("ended", "Restart"),
+        SessionStatus::Removed => ("removed", "Metadata"),
     };
     format!(
         "[{lifecycle}] Tether · {action} …{} · {} · {}",
@@ -299,10 +310,20 @@ pub struct OpenSelection {
     pub placement: Placement,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickerCloseAction {
+    Stop,
+    Remove,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerSelection {
     Create(OpenSelection),
     Resume {
+        id: SessionId,
+        placement: Placement,
+    },
+    Restart {
         id: SessionId,
         placement: Placement,
     },
@@ -352,6 +373,7 @@ pub enum PickerOutcome {
     CloseOwnedRequested {
         id: SessionId,
         generation: u64,
+        action: PickerCloseAction,
     },
     PrunePreviewRequested {
         older_than_days: u64,
@@ -590,6 +612,7 @@ pub struct PickerState {
     command_index: usize,
     placement_index: usize,
     resume_id: Option<SessionId>,
+    restart_id: Option<SessionId>,
     external_name: Option<ExternalSessionName>,
     generation: u64,
     host_status: HashMap<String, StatusCell<HostReachability>>,
@@ -603,6 +626,7 @@ pub struct PickerState {
     input: PickerInput,
     selected_directory: Option<String>,
     close_modal: Option<PickerCloseModal>,
+    close_modal_action: Option<PickerCloseAction>,
     pending_close: Option<(SessionId, u64)>,
     close_failed: HashMap<SessionId, String>,
     retention_days: u64,
@@ -646,6 +670,7 @@ impl PickerState {
             command_index: 0,
             placement_index,
             resume_id: None,
+            restart_id: None,
             external_name: None,
             generation: 0,
             host_status: HashMap::new(),
@@ -659,6 +684,7 @@ impl PickerState {
             input: PickerInput::None,
             selected_directory: None,
             close_modal: None,
+            close_modal_action: None,
             pending_close: None,
             close_failed: HashMap::new(),
             retention_days,
@@ -848,9 +874,7 @@ impl PickerState {
     }
 
     pub fn apply_close_result(&mut self, result: PickerCloseResult) -> bool {
-        if result.generation != self.generation
-            || self.pending_close.as_ref() != Some(&(result.id, result.generation))
-        {
+        if self.pending_close.as_ref() != Some(&(result.id, result.generation)) {
             return false;
         }
         self.pending_close = None;
@@ -880,6 +904,7 @@ impl PickerState {
         } else {
             self.close_failed.remove(&result.id);
             self.close_modal = None;
+            self.close_modal_action = None;
         }
         self.rebuild_status_labels();
         true
@@ -1005,6 +1030,7 @@ impl PickerState {
             .push(PickerWorkload {
                 id: record.id,
                 status: record.status,
+                legacy: record.ownership_proof.is_none(),
                 last_used_at: record.last_used_at,
                 base_label: label.clone(),
                 label,
@@ -1166,19 +1192,7 @@ impl PickerState {
 
     pub fn begin_refresh(&mut self, generation: u64) {
         self.generation = generation;
-        if self
-            .pending_close
-            .as_ref()
-            .is_some_and(|(_, pending_generation)| *pending_generation != generation)
-        {
-            self.pending_close = None;
-        }
-        for host in self
-            .options
-            .hosts
-            .iter()
-            .filter(|host| host.origin == PickerHostOrigin::Effective)
-        {
+        for host in &self.options.hosts {
             self.host_status
                 .entry(host.name.clone())
                 .or_default()
@@ -1186,7 +1200,7 @@ impl PickerState {
             for workload in host
                 .workloads
                 .iter()
-                .filter(|workload| workload.status == SessionStatus::Active)
+                .filter(|workload| workload.status == SessionStatus::Running && !workload.legacy)
             {
                 self.workload_status
                     .entry(workload.id)
@@ -1235,10 +1249,15 @@ impl PickerState {
                 status,
                 checked_at,
                 ..
-            } => self.workload_status.get_mut(&id).is_some_and(|cell| {
-                cell.apply(status, checked_at);
-                true
-            }),
+            } => {
+                if status == WorkloadStatus::Missing {
+                    self.mark_workload_ended(id);
+                }
+                self.workload_status.get_mut(&id).is_some_and(|cell| {
+                    cell.apply(status, checked_at);
+                    true
+                })
+            }
             StatusMessage::Catalog {
                 host,
                 status,
@@ -1321,18 +1340,97 @@ impl PickerState {
                 .options
                 .hosts
                 .iter()
-                .filter(|host| host.origin == PickerHostOrigin::Effective)
                 .map(|host| StatusHost {
                     name: host.name.clone(),
                     target: host.target.clone(),
                     workloads: host
                         .workloads
                         .iter()
-                        .filter(|workload| workload.status == SessionStatus::Active)
+                        .filter(|workload| {
+                            workload.status == SessionStatus::Running && !workload.legacy
+                        })
                         .map(|workload| workload.id)
                         .collect(),
                 })
                 .collect(),
+        }
+    }
+
+    fn mark_workload_ended(&mut self, id: SessionId) {
+        for workload in self
+            .options
+            .hosts
+            .iter_mut()
+            .flat_map(|host| &mut host.workloads)
+            .filter(|workload| workload.id == id)
+        {
+            workload.status = SessionStatus::Ended;
+            workload.base_label = workload
+                .base_label
+                .replacen("[running]", "[ended]", 1)
+                .replacen(" · Open ", " · Restart ", 1);
+        }
+    }
+
+    fn current_host_reachable(&self) -> bool {
+        let Some(host) = self.options.hosts.get(self.host_index) else {
+            return false;
+        };
+        self.host_status
+            .get(&host.name)
+            .is_some_and(|cell| !cell.stale && cell.value == Some(HostReachability::Reachable))
+    }
+    fn current_host_unreachable(&self) -> bool {
+        let Some(host) = self.options.hosts.get(self.host_index) else {
+            return false;
+        };
+        self.host_status.get(&host.name).is_some_and(|cell| {
+            !cell.stale
+                && cell
+                    .value
+                    .is_some_and(|status| status != HostReachability::Reachable)
+        })
+    }
+
+    fn current_legacy_id(&self) -> Option<SessionId> {
+        if self.stage != PickerStage::Resource {
+            return None;
+        }
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| {
+                workload.id == id && workload.legacy && workload.status != SessionStatus::Removed
+            })
+            .map(|workload| workload.id)
+    }
+    fn current_owned_action(&self) -> Option<(SessionId, bool)> {
+        if self.stage != PickerStage::Resource || !self.current_host_reachable() {
+            return None;
+        }
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        let workload = self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| workload.id == id)?;
+        if workload.legacy {
+            return None;
+        }
+        match workload.status {
+            SessionStatus::Ended => Some((id, true)),
+            SessionStatus::Running
+                if self.workload_status.get(&id).is_some_and(|cell| {
+                    !cell.stale && matches!(cell.value, Some(WorkloadStatus::Running { .. }))
+                }) =>
+            {
+                Some((id, false))
+            }
+            _ => None,
         }
     }
 
@@ -1350,7 +1448,7 @@ impl PickerState {
                 }
             }
             for workload in &mut host.workloads {
-                workload.label = if workload.status == SessionStatus::Active {
+                workload.label = if workload.status == SessionStatus::Running {
                     format_status_label(
                         &workload.base_label,
                         self.workload_status.get(&workload.id),
@@ -1364,9 +1462,9 @@ impl PickerState {
                     .as_ref()
                     .is_some_and(|(id, _)| *id == workload.id)
                 {
-                    workload.label = format!("[closing…] {}", workload.base_label);
+                    workload.label = format!("[applying…] {}", workload.base_label);
                 } else if self.close_failed.contains_key(&workload.id) {
-                    workload.label = format!("[close failed · c retry] {}", workload.base_label);
+                    workload.label = format!("[action failed · x retry] {}", workload.base_label);
                 }
             }
         }
@@ -1411,6 +1509,7 @@ impl PickerState {
             return match event {
                 PickerEvent::DismissClose => {
                     self.close_modal = None;
+                    self.close_modal_action = None;
                     PickerOutcome::Continue
                 }
                 PickerEvent::ConfirmClose => self.confirm_close(),
@@ -1517,24 +1616,22 @@ impl PickerState {
         }
     }
     fn begin_close(&mut self) -> PickerOutcome {
-        if self.stage != PickerStage::Resource || self.pending_close.is_some() {
+        if self.pending_close.is_some() {
             return PickerOutcome::Continue;
         }
-        let Some(ResourceIdentity::Owned(id)) = self.current_resource_identity() else {
-            return PickerOutcome::Continue;
-        };
-        let Some(workload) = self
-            .options
-            .hosts
-            .iter()
-            .flat_map(|host| &host.workloads)
-            .find(|workload| workload.id == id)
-        else {
-            return PickerOutcome::Continue;
-        };
-        if workload.status == SessionStatus::Closed {
+        if let Some(id) = self.current_legacy_id() {
+            self.close_modal_action = Some(PickerCloseAction::Remove);
+            self.close_modal = Some(PickerCloseModal::Confirm { id });
             return PickerOutcome::Continue;
         }
+        let Some((id, restart)) = self.current_owned_action() else {
+            return PickerOutcome::Continue;
+        };
+        self.close_modal_action = Some(if restart {
+            PickerCloseAction::Remove
+        } else {
+            PickerCloseAction::Stop
+        });
         self.close_modal = Some(PickerCloseModal::Confirm { id });
         PickerOutcome::Continue
     }
@@ -1548,20 +1645,17 @@ impl PickerState {
         }) else {
             return PickerOutcome::Continue;
         };
-        if !self.options.hosts.iter().any(|host| {
-            host.workloads
-                .iter()
-                .any(|workload| workload.id == id && workload.status != SessionStatus::Closed)
-        }) {
+        let Some(action) = self.close_modal_action else {
             self.close_modal = None;
             return PickerOutcome::Continue;
-        }
+        };
         self.close_modal = None;
         self.pending_close = Some((id, self.generation));
         self.rebuild_status_labels();
         PickerOutcome::CloseOwnedRequested {
             id,
             generation: self.generation,
+            action,
         }
     }
 
@@ -1623,12 +1717,17 @@ impl PickerState {
             PickerStage::Resource => PickerStage::Host,
             PickerStage::Directory => PickerStage::Resource,
             PickerStage::Command => PickerStage::Directory,
-            PickerStage::Placement if self.resume_id.is_some() || self.external_name.is_some() => {
+            PickerStage::Placement
+                if self.resume_id.is_some()
+                    || self.restart_id.is_some()
+                    || self.external_name.is_some() =>
+            {
                 PickerStage::Resource
             }
             PickerStage::Placement => PickerStage::Command,
         };
         self.resume_id = None;
+        self.restart_id = None;
         self.external_name = None;
         PickerOutcome::Continue
     }
@@ -1643,6 +1742,7 @@ impl PickerState {
                 self.directory_index = 0;
                 self.command_index = 0;
                 self.resume_id = None;
+                self.restart_id = None;
                 self.external_name = None;
                 self.selected_directory = None;
                 self.directory_filter.clear();
@@ -1650,24 +1750,19 @@ impl PickerState {
                 PickerOutcome::Continue
             }
             PickerStage::Resource => {
+                if self.current_host_unreachable() {
+                    return PickerOutcome::Continue;
+                }
                 let host = &self.options.hosts[self.host_index];
                 if let Some(workload) = host.workloads.get(self.resource_index) {
-                    if workload.status != SessionStatus::Active
-                        || self.close_failed.contains_key(&workload.id)
-                        || self
-                            .pending_close
-                            .as_ref()
-                            .is_some_and(|(id, _)| *id == workload.id)
-                    {
+                    let Some((id, restart)) = self.current_owned_action() else {
+                        return PickerOutcome::Continue;
+                    };
+                    if id != workload.id || self.close_failed.contains_key(&id) {
                         return PickerOutcome::Continue;
                     }
-                    let missing = self.workload_status.get(&workload.id).is_some_and(|cell| {
-                        !cell.stale && matches!(cell.value, Some(WorkloadStatus::Missing))
-                    });
-                    if missing {
-                        return PickerOutcome::Continue;
-                    }
-                    self.resume_id = Some(workload.id);
+                    self.resume_id = (!restart).then_some(id);
+                    self.restart_id = restart.then_some(id);
                     self.external_name = None;
                     self.stage = PickerStage::Placement;
                     return PickerOutcome::Continue;
@@ -1680,12 +1775,14 @@ impl PickerState {
                         .and_then(|catalog| catalog.sessions.get(external_index))
                 {
                     self.resume_id = None;
+                    self.restart_id = None;
                     self.external_name = Some(session.name.clone());
                     self.stage = PickerStage::Placement;
                     return PickerOutcome::Continue;
                 }
                 if host.allow_create {
                     self.resume_id = None;
+                    self.restart_id = None;
                     self.external_name = None;
                     self.selected_directory = None;
                     self.directory_filter.clear();
@@ -1715,6 +1812,9 @@ impl PickerState {
         let placement = PLACEMENTS[self.placement_index];
         if let Some(id) = self.resume_id {
             return PickerSelection::Resume { id, placement };
+        }
+        if let Some(id) = self.restart_id {
+            return PickerSelection::Restart { id, placement };
         }
         if let Some(name) = &self.external_name {
             let host = &self.options.hosts[self.host_index];
@@ -1903,6 +2003,27 @@ impl PickerState {
         (!notices.is_empty()).then(|| notices.join(" · "))
     }
 
+    fn close_action(&self, id: SessionId) -> PickerCloseAction {
+        if self
+            .options
+            .hosts
+            .iter()
+            .flat_map(|host| &host.workloads)
+            .any(|workload| {
+                workload.id == id && (workload.legacy || workload.status == SessionStatus::Ended)
+            })
+        {
+            PickerCloseAction::Remove
+        } else {
+            PickerCloseAction::Stop
+        }
+    }
+
+    fn modal_close_action(&self, id: SessionId) -> PickerCloseAction {
+        self.close_modal_action
+            .unwrap_or_else(|| self.close_action(id))
+    }
+
     fn modal_text(&self) -> Option<String> {
         if let Some(error) = &self.operation_error {
             return Some(format!(
@@ -1927,12 +2048,26 @@ impl PickerState {
             });
         }
         match self.close_modal.as_ref()? {
-            PickerCloseModal::Confirm { id } => Some(format!(
-                "y confirm · n/Esc keep · Close exact {id}? Terminates its tmux session."
+            PickerCloseModal::Confirm { id } => match self.modal_close_action(*id) {
+                PickerCloseAction::Stop => Some(format!(
+                    "y confirm · n/Esc keep · Stop exact {id}? Ends its Tether workload."
+                )),
+                PickerCloseAction::Remove if self.current_legacy_id() == Some(*id) => {
+                    Some(format!(
+                        "y confirm · n/Esc keep · Remove legacy record {id}? Metadata only; any same-named tmux session is untouched."
+                    ))
+                }
+                PickerCloseAction::Remove => Some(format!(
+                    "y confirm · n/Esc keep · Remove ended {id}? Metadata only; no live workload is touched."
+                )),
+            },
+            PickerCloseModal::Failed { id, error } => Some(format!(
+                "y retry · n/Esc dismiss · {} failed: {error}",
+                match self.modal_close_action(*id) {
+                    PickerCloseAction::Stop => "Stop",
+                    PickerCloseAction::Remove => "Remove",
+                }
             )),
-            PickerCloseModal::Failed { error, .. } => {
-                Some(format!("y retry · n/Esc dismiss · Close failed: {error}"))
-            }
         }
     }
 
@@ -1945,16 +2080,23 @@ impl PickerState {
             (Some(PickerPruneModal::Failed { .. }), _, _) => "Prune failed".to_owned(),
             (_, Some(PickerPrunePending::Preview { .. }), _) => "Previewing prune".to_owned(),
             (_, Some(PickerPrunePending::Apply { .. }), _) => "Pruning metadata".to_owned(),
-            (_, _, Some(PickerCloseModal::Confirm { .. })) => "Confirm close".to_owned(),
-            (_, _, Some(PickerCloseModal::Failed { .. })) => "Close failed".to_owned(),
-            (_, _, None) if self.pending_close.is_some() => "Closing workload".to_owned(),
+            (_, _, Some(PickerCloseModal::Confirm { id })) => match self.modal_close_action(*id) {
+                PickerCloseAction::Stop => "Confirm Stop".to_owned(),
+                PickerCloseAction::Remove => "Confirm Remove".to_owned(),
+            },
+            (_, _, Some(PickerCloseModal::Failed { id, .. })) => match self.modal_close_action(*id)
+            {
+                PickerCloseAction::Stop => "Stop failed".to_owned(),
+                PickerCloseAction::Remove => "Remove failed".to_owned(),
+            },
+            (_, _, None) if self.pending_close.is_some() => "Applying lifecycle action".to_owned(),
             _ => self.title().to_owned(),
         }
     }
 
     pub fn footer_text(&self) -> String {
         if let Some((id, _)) = self.pending_close {
-            return format!("Closing · wait for result · {id} · ↑/↓ navigate");
+            return format!("Applying confirmed action · wait for result · {id} · ↑/↓ navigate");
         }
         if let Some(pending) = &self.pending_prune {
             return match pending {
@@ -1999,51 +2141,66 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
-                let close_hint = if self.stage == PickerStage::Resource
-                    && self
-                        .current_resource_identity()
-                        .is_some_and(|identity| match identity {
-                            ResourceIdentity::Owned(id) => self.options.hosts[self.host_index]
-                                .workloads
-                                .iter()
-                                .find(|workload| workload.id == id)
-                                .is_some_and(|workload| workload.status != SessionStatus::Closed),
-                            _ => false,
-                        }) {
-                    " · c close"
+                let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
+                    if self.current_legacy_id().is_some() {
+                        ("", " · x Remove")
+                    } else {
+                        match self.current_owned_action() {
+                            Some((_, false)) => ("Enter Open", " · x Stop"),
+                            Some((_, true)) => ("Enter Restart", " · x Remove"),
+                            None => match self.current_resource_identity() {
+                                Some(ResourceIdentity::External(_))
+                                | Some(ResourceIdentity::Create)
+                                    if !self.current_host_unreachable() =>
+                                {
+                                    ("Enter select", "")
+                                }
+                                _ => ("", ""),
+                            },
+                        }
+                    }
+                } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
+                    ("", "")
                 } else {
-                    ""
+                    ("Enter select", "")
+                };
+                let primary_hint = if primary_hint.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{primary_hint} · ")
                 };
                 let path_hint = if self.stage == PickerStage::Directory {
                     " · / filter · p path"
                 } else {
                     ""
                 };
-                let select_hint = if self.stage == PickerStage::Resource
-                    && self
-                        .current_resource_identity()
-                        .is_some_and(|identity| match identity {
-                            ResourceIdentity::Owned(id) => self.options.hosts[self.host_index]
-                                .workloads
-                                .iter()
-                                .find(|workload| workload.id == id)
-                                .is_some_and(|workload| workload.status == SessionStatus::Active),
-                            ResourceIdentity::External(_) | ResourceIdentity::Create => true,
-                        }) {
-                    " · Enter select"
-                } else if self.stage == PickerStage::Resource
-                    || (self.stage == PickerStage::Host && self.options.hosts.is_empty())
-                {
-                    ""
+                let refresh_hint = if self.current_host_unreachable() {
+                    "Retry"
                 } else {
-                    " · Enter select"
+                    "Refresh"
                 };
-                parts.push(format!(
-                    "↑/↓ navigate{select_hint}{close_hint}{path_hint} · P prune closed metadata · r refresh · Backspace back · Esc cancel"
-                ));
+                let back_action = if self.stage == PickerStage::Host {
+                    "close"
+                } else {
+                    "back"
+                };
+                parts.insert(
+                    0,
+                    format!(
+                        "Esc {back_action} · {primary_hint}↑/↓ navigate{destructive_hint}{path_hint} · r {refresh_hint} · Backspace {back_action}"
+                    ),
+                );
                 parts.join(" · ")
             }
         }
+    }
+}
+
+fn terminal_safe_text(text: &str) -> Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        Cow::Owned(sanitize_terminal_text(text))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -2175,16 +2332,34 @@ pub fn run_picker_with_operation_error(
         &lifecycle_service,
         &prune_service,
     );
-    let leave_result =
-        execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen");
-    let raw_result = disable_raw_mode().context("disable terminal raw mode");
+    finish_terminal_session(
+        result,
+        || execute!(io::stdout(), LeaveAlternateScreen, Show).context("restore terminal screen"),
+        || disable_raw_mode().context("disable terminal raw mode"),
+    )
+}
 
-    match result {
-        Err(error) => Err(error),
-        Ok(selection) => {
-            leave_result?;
-            raw_result?;
-            Ok(selection)
+fn finish_terminal_session<T>(
+    picker_result: Result<T>,
+    restore_screen: impl FnOnce() -> Result<()>,
+    disable_raw: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let screen_result = restore_screen();
+    let raw_result = disable_raw();
+    match (picker_result, screen_result, raw_result) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (picker_result, screen_result, raw_result) => {
+            let mut failures = Vec::new();
+            if let Err(error) = picker_result {
+                failures.push(format!("picker: {error:#}"));
+            }
+            if let Err(error) = screen_result {
+                failures.push(format!("screen cleanup: {error:#}"));
+            }
+            if let Err(error) = raw_result {
+                failures.push(format!("terminal mode cleanup: {error:#}"));
+            }
+            Err(anyhow::anyhow!(failures.join("; ")))
         }
     }
 }
@@ -2227,7 +2402,22 @@ fn run_terminal_picker(
 
     loop {
         while let Ok(message) = status_run.receiver.try_recv() {
+            let missing_id = match &message {
+                StatusMessage::Workload {
+                    id,
+                    status: WorkloadStatus::Missing,
+                    ..
+                } => Some(*id),
+                _ => None,
+            };
             dirty |= state.apply_status(message);
+            if let Some(id) = missing_id
+                && lifecycle_service.observe_owned(id).is_ok()
+                && let Ok(Some(record)) = lifecycle_service.owned_record(id)
+            {
+                state.reconcile_owned_record(&record);
+                dirty = true;
+            }
         }
         while let Ok(message) = discovery_run.receiver.try_recv() {
             dirty |= state.apply_discovery(message);
@@ -2284,11 +2474,20 @@ fn run_terminal_picker(
                 status_run = start_status_run(state, status_service, generation);
                 discovery_run = start_discovery_run(state, discovery_service, generation);
             }
-            PickerOutcome::CloseOwnedRequested { id, generation } => {
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation,
+                action,
+            } => {
                 let service = lifecycle_service.clone();
                 let sender = close_sender.clone();
                 thread::spawn(move || {
-                    let mut error = service.close_owned(id).err().map(format_close_error);
+                    let mut error = match action {
+                        PickerCloseAction::Stop => service.close_owned(id).map(|_| ()),
+                        PickerCloseAction::Remove => service.remove_owned(id).map(|_| ()),
+                    }
+                    .err()
+                    .map(format_close_error);
                     let record = match service.owned_record(id) {
                         Ok(record) => record,
                         Err(read_error) => {
@@ -2424,23 +2623,24 @@ fn map_key_with_modals(
             _ => None,
         };
     }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
     match key.code {
-        KeyCode::Esc => Some(PickerEvent::Cancel),
+        KeyCode::Esc if stage == PickerStage::Host => Some(PickerEvent::Cancel),
+        KeyCode::Esc => Some(PickerEvent::Back),
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Some(PickerEvent::Previous),
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Some(PickerEvent::Next),
         KeyCode::Backspace => Some(PickerEvent::Back),
         KeyCode::Enter => Some(PickerEvent::Confirm),
         KeyCode::Char('/') if stage == PickerStage::Directory => Some(PickerEvent::BeginFilter),
-        KeyCode::Char('P')
-            if key.kind == KeyEventKind::Press
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(PickerEvent::BeginPrune)
-        }
+        KeyCode::Char('P') => None,
         KeyCode::Char('p') if stage == PickerStage::Directory => Some(PickerEvent::BeginPath),
-        KeyCode::Char('c' | 'C')
+        KeyCode::Char('x' | 'X')
             if stage == PickerStage::Resource
                 && key.kind == KeyEventKind::Press
                 && !key
@@ -2462,6 +2662,10 @@ fn map_key_with_modals(
 }
 
 fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
+    render_picker_with_color_mode(frame, state, std::env::var_os("NO_COLOR").is_none());
+}
+
+fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, colors_enabled: bool) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
     let footer = state.footer_text();
@@ -2482,7 +2686,23 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         || state.prune_modal.is_some()
         || state.pending_prune.is_some()
         || state.operation_error.is_some();
-    let accent = if destructive { Color::Red } else { Color::Cyan };
+    let accent = if !colors_enabled {
+        Color::Reset
+    } else if destructive {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let selected_text = if colors_enabled {
+        Color::White
+    } else {
+        Color::Reset
+    };
+    let secondary_text = if colors_enabled {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
     let block = Block::default()
         .title(format!(" Tether · {} ", state.frame_title()))
         .title_alignment(Alignment::Center)
@@ -2508,25 +2728,28 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         .skip(start)
         .take(max_rows)
         .map(|(index, label)| {
+            let label = terminal_safe_text(label);
             if has_selection && index == selected {
                 Line::from(vec![
                     Span::styled("> ", Style::default().fg(accent)),
                     Span::styled(
-                        *label,
+                        label,
                         Style::default()
-                            .fg(Color::White)
+                            .fg(selected_text)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
             } else {
-                Line::from(vec![Span::raw("  "), Span::styled(*label, Color::DarkGray)])
+                Line::from(vec![Span::raw("  "), Span::styled(label, secondary_text)])
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
         Paragraph::new(footer)
-            .style(Style::default().fg(if destructive {
+            .style(Style::default().fg(if !colors_enabled {
+                Color::Reset
+            } else if destructive {
                 Color::Red
             } else {
                 Color::DarkGray
@@ -2538,6 +2761,15 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
 
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
     let width = usize::from(width.max(1));
+    let lines = text
+        .split('\n')
+        .map(|line| wrapped_single_line_count(line, width))
+        .sum::<usize>()
+        .max(1);
+    lines.min(usize::from(u16::MAX)) as u16
+}
+
+fn wrapped_single_line_count(text: &str, width: usize) -> usize {
     let mut lines = 0_usize;
     let mut occupied = 0_usize;
     for word in text.split_whitespace() {
@@ -2558,10 +2790,7 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
             occupied = word_width;
         }
     }
-    lines
-        .saturating_add(usize::from(occupied > 0))
-        .max(1)
-        .min(usize::from(u16::MAX)) as u16
+    lines.saturating_add(usize::from(occupied > 0)).max(1)
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
@@ -2619,6 +2848,28 @@ mod tests {
     }
 
     #[test]
+    fn escape_backs_out_until_the_host_stage_then_closes() {
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Resource,
+                false,
+            ),
+            Some(PickerEvent::Back)
+        );
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+                false,
+            ),
+            Some(PickerEvent::Cancel)
+        );
+    }
+
+    #[test]
     fn input_mode_maps_command_keys_to_text() {
         for character in ['r', 'j', 'k', 'p', '/'] {
             assert_eq!(
@@ -2637,7 +2888,7 @@ mod tests {
     fn destructive_keys_are_press_only_and_modal_keys_are_isolated() {
         assert_eq!(
             map_key(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &PickerInput::None,
                 PickerStage::Resource,
                 false,
@@ -2647,7 +2898,7 @@ mod tests {
         assert_eq!(
             map_key(
                 KeyEvent::new_with_kind(
-                    KeyCode::Char('c'),
+                    KeyCode::Char('x'),
                     KeyModifiers::NONE,
                     KeyEventKind::Repeat,
                 ),
@@ -2659,12 +2910,12 @@ mod tests {
         );
         assert_eq!(
             map_key(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                 &PickerInput::Filter(String::new()),
                 PickerStage::Resource,
                 false,
             ),
-            Some(PickerEvent::Insert('c'))
+            Some(PickerEvent::Insert('x'))
         );
         assert_eq!(
             map_key(
@@ -2705,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn global_prune_key_is_uppercase_press_only_unmodified_and_modal_isolated() {
+    fn primary_picker_has_no_prune_shortcut() {
         assert_eq!(
             map_key_with_modals(
                 KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
@@ -2714,7 +2965,7 @@ mod tests {
                 false,
                 false,
             ),
-            Some(PickerEvent::BeginPrune)
+            None
         );
         for key in [
             KeyEvent::new_with_kind(KeyCode::Char('P'), KeyModifiers::NONE, KeyEventKind::Repeat),
@@ -2804,6 +3055,21 @@ mod tests {
             Some(PickerEvent::Confirm)
         );
     }
+    #[test]
+    fn modified_navigation_and_action_keys_do_not_leak_into_picker_controls() {
+        for key in [
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        ] {
+            assert_eq!(
+                map_key(key, &PickerInput::None, PickerStage::Resource, false,),
+                None
+            );
+        }
+    }
 
     fn navigation_picker() -> PickerState {
         PickerState::new(PickerOptions {
@@ -2833,7 +3099,10 @@ mod tests {
         let controls = picker.footer_text();
         assert!(controls.contains("↑/↓ navigate"));
         assert!(controls.contains("Enter select"));
-        assert!(controls.contains("Backspace back"));
+        assert!(controls.contains("Backspace close"));
+        assert!(controls.contains("Esc close"));
+        assert!(controls.contains("r Refresh"));
+        assert!(!controls.contains("r Retry"));
         assert!(!controls.contains("← back"));
 
         assert_eq!(picker.handle(PickerEvent::Next), PickerOutcome::Continue);
@@ -2883,6 +3152,32 @@ mod tests {
         assert_eq!(picker.handle(PickerEvent::Back), PickerOutcome::Continue);
         assert!(picker.operation_error().is_none());
     }
+    #[test]
+    fn terminal_cleanup_attempts_both_restorations_after_picker_failure() {
+        use std::cell::Cell;
+
+        let screen_restored = Cell::new(false);
+        let raw_disabled = Cell::new(false);
+        let error = finish_terminal_session::<()>(
+            Err(anyhow::anyhow!("picker failed")),
+            || {
+                screen_restored.set(true);
+                Err(anyhow::anyhow!("screen restore failed"))
+            },
+            || {
+                raw_disabled.set(true);
+                Err(anyhow::anyhow!("raw restore failed"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(screen_restored.get());
+        assert!(raw_disabled.get());
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("picker failed"));
+        assert!(diagnostic.contains("screen restore failed"));
+        assert!(diagnostic.contains("raw restore failed"));
+    }
 }
 
 #[cfg(test)]
@@ -2906,7 +3201,8 @@ mod close_render_tests {
                 workloads: vec![PickerWorkload {
                     id,
                     base_label: label.clone(),
-                    status: SessionStatus::Active,
+                    status: SessionStatus::Running,
+                    legacy: false,
                     last_used_at: chrono::Utc::now(),
                     label,
                 }],
@@ -2917,9 +3213,46 @@ mod close_render_tests {
         };
         let mut picker = PickerState::new(options).unwrap();
         picker.begin_refresh(9);
+        picker.apply_status(StatusMessage::Host {
+            generation: 9,
+            host: "build-box".to_owned(),
+            status: HostReachability::Reachable,
+            detail: None,
+            checked_at: std::time::SystemTime::now(),
+        });
+        picker.apply_status(StatusMessage::Workload {
+            generation: 9,
+            id,
+            status: WorkloadStatus::Running { attached: 0 },
+            checked_at: std::time::SystemTime::now(),
+        });
         picker.handle(PickerEvent::Confirm);
         picker.handle(PickerEvent::Close);
         (picker, id)
+    }
+
+    #[test]
+    fn resource_hints_match_reachability_and_available_actions() {
+        let (mut picker, _) = close_picker();
+        picker.handle(PickerEvent::DismissClose);
+
+        let reachable = picker.footer_text();
+        assert!(reachable.contains("Enter Open"));
+        assert!(reachable.contains("x Stop"));
+        assert!(reachable.contains("r Refresh"));
+        assert!(!reachable.contains("r Retry"));
+
+        assert!(picker.apply_status(StatusMessage::Host {
+            generation: 9,
+            host: "build-box".to_owned(),
+            status: HostReachability::Unreachable,
+            detail: Some("connection refused".to_owned()),
+            checked_at: std::time::SystemTime::now(),
+        }));
+        let unreachable = picker.footer_text();
+        assert!(unreachable.contains("r Retry"));
+        assert!(!unreachable.contains("Enter Open"));
+        assert!(!unreachable.contains("x Stop"));
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
@@ -2938,10 +3271,10 @@ mod close_render_tests {
         let mut terminal = Terminal::new(TestBackend::new(32, 16)).unwrap();
 
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Confirm close"));
+        assert!(rendered.contains("Confirm Stop"));
         assert!(rendered.contains("y confirm"));
         assert!(rendered.contains("n/Esc keep"));
         assert!(
@@ -2955,13 +3288,17 @@ mod close_render_tests {
 
         assert_eq!(
             picker.handle(PickerEvent::ConfirmClose),
-            PickerOutcome::CloseOwnedRequested { id, generation: 9 }
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop
+            }
         );
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Closing workload"));
+        assert!(rendered.contains("Applying lifecycle"));
         assert!(rendered.contains("wait for result"));
         assert!(
             terminal
@@ -2983,10 +3320,10 @@ mod close_render_tests {
         };
         assert!(error.chars().count() <= 241);
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
-        assert!(rendered.contains("Close failed"));
+        assert!(rendered.contains("Stop failed"));
         assert!(rendered.contains("y retry"));
         assert!(rendered.contains("n/Esc dismiss"));
         assert!(
@@ -2996,6 +3333,38 @@ mod close_render_tests {
                 .content()
                 .iter()
                 .any(|cell| cell.fg == Color::Red)
+        );
+    }
+
+    #[test]
+    fn failed_close_retry_keeps_the_confirmed_action_when_status_changes() {
+        let (mut picker, id) = close_picker();
+        assert_eq!(
+            picker.handle(PickerEvent::ConfirmClose),
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop,
+            }
+        );
+        picker.options.hosts[0].workloads[0].status = SessionStatus::Ended;
+
+        assert!(picker.apply_close_result(PickerCloseResult {
+            id,
+            generation: 9,
+            error: Some("transport failed after the workload ended".to_owned()),
+            record: None,
+        }));
+
+        assert_eq!(picker.frame_title(), "Stop failed");
+        assert!(picker.footer_text().contains("Stop failed"));
+        assert_eq!(
+            picker.handle(PickerEvent::ConfirmClose),
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop,
+            }
         );
     }
 
@@ -3012,10 +3381,14 @@ mod close_render_tests {
                     target: "old.example".to_owned(),
                     directory: "/old".to_owned(),
                     preset: None,
-                    status: SessionStatus::Closed,
+                    command: Some("exec shell".to_owned()),
+                    tmux_session_id: None,
+                    ownership_proof: None,
+                    status: SessionStatus::Ended,
                     created_at: now - chrono::Duration::days(40),
                     last_used_at: now - chrono::Duration::days(40),
                     closed_at: Some(now - chrono::Duration::days(40)),
+                    exit_status: None,
                 }],
             })
             .unwrap();
@@ -3035,7 +3408,7 @@ mod close_render_tests {
             PickerOutcome::PrunePreviewRequested { .. }
         ));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let pending = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3050,7 +3423,7 @@ mod close_render_tests {
             result: Ok(preview.clone()),
         }));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let confirm = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3073,7 +3446,7 @@ mod close_render_tests {
             error: Some("persistence unavailable".to_owned()),
         }));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let failed = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3105,7 +3478,7 @@ mod close_render_tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
 
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3124,5 +3497,76 @@ mod close_render_tests {
                 .iter()
                 .any(|cell| cell.fg == Color::Red)
         );
+    }
+    #[test]
+    fn monochrome_render_keeps_selection_and_destructive_guidance_textual() {
+        let (picker, _) = close_picker();
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+
+        terminal
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, false))
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains('>'));
+        assert!(rendered.contains("y confirm"));
+        assert!(rendered.contains("n/Esc keep"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn rendered_resource_labels_never_emit_terminal_control_sequences() {
+        let (mut picker, _) = close_picker();
+        let unsafe_label = "workload\u{1b}]0;spoof\u{7}\nnext".to_owned();
+        picker.options.hosts[0].workloads[0].label = unsafe_label.clone();
+        picker.options.hosts[0].workloads[0].base_label = unsafe_label;
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+
+        terminal
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("workload next"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains("spoof"));
+    }
+
+    #[test]
+    fn tiny_picker_and_modal_geometries_never_panic() {
+        for (width, height) in [(1, 1), (5, 3), (20, 5), (32, 8), (80, 24)] {
+            let (mut picker, _) = close_picker();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_picker(frame, &picker))
+                .unwrap();
+            if width >= 20 {
+                let confirmation = rendered_text(&terminal);
+                assert!(confirmation.contains("y confirm"), "{width}x{height}");
+                assert!(confirmation.contains("n/Esc keep"), "{width}x{height}");
+            }
+            picker.handle(PickerEvent::DismissClose);
+            terminal
+                .draw(|frame| render_picker(frame, &picker))
+                .unwrap();
+            if width >= 20 {
+                let picker_text = rendered_text(&terminal);
+                assert!(
+                    picker_text.contains("Enter Open"),
+                    "{width}x{height}: {picker_text:?}"
+                );
+                assert!(
+                    picker_text.contains("Esc back"),
+                    "{width}x{height}: {picker_text:?}"
+                );
+            }
+        }
     }
 }

@@ -29,19 +29,38 @@ permissions:
   contents: read
 
 jobs:
-  macos-live-product:
-    name: Herdr 0.7.3 / tmux / macOS 14
-    runs-on: macos-14
+  live-product:
+    name: Herdr 0.7.3 / tmux / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Ubuntu 24.04
+            platform: linux
+          - os: macos-14
+            label: macOS 14
+            platform: macos
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
       HERDR_VERSION: "0.7.3"
+      HERDR_PLATFORM: ${{ matrix.platform }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install tmux
+      - name: Install tmux on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
+
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS'
         run: |
           brew install tmux
           tmux -V
@@ -57,17 +76,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            arm64)
+          case "${HERDR_PLATFORM}:$(uname -m)" in
+            linux:aarch64|linux:arm64)
+              asset="herdr-linux-aarch64"
+              sha256="ea490094f2c7c39099870857d00c64c628ef7b5eba1967df4258033455ee2cb1"
+              ;;
+            linux:x86_64)
+              asset="herdr-linux-x86_64"
+              sha256="043ef43ecbabda28465dcff1eec3184518150d567b8b8f20cda9c6c88770641d"
+              ;;
+            macos:arm64)
               asset="herdr-macos-aarch64"
               sha256="b31345392d004ec1f1b2c821e1ad601019fa8385fe1e4c6931321eb58a920773"
               ;;
-            x86_64)
+            macos:x86_64)
               asset="herdr-macos-x86_64"
               sha256="9b5f35d283b0877eeda0cf66ba1ef1d95ae40f32e858a04da0041f3a20df027c"
               ;;
             *)
-              echo "unsupported macOS runner architecture: $(uname -m)" >&2
+              echo "unsupported runner: ${HERDR_PLATFORM}/$(uname -m)" >&2
               exit 1
               ;;
           esac
@@ -75,7 +102,11 @@ jobs:
           curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
             --output "$destination" \
             "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/${asset}"
-          printf '%s  %s\n' "$sha256" "$destination" | shasum --algorithm 256 --check
+          if [[ "$HERDR_PLATFORM" == linux ]]; then
+            printf '%s  %s\n' "$sha256" "$destination" | sha256sum --check
+          else
+            printf '%s  %s\n' "$sha256" "$destination" | shasum --algorithm 256 --check
+          fi
           chmod 0755 "$destination"
           "$destination" --version
           printf 'HERDR_BIN=%s\n' "$destination" >> "$GITHUB_ENV"
@@ -83,12 +114,59 @@ jobs:
       - name: Build locked release artifact
         run: cargo build --release --locked
 
-      - name: Verify parent tmux isolation
+      - name: Run deterministic harness tests
         run: python3 tools/test_live_product_smoke.py
 
-      - name: Run disposable live product smoke
+      - name: Run isolated live product smoke and preserve parent tmux
+        shell: bash
+        env:
+          TETHER_SMOKE_REMOTE_TARGET: ${{ secrets.TETHER_SMOKE_REMOTE_TARGET }}
+          TETHER_SMOKE_REMOTE_DIRECTORY: ${{ secrets.TETHER_SMOKE_REMOTE_DIRECTORY }}
+          TETHER_SMOKE_REMOTE_KNOWN_HOSTS: ${{ secrets.TETHER_SMOKE_REMOTE_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
+          witness_socket="tether-parent-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          witness_session="tether-parent-witness"
+          cleanup_witness() {
+            tmux -L "$witness_socket" kill-session -t "=$witness_session" 2>/dev/null || true
+          }
+          trap cleanup_witness EXIT
+          tmux -L "$witness_socket" new-session -d -s "$witness_session"
+          socket_path="$(tmux -L "$witness_socket" display-message -p -t "=$witness_session" '#{socket_path}')"
+          server_pid="$(tmux -L "$witness_socket" display-message -p -t "=$witness_session" '#{pid}')"
+          export TMUX="${socket_path},${server_pid},0"
+
+          remote_args=()
+          remote_values=0
+          if [[ -n "$TETHER_SMOKE_REMOTE_TARGET" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_DIRECTORY" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ "$remote_values" -eq 3 ]]; then
+            remote_known_hosts="$RUNNER_TEMP/tether-remote-known-hosts"
+            umask 077
+            printf '%s\n' "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" > "$remote_known_hosts"
+            remote_args=(
+              --remote-target "$TETHER_SMOKE_REMOTE_TARGET"
+              --remote-directory "$TETHER_SMOKE_REMOTE_DIRECTORY"
+              --remote-known-hosts "$remote_known_hosts"
+            )
+          elif [[ "$remote_values" -ne 0 ]]; then
+            echo "remote smoke requires target, directory, and pinned known-hosts together" >&2
+            exit 1
+          else
+            echo "::notice::Remote equivalence was not exercised because no disposable SSH target is configured."
+          fi
+
           python3 tools/live_product_smoke.py \
             --herdr "$HERDR_BIN" \
             --tether target/release/herdr-tether \
-            --repo-root "$GITHUB_WORKSPACE"
+            --repo-root "$GITHUB_WORKSPACE" \
+            "${remote_args[@]}"
+
+          tmux -L "$witness_socket" has-session -t "=$witness_session"
