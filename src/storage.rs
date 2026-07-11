@@ -90,30 +90,15 @@ impl AtomicWriteError {
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
-    reconcile_committed_write(path, contents, atomic_write_mode(path, contents, true))
+    atomic_write_mode(path, contents, true)
 }
 
 pub(crate) fn atomic_write_preserving_parent(
     path: &Path,
     contents: &[u8],
 ) -> Result<(), AtomicWriteError> {
-    reconcile_committed_write(path, contents, atomic_write_mode(path, contents, false))
+    atomic_write_mode(path, contents, false)
 }
-
-fn reconcile_committed_write(
-    path: &Path,
-    contents: &[u8],
-    result: Result<(), AtomicWriteError>,
-) -> Result<(), AtomicWriteError> {
-    match result {
-        Err(error) if error.committed() => match fs::read(path) {
-            Ok(actual) if actual == contents => Ok(()),
-            _ => Err(error),
-        },
-        result => result,
-    }
-}
-
 fn atomic_write_mode(
     path: &Path,
     contents: &[u8],
@@ -295,9 +280,7 @@ mod tests {
         .unwrap_err();
         assert!(postcommit.committed());
         assert_eq!(fs::read(&path).unwrap(), b"new");
-        assert!(
-            reconcile_committed_write(&path, b"new", Err(postcommit)).is_ok(),
-            "a caller must re-read and accept the complete committed document"
-        );
+        atomic_write_mode_with(&path, b"new", true, || Ok(()), |_| Ok(())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 }

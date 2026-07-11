@@ -23,6 +23,7 @@ use crate::{
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_DRAIN_BYTES_PER_TICK: usize = MAX_CAPTURE_BYTES + 8192;
+const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostReachability {
@@ -341,14 +342,17 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             hidden_reserved: 0,
             hidden_unsafe: 0,
         },
-        BoundedOutput::Completed { status, .. }
+        BoundedOutput::Completed { status, stderr, .. }
             if host.target.is_some() && status.code() == Some(255) =>
         {
-            classified_failure(
-                host,
-                HostReachability::Unreachable,
-                WorkloadStatus::Unknown,
-                ExternalCatalogStatus::Unavailable,
+            with_detail(
+                classified_failure(
+                    host,
+                    HostReachability::Unreachable,
+                    WorkloadStatus::Unknown,
+                    ExternalCatalogStatus::Unavailable,
+                ),
+                classify_ssh_failure(&stderr).to_owned(),
             )
         }
         BoundedOutput::TimedOut => with_detail(
@@ -390,12 +394,19 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             stderr_truncated,
             ..
         } => {
-            let mut detail = String::from_utf8_lossy(&stderr).trim().to_owned();
-            if detail.is_empty() {
-                detail = format!("status probe exited with {status}");
-            } else if stderr_truncated {
-                detail.push('…');
-            }
+            let detail = if host.target.is_some() {
+                format!(
+                    "remote status probe exited with {status}; retry after checking SSH and tmux"
+                )
+            } else {
+                let mut detail = sanitize_process_detail(&stderr);
+                if detail.is_empty() {
+                    detail = format!("status probe exited with {status}");
+                } else if stderr_truncated {
+                    detail.push('…');
+                }
+                detail
+            };
             with_detail(
                 classified_failure(
                     host,
@@ -408,6 +419,53 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
         }
         BoundedOutput::Cancelled => unreachable!("cancelled probes do not publish"),
     }
+}
+
+fn classify_ssh_failure(stderr: &[u8]) -> &'static str {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if lower.contains("connection refused") {
+        "SSH connection was refused; check that the host is online and SSH is running"
+    } else if lower.contains("permission denied") {
+        "SSH authentication failed; check the configured user and credentials"
+    } else if lower.contains("host key verification failed") {
+        "SSH host verification failed; verify the host key before retrying"
+    } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known")
+    {
+        "SSH could not resolve the host name; check the configured target"
+    } else if lower.contains("timed out") || lower.contains("no route to host") {
+        "SSH could not reach the host; check its network connection"
+    } else {
+        "SSH connection failed; retry after checking the host and credentials"
+    }
+}
+
+fn sanitize_process_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut pending_space = false;
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if chars.next_if_eq(&'[').is_some() {
+                for sequence in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !cleaned.is_empty();
+            continue;
+        }
+        if pending_space {
+            cleaned.push(' ');
+            pending_space = false;
+        }
+        cleaned.push(character);
+    }
+    cleaned
 }
 
 fn classified_failure(
@@ -525,7 +583,7 @@ pub(crate) fn run_bounded(
     }
     let mut stdout_capture = Capture::default();
     let mut stderr_capture = Capture::default();
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout.min(MAX_PROCESS_TIMEOUT);
 
     loop {
         if drain_pipe(stdout.as_mut(), &mut stdout_capture).is_err()
