@@ -50,6 +50,7 @@ jobs:
       HERDR_PLATFORM: ${{ matrix.platform }}
       TETHER_SMOKE_REMOTE_TARGET: ${{ secrets.TETHER_SMOKE_REMOTE_TARGET }}
       TETHER_SMOKE_REMOTE_DIRECTORY: ${{ secrets.TETHER_SMOKE_REMOTE_DIRECTORY }}
+      TETHER_SMOKE_REMOTE_KNOWN_HOSTS: ${{ secrets.TETHER_SMOKE_REMOTE_KNOWN_HOSTS }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -135,13 +136,27 @@ jobs:
           export TMUX="${socket_path},${server_pid},0"
 
           remote_args=()
-          if [[ -n "$TETHER_SMOKE_REMOTE_TARGET" && -n "$TETHER_SMOKE_REMOTE_DIRECTORY" ]]; then
+          remote_values=0
+          if [[ -n "$TETHER_SMOKE_REMOTE_TARGET" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_DIRECTORY" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ "$remote_values" -eq 3 ]]; then
+            remote_known_hosts="$RUNNER_TEMP/tether-remote-known-hosts"
+            umask 077
+            printf '%s\n' "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" > "$remote_known_hosts"
             remote_args=(
               --remote-target "$TETHER_SMOKE_REMOTE_TARGET"
               --remote-directory "$TETHER_SMOKE_REMOTE_DIRECTORY"
+              --remote-known-hosts "$remote_known_hosts"
             )
-          elif [[ -n "$TETHER_SMOKE_REMOTE_TARGET" || -n "$TETHER_SMOKE_REMOTE_DIRECTORY" ]]; then
-            echo "remote smoke configuration must provide both target and directory" >&2
+          elif [[ "$remote_values" -ne 0 ]]; then
+            echo "remote smoke requires target, directory, and pinned known-hosts together" >&2
             exit 1
           else
             echo "::notice::Remote equivalence was not exercised because no disposable SSH target is configured."

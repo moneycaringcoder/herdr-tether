@@ -4,11 +4,12 @@ import io
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-from live_product_smoke import Smoke, terminal_screen_text
+from live_product_smoke import Smoke, terminal_screen_text, validate_remote_target
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
@@ -78,6 +79,53 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 self.assertNotIn("homebrew", smoke.env["PATH"].lower())
                 self.assertNotIn("/usr/local/bin", smoke.env["PATH"])
                 self.assertTrue(smoke.tmux.is_absolute())
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
+    def test_remote_target_is_a_single_explicit_ssh_destination(self) -> None:
+        for target in ("host.example", "runner@host.example", "runner@192.0.2.10"):
+            self.assertEqual(validate_remote_target(target), target)
+        for target in (
+            "",
+            "-oProxyCommand=evil",
+            "host.example other.example",
+            "ssh://host.example",
+            "runner@host.example:22",
+            "runner@@host.example",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaises(ValueError):
+                    validate_remote_target(target)
+
+    def test_remote_known_hosts_is_copied_into_isolated_home(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            source = Path(repository) / "known_hosts"
+            contents = "host.example ssh-ed25519 AAAAC3NzaFixtureOnly\n"
+            source.write_text(contents, encoding="utf-8")
+            source.chmod(0o644)
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+                remote_target="runner@host.example",
+                remote_directory="/srv/tether-smoke",
+                remote_known_hosts=source,
+            )
+            try:
+                isolated = Path(smoke.env["HOME"]) / ".ssh" / "known_hosts"
+                self.assertEqual(isolated.read_text(encoding="utf-8"), contents)
+                self.assertEqual(isolated.stat().st_mode & 0o777, 0o600)
+                refused = subprocess.run(
+                    [str(smoke.root / "bin" / "ssh"), "other.example", "true"],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                self.assertEqual(refused.returncode, 64)
+                self.assertIn("refused unspecified SSH destination", refused.stderr)
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
 

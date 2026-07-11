@@ -33,6 +33,18 @@ COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
 OWNED_SESSION_RE = re.compile(r"^tether-[0-9a-f]{32}$")
+SSH_TARGET_RE = re.compile(
+    r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+)
+
+
+def validate_remote_target(target: str) -> str:
+    """Accept one explicit SSH destination, never options, URLs, or extra hosts."""
+    if not SSH_TARGET_RE.fullmatch(target):
+        raise ValueError(
+            "remote target must be a single [user@]hostname or IPv4 address"
+        )
+    return target
 
 
 class SmokeFailure(RuntimeError):
@@ -136,13 +148,19 @@ class Smoke:
         keep: bool,
         remote_target: str | None = None,
         remote_directory: str | None = None,
+        remote_known_hosts: Path | None = None,
     ) -> None:
         self.herdr = herdr.resolve()
         self.tether = tether.resolve()
         self.repo_root = repo_root.resolve()
         self.keep = keep
-        self.remote_target = remote_target
+        self.remote_target = (
+            validate_remote_target(remote_target) if remote_target is not None else None
+        )
         self.remote_directory = remote_directory
+        self.remote_known_hosts = (
+            remote_known_hosts.resolve() if remote_known_hosts is not None else None
+        )
         self.root = Path(tempfile.mkdtemp(prefix="tether-smoke-", dir="/tmp"))
         self.session = f"tether-smoke-{os.getpid()}"
         self.external_session = f"external-smoke-{os.getpid()}"
@@ -155,6 +173,8 @@ class Smoke:
         inherited_path = os.environ.get("PATH", "")
         resolved_tmux = shutil.which("tmux", path=inherited_path)
         self.tmux = Path(resolved_tmux).resolve() if resolved_tmux else Path("tmux")
+        resolved_ssh = shutil.which("ssh", path=inherited_path)
+        self.ssh = Path(resolved_ssh).resolve() if resolved_ssh else Path("ssh")
         home = self.root / "home"
         for directory in (
             home,
@@ -165,6 +185,8 @@ class Smoke:
             self.root / "tmp",
             self.root / "tmux",
             self.root / "work",
+            self.root / "bin",
+            home / ".ssh",
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         # macOS/Linux zsh otherwise blocks the first disposable shell on its
@@ -211,9 +233,56 @@ class Smoke:
         # Herdr's GUI plugin runtime does not inherit an interactive Homebrew
         # PATH. Product commands deliberately run under that same restriction;
         # Tether must resolve standard macOS package-manager locations itself.
-        self.env["PATH"] = os.pathsep.join(
-            ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
-        )
+        restricted_path = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        if self.remote_target is not None:
+            if self.remote_known_hosts is None:
+                fail("remote smoke requires an explicit --remote-known-hosts file")
+            try:
+                known_hosts = self.remote_known_hosts.read_bytes()
+            except OSError as error:
+                fail(f"could not read remote known-hosts file: {error}")
+            if not known_hosts or len(known_hosts) > 1_048_576:
+                fail("remote known-hosts file must contain between 1 byte and 1 MiB")
+            isolated_known_hosts = home / ".ssh" / "known_hosts"
+            isolated_known_hosts.write_bytes(known_hosts)
+            isolated_known_hosts.chmod(0o600)
+            ssh_config = home / ".ssh" / "config"
+            ssh_config.write_text(
+                "Host *\n"
+                "    BatchMode yes\n"
+                "    CanonicalizeHostname no\n"
+                "    GlobalKnownHostsFile /dev/null\n"
+                f"    UserKnownHostsFile {isolated_known_hosts}\n"
+                "    StrictHostKeyChecking yes\n"
+                "    ProxyCommand none\n"
+                "    ProxyJump none\n",
+                encoding="utf-8",
+            )
+            ssh_config.chmod(0o600)
+            ssh_wrapper = self.root / "bin" / "ssh"
+            ssh_wrapper.write_text(
+                "#!/bin/sh\n"
+                "allowed="
+                + self._shell_quote(self.remote_target)
+                + "\n"
+                "found=false\n"
+                "for arg do\n"
+                '    if [ "$arg" = "$allowed" ]; then found=:; fi\n'
+                "done\n"
+                'if ! "$found"; then\n'
+                '    echo "remote smoke refused unspecified SSH destination" >&2\n'
+                "    exit 64\n"
+                "fi\n"
+                "exec "
+                + self._shell_quote(str(self.ssh))
+                + " -F "
+                + self._shell_quote(str(ssh_config))
+                + ' "$@"\n',
+                encoding="utf-8",
+            )
+            ssh_wrapper.chmod(0o700)
+            restricted_path.insert(0, str(self.root / "bin"))
+        self.env["PATH"] = os.pathsep.join(restricted_path)
         # A wrapper gives Tether's Herdr client the exact disposable named
         # session even outside a Herdr-launched plugin process.
         self.herdr_wrapper = self.root / "herdr-session"
@@ -1339,18 +1408,36 @@ def parse_args() -> argparse.Namespace:
         "--remote-directory",
         help="existing disposable absolute directory on --remote-target",
     )
+    parser.add_argument(
+        "--remote-known-hosts",
+        type=Path,
+        help="known_hosts file pinning the optional disposable SSH target",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if (args.remote_target is None) != (args.remote_directory is None):
+    remote_values = (
+        args.remote_target,
+        args.remote_directory,
+        args.remote_known_hosts,
+    )
+    if any(value is not None for value in remote_values) and not all(
+        value is not None for value in remote_values
+    ):
         print(
-            "live product smoke FAILED: --remote-target and --remote-directory "
-            "must be supplied together",
+            "live product smoke FAILED: --remote-target, --remote-directory, and "
+            "--remote-known-hosts must be supplied together",
             file=sys.stderr,
         )
         return 2
+    if args.remote_target is not None:
+        try:
+            validate_remote_target(args.remote_target)
+        except ValueError as error:
+            print(f"live product smoke FAILED: {error}", file=sys.stderr)
+            return 2
     smoke = Smoke(
         args.herdr,
         args.tether,
@@ -1358,6 +1445,7 @@ def main() -> int:
         args.keep,
         args.remote_target,
         args.remote_directory,
+        args.remote_known_hosts,
     )
     atexit.register(smoke.cleanup)
 

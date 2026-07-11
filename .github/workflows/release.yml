@@ -12,6 +12,7 @@ jobs:
   identity:
     name: release identity
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -22,6 +23,7 @@ jobs:
   gates:
     name: ${{ matrix.os }} release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -71,8 +73,11 @@ jobs:
 
       - name: Run serialized tests
         run: cargo test --locked --all-targets --all-features -- --test-threads=1
-      - name: Run deterministic compatibility harness tests
-        run: python3 tools/test_live_product_smoke.py
+      - name: Run deterministic compatibility and package harness tests
+        run: |
+          python3 tools/test_live_product_smoke.py
+          python3 tools/test_check_package.py
+          python3 tools/check_package.py
 
       - name: Build installed release artifact
         run: cargo build --release --locked
@@ -81,16 +86,27 @@ jobs:
         run: |
           set -euo pipefail
           cargo package --locked
+          package_crates=(target/package/herdr-tether-*.crate)
+          if [[ "${#package_crates[@]}" -ne 1 || ! -f "${package_crates[0]}" ]]; then
+            echo "expected exactly one packaged herdr-tether crate" >&2
+            exit 1
+          fi
           package_manifests=(target/package/herdr-tether-*/Cargo.toml)
           if [[ "${#package_manifests[@]}" -ne 1 || ! -f "${package_manifests[0]}" ]]; then
             echo "expected exactly one packaged herdr-tether manifest" >&2
             exit 1
           fi
           cargo test --locked --manifest-path "${package_manifests[0]}" -- --test-threads=1
+          cargo install \
+            --path "$(dirname "${package_manifests[0]}")" \
+            --locked \
+            --root "$RUNNER_TEMP/package-install"
+          "$RUNNER_TEMP/package-install/bin/herdr-tether" --version
 
   msrv:
     name: rust-1.88 release
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

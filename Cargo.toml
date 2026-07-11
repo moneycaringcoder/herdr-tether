@@ -10,6 +10,20 @@ homepage = "https://github.com/moneycaringcoder/herdr-tether"
 documentation = "https://github.com/moneycaringcoder/herdr-tether/blob/v0.2.2/docs/architecture.md"
 keywords = ["herdr", "terminal", "ssh", "tmux"]
 categories = ["command-line-utilities"]
+include = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "assets/**",
+    "docs/**",
+    "herdr-plugin.toml",
+    "src/**",
+    "tests/**",
+]
 
 [dependencies]
 anyhow = "1.0"
