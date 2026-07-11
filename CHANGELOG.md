@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-11
+
+### Added
+
+- Added an ended-workload lifecycle with native pane-exit observation, retained exit context, safe Restart in the original directory, and metadata-only Remove.
+- Added automatic cleanup of safely finalized history after the configured retention period; cleanup has no SSH, `tmux`, probe, or Stop capability.
+- Added focused quickstart, lifecycle, configuration, troubleshooting, architecture/security, and contribution paths plus original light/dark-ready project artwork.
+
+### Changed
+
+- Simplified the picker around contextual `Enter Open` / `x Stop`, `Enter Restart` / `x Remove`, and `r Retry` actions, with history maintenance moved out of the primary workflow.
+- Stop, Restart, Remove, and migration transitions now preserve recoverable identity and state across persistence, transport, placement, and concurrent-operation failures.
+- Public installation, lifecycle, security, and limitations guidance now uses a concise first-visit path and evergreen support wording.
+
+### Fixed
+
+- Workloads whose commands exit are no longer left as contradictory active/missing rows or offered as failed attachments.
+- Status and discovery refreshes no longer dismiss or route input around active confirmation and error dialogs.
+- Preserved remote `~` expansion and captured-internal-identity rollback while extending lifecycle behavior.
+
+### Limitations
+
+- Remote workloads remain SSH-backed `tmux`; Tether does not provide native remote Herdr federation or pane streaming.
+- Herdr 0.7.3 has no general nested-workload registration API. Tether uses clear pane/session titles and does not fabricate sidebar agent state.
+
 ## [0.2.2] - 2026-07-11
 
 ### Fixed
@@ -13,7 +38,7 @@
 
 ### Added
 
-- Added explicit `setup keybinding` and `--rollback` commands for an idempotent, backed-up `prefix+t` binding with conflict refusal, merged-TOML validation, later-edit protection, reusable rollback, and Herdr config reload.
+- Added explicit `setup keybinding` and `--rollback` commands for an idempotent, backed-up `prefix+t` binding with conflict refusal, merged-TOML validation, later-edit protection, one-shot rollback that consumes its backup, and Herdr config reload.
 - Added Replace current pane with foreground-process confirmation, destination-first readiness checks, source preservation on pre-close failure, and explicit destination cleanup reporting.
 
 ### Changed
