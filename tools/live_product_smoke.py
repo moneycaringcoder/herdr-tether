@@ -379,6 +379,7 @@ class Smoke:
                 fail(f"plugin action listing omitted {action!r}: {actions}")
 
         config_before = self.file_fingerprint(self.herdr_config)
+        workspace_id, invoking_pane = self.workspace_and_pane()
         for action in ("open", "setup"):
             before = self.pane_ids()
             response = self.result_object(
@@ -421,7 +422,7 @@ class Smoke:
                     json.loads(plugin_state.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as error:
                     fail(f"setup action state is unreadable or invalid JSON: {error}")
-                plugin_env = self.env.copy()
+                plugin_env = self.tether_env(workspace_id, invoking_pane)
                 plugin_env.update(
                     {
                         "HERDR_PLUGIN_CONFIG_DIR": str(plugin_config.parent),
