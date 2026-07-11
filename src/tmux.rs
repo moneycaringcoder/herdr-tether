@@ -241,8 +241,7 @@ impl TmuxBackend {
             return Ok(());
         }
 
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let detail = detail.trim();
+        let detail = sanitize_tmux_detail(&output.stderr, None);
         if detail.is_empty() {
             bail!("tmux {operation} failed with status {}", output.status);
         }
@@ -298,11 +297,10 @@ impl TmuxBackend {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => {
-                let detail = String::from_utf8_lossy(&output.stderr);
+                let detail = sanitize_tmux_detail(&output.stderr, None);
                 bail!(
-                    "compare created pane cwd with selected directory failed with status {}: {}",
-                    output.status,
-                    detail.trim()
+                    "compare created pane cwd with selected directory failed with status {}: {detail}",
+                    output.status
                 )
             }
         }
@@ -321,8 +319,7 @@ impl TmuxBackend {
         )?;
         let output = self.output(&spec)?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            let detail = detail.trim();
+            let detail = sanitize_tmux_detail(&output.stderr, None);
             if detail.is_empty() {
                 bail!(
                     "tmux verify created cwd failed with status {}",
@@ -349,18 +346,23 @@ impl TmuxBackend {
     fn rollback_created(
         &self,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
         internal_target: TmuxSessionId,
         cause: anyhow::Error,
     ) -> anyhow::Error {
+        let cause = sanitize_tmux_error(cause, ownership_proof);
         let rollback = self
             .close_exact_spec(internal_target)
             .and_then(|spec| self.require_success("rollback created session", &spec));
         match rollback {
             Ok(()) => cause,
-            Err(rollback) => CreateOutcomeUncertain::new(cause.context(format!(
-                "also failed to roll back exact owned session `{id}`: {rollback:#}"
-            )))
-            .into(),
+            Err(rollback) => {
+                let rollback = sanitize_tmux_error(rollback, ownership_proof);
+                CreateOutcomeUncertain::new(cause.context(format!(
+                    "also failed to roll back exact owned session `{id}`: {rollback:#}"
+                )))
+                .into()
+            }
         }
     }
 }
@@ -398,11 +400,10 @@ impl DurableBackend for TmuxBackend {
             Err(error) => return Err(error.into()),
         };
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = sanitize_tmux_detail(&output.stderr, Some(&launch.ownership_proof));
             bail!(
-                "tmux create failed with status {}: {}",
-                output.status,
-                detail.trim()
+                "tmux create failed with status {}: {detail}",
+                output.status
             );
         }
         let created = std::str::from_utf8(&output.stdout)
@@ -427,7 +428,14 @@ impl DurableBackend for TmuxBackend {
         self.enable_remain_on_exit(&pane_target)
             .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
             .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
-            .map_err(|error| self.rollback_created(&launch.id, session_target, error))?;
+            .map_err(|error| {
+                self.rollback_created(
+                    &launch.id,
+                    &launch.ownership_proof,
+                    session_target,
+                    error,
+                )
+            })?;
         Ok(session_target)
     }
 
@@ -457,6 +465,69 @@ impl DurableBackend for TmuxBackend {
         let spec = self.close_exact_spec(identity)?;
         self.require_success("close", &spec)
     }
+}
+
+fn sanitize_tmux_error(error: anyhow::Error, ownership_proof: &OwnershipProof) -> anyhow::Error {
+    anyhow::anyhow!(sanitize_tmux_detail(
+        format!("{error:#}").as_bytes(),
+        Some(ownership_proof),
+    ))
+}
+
+fn sanitize_tmux_detail(stderr: &[u8], ownership_proof: Option<&OwnershipProof>) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut detail = String::from_utf8_lossy(stderr).into_owned();
+    if let Some(ownership_proof) = ownership_proof {
+        let ownership_proof = ownership_proof.to_string();
+        detail = detail.replace(
+            &format!("TETHER_OWNERSHIP_PROOF={ownership_proof}"),
+            "[redacted ownership proof]",
+        );
+        detail = detail.replace(&ownership_proof, "[redacted ownership proof]");
+    }
+    detail = detail.replace("TETHER_OWNERSHIP_PROOF", "[redacted ownership proof]");
+
+    let mut sanitized = String::with_capacity(detail.len().min(MAX_CHARS));
+    let mut characters = detail.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            match characters.next() {
+                Some('[') => {
+                    for sequence_character in characters.by_ref() {
+                        if ('@'..='~').contains(&sequence_character) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(sequence_character) = characters.next() {
+                        if sequence_character == '\u{7}' {
+                            break;
+                        }
+                        if sequence_character == '\u{1b}' {
+                            let _ = characters.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut bounded = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn classify_exact_inspect(

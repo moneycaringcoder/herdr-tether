@@ -834,6 +834,41 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
 }
 
 #[test]
+fn remote_create_error_redacts_ownership_proof_and_terminal_controls() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let script = "#!/bin/sh\nremote=$9\nprintf '\\033]2;spoofed title\\007\\033[31m%s\\033[0m\\n' \"$remote\" >&2\nexit 23\n";
+    fs::write(&ssh, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::remote(
+        "builder@example.test",
+        ProcessBinaries::new(ssh, temp.path().join("unused-tmux")),
+    )
+    .unwrap();
+
+    let error = format!(
+        "{:#}",
+        backend
+            .create(&LaunchSpec {
+                id: id(),
+                ownership_proof: proof(),
+                directory: "/srv/private".into(),
+                command: "sleep 10".into(),
+            })
+            .unwrap_err()
+    );
+
+    assert!(error.contains("tmux create failed"));
+    assert!(!error.contains(&proof().to_string()), "{error}");
+    assert!(!error.contains("TETHER_OWNERSHIP_PROOF"), "{error}");
+    assert!(!error.contains('\u{1b}'), "{error:?}");
+    assert!(!error.contains("spoofed title"), "{error}");
+}
+
+
+#[test]
 fn attach_only_attaches_and_close_is_the_only_kill_path() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
