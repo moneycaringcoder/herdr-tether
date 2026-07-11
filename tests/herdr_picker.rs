@@ -443,6 +443,14 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
             .iter()
             .all(|workload| !workload.label.contains("Resume"))
     );
+    let stopping = options.hosts[1]
+        .workloads
+        .iter()
+        .find(|workload| workload.status == SessionStatus::Stopping)
+        .unwrap();
+    assert!(stopping.label.contains("[stopping]"));
+    assert!(stopping.label.contains("Pending"));
+    assert!(!stopping.label.to_lowercase().contains("retry"));
     assert_eq!(options.hosts[2].name, "removed-box");
     assert_eq!(options.hosts[2].workloads[0].status, SessionStatus::Running);
 
@@ -1182,7 +1190,7 @@ fn close_is_owned_only_and_cached_status_never_skips_confirmation() {
     picker.begin_refresh(8);
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert!(picker.close_modal().is_none());
-    assert!(picker.footer_text().contains("r Retry"));
+    assert!(picker.footer_text().contains("r Refresh"));
 
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Next);

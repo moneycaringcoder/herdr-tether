@@ -274,9 +274,9 @@ fn workload_label(session: &SessionRecord) -> String {
     let id = session.id.to_string();
     let short_id = &id[id.len().saturating_sub(8)..];
     let (lifecycle, action) = match session.status {
-        SessionStatus::Creating => ("creating", "Retry"),
+        SessionStatus::Creating => ("creating", "Pending"),
         SessionStatus::Running => ("running", "Open"),
-        SessionStatus::Stopping => ("stopping · retry", "Metadata"),
+        SessionStatus::Stopping => ("stopping", "Pending"),
         SessionStatus::Ended => ("ended", "Restart"),
         SessionStatus::Removed => ("removed", "Metadata"),
     };
@@ -1361,13 +1361,17 @@ impl PickerState {
     }
 
     fn current_host_reachable(&self) -> bool {
-        let host = &self.options.hosts[self.host_index];
+        let Some(host) = self.options.hosts.get(self.host_index) else {
+            return false;
+        };
         self.host_status.get(&host.name).is_some_and(|cell| {
             !cell.stale && cell.value == Some(HostReachability::Reachable)
         })
     }
     fn current_host_unreachable(&self) -> bool {
-        let host = &self.options.hosts[self.host_index];
+        let Some(host) = self.options.hosts.get(self.host_index) else {
+            return false;
+        };
         self.host_status.get(&host.name).is_some_and(|cell| {
             !cell.stale
                 && cell
@@ -2093,36 +2097,52 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
-                let action_hints = if self.stage == PickerStage::Resource {
-                    match self.current_owned_action() {
-                        Some((_, false)) => " · Enter Open · x Stop",
-                        Some((_, true)) => " · Enter Restart · x Remove",
-                        None if !self.current_host_reachable() => " · r Retry",
-                        None => "",
-                    }
+                let (primary_hint, destructive_hint) =
+                    if self.stage == PickerStage::Resource {
+                        match self.current_owned_action() {
+                            Some((_, false)) => ("Enter Open", " · x Stop"),
+                            Some((_, true)) => ("Enter Restart", " · x Remove"),
+                            None => match self.current_resource_identity() {
+                                Some(ResourceIdentity::External(_))
+                                | Some(ResourceIdentity::Create)
+                                    if !self.current_host_unreachable() =>
+                                {
+                                    ("Enter select", "")
+                                }
+                                _ => ("", ""),
+                            },
+                        }
+                    } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
+                        ("", "")
+                    } else {
+                        ("Enter select", "")
+                    };
+                let primary_hint = if primary_hint.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!("\n{primary_hint} · ")
                 };
                 let path_hint = if self.stage == PickerStage::Directory {
                     " · / filter · p path"
                 } else {
                     ""
                 };
-                let select_hint = if self.stage == PickerStage::Resource {
-                    match self.current_resource_identity() {
-                        Some(ResourceIdentity::External(_)) | Some(ResourceIdentity::Create) => {
-                            " · Enter select"
-                        }
-                        _ => "",
-                    }
-                } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
-                    ""
+                let refresh_hint = if self.current_host_unreachable() {
+                    "Retry"
                 } else {
-                    " · Enter select"
+                    "Refresh"
                 };
-                parts.push(format!(
-                    "↑/↓ navigate{select_hint}{action_hints}{path_hint} · r Retry · Backspace back · Esc back"
-                ));
+                let back_action = if self.stage == PickerStage::Host {
+                    "close"
+                } else {
+                    "back"
+                };
+                parts.insert(
+                    0,
+                    format!(
+                        "Esc {back_action} · {primary_hint}↑/↓ navigate{destructive_hint}{path_hint} · r {refresh_hint} · Backspace {back_action}"
+                    ),
+                );
                 parts.join(" · ")
             }
         }
@@ -2548,6 +2568,13 @@ fn map_key_with_modals(
             _ => None,
         };
     }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
     match key.code {
         KeyCode::Esc if stage == PickerStage::Host => Some(PickerEvent::Cancel),
         KeyCode::Esc => Some(PickerEvent::Back),
@@ -2580,6 +2607,14 @@ fn map_key_with_modals(
 }
 
 fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
+    render_picker_with_color_mode(frame, state, std::env::var_os("NO_COLOR").is_none());
+}
+
+fn render_picker_with_color_mode(
+    frame: &mut Frame<'_>,
+    state: &PickerState,
+    colors_enabled: bool,
+) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
     let footer = state.footer_text();
@@ -2600,7 +2635,17 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
         || state.prune_modal.is_some()
         || state.pending_prune.is_some()
         || state.operation_error.is_some();
-    let accent = if destructive { Color::Red } else { Color::Cyan };
+    let accent = if !colors_enabled {
+        Color::Reset
+    } else if destructive {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let selected_text = colors_enabled.then_some(Color::White).unwrap_or(Color::Reset);
+    let secondary_text = colors_enabled
+        .then_some(Color::DarkGray)
+        .unwrap_or(Color::Reset);
     let block = Block::default()
         .title(format!(" Tether · {} ", state.frame_title()))
         .title_alignment(Alignment::Center)
@@ -2632,19 +2677,21 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
                     Span::styled(
                         *label,
                         Style::default()
-                            .fg(Color::White)
+                            .fg(selected_text)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
             } else {
-                Line::from(vec![Span::raw("  "), Span::styled(*label, Color::DarkGray)])
+                Line::from(vec![Span::raw("  "), Span::styled(*label, secondary_text)])
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[0]);
     frame.render_widget(
         Paragraph::new(footer)
-            .style(Style::default().fg(if destructive {
+            .style(Style::default().fg(if !colors_enabled {
+                Color::Reset
+            } else if destructive {
                 Color::Red
             } else {
                 Color::DarkGray
@@ -2656,6 +2703,15 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
 
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
     let width = usize::from(width.max(1));
+    let lines = text
+        .split('\n')
+        .map(|line| wrapped_single_line_count(line, width))
+        .sum::<usize>()
+        .max(1);
+    lines.min(usize::from(u16::MAX)) as u16
+}
+
+fn wrapped_single_line_count(text: &str, width: usize) -> usize {
     let mut lines = 0_usize;
     let mut occupied = 0_usize;
     for word in text.split_whitespace() {
@@ -2676,10 +2732,7 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
             occupied = word_width;
         }
     }
-    lines
-        .saturating_add(usize::from(occupied > 0))
-        .max(1)
-        .min(usize::from(u16::MAX)) as u16
+    lines.saturating_add(usize::from(occupied > 0)).max(1)
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
@@ -2944,6 +2997,27 @@ mod tests {
             Some(PickerEvent::Confirm)
         );
     }
+    #[test]
+    fn modified_navigation_and_action_keys_do_not_leak_into_picker_controls() {
+        for key in [
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        ] {
+            assert_eq!(
+                map_key(
+                    key,
+                    &PickerInput::None,
+                    PickerStage::Resource,
+                    false,
+                ),
+                None
+            );
+        }
+    }
+
 
     fn navigation_picker() -> PickerState {
         PickerState::new(PickerOptions {
@@ -2973,7 +3047,10 @@ mod tests {
         let controls = picker.footer_text();
         assert!(controls.contains("↑/↓ navigate"));
         assert!(controls.contains("Enter select"));
-        assert!(controls.contains("Backspace back"));
+        assert!(controls.contains("Backspace close"));
+        assert!(controls.contains("Esc close"));
+        assert!(controls.contains("r Refresh"));
+        assert!(!controls.contains("r Retry"));
         assert!(!controls.contains("← back"));
 
         assert_eq!(picker.handle(PickerEvent::Next), PickerOutcome::Continue);
@@ -3101,6 +3178,30 @@ mod close_render_tests {
         (picker, id)
     }
 
+    #[test]
+    fn resource_hints_match_reachability_and_available_actions() {
+        let (mut picker, _) = close_picker();
+        picker.handle(PickerEvent::DismissClose);
+
+        let reachable = picker.footer_text();
+        assert!(reachable.contains("Enter Open"));
+        assert!(reachable.contains("x Stop"));
+        assert!(reachable.contains("r Refresh"));
+        assert!(!reachable.contains("r Retry"));
+
+        assert!(picker.apply_status(StatusMessage::Host {
+            generation: 9,
+            host: "build-box".to_owned(),
+            status: HostReachability::Unreachable,
+            detail: Some("connection refused".to_owned()),
+            checked_at: std::time::SystemTime::now(),
+        }));
+        let unreachable = picker.footer_text();
+        assert!(unreachable.contains("r Retry"));
+        assert!(!unreachable.contains("Enter Open"));
+        assert!(!unreachable.contains("x Stop"));
+    }
+
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -3117,7 +3218,7 @@ mod close_render_tests {
         let mut terminal = Terminal::new(TestBackend::new(32, 16)).unwrap();
 
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Confirm Stop"));
@@ -3137,7 +3238,7 @@ mod close_render_tests {
             PickerOutcome::CloseOwnedRequested { id, generation: 9, action: PickerCloseAction::Stop }
         );
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Applying lifecycle"));
@@ -3162,7 +3263,7 @@ mod close_render_tests {
         };
         assert!(error.chars().count() <= 241);
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("Stop failed"));
@@ -3218,7 +3319,7 @@ mod close_render_tests {
             PickerOutcome::PrunePreviewRequested { .. }
         ));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let pending = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3233,7 +3334,7 @@ mod close_render_tests {
             result: Ok(preview.clone()),
         }));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let confirm = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3256,7 +3357,7 @@ mod close_render_tests {
             error: Some("persistence unavailable".to_owned()),
         }));
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let failed = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3288,7 +3389,7 @@ mod close_render_tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
 
         terminal
-            .draw(|frame| render_picker(frame, &picker))
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
             .unwrap();
         let rendered = rendered_text(&terminal)
             .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
@@ -3309,17 +3410,48 @@ mod close_render_tests {
         );
     }
     #[test]
+    fn monochrome_render_keeps_selection_and_destructive_guidance_textual() {
+        let (picker, _) = close_picker();
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+
+        terminal
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, false))
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains('>'));
+        assert!(rendered.contains("y confirm"));
+        assert!(rendered.contains("n/Esc keep"));
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.fg == Color::Reset));
+    }
+
+    #[test]
     fn tiny_picker_and_modal_geometries_never_panic() {
-        for (width, height) in [(1, 1), (5, 3), (20, 5), (32, 8)] {
+        for (width, height) in [(1, 1), (5, 3), (20, 5), (32, 8), (80, 24)] {
             let (mut picker, _) = close_picker();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| render_picker(frame, &picker))
                 .unwrap();
+            if width >= 20 {
+                let confirmation = rendered_text(&terminal);
+                assert!(confirmation.contains("y confirm"), "{width}x{height}");
+                assert!(confirmation.contains("n/Esc keep"), "{width}x{height}");
+            }
             picker.handle(PickerEvent::DismissClose);
             terminal
                 .draw(|frame| render_picker(frame, &picker))
                 .unwrap();
+            if width >= 20 {
+                let picker_text = rendered_text(&terminal);
+                assert!(picker_text.contains("Enter Open"), "{width}x{height}: {picker_text:?}");
+                assert!(picker_text.contains("Esc back"), "{width}x{height}: {picker_text:?}");
+            }
         }
     }
 
