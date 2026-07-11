@@ -12,10 +12,10 @@ Implemented and covered by the current command/test surface:
 - configured hosts plus literal aliases read from `~/.ssh/config`;
 - a unified host → Tether-owned/external/create explorer with exact resume of owned workloads and non-owning attachment to safely discovered existing tmux sessions;
 - progressive local/remote reachability, owned-workload status, and external tmux catalog discovery with independent three-second probe deadlines and explicit `r` refresh;
-- bounded local and BatchMode-SSH repository discovery from each host's seed directories (recent workload directories, configured roots, and the local `HOME`/remote `~` fallback), with progressive results, deterministic local ordering, and no symlink traversal;
+- bounded local and BatchMode-SSH repository discovery from configured per-host scan roots plus the local `HOME`/remote `~` fallback, with configurable depth/entry/result/deadline/worker bounds, progressive results, deterministic local ordering, and no symlink traversal;
 - case-insensitive directory filtering and literal direct-path entry from the explorer;
 - Herdr managed terminal overlays and focused split-right, split-down, or new-tab placement;
-- versioned, private, atomic configuration and session-state persistence;
+- versioned, private, advisory-locked, atomic configuration and session-state persistence, including lock-safe v0.1 migration;
 - list, resume, close, age-based closed-metadata pruning, and JSON output;
 - Linux and macOS declared by the plugin manifest.
 
@@ -31,7 +31,7 @@ Important limitations:
 
 ### Verification status for this run
 
-The current branch passes 67 automated tests and a locked release build. Coverage includes bounded repository discovery, adversarial remote-root quoting and parser responses, bounded external tmux catalogs, reserved-name collision handling, exact non-owning external attachment, explorer filter/direct-path behavior, progressive multi-host status, timeout/cancellation and process cleanup, refresh generations and stale labels, exact owned resume IDs, and the v0.1 lifecycle suite. Tmux-hosted interactive smokes selected a newly discovered repository for creation, resumed an owned workload, and attached an external session without creating, killing, or persisting it.
+The current branch passes 79 automated tests and a locked release build. Coverage includes lock-safe v0/v1 config and v0 state migration, concurrent config/state updates, configurable discovery/retention precedence, bounded actionable doctor probes, bounded repository discovery and adversarial remote responses, bounded external tmux catalogs, reserved-name collision handling, exact non-owning external attachment, explorer search/direct-path behavior, progressive multi-host status, timeout/cancellation/process cleanup, refresh generations/stale labels, exact owned resume IDs, and the v0.1 lifecycle suite. Tmux-hosted interactive smokes selected a newly discovered repository for creation, resumed an owned workload, and attached an external session without creating, killing, or persisting it.
 
 For the v0.1.0 release baseline, a locked release build and Herdr 0.7.3 development link/action-list/unlink smoke passed. Independent live verification from the Hermes host to `dev` used strict BatchMode OpenSSH and exercised remote create, real-TTY attach, detach, resume, and explicit close against `tmux` 3.4. That baseline retained the same workload PID while its counter advanced after detach, covered a directory containing spaces and literal shell metacharacters without injection, and left an unrelated tmux session intact during exact close/prune checks. Native Herdr placement interaction and the macOS live lifecycle remain acceptance checks.
 
@@ -145,7 +145,7 @@ herdr-tether session close tether-…
 herdr-tether setup [--yes]
 ```
 
-Creates or validates the default versioned config and state. `--yes` is required when standard input is not a terminal. Setup does not prompt today and never edits Herdr keybindings.
+Creates or validates the versioned config and state, then prints their paths, effective discovery/retention/placement defaults, configured-target count, required prerequisites, binding guidance, and the next doctor command. `--yes` is required when standard input is not a terminal. Setup is idempotent, does not probe remote targets, and never edits Herdr or SSH configuration.
 
 ```text
 herdr-tether host add <NAME> <TARGET> [--root <DIR>]... [--preset <NAME=COMMAND>]...
@@ -178,13 +178,13 @@ herdr-tether session prune [--dry-run] [--older-than-days <DAYS>]
 - `list` shows persisted metadata; JSON includes the complete records.
 - `resume` refuses closed, missing, or indeterminate workloads; a valid attempt updates `last_used_at` before attaching.
 - `close` is the only lifecycle command allowed to invoke `tmux kill-session`. It inspects first: a workload proven missing is marked closed without a kill; a running workload is first marked `closing`, then killed by exact session ID and finalized as closed. A failed kill or final state write leaves the recoverable `closing` marker for a later `close` retry; an indeterminate workload is left unchanged.
-- `prune` prints eligible IDs and removes only closed metadata at least 30 days old by default. `--dry-run` only prints. `--older-than-days 0` makes every already-closed record eligible.
+- `prune` prints eligible IDs and removes only closed metadata at least `retention.closed_days` old (30 days in a migrated/default config). `--older-than-days` overrides the configured value; `--dry-run` only prints. An explicit `--older-than-days 0` makes every already-closed record eligible.
 
 ```text
 herdr-tether doctor
 ```
 
-Reports config/state readability and whether `tmux`, `ssh`, and Herdr are invokable. It is a local health report, not an end-to-end SSH test.
+Reports config/state presence and usability, then probes required `tmux`, `ssh`, Cargo, and the selected Herdr executable with three-second deadlines and 64 KiB output caps. Missing, permission-denied, nonzero, timeout, unusable-file, and incomplete Herdr plugin-context failures are actionable and make doctor exit nonzero without suppressing later checks. An unrelated standalone `PANE_ID` does not imply plugin context. This is a local health report; use `host check <NAME>` for an end-to-end SSH target test.
 
 The hidden `plugin open` and `plugin setup` commands are manifest action entrypoints. They require Herdr-provided pane/workspace/binary environment and open the corresponding managed overlay; they are not normal standalone commands.
 
@@ -209,7 +209,31 @@ Default paths outside plugin context:
 - config: `${XDG_CONFIG_HOME:-$HOME/.config}/herdr-tether/config.toml`
 - state: `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tether/state.json`
 
-Inside a plugin, `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR` independently take precedence. Missing files load as empty version-1 data. On Unix, parent directories are forced to mode `0700`; data, temporary, and advisory-lock files are mode `0600`. Mutating CLI operations hold a per-file advisory lock across load, mutation, and atomic save. Writes use a same-directory temporary file, file sync, atomic rename, and directory sync.
+Inside a plugin, `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR` independently take precedence. Missing files load as version-2 config and version-1 state defaults. Existing v0/v1 config and v0 state migrate and rewrite while holding the same per-file advisory lock used by save/update transactions. On Unix, parent directories are forced to mode `0700`; data, temporary, and advisory-lock files are mode `0600`. Writes use a same-directory temporary file, file sync, atomic rename, and directory sync.
+
+The generated TOML config is the settings source; JSON state never needs hand editing. Host roots/presets can also be managed with `host add`.
+
+```toml
+version = 2
+hosts = []
+
+[ui]
+placement = "split-right"
+
+[discovery]
+local_roots = []
+max_depth = 4
+max_entries = 4096
+max_results = 64
+timeout_seconds = 3
+workers = 4
+
+[retention]
+closed_days = 30
+```
+
+An empty `local_roots` uses `HOME`; `~` and `~/…` entries expand against `HOME`. Remote hosts scan their configured `roots`, or `~` when none are configured. Recent session directories remain picker suggestions but do not silently expand the configured scan scope.
+Configured `timeout_seconds` must be between 1 and 3600.
 
 State stores IDs, resolved target, host label, directory, preset name, lifecycle status, and timestamps—not terminal output or credentials. If state persistence fails after creating a workload, Tether attempts to close that newly created workload. Failed attach/resume does not implicitly kill it.
 External tmux sessions are never written to state. Their validated names and attached-client counts exist only in the current explorer invocation.

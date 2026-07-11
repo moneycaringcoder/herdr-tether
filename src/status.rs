@@ -279,6 +279,7 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             status,
             stdout,
             stdout_truncated: false,
+            ..
         } if status.success() => match parse_sessions(&stdout) {
             Some(catalog) => ClassifiedResult {
                 reachability: HostReachability::Reachable,
@@ -345,12 +346,14 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             WorkloadStatus::TimedOut,
             ExternalCatalogStatus::TimedOut,
         ),
-        BoundedOutput::Error | BoundedOutput::Completed { .. } => classified_failure(
-            host,
-            HostReachability::Error,
-            WorkloadStatus::Error,
-            ExternalCatalogStatus::Error,
-        ),
+        BoundedOutput::Error | BoundedOutput::SpawnError(_) | BoundedOutput::Completed { .. } => {
+            classified_failure(
+                host,
+                HostReachability::Error,
+                WorkloadStatus::Error,
+                ExternalCatalogStatus::Error,
+            )
+        }
         BoundedOutput::Cancelled => unreachable!("cancelled probes do not publish"),
     }
 }
@@ -430,9 +433,12 @@ pub(crate) enum BoundedOutput {
         status: ExitStatus,
         stdout: Vec<u8>,
         stdout_truncated: bool,
+        stderr: Vec<u8>,
+        stderr_truncated: bool,
     },
     TimedOut,
     Cancelled,
+    SpawnError(io::ErrorKind),
     Error,
 }
 
@@ -451,7 +457,7 @@ pub(crate) fn run_bounded(
     command.process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return BoundedOutput::Error,
+        Err(error) => return BoundedOutput::SpawnError(error.kind()),
     };
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -484,6 +490,8 @@ pub(crate) fn run_bounded(
                     status,
                     stdout: stdout_capture.bytes,
                     stdout_truncated: stdout_capture.truncated,
+                    stderr: stderr_capture.bytes,
+                    stderr_truncated: stderr_capture.truncated,
                 };
             }
             Ok(None) if Instant::now() >= deadline => {

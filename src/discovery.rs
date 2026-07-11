@@ -434,6 +434,7 @@ fn scan_remote(
             status,
             stdout,
             stdout_truncated: false,
+            ..
         } if status.success() => parse_remote(&stdout, &location.roots, limits.max_results),
         BoundedOutput::Completed {
             stdout_truncated: true,
@@ -443,7 +444,7 @@ fn scan_remote(
             (Vec::new(), DiscoveryCompletion::Unavailable)
         }
         BoundedOutput::TimedOut => (Vec::new(), DiscoveryCompletion::TimedOut),
-        BoundedOutput::Error | BoundedOutput::Completed { .. } => {
+        BoundedOutput::Error | BoundedOutput::SpawnError(_) | BoundedOutput::Completed { .. } => {
             (Vec::new(), DiscoveryCompletion::Error)
         }
         BoundedOutput::Cancelled => return,

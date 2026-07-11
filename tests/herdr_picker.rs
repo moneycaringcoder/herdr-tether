@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::Path, sync::Mutex, time::SystemTime};
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
     backend::CommandSpec,
-    config::{CommandPreset, Config, HostConfig, UiDefaults},
+    config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext},
     model::{ExternalSessionName, Placement, SessionId},
@@ -126,6 +126,15 @@ fn picker_fixture() -> (Config, State) {
                 command: "exec codex".into(),
             }],
         }],
+        discovery: DiscoveryDefaults {
+            local_roots: vec!["~/code".into(), "/opt/work".into()],
+            max_depth: 2,
+            max_entries: 128,
+            max_results: 12,
+            timeout_seconds: 5,
+            workers: 3,
+        },
+        retention: RetentionDefaults { closed_days: 14 },
         ui: UiDefaults {
             placement: Placement::SplitRight,
         },
@@ -205,6 +214,43 @@ fn picker_walks_host_directory_command_and_placement() {
     assert_eq!(selection.preset.as_deref(), Some("agent"));
     assert_eq!(selection.command, "exec codex");
     assert_eq!(selection.placement, Placement::SplitDown);
+}
+
+#[test]
+fn picker_separates_recent_suggestions_from_configured_discovery_roots() {
+    let (config, mut state) = picker_fixture();
+    let mut local_recent = state.sessions[0].clone();
+    local_recent.id = "tether-0197f198000070008000000000000004"
+        .parse::<SessionId>()
+        .unwrap();
+    local_recent.host = "local".into();
+    local_recent.target = "local".into();
+    local_recent.directory = "/tmp/recent-local".into();
+    state.sessions.push(local_recent);
+
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let local = options
+        .hosts
+        .iter()
+        .find(|host| host.name == "local")
+        .unwrap();
+    assert_eq!(local.scan_roots, ["/home/user/code", "/opt/work"]);
+    assert_eq!(
+        local.directories,
+        ["/tmp/recent-local", "/home/user/code", "/opt/work"]
+    );
+
+    let remote = options
+        .hosts
+        .iter()
+        .find(|host| host.name == "build-box")
+        .unwrap();
+    assert_eq!(remote.scan_roots, ["/srv/configured", "/srv/shared"]);
+    assert_eq!(
+        remote.directories,
+        ["/srv/recent", "/srv/shared", "/srv/configured"]
+    );
+    assert!(!remote.scan_roots.contains(&"/srv/recent".to_owned()));
 }
 
 #[test]

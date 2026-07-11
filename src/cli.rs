@@ -1,8 +1,5 @@
 use std::{
-    env,
-    path::PathBuf,
-    process::{Command, Stdio},
-    time::Duration as StdDuration,
+    env, path::PathBuf, process::Command, sync::atomic::AtomicBool, time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +17,7 @@ use crate::{
     paths::AppPaths,
     sshcfg::discover_aliases,
     state::{SessionRecord, SessionStatus, State, StateStore},
-    status::StatusService,
+    status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
     tui::{OpenSelection, PickerOptions, PickerSelection, run_picker},
 };
@@ -138,6 +135,14 @@ impl From<PlacementArg> for Placement {
     }
 }
 
+fn placement_name(placement: Placement) -> &'static str {
+    match placement {
+        Placement::SplitRight => "split-right",
+        Placement::SplitDown => "split-down",
+        Placement::NewTab => "new-tab",
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// List persisted session metadata.
@@ -162,9 +167,9 @@ struct PruneArgs {
     /// Show eligible records without changing state.
     #[arg(long)]
     dry_run: bool,
-    /// Minimum age since close.
-    #[arg(long, default_value_t = 30)]
-    older_than_days: u64,
+    /// Minimum age since close. Uses configured retention when omitted.
+    #[arg(long)]
+    older_than_days: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -201,11 +206,33 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
     let state_store = StateStore::new(paths.state_file.clone());
     config_store.update(|_| Ok(()))?;
     state_store.update(|_| Ok(()))?;
+    let config = config_store.load()?;
 
     println!("Tether configuration: {}", paths.config_file.display());
     println!("Tether state: {}", paths.state_file.display());
+    let roots = if config.discovery.local_roots.is_empty() {
+        "HOME fallback".to_owned()
+    } else {
+        config.discovery.local_roots.join(", ")
+    };
+    println!(
+        "Effective discovery: roots {roots}; depth {}; entries {}; results {}; timeout {}s; workers {}",
+        config.discovery.max_depth,
+        config.discovery.max_entries,
+        config.discovery.max_results,
+        config.discovery.timeout_seconds,
+        config.discovery.workers
+    );
+    println!("Effective retention: {} days", config.retention.closed_days);
+    println!(
+        "Effective placement: {}",
+        placement_name(config.ui.placement)
+    );
+    println!("Configured targets: {}", config.hosts.len());
+    println!("Prerequisites: Herdr, tmux, SSH, and Cargo must be installed and executable.");
     println!("Herdr keybindings are not edited automatically.");
     println!("Suggested binding: plugin_action moneycaringcoder.tether.open");
+    println!("Next: herdr-tether doctor");
     Ok(())
 }
 
@@ -428,11 +455,11 @@ fn selection_from_picker(
     let discovery_service = DiscoveryService::new(
         ProcessBinaries::new("ssh", "tmux"),
         DiscoveryLimits {
-            max_depth: 4,
-            max_entries: 4096,
-            max_results: 64,
-            timeout: StdDuration::from_secs(3),
-            workers: 4,
+            max_depth: config.discovery.max_depth,
+            max_entries: config.discovery.max_entries,
+            max_results: config.discovery.max_results,
+            timeout: StdDuration::from_secs(config.discovery.timeout_seconds),
+            workers: config.discovery.workers,
         },
     );
     let Some(selection) = run_picker(options, status_service, discovery_service)? else {
@@ -674,13 +701,25 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             println!("closed {id}");
             Ok(())
         }
-        SessionCommand::Prune(args) => prune(&store, args),
+        SessionCommand::Prune(args) => {
+            let (days, source) = match args.older_than_days {
+                Some(days) => (days, "--older-than-days"),
+                None => (
+                    ConfigStore::new(paths.config_file.clone())
+                        .load()?
+                        .retention
+                        .closed_days,
+                    "retention.closed_days",
+                ),
+            };
+            prune(&store, args, days, source)
+        }
     }
 }
 
-fn prune(store: &StateStore, args: PruneArgs) -> Result<()> {
-    let days = i64::try_from(args.older_than_days).context("--older-than-days is too large")?;
-    let retention = Duration::try_days(days).context("--older-than-days is too large")?;
+fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result<()> {
+    let days = i64::try_from(days).with_context(|| format!("{source} is too large"))?;
+    let retention = Duration::try_days(days).with_context(|| format!("{source} is too large"))?;
     let now = Utc::now();
     let collect = |state: &State| {
         state
@@ -727,49 +766,199 @@ fn plugin_command(command: PluginCommand) -> Result<()> {
 }
 
 fn doctor(paths: &AppPaths) -> Result<()> {
-    let config = ConfigStore::new(paths.config_file.clone()).load();
-    let state = StateStore::new(paths.state_file.clone()).load();
-    println!(
-        "config {}: {}",
-        paths.config_file.display(),
-        if config.is_ok() { "ok" } else { "error" }
-    );
-    println!(
-        "state {}: {}",
-        paths.state_file.display(),
-        if state.is_ok() { "ok" } else { "error" }
-    );
-    report_binary("tmux", &["-V"]);
-    report_binary("ssh", &["-V"]);
-    if let Some(binary) = env::var_os("HERDR_BIN_PATH") {
-        report_binary_path(PathBuf::from(binary), &["--version"]);
+    let mut failures = 0usize;
+
+    if !paths.config_file.exists() {
+        println!(
+            "config {}: missing (run `herdr-tether setup`)",
+            paths.config_file.display()
+        );
+        failures += 1;
     } else {
-        report_binary("herdr", &["--version"]);
-    }
-    config?;
-    state?;
-    Ok(())
-}
-
-fn report_binary(program: &str, args: &[&str]) {
-    report_binary_path(PathBuf::from(program), args);
-}
-
-fn report_binary_path(program: PathBuf, args: &[&str]) {
-    let status = Command::new(&program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    println!(
-        "{}: {}",
-        program.display(),
-        if status.is_ok_and(|status| status.success()) {
-            "ok"
-        } else {
-            "not found"
+        match ConfigStore::new(paths.config_file.clone()).load() {
+            Ok(_) => println!("config {}: ok", paths.config_file.display()),
+            Err(error) => {
+                println!(
+                    "config {}: unusable ({error:#})",
+                    paths.config_file.display()
+                );
+                failures += 1;
+            }
         }
+    }
+
+    if !paths.state_file.exists() {
+        println!(
+            "state {}: missing (run `herdr-tether setup`)",
+            paths.state_file.display()
+        );
+        failures += 1;
+    } else {
+        match StateStore::new(paths.state_file.clone()).load() {
+            Ok(_) => println!("state {}: ok", paths.state_file.display()),
+            Err(error) => {
+                println!("state {}: unusable ({error:#})", paths.state_file.display());
+                failures += 1;
+            }
+        }
+    }
+
+    failures += usize::from(!report_binary("tmux", &["-V"]));
+    failures += usize::from(!report_binary("ssh", &["-V"]));
+    failures += usize::from(!report_binary("cargo", &["--version"]));
+
+    let herdr = env::var_os("HERDR_BIN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("herdr"));
+    println!("Herdr binary: {}", herdr.display());
+    failures += usize::from(!report_binary_path(herdr, &["--version"]));
+    let herdr_binary_provided = env::var_os("HERDR_BIN_PATH")
+        .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
+    let plugin_context_signaled = herdr_binary_provided
+        || env::var_os("HERDR_PANE_ID").is_some()
+        || env::var_os("HERDR_WORKSPACE_ID").is_some();
+    if !plugin_context_signaled {
+        println!("Herdr context: standalone (no plugin pane selected)");
+    } else {
+        let pane = env::var("HERDR_PANE_ID")
+            .or_else(|_| env::var("PANE_ID"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let workspace = env::var("HERDR_WORKSPACE_ID")
+            .or_else(|_| env::var("WORKSPACE_ID"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        match (pane, workspace, herdr_binary_provided) {
+            (Some(pane), Some(workspace), true) => {
+                println!("Herdr context: {pane} in workspace {workspace}");
+            }
+            (pane, workspace, binary) => {
+                let mut missing = Vec::new();
+                if pane.is_none() {
+                    missing.push("HERDR_PANE_ID");
+                }
+                if workspace.is_none() {
+                    missing.push("HERDR_WORKSPACE_ID");
+                }
+                if !binary {
+                    missing.push("HERDR_BIN_PATH");
+                }
+                println!(
+                    "Herdr context: incomplete (missing {}; invoke Tether through a Herdr plugin action)",
+                    missing.join(", ")
+                );
+                failures += 1;
+            }
+        }
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        bail!(
+            "doctor found {failures} required failure{}",
+            if failures == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn report_binary(program: &str, args: &[&str]) -> bool {
+    report_binary_path(PathBuf::from(program), args)
+}
+
+fn report_binary_path(program: PathBuf, args: &[&str]) -> bool {
+    let spec = CommandSpec::new(
+        program.clone(),
+        args.iter().map(|argument| (*argument).to_owned()).collect(),
     );
+    let cancelled = AtomicBool::new(false);
+    match run_bounded(&spec, StdDuration::from_secs(3), &cancelled) {
+        BoundedOutput::Completed { status, .. } if status.success() => {
+            println!("{}: ok", program.display());
+            true
+        }
+        BoundedOutput::Completed {
+            status,
+            stdout,
+            stdout_truncated,
+            stderr,
+            stderr_truncated,
+        } => {
+            let (bytes, truncated) = if stderr.is_empty() {
+                (&stdout, stdout_truncated)
+            } else {
+                (&stderr, stderr_truncated)
+            };
+            let detail = concise_probe_detail(bytes, truncated)
+                .map(|detail| format!("; {detail}"))
+                .unwrap_or_default();
+            println!(
+                "{}: failed ({}{detail}); verify the executable works with `{}`",
+                program.display(),
+                status,
+                program.display()
+            );
+            false
+        }
+        BoundedOutput::TimedOut => {
+            println!(
+                "{}: timed out after 3s (run `{}` directly to diagnose it)",
+                program.display(),
+                program.display()
+            );
+            false
+        }
+        BoundedOutput::SpawnError(std::io::ErrorKind::NotFound) => {
+            println!(
+                "{}: missing (install it or add it to PATH)",
+                program.display()
+            );
+            false
+        }
+        BoundedOutput::SpawnError(std::io::ErrorKind::PermissionDenied) => {
+            println!(
+                "{}: permission denied (make the selected file executable)",
+                program.display()
+            );
+            false
+        }
+        BoundedOutput::SpawnError(error) => {
+            println!("{}: unavailable ({error})", program.display());
+            false
+        }
+        BoundedOutput::Error => {
+            println!(
+                "{}: probe failed (run it directly to diagnose it)",
+                program.display()
+            );
+            false
+        }
+        BoundedOutput::Cancelled => unreachable!("doctor probes are never cancelled"),
+    }
+}
+
+fn concise_probe_detail(bytes: &[u8], truncated: bool) -> Option<String> {
+    const MAX_CHARS: usize = 240;
+    let safe = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let detail = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.is_empty() {
+        return truncated.then(|| "output exceeded 64 KiB".to_owned());
+    }
+    let mut chars = detail.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() || truncated {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn resolve_host(paths: &AppPaths, config: &Config, name: &str) -> Result<HostConfig> {

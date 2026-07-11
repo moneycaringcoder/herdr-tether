@@ -662,3 +662,232 @@ fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
         .assert()
         .success();
 }
+
+#[test]
+fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutating_herdr() {
+    let sandbox = Sandbox::new();
+    let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
+    fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+    fs::write(&herdr_config, "# unchanged\n").unwrap();
+
+    sandbox
+        .command()
+        .args(["host", "add", "build-box", "builder@example.test"])
+        .assert()
+        .success();
+
+    let defaults = fs::read_to_string(sandbox.config_file()).unwrap();
+    let configured = defaults
+        .replace(
+            "local_roots = []",
+            "local_roots = [\"~/work\", \"/srv/local\"]",
+        )
+        .replace("max_depth = 4", "max_depth = 2")
+        .replace("max_entries = 4096", "max_entries = 128")
+        .replace("max_results = 64", "max_results = 12")
+        .replace("timeout_seconds = 3", "timeout_seconds = 5")
+        .replace("workers = 4", "workers = 3")
+        .replace("closed_days = 30", "closed_days = 14");
+    assert_ne!(configured, defaults, "the v2 defaults must be present");
+    fs::write(sandbox.config_file(), configured).unwrap();
+
+    sandbox
+        .command()
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            sandbox.config_file().display().to_string(),
+        ))
+        .stdout(predicate::str::contains(
+            sandbox.state_file().display().to_string(),
+        ))
+        .stdout(predicate::str::contains("discovery"))
+        .stdout(predicate::str::contains("roots ~/work, /srv/local"))
+        .stdout(predicate::str::contains("depth 2"))
+        .stdout(predicate::str::contains("entries 128"))
+        .stdout(predicate::str::contains("results 12"))
+        .stdout(predicate::str::contains("timeout 5s"))
+        .stdout(predicate::str::contains("workers 3"))
+        .stdout(predicate::str::contains("retention: 14 days"))
+        .stdout(predicate::str::contains("placement: split-right"))
+        .stdout(predicate::str::contains("Configured targets: 1"))
+        .stdout(predicate::str::contains("tmux"))
+        .stdout(predicate::str::contains("SSH"))
+        .stdout(predicate::str::contains("Cargo"))
+        .stdout(predicate::str::contains("Herdr"))
+        .stdout(predicate::str::contains("plugin_action"))
+        .stdout(predicate::str::contains("herdr-tether doctor"));
+
+    assert_eq!(fs::read_to_string(herdr_config).unwrap(), "# unchanged\n");
+}
+
+#[test]
+fn prune_uses_configured_retention_unless_the_flag_explicitly_overrides_it() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .command()
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+    let defaults = fs::read_to_string(sandbox.config_file()).unwrap();
+    let configured = defaults.replace("closed_days = 30", "closed_days = 1");
+    assert_ne!(
+        configured, defaults,
+        "the v2 retention default must be present"
+    );
+    fs::write(sandbox.config_file(), configured).unwrap();
+    fs::write(
+        sandbox.state_file(),
+        format!(
+            r#"{{
+  "version": 1,
+  "sessions": [{{
+    "id": "{SESSION_ID}",
+    "host": "local",
+    "target": "local",
+    "directory": "/tmp",
+    "preset": null,
+    "status": "closed",
+    "created_at": "2026-07-01T00:00:00Z",
+    "last_used_at": "2026-07-01T00:00:00Z",
+    "closed_at": "2026-07-01T00:00:00Z"
+  }}]
+}}"#
+        ),
+    )
+    .unwrap();
+
+    sandbox
+        .command()
+        .args(["session", "prune", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(SESSION_ID));
+
+    sandbox
+        .command()
+        .args([
+            "session",
+            "prune",
+            "--dry-run",
+            "--older-than-days",
+            "99999",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    fs::write(sandbox.config_file(), "not valid TOML").unwrap();
+    sandbox
+        .command()
+        .args([
+            "session",
+            "prune",
+            "--dry-run",
+            "--older-than-days",
+            "99999",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn doctor_reports_every_check_and_fails_for_missing_config_and_required_executables() {
+    let sandbox = Sandbox::new();
+    let empty_path = sandbox.path("empty-bin");
+    fs::create_dir_all(&empty_path).unwrap();
+
+    sandbox
+        .command()
+        .env("PATH", &empty_path)
+        .env("HERDR_BIN_PATH", sandbox.path("selected-herdr"))
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("config").and(predicate::str::contains("missing")))
+        .stdout(predicate::str::contains("state"))
+        .stdout(predicate::str::contains("tmux: missing"))
+        .stdout(predicate::str::contains("ssh: missing"))
+        .stdout(predicate::str::contains("cargo: missing"))
+        .stdout(predicate::str::contains("selected-herdr"))
+        .stdout(predicate::str::contains("Herdr context: w1:p1"))
+        .stderr(predicate::str::contains("doctor found"));
+}
+
+#[test]
+fn doctor_distinguishes_incomplete_herdr_plugin_context_from_standalone() {
+    let sandbox = Sandbox::new();
+    let empty_path = sandbox.path("empty-bin");
+    fs::create_dir_all(&empty_path).unwrap();
+
+    sandbox
+        .command()
+        .env("PATH", &empty_path)
+        .env("HERDR_PANE_ID", "w1:p1")
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Herdr context: incomplete"))
+        .stdout(predicate::str::contains("HERDR_WORKSPACE_ID"));
+
+    sandbox
+        .command()
+        .env("PATH", &empty_path)
+        .env("PANE_ID", "unrelated-shell-pane")
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "Herdr context: standalone (no plugin pane selected)",
+        ));
+}
+
+#[test]
+fn doctor_classifies_invalid_config_nonzero_and_permission_failures_without_short_circuiting() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.config_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.config_file(), "version = 2\nunknown = true\n").unwrap();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), r#"{"version":1,"sessions":[]}"#).unwrap();
+
+    let bin = sandbox.path("doctor-bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("tmux"),
+        "#!/bin/sh\nprintf 'broken tmux socket\\033]0;owned\\a\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    fs::write(bin.join("ssh"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("cargo"), "#!/bin/sh\nexit 0\n").unwrap();
+    let herdr = sandbox.path("herdr-no-execute");
+    fs::write(&herdr, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        fs::set_permissions(bin.join("tmux"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&herdr, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("config").and(predicate::str::contains("unusable")))
+        .stdout(predicate::str::contains("state").and(predicate::str::contains("ok")))
+        .stdout(predicate::str::contains(
+            "tmux: failed (exit status: 7; broken tmux socket",
+        ))
+        .stdout(predicate::str::contains("\u{1b}").not())
+        .stdout(predicate::str::contains("ssh: ok"))
+        .stdout(predicate::str::contains("cargo: ok"))
+        .stdout(predicate::str::contains("permission denied"))
+        .stderr(predicate::str::contains("doctor found"));
+}

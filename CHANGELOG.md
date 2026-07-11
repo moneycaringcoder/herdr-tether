@@ -9,8 +9,10 @@
 - Added progressive, non-destructive host and Tether workload status to the explorer. Four bounded workers isolate slow hosts; each local/SSH probe has a three-second deadline, cancellation and process-group cleanup, null stdin, and capped output.
 - Added explicit `r` refresh with generation-safe stale/fresh presentation. Host rows distinguish online/offline/timeout/error; workload rows distinguish running/missing/unknown/timeout/error, and freshly missing workloads cannot be resumed.
 - Expanded the bounded per-host status probe into one validated tmux catalog snapshot that derives both owned workload state and external rows. Duplicate/structurally malformed catalogs fail closed; refresh keeps prior external rows visibly stale and selected by stable identity.
-- Added asynchronous bounded repository discovery beneath recent workload directories, configured roots, and the local `HOME`/remote `~` fallback. Local traversal is deterministic and does not follow symlinks; remote scans use BatchMode SSH, quoted root argv, fixed depth/entry/result/deadline/output limits, and a validated NUL-framed protocol.
+- Added asynchronous bounded repository discovery beneath configured per-host roots plus the local `HOME`/remote `~` fallback. Recent directories remain picker suggestions without widening scan scope. Local traversal is deterministic and does not follow symlinks; remote scans use BatchMode SSH, quoted root argv, configurable validated depth/entry/result/deadline/worker bounds, a fixed output cap, and a validated NUL-framed protocol.
 - Added case-insensitive directory filtering with `/` and literal direct-path entry with `p`. Refresh now restarts both status and discovery generations while rejecting stale results.
+- Added version-2 TOML discovery roots/limits and retention defaults. Existing v0/v1 config and v0 state now migrate under the same advisory lock as normal transactions; recent picker directories no longer silently widen repository scan scope.
+- Expanded idempotent setup with effective-default/prerequisite/next-step guidance, and made doctor classify required config/state/tmux/SSH/Cargo/Herdr failures with bounded deadlines/output while continuing the complete report. Explicit prune age continues to override configured retention.
 
 ## [0.1.0] - 2026-07-10
 
