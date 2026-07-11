@@ -783,7 +783,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     let command = "printf '%s\\n' \"$HOME\"; echo `id`";
     let escaped_directory = "/canonical/repo";
     let script = format!(
-        "#!/bin/sh\nremote=$9\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
+        "#!/bin/sh\nfor remote do :; done\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
         log = log.display(),
         calls = calls.display(),
     );
@@ -808,7 +808,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
 
     let argv = read_argv(&log);
     assert_eq!(
-        &argv[..8],
+        &argv[..10],
         [
             "-o",
             "BatchMode=yes",
@@ -816,17 +816,19 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
             "ServerAliveInterval=15",
             "-o",
             "ServerAliveCountMax=3",
+            "-p",
+            "2222",
             "--",
-            "ssh://builder@example.test:2222",
+            "builder@example.test",
         ]
     );
     assert_eq!(
         argv.len(),
-        9,
+        11,
         "ssh must receive one remote command argument"
     );
     let launch_script = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
-    let remote = &argv[8];
+    let remote = &argv[10];
     for expected in [
         "'tmux' 'new-session' '-d'",
         &posix_quote(directory).unwrap(),
@@ -846,6 +848,36 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     assert!(calls.contains("'tmux' 'display-message' '-p' '-t' '%3' '#{pane_current_path}'"));
     assert!(calls.contains("'tmux' 'set-option' '-p' '-t' '%3' 'remain-on-exit' 'on'"));
     assert!(calls.contains("'tmux' 'set-option' '-t' '$7' 'mouse' 'on'"));
+}
+
+#[test]
+fn remote_ipv6_uri_maps_authority_and_port_to_openssh_argv() {
+    let backend = TmuxBackend::remote(
+        "ssh://builder@[2001:db8::10]:2222",
+        ProcessBinaries::new("/usr/bin/ssh", "/usr/bin/tmux"),
+    )
+    .unwrap();
+
+    let command = backend
+        .attach_external_command(&"work".parse().unwrap())
+        .unwrap();
+    assert_eq!(
+        &command.args[..11],
+        [
+            "-o",
+            "BatchMode=yes",
+            "-t",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-p",
+            "2222",
+            "--",
+            "builder@2001:db8::10",
+        ]
+    );
+    assert_eq!(command.args[11], "'tmux' 'attach-session' '-t' '=work'");
 }
 
 #[test]

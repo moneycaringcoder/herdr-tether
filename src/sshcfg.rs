@@ -39,6 +39,48 @@ pub fn discover_aliases(path: &Path) -> Result<Vec<String>> {
     Ok(aliases)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OpenSshTarget {
+    pub(crate) destination: String,
+    pub(crate) port: Option<u16>,
+}
+
+pub(crate) fn openssh_target(target: &str) -> Result<OpenSshTarget> {
+    validate_ssh_target(target)?;
+    let Some(authority) = target.strip_prefix("ssh://") else {
+        return Ok(OpenSshTarget {
+            destination: target.to_owned(),
+            port: None,
+        });
+    };
+    let (user, host_and_port) = authority
+        .split_once('@')
+        .map_or((None, authority), |(user, remainder)| {
+            (Some(user), remainder)
+        });
+    let (host, port) = if let Some(rest) = host_and_port.strip_prefix('[') {
+        let (address, suffix) = rest
+            .split_once(']')
+            .expect("validated SSH URI has a closing IPv6 bracket");
+        (address, suffix.strip_prefix(':'))
+    } else {
+        host_and_port
+            .split_once(':')
+            .map_or((host_and_port, None), |(host, port)| (host, Some(port)))
+    };
+    let destination = user.map_or_else(
+        || host.to_owned(),
+        |user| format!("{user}@{host}"),
+    );
+    Ok(OpenSshTarget {
+        destination,
+        port: port.map(|port| {
+            port.parse()
+                .expect("validated SSH URI port is a nonzero u16")
+        }),
+    })
+}
+
 /// Validate a target that can be passed to OpenSSH as one destination argv.
 ///
 /// Accepted forms are a literal host/alias, `user@host`, and an `ssh://` URI
