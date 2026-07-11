@@ -9,6 +9,7 @@ on:
       - "herdr-plugin.toml"
       - "src/**"
       - "tools/live_product_smoke.py"
+      - "tools/test_live_product_smoke.py"
       - ".github/workflows/live-product.yml"
   push:
     branches:
@@ -21,6 +22,7 @@ on:
       - "herdr-plugin.toml"
       - "src/**"
       - "tools/live_product_smoke.py"
+      - "tools/test_live_product_smoke.py"
       - ".github/workflows/live-product.yml"
 
 permissions:
@@ -78,6 +80,9 @@ jobs:
 
       - name: Build locked release artifact
         run: cargo build --release --locked
+
+      - name: Verify parent tmux isolation
+        run: python3 tools/test_live_product_smoke.py
 
       - name: Run disposable live product smoke
         run: |
