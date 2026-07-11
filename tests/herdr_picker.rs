@@ -13,9 +13,9 @@ use herdr_tether::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
     },
     tui::{
-        PickerCloseModal, PickerCloseResult, PickerEvent, PickerInput, PickerOptions,
-        PickerOutcome, PickerPruneModal, PickerPrunePhase, PickerPruneResult, PickerSelection,
-        PickerStage, PickerState, format_close_error,
+        PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin, PickerInput,
+        PickerOptions, PickerOutcome, PickerPruneModal, PickerPrunePhase, PickerPruneResult,
+        PickerSelection, PickerStage, PickerState, format_close_error,
     },
 };
 use tempfile::tempdir;
@@ -176,6 +176,105 @@ fn picker_fixture() -> (Config, State) {
 }
 
 #[test]
+fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
+    let (mut config, mut state) = picker_fixture();
+    config.hosts[0].target = "new-builder@example.test".into();
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    state.sessions.push(SessionRecord {
+        id: "tether-0197f198000070008000000000000003".parse().unwrap(),
+        host: "removed-box".into(),
+        target: "removed@example.test".into(),
+        directory: "/srv/removed".into(),
+        preset: None,
+        status: SessionStatus::Active,
+        created_at: now,
+        last_used_at: now,
+        closed_at: None,
+    });
+    state.sessions[0].status = SessionStatus::Closing;
+    state.sessions[1].status = SessionStatus::Closed;
+    state.sessions[1].closed_at = Some(now);
+
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    assert_eq!(options.hosts.len(), 3);
+    assert_eq!(options.hosts[0].origin, PickerHostOrigin::Effective);
+    assert_eq!(
+        options.hosts[0].target.as_deref(),
+        Some("new-builder@example.test")
+    );
+    assert!(options.hosts[0].allow_create);
+    assert!(options.hosts[0].workloads.is_empty());
+    assert_eq!(options.hosts[1].origin, PickerHostOrigin::Retained);
+    assert_eq!(options.hosts[1].name, "build-box");
+    assert_eq!(
+        options.hosts[1].target.as_deref(),
+        Some("builder@example.test")
+    );
+    assert!(!options.hosts[1].allow_create);
+    assert_eq!(
+        options.hosts[1]
+            .workloads
+            .iter()
+            .map(|workload| workload.status)
+            .collect::<Vec<_>>(),
+        vec![SessionStatus::Closed, SessionStatus::Closing]
+    );
+    assert!(
+        options.hosts[1]
+            .workloads
+            .iter()
+            .all(|workload| !workload.label.contains("Resume"))
+    );
+    assert_eq!(options.hosts[2].name, "removed-box");
+    assert_eq!(options.hosts[2].workloads[0].status, SessionStatus::Active);
+
+    let closing_id = options.hosts[1].workloads[1].id;
+    let removed_id = options.hosts[2].workloads[0].id;
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(4);
+    assert!(!picker.apply_status(StatusMessage::Workload {
+        generation: 4,
+        id: removed_id,
+        status: WorkloadStatus::Running { attached: 0 },
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    picker.begin_discovery(4);
+    assert!(!picker.apply_discovery(DiscoveryMessage::Repository {
+        generation: 4,
+        host: "removed-box".into(),
+        path: "/must-not-append".into(),
+    }));
+
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    assert!(!picker.footer_text().contains("Enter select"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(picker.close_modal().is_none());
+    picker.handle(PickerEvent::Next);
+    assert!(!picker.footer_text().contains("Enter select"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: closing_id })
+    );
+    picker.handle(PickerEvent::DismissClose);
+    picker.handle(PickerEvent::Back);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Confirm);
+    assert_eq!(picker.stage(), PickerStage::Placement);
+    assert_eq!(
+        picker.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::Resume {
+            id: removed_id,
+            placement: Placement::SplitRight,
+        })
+    );
+}
+
+#[test]
 fn picker_walks_host_directory_command_and_placement() {
     let (config, state) = picker_fixture();
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
@@ -272,18 +371,16 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
         .iter()
         .find(|host| host.name == "build-box")
         .unwrap();
-    assert_eq!(build_box.workloads.len(), 2);
+    assert_eq!(build_box.workloads.len(), 3);
     assert!(
         build_box.workloads[0]
             .label
-            .starts_with("Tether · Resume …00000002 · Shell · ")
+            .starts_with("[active] Tether · Resume …00000002 · Shell · ")
     );
-    assert!(
-        build_box
-            .workloads
-            .iter()
-            .all(|workload| workload.id.to_string() != "tether-0197f198000070008000000000000003")
-    );
+    assert!(build_box.workloads.iter().any(|workload| {
+        workload.id.to_string() == "tether-0197f198000070008000000000000003"
+            && workload.status == SessionStatus::Closed
+    }));
 
     let expected_id = build_box.workloads[0].id;
     let mut explorer = PickerState::new(options).unwrap();
@@ -531,7 +628,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         explorer
             .workload_label(workload_id)
             .unwrap()
-            .starts_with("[running · 2 attached] Tether · Resume …00000002")
+            .starts_with("[running · 2 attached] [active] Tether · Resume …00000002")
     );
 
     explorer.begin_refresh(2);
@@ -775,8 +872,16 @@ fn close_is_owned_only_and_cached_status_never_skips_confirmation() {
 }
 
 #[test]
-fn close_success_removes_only_exact_row_and_chooses_deterministic_neighbor() {
+fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
+    let (_, state) = picker_fixture();
     let (mut picker, first_id, second_id) = owned_close_picker();
+    let mut record = state
+        .sessions
+        .into_iter()
+        .find(|record| record.id == first_id)
+        .unwrap();
+    record.status = SessionStatus::Closed;
+    record.closed_at = Some(record.last_used_at);
     picker.handle(PickerEvent::Close);
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
@@ -789,12 +894,16 @@ fn close_success_removes_only_exact_row_and_chooses_deterministic_neighbor() {
         id: first_id,
         generation: 7,
         error: None,
+        record: Some(record),
     }));
 
     let labels = picker.resource_labels("build-box").unwrap();
-    assert_eq!(labels.len(), 2);
-    assert!(labels[0].contains("00000001"));
-    assert_eq!(labels[1], "Create new Tether workload");
+    assert_eq!(labels.len(), 3);
+    assert!(labels.iter().any(|label| label.contains("closed")));
+    assert!(labels[0].contains("00000002"));
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(picker.close_modal().is_none());
+    picker.handle(PickerEvent::Next);
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert_eq!(
         picker.close_modal(),
@@ -804,18 +913,80 @@ fn close_success_removes_only_exact_row_and_chooses_deterministic_neighbor() {
         id: first_id,
         generation: 7,
         error: None,
+        record: None,
     }));
 }
 
 #[test]
-fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() {
+fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
+    let (config, mut state) = picker_fixture();
+    let record = state.sessions.remove(0);
+    let id = record.id;
+    state.sessions = vec![SessionRecord {
+        host: "removed-box".into(),
+        target: "removed@example.test".into(),
+        ..record
+    }];
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(7);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested { id, generation: 7 }
+    );
+
+    assert!(picker.apply_close_result(PickerCloseResult {
+        id,
+        generation: 7,
+        error: None,
+        record: None,
+    }));
+    assert!(picker.workload_label(id).is_none());
+    assert!(picker.host_label("removed-box").is_none());
+}
+
+#[test]
+fn unreadable_authoritative_reread_blocks_active_resume_but_allows_close_retry() {
     let (mut picker, id, _) = owned_close_picker();
     picker.handle(PickerEvent::Close);
     picker.handle(PickerEvent::ConfirmClose);
     assert!(picker.apply_close_result(PickerCloseResult {
         id,
         generation: 7,
+        error: Some("authoritative state reread failed".into()),
+        record: None,
+    }));
+    picker.handle(PickerEvent::DismissClose);
+
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id })
+    );
+}
+
+#[test]
+fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() {
+    let (mut picker, id, _) = owned_close_picker();
+    let (_, state) = picker_fixture();
+    let mut record = state
+        .sessions
+        .into_iter()
+        .find(|record| record.id == id)
+        .unwrap();
+    record.status = SessionStatus::Closing;
+    picker.handle(PickerEvent::Close);
+    picker.handle(PickerEvent::ConfirmClose);
+    assert!(picker.apply_close_result(PickerCloseResult {
+        id,
+        generation: 7,
         error: Some("backend\u{1b}[31m failed\nretry".into()),
+        record: Some(record),
     }));
     assert_eq!(
         picker.close_modal(),
@@ -824,10 +995,12 @@ fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() 
             error: "backend failed retry".into(),
         })
     );
-    assert_eq!(picker.frame_title(), "Close failed");
-    assert!(picker.footer_text().starts_with("y retry · n/Esc dismiss"));
     assert!(
-        picker.resource_labels("build-box").unwrap()[0].starts_with("[close failed · c retry]")
+        picker
+            .resource_labels("build-box")
+            .unwrap()
+            .iter()
+            .any(|label| label.starts_with("[close failed · c retry]"))
     );
     picker.handle(PickerEvent::DismissClose);
     assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
@@ -865,6 +1038,7 @@ fn refresh_rejects_late_close_generation() {
         id,
         generation: 7,
         error: None,
+        record: None,
     }));
     assert_eq!(picker.resource_labels("build-box").unwrap().len(), 3);
 }
@@ -925,6 +1099,161 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
         })
         .unwrap();
     PruneService::new(store).preview(days).unwrap()
+}
+
+#[test]
+fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
+    let (config, _) = picker_fixture();
+    let now = Utc::now();
+    let records = (0..3)
+        .map(|index| SessionRecord {
+            id: format!("tether-0197f198000070008000000000000{:03}", index + 100)
+                .parse()
+                .unwrap(),
+            host: if index == 2 { "lone" } else { "archived" }.into(),
+            target: "removed@example.test".into(),
+            directory: "/closed".into(),
+            preset: None,
+            status: SessionStatus::Closed,
+            created_at: now - Duration::days(60),
+            last_used_at: now - Duration::days(40),
+            closed_at: Some(now - Duration::days(40)),
+        })
+        .collect::<Vec<_>>();
+    let state = State {
+        version: State::CURRENT_VERSION,
+        sessions: records.clone(),
+    };
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    store.save(&state).unwrap();
+    let preview = PruneService::new(store).preview(14).unwrap();
+    let removed = vec![records[0].id, records[2].id];
+    let skipped = vec![records[1].id];
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::with_retention(options, 14).unwrap();
+    picker.begin_refresh(11);
+    picker.handle(PickerEvent::BeginPrune);
+    picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    });
+    picker.handle(PickerEvent::ConfirmPrune);
+
+    assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview,
+        removed_ids: Some(removed),
+        skipped_ids: Some(skipped),
+        error: None,
+    }));
+    assert!(picker.workload_label(records[0].id).is_none());
+    assert!(picker.workload_label(records[1].id).is_some());
+    assert!(picker.workload_label(records[2].id).is_none());
+    assert!(picker.host_label("lone").is_none());
+    assert!(picker.host_label("archived").is_some());
+}
+
+#[test]
+fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
+    let (config, _) = picker_fixture();
+    let now = Utc::now();
+    let mut records = Vec::new();
+    for (suffix, status, age) in [
+        (200, SessionStatus::Closed, 40),
+        (201, SessionStatus::Closing, 41),
+        (202, SessionStatus::Active, 42),
+    ] {
+        records.push(SessionRecord {
+            id: format!("tether-0197f198000070008000000000000{suffix:03}")
+                .parse()
+                .unwrap(),
+            host: "archived".into(),
+            target: "removed@example.test".into(),
+            directory: "/closed".into(),
+            preset: None,
+            status,
+            created_at: now - Duration::days(60),
+            last_used_at: now - Duration::days(age),
+            closed_at: (status == SessionStatus::Closed).then_some(now - Duration::days(age)),
+        });
+    }
+    let state = State {
+        version: State::CURRENT_VERSION,
+        sessions: records.clone(),
+    };
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    store.save(&state).unwrap();
+    let preview = PruneService::new(store).preview(14).unwrap();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::with_retention(options, 14).unwrap();
+    picker.begin_refresh(11);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::BeginPrune);
+    picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    });
+    picker.handle(PickerEvent::ConfirmPrune);
+    picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview,
+        removed_ids: Some(vec![records[0].id]),
+        skipped_ids: Some(Vec::new()),
+        error: None,
+    });
+
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: records[1].id })
+    );
+}
+
+#[test]
+fn prune_of_final_retained_host_resets_empty_picker_to_safe_host_stage() {
+    let (mut config, mut state) = picker_fixture();
+    config.hosts.clear();
+    state.sessions.truncate(1);
+    state.sessions[0].host = "removed".into();
+    state.sessions[0].target = "removed@example.test".into();
+    state.sessions[0].status = SessionStatus::Closed;
+    state.sessions[0].closed_at = Some(state.sessions[0].last_used_at);
+    state.sessions[0].last_used_at = Utc::now() - Duration::days(40);
+    state.sessions[0].created_at = Utc::now() - Duration::days(60);
+    state.sessions[0].closed_at = Some(state.sessions[0].last_used_at);
+    let id = state.sessions[0].id;
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    store.save(&state).unwrap();
+    let preview = PruneService::new(store).preview(14).unwrap();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::with_retention(options, 14).unwrap();
+    picker.begin_refresh(11);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::BeginPrune);
+    picker.apply_prune_result(PickerPruneResult::Preview {
+        generation: 11,
+        result: Ok(preview.clone()),
+    });
+    picker.handle(PickerEvent::ConfirmPrune);
+
+    assert!(picker.apply_prune_result(PickerPruneResult::Apply {
+        generation: 11,
+        preview,
+        removed_ids: Some(vec![id]),
+        skipped_ids: Some(Vec::new()),
+        error: None,
+    }));
+    assert_eq!(picker.stage(), PickerStage::Host);
+    assert!(picker.footer_text().contains("navigate"));
+    assert!(!picker.footer_text().contains("Enter select"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Host);
+    assert!(!picker.footer_text().contains("Enter select"));
 }
 
 fn prune_picker() -> PickerState {

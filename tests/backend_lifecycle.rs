@@ -126,6 +126,34 @@ fn lifecycle_fixture(
 }
 
 #[test]
+fn owned_record_reread_is_authoritative_and_transport_free() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let record = owned_record(SessionStatus::Closing);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record.clone()],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store,
+        ProcessBinaries::new(
+            temp.path().join("must-not-run-ssh"),
+            temp.path().join("must-not-run-tmux"),
+        ),
+    );
+
+    assert_eq!(service.owned_record(id()).unwrap(), Some(record));
+    assert_eq!(
+        service
+            .owned_record("tether-0197f198000070008000000000000009".parse().unwrap())
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
     let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
     let temp = tempdir().unwrap();

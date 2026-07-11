@@ -21,7 +21,7 @@ use crate::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
         StatusRequest, StatusRun, StatusService, WorkloadStatus,
     },
-    tui::PickerOptions,
+    tui::{PickerHostOrigin, PickerOptions},
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -120,9 +120,15 @@ pub fn collect(
     let mut picker_config = config.clone();
     picker_config.append_alias_hosts(aliases);
     let options = PickerOptions::from_config_state(&picker_config, state, home, true);
+    let effective_hosts = options
+        .hosts
+        .iter()
+        .filter(|host| host.origin == PickerHostOrigin::Effective)
+        .collect::<Vec<_>>();
     let effective_keys: HashSet<(String, String)> = options
         .hosts
         .iter()
+        .filter(|host| host.origin == PickerHostOrigin::Effective)
         .map(|host| {
             (
                 host.name.clone(),
@@ -140,8 +146,7 @@ pub fn collect(
         .map(|record| (record.id, record.host.clone()))
         .collect();
     let generation = 1;
-    let status_hosts = options
-        .hosts
+    let status_hosts = effective_hosts
         .iter()
         .map(|host| StatusHost {
             name: host.name.clone(),
@@ -158,8 +163,7 @@ pub fn collect(
                 .collect(),
         })
         .collect();
-    let locations = options
-        .hosts
+    let locations = effective_hosts
         .iter()
         .map(|host| DiscoveryLocation {
             host: host.name.clone(),
@@ -190,14 +194,13 @@ pub fn collect(
         locations,
     });
 
-    let host_count = options.hosts.len();
+    let host_count = effective_hosts.len();
     let status_waves = host_count.div_ceil(STATUS_WORKERS.max(1));
     let discovery_waves = host_count.div_ceil(discovery_workers);
     let status_budget = STATUS_TIMEOUT.saturating_mul(status_waves as u32);
     let discovery_budget = discovery_timeout.saturating_mul(discovery_waves as u32);
     let deadline = Instant::now() + status_budget.max(discovery_budget);
-    let mut results: HashMap<String, HostResults> = options
-        .hosts
+    let mut results: HashMap<String, HostResults> = effective_hosts
         .iter()
         .map(|host| (host.name.clone(), HostResults::default()))
         .collect();
@@ -269,6 +272,7 @@ pub fn collect(
     let mut hosts: Vec<_> = options
         .hosts
         .into_iter()
+        .filter(|host| host.origin == PickerHostOrigin::Effective)
         .map(|host| {
             let result = results.remove(&host.name).unwrap_or_default();
             let retained_target = effective_target(host.target.as_deref());
