@@ -534,18 +534,41 @@ impl LifecycleService {
         Ok(RestartOwnedResult { id, identity })
     }
 
-    /// Finalizes ended metadata and removes only an exact dead tmux incarnation.
+    /// Finalizes ended metadata, or forgets proofless legacy metadata without transport.
     pub fn remove_owned(&self, id: SessionId) -> Result<RemoveOwnedResult, CloseOwnedError> {
         let record = self
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
-        let ownership_proof = self.require_ownership_proof(&record)?;
         if record.status == SessionStatus::Removed {
             return Ok(RemoveOwnedResult {
                 id,
                 workload: ClosedWorkload::Missing,
             });
         }
+        if record.ownership_proof.is_none() {
+            self.store
+                .update(|state| {
+                    let current = state
+                        .sessions
+                        .iter_mut()
+                        .find(|current| current.id == id)
+                        .ok_or_else(|| anyhow!("session disappeared"))?;
+                    if current != &record {
+                        return Err(anyhow!("session changed"));
+                    }
+                    let now = Utc::now();
+                    current.status = SessionStatus::Removed;
+                    current.last_used_at = now;
+                    current.closed_at.get_or_insert(now);
+                    Ok(())
+                })
+                .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+            return Ok(RemoveOwnedResult {
+                id,
+                workload: ClosedWorkload::Missing,
+            });
+        }
+        let ownership_proof = self.require_ownership_proof(&record)?;
         if record.status != SessionStatus::Ended {
             return Err(CloseOwnedError::InvalidStatus {
                 id,

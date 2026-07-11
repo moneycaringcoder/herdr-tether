@@ -61,6 +61,8 @@ Tether reserves generated `tether-*` identities for workloads it creates. Lifecy
 
 Existing non-Tether sessions may appear as **External**. Tether can validate and attach to their exact names, but it does not adopt, persist, rename, stop, remove, or otherwise manage them. A name in Tether's reserved namespace is never downgraded to an external session merely because its metadata is unavailable.
 
+Records migrated from Tether 0.2.x do not contain the private ownership proof required by 0.3. Tether labels them **Legacy**, never offers Open, Stop, or Restart, and does not adopt or inspect a same-named `tmux` session. Use `x` in the picker or `herdr-tether session remove <id>` to remove only the legacy metadata; any workload with that name is left untouched.
+
 ## Failure behavior
 
 - **The view closes or SSH drops:** the workload keeps running.

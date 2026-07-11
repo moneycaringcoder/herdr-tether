@@ -418,7 +418,7 @@ fn picker_fixture() -> (Config, State) {
                 preset: Some("agent".into()),
                 command: Some("exec ${SHELL:-/bin/sh}".into()),
                 tmux_session_id: None,
-                ownership_proof: None,
+                ownership_proof: Some("0197f198000070008000000000000091".parse().unwrap()),
                 status: SessionStatus::Running,
                 created_at: now - Duration::days(2),
                 last_used_at: now - Duration::hours(2),
@@ -435,7 +435,7 @@ fn picker_fixture() -> (Config, State) {
                 preset: None,
                 command: Some("exec ${SHELL:-/bin/sh}".into()),
                 tmux_session_id: None,
-                ownership_proof: None,
+                ownership_proof: Some("0197f198000070008000000000000092".parse().unwrap()),
                 status: SessionStatus::Running,
                 created_at: now - Duration::days(1),
                 last_used_at: now - Duration::hours(1),
@@ -445,6 +445,51 @@ fn picker_fixture() -> (Config, State) {
         ],
     };
     (config, state)
+}
+
+#[test]
+fn proofless_legacy_workload_offers_only_metadata_remove() {
+    let (config, mut state) = picker_fixture();
+    state.sessions.truncate(1);
+    state.sessions[0].command = None;
+    state.sessions[0].ownership_proof = None;
+    let id = state.sessions[0].id;
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let workload = &options
+        .hosts
+        .iter()
+        .find(|host| host.name == "build-box")
+        .unwrap()
+        .workloads[0];
+    assert!(workload.label.contains("[legacy]"));
+    assert!(workload.label.contains("Remove metadata"));
+    assert!(!workload.label.contains("Open"));
+    assert!(!workload.label.contains("Restart"));
+
+    let mut picker = PickerState::new(options).unwrap();
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    assert!(picker.footer_text().contains("x Remove"));
+    assert!(!picker.footer_text().contains("Enter Open"));
+    assert!(!picker.footer_text().contains("Enter Restart"));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id })
+    );
+    assert!(picker.footer_text().contains("same-named tmux session is untouched"));
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested {
+            id,
+            generation: 0,
+            action: PickerCloseAction::Remove,
+        }
+    );
 }
 
 #[test]
@@ -460,7 +505,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
         preset: None,
         command: Some("exec ${SHELL:-/bin/sh}".into()),
         tmux_session_id: None,
-        ownership_proof: None,
+        ownership_proof: Some("0197f198000070008000000000000093".parse().unwrap()),
         status: SessionStatus::Running,
         created_at: now,
         last_used_at: now,
@@ -1594,7 +1639,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
             preset: None,
             command: Some("exec ${SHELL:-/bin/sh}".into()),
             tmux_session_id: None,
-            ownership_proof: None,
+            ownership_proof: Some("0197f198000070008000000000000094".parse().unwrap()),
             status,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(age),

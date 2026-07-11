@@ -73,6 +73,7 @@ pub enum PickerHostOrigin {
 pub struct PickerWorkload {
     pub id: SessionId,
     pub status: SessionStatus,
+    pub legacy: bool,
     pub last_used_at: chrono::DateTime<chrono::Utc>,
     pub base_label: String,
     pub label: String,
@@ -262,6 +263,7 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
             PickerWorkload {
                 id: session.id,
                 status: session.status,
+                legacy: session.ownership_proof.is_none(),
                 last_used_at: session.last_used_at,
                 base_label: label.clone(),
                 label,
@@ -274,6 +276,12 @@ fn workload_label(session: &SessionRecord) -> String {
     let command = session.preset.as_deref().unwrap_or("Shell");
     let id = session.id.to_string();
     let short_id = &id[id.len().saturating_sub(8)..];
+    if session.ownership_proof.is_none() && session.status != SessionStatus::Removed {
+        return format!(
+            "[legacy] Tether · Remove metadata …{} · {} · {}",
+            short_id, command, session.directory
+        );
+    }
     let (lifecycle, action) = match session.status {
         SessionStatus::Creating => ("creating", "Pending"),
         SessionStatus::Running => ("running", "Open"),
@@ -1022,6 +1030,7 @@ impl PickerState {
             .push(PickerWorkload {
                 id: record.id,
                 status: record.status,
+                legacy: record.ownership_proof.is_none(),
                 last_used_at: record.last_used_at,
                 base_label: label.clone(),
                 label,
@@ -1188,11 +1197,9 @@ impl PickerState {
                 .entry(host.name.clone())
                 .or_default()
                 .begin_refresh();
-            for workload in host
-                .workloads
-                .iter()
-                .filter(|workload| workload.status == SessionStatus::Running)
-            {
+            for workload in host.workloads.iter().filter(|workload| {
+                workload.status == SessionStatus::Running && !workload.legacy
+            }) {
                 self.workload_status
                     .entry(workload.id)
                     .or_default()
@@ -1337,7 +1344,9 @@ impl PickerState {
                     workloads: host
                         .workloads
                         .iter()
-                        .filter(|workload| workload.status == SessionStatus::Running)
+                        .filter(|workload| {
+                            workload.status == SessionStatus::Running && !workload.legacy
+                        })
                         .map(|workload| workload.id)
                         .collect(),
                 })
@@ -1381,6 +1390,24 @@ impl PickerState {
         })
     }
 
+
+    fn current_legacy_id(&self) -> Option<SessionId> {
+        if self.stage != PickerStage::Resource {
+            return None;
+        }
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| {
+                workload.id == id
+                    && workload.legacy
+                    && workload.status != SessionStatus::Removed
+            })
+            .map(|workload| workload.id)
+    }
     fn current_owned_action(&self) -> Option<(SessionId, bool)> {
         if self.stage != PickerStage::Resource || !self.current_host_reachable() {
             return None;
@@ -1392,6 +1419,9 @@ impl PickerState {
             .workloads
             .iter()
             .find(|workload| workload.id == id)?;
+        if workload.legacy {
+            return None;
+        }
         match workload.status {
             SessionStatus::Ended => Some((id, true)),
             SessionStatus::Running
@@ -1588,6 +1618,11 @@ impl PickerState {
     }
     fn begin_close(&mut self) -> PickerOutcome {
         if self.pending_close.is_some() {
+            return PickerOutcome::Continue;
+        }
+        if let Some(id) = self.current_legacy_id() {
+            self.close_modal_action = Some(PickerCloseAction::Remove);
+            self.close_modal = Some(PickerCloseModal::Confirm { id });
             return PickerOutcome::Continue;
         }
         let Some((id, restart)) = self.current_owned_action() else {
@@ -1970,13 +2005,12 @@ impl PickerState {
     }
 
     fn close_action(&self, id: SessionId) -> PickerCloseAction {
-        if self
-            .options
-            .hosts
-            .iter()
-            .flat_map(|host| &host.workloads)
-            .any(|workload| workload.id == id && workload.status == SessionStatus::Ended)
-        {
+        if self.options.hosts.iter().flat_map(|host| &host.workloads).any(
+            |workload| {
+                workload.id == id
+                    && (workload.legacy || workload.status == SessionStatus::Ended)
+            },
+        ) {
             PickerCloseAction::Remove
         } else {
             PickerCloseAction::Stop
@@ -2016,6 +2050,9 @@ impl PickerState {
             {
                 PickerCloseAction::Stop => Some(format!(
                     "y confirm · n/Esc keep · Stop exact {id}? Ends its Tether workload."
+                )),
+                PickerCloseAction::Remove if self.current_legacy_id() == Some(*id) => Some(format!(
+                    "y confirm · n/Esc keep · Remove legacy record {id}? Metadata only; any same-named tmux session is untouched."
                 )),
                 PickerCloseAction::Remove => Some(format!(
                     "y confirm · n/Esc keep · Remove ended {id}? Metadata only; no live workload is touched."
@@ -2100,25 +2137,30 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
-                let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
-                    match self.current_owned_action() {
-                        Some((_, false)) => ("Enter Open", " · x Stop"),
-                        Some((_, true)) => ("Enter Restart", " · x Remove"),
-                        None => match self.current_resource_identity() {
-                            Some(ResourceIdentity::External(_))
-                            | Some(ResourceIdentity::Create)
-                                if !self.current_host_unreachable() =>
-                            {
-                                ("Enter select", "")
+                let (primary_hint, destructive_hint) =
+                    if self.stage == PickerStage::Resource {
+                        if self.current_legacy_id().is_some() {
+                            ("", " · x Remove")
+                        } else {
+                            match self.current_owned_action() {
+                                Some((_, false)) => ("Enter Open", " · x Stop"),
+                                Some((_, true)) => ("Enter Restart", " · x Remove"),
+                                None => match self.current_resource_identity() {
+                                    Some(ResourceIdentity::External(_))
+                                    | Some(ResourceIdentity::Create)
+                                        if !self.current_host_unreachable() =>
+                                    {
+                                        ("Enter select", "")
+                                    }
+                                    _ => ("", ""),
+                                },
                             }
-                            _ => ("", ""),
-                        },
-                    }
-                } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
-                    ("", "")
-                } else {
-                    ("Enter select", "")
-                };
+                        }
+                    } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
+                        ("", "")
+                    } else {
+                        ("Enter select", "")
+                    };
                 let primary_hint = if primary_hint.is_empty() {
                     String::new()
                 } else {
@@ -3157,6 +3199,7 @@ mod close_render_tests {
                     id,
                     base_label: label.clone(),
                     status: SessionStatus::Running,
+                    legacy: false,
                     last_used_at: chrono::Utc::now(),
                     label,
                 }],

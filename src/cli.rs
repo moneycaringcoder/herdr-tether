@@ -211,7 +211,7 @@ enum SessionCommand {
     },
     /// Stop the exact Tether-owned workload and retain its history.
     Stop { id: SessionId },
-    /// Remove an ended workload from normal history without touching live work.
+    /// Remove an ended workload or safely forget legacy metadata without contacting it.
     Remove { id: SessionId },
     /// Clear old ended or removed history without touching workloads.
     Prune(PruneArgs),
@@ -995,14 +995,24 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             Ok(())
         }
         SessionCommand::Remove { id } => {
+            let legacy = store
+                .load()?
+                .sessions
+                .iter()
+                .find(|record| record.id == id)
+                .is_some_and(|record| record.ownership_proof.is_none());
             LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
                 .remove_owned(id)
                 .with_context(|| {
                     format!(
-                        "remove ended session `{id}`; retry `herdr-tether session remove {id}` after resolving the reported error"
+                        "remove session metadata `{id}`; retry `herdr-tether session remove {id}` after resolving the reported error"
                     )
                 })?;
-            println!("removed {id}");
+            if legacy {
+                println!("removed legacy metadata {id}; no workload was contacted");
+            } else {
+                println!("removed {id}");
+            }
             Ok(())
         }
         SessionCommand::Prune(args) => {

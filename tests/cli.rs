@@ -801,42 +801,55 @@ fn ended_sessions_have_obvious_restart_stop_and_remove_actions() {
 }
 
 #[test]
-fn legacy_record_without_proof_fails_closed_before_transport() {
+fn migrated_v022_record_can_only_remove_metadata_without_transport() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let legacy = active_state(SESSION_ID)
-        .replace(r#""version": 2"#, r#""version": 1"#)
-        .replace(
-            r#"    "command": "true",
-"#,
-            "",
-        )
-        .replace(
-            r#"    "tmux_session_id": 7,
-"#,
-            "",
-        )
-        .replace(
-            r#"    "ownership_proof": "0197f198000070008000000000000099",
-"#,
-            "",
-        )
-        .replace(r#""status": "running""#, r#""status": "active""#);
-    fs::write(sandbox.state_file(), legacy).unwrap();
+    fs::write(
+        sandbox.state_file(),
+        format!(
+            r#"{{
+  "version": 1,
+  "sessions": [{{
+    "id": "{SESSION_ID}",
+    "host": "local",
+    "target": "local",
+    "directory": "/tmp",
+    "preset": null,
+    "status": "active",
+    "created_at": "2026-01-01T00:00:00Z",
+    "last_used_at": "2026-01-01T00:00:00Z",
+    "closed_at": null
+  }}]
+}}"#
+        ),
+    )
+    .unwrap();
     let log = sandbox.path("tmux.log");
     let body = format!("printf invoked > '{}'\nexit 99", log.display());
     let (path, _) = install_tmux_script(&sandbox, &body);
 
     sandbox
         .command()
-        .env("PATH", path)
+        .env("PATH", &path)
         .args(["session", "stop", SESSION_ID])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no private ownership proof"));
-    assert!(!log.exists(), "legacy ownership must not invoke tmux");
+    assert!(!log.exists(), "legacy Stop must not invoke tmux");
+
+    sandbox
+        .command()
+        .env("PATH", path)
+        .args(["session", "remove", SESSION_ID])
+        .assert()
+        .success()
+        .stdout(format!(
+            "removed legacy metadata {SESSION_ID}; no workload was contacted\n"
+        ));
+    assert!(!log.exists(), "legacy Remove must not invoke tmux");
     let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
     assert!(migrated.contains(r#""version": 2"#));
+    assert!(migrated.contains(r#""status": "removed""#));
     assert!(!migrated.contains("ownership_proof"));
 }
 
