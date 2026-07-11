@@ -76,6 +76,47 @@ impl TmuxBackend {
             .output()
             .with_context(|| format!("run `{}`", spec.program.display()))
     }
+
+    pub(crate) fn inspect_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
+        let id_text = id.to_string();
+        self.tmux_spec(
+            vec![
+                "list-sessions".to_owned(),
+                "-F".to_owned(),
+                "#{session_name}\t#{session_attached}".to_owned(),
+                "-f".to_owned(),
+                format!("#{{==:#{{session_name}},{id_text}}}"),
+            ],
+            false,
+        )
+    }
+
+    pub(crate) fn close_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
+        self.tmux_spec(
+            vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
+            false,
+        )
+    }
+
+    pub(crate) fn classify_exact_inspect(
+        &self,
+        id: &SessionId,
+        output: &Output,
+        stdout_truncated: bool,
+    ) -> WorkloadState {
+        classify_exact_inspect(id, output.status.code(), &output.stdout, stdout_truncated)
+    }
+
+    pub(crate) fn classify_exact_inspect_parts(
+        &self,
+        id: &SessionId,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stdout_truncated: bool,
+    ) -> WorkloadState {
+        classify_exact_inspect(id, exit_code, stdout, stdout_truncated)
+    }
+
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
         self.tmux_spec(
             vec![
@@ -137,44 +178,9 @@ impl DurableBackend for TmuxBackend {
     }
 
     fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
-        let id_text = id.to_string();
-        let spec = self.tmux_spec(
-            vec![
-                "list-sessions".to_owned(),
-                "-F".to_owned(),
-                "#{session_name}\t#{session_attached}".to_owned(),
-                "-f".to_owned(),
-                format!("#{{==:#{{session_name}},{id_text}}}"),
-            ],
-            false,
-        )?;
+        let spec = self.inspect_exact_spec(id)?;
         let output = self.output(&spec)?;
-        if output.status.success() {
-            let stdout = match String::from_utf8(output.stdout) {
-                Ok(stdout) => stdout,
-                Err(_) => return Ok(WorkloadState::Unknown),
-            };
-            let line = stdout.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                return Ok(WorkloadState::Missing);
-            }
-            let Some((name, attached)) = line.split_once('\t') else {
-                return Ok(WorkloadState::Unknown);
-            };
-            if name != id_text {
-                return Ok(WorkloadState::Unknown);
-            }
-            return Ok(match attached.parse::<u32>() {
-                Ok(attached) => WorkloadState::Running { attached },
-                Err(_) => WorkloadState::Unknown,
-            });
-        }
-
-        Ok(if output.status.code() == Some(1) {
-            WorkloadState::Missing
-        } else {
-            WorkloadState::Unknown
-        })
+        Ok(self.classify_exact_inspect(id, &output, false))
     }
 
     fn attach_command(&self, id: &SessionId) -> Result<CommandSpec> {
@@ -189,11 +195,44 @@ impl DurableBackend for TmuxBackend {
     }
 
     fn close(&self, id: &SessionId) -> Result<()> {
-        let spec = self.tmux_spec(
-            vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
-            false,
-        )?;
+        let spec = self.close_exact_spec(id)?;
         self.require_success("close", &spec)
+    }
+}
+
+fn classify_exact_inspect(
+    id: &SessionId,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stdout_truncated: bool,
+) -> WorkloadState {
+    if exit_code == Some(0) {
+        if stdout_truncated {
+            return WorkloadState::Unknown;
+        }
+        let Ok(stdout) = std::str::from_utf8(stdout) else {
+            return WorkloadState::Unknown;
+        };
+        let line = stdout.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            return WorkloadState::Missing;
+        }
+        let Some((name, attached)) = line.split_once('\t') else {
+            return WorkloadState::Unknown;
+        };
+        if name != id.to_string() {
+            return WorkloadState::Unknown;
+        }
+        return match attached.parse::<u32>() {
+            Ok(attached) => WorkloadState::Running { attached },
+            Err(_) => WorkloadState::Unknown,
+        };
+    }
+
+    if exit_code == Some(1) {
+        WorkloadState::Missing
+    } else {
+        WorkloadState::Unknown
     }
 }
 

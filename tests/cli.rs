@@ -396,7 +396,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
         .args(["session", "close", SESSION_ID])
         .assert()
         .success()
-        .stdout(predicate::str::contains("closed"));
+        .stdout(format!("closed {SESSION_ID}\n"));
 
     let transcript = fs::read_to_string(log).unwrap();
     assert!(transcript.contains("list-sessions"));
@@ -407,7 +407,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
 }
 
 #[test]
-fn close_unknown_or_failed_running_workload_preserves_active_metadata() {
+fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
     for (name, body) in [
         (
             "unknown",
@@ -435,7 +435,10 @@ fn close_unknown_or_failed_running_workload_preserves_active_metadata() {
 
         let after = fs::read(sandbox.state_file()).unwrap();
         if name == "unknown" {
-            assert_eq!(after, before, "unknown state must remain unchanged");
+            assert_eq!(
+                after, before,
+                "indeterminate inspect must not rewrite state"
+            );
         } else {
             let persisted = String::from_utf8(after).unwrap();
             assert!(

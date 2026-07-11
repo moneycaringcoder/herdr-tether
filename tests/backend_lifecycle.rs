@@ -8,10 +8,12 @@ use std::{
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    lifecycle::{CleanupEligibility, cleanup_eligibility},
+    lifecycle::{
+        CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, cleanup_eligibility,
+    },
     model::{ExternalSessionName, SessionId},
     quote::posix_quote,
-    state::{SessionRecord, SessionStatus},
+    state::{SessionRecord, SessionStatus, State, StateStore},
     tmux::TmuxBackend,
 };
 use tempfile::tempdir;
@@ -52,6 +54,474 @@ fn read_argv(log: &Path) -> Vec<String> {
 
 fn id() -> SessionId {
     "tether-0197f198000070008000000000000001".parse().unwrap()
+}
+
+fn owned_record(status: SessionStatus) -> SessionRecord {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    SessionRecord {
+        id: id(),
+        host: "local".into(),
+        target: "local".into(),
+        directory: "/srv/code".into(),
+        preset: Some("shell".into()),
+        status,
+        created_at: now,
+        last_used_at: now,
+        closed_at: (status == SessionStatus::Closed).then_some(now),
+    }
+}
+
+fn lifecycle_fixture(
+    tmux_body: &str,
+) -> (
+    tempfile::TempDir,
+    StateStore,
+    LifecycleService,
+    std::path::PathBuf,
+) {
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    write_fake(&tmux, &log, tmux_body, 0);
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+    (temp, store, service, log)
+}
+
+#[test]
+fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let lock_path = temp.path().join(".state.json.lock");
+    let observed = temp.path().join("observed");
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    let script = format!(
+        "#!/bin/sh\ncase \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\nflock -n '{lock}' -c true || exit 71\nprintf ok > '{observed}'\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        state = state_path.display(),
+        lock = lock_path.display(),
+        observed = observed.display(),
+        log = log.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let result = service.close_owned(id()).unwrap();
+
+    assert_eq!(result.id, id());
+    assert_eq!(result.workload, ClosedWorkload::Missing);
+    assert_eq!(fs::read_to_string(observed).unwrap(), "ok");
+    let state = store.load().unwrap();
+    let record = &state.sessions[0];
+    assert_eq!(record.status, SessionStatus::Closed);
+    assert_eq!(record.closed_at, Some(record.last_used_at));
+    assert_eq!(
+        read_argv(&log),
+        [
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
+            "-f",
+            "#{==:#{session_name},tether-0197f198000070008000000000000001}",
+        ]
+    );
+}
+
+#[test]
+fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    for (stdout, status, expected_unknown) in [
+        ("malformed", 0, true),
+        ("tether-0197f198000070008000000000000001\t0", 2, false),
+    ] {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let store = StateStore::new(state_path);
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+
+                sessions: vec![owned_record(SessionStatus::Active)],
+            })
+            .unwrap();
+        let before = fs::read(temp.path().join("state.json")).unwrap();
+        let tmux = temp.path().join("tmux");
+        let log = temp.path().join("tmux.args");
+        let script = format!(
+            "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{stdout}'; exit 0;;\nkill-session) printf '\\033]0;spoof\\007close refused' >&2; exit {status};;\nesac\n",
+            log = log.display(),
+        );
+        fs::write(&tmux, script).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let service = LifecycleService::new(
+            store.clone(),
+            ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+        );
+
+        let error = service.close_owned(id()).unwrap_err();
+        assert_eq!(
+            matches!(error, CloseOwnedError::WorkloadUnknown(_)),
+            expected_unknown
+        );
+        let after = fs::read(temp.path().join("state.json")).unwrap();
+        let record = &store.load().unwrap().sessions[0];
+        if expected_unknown {
+            assert_eq!(
+                after, before,
+                "indeterminate inspect must not rewrite state"
+            );
+            assert_eq!(record.status, SessionStatus::Active);
+        } else {
+            assert_eq!(record.status, SessionStatus::Closing);
+            let rendered = format!("{:#}", anyhow::Error::new(error));
+            assert!(!rendered.contains('\u{1b}'));
+            assert!(!rendered.contains("spoof"));
+            assert!(rendered.contains("close refused"));
+        }
+        assert_eq!(record.closed_at, None);
+    }
+}
+
+#[test]
+fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let lock_path = temp.path().join(".state.json.lock");
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    let script = format!(
+        "#!/bin/sh\nflock -n '{lock}' -c true || exit 71\ncase \"$1\" in\nlist-sessions)\n  case \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n  printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session)\n  case \"$(cat '{state}')\" in *'\"status\": \"closing\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        state = state_path.display(),
+        lock = lock_path.display(),
+        log = log.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let result = service.close_owned(id()).unwrap();
+
+    assert_eq!(result.workload, ClosedWorkload::Terminated);
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Closed
+    );
+    let argv = read_argv(&log);
+    assert!(argv.iter().any(|argument| argument == "list-sessions"));
+    assert!(argv.ends_with(&[
+        "kill-session".into(),
+        "-t".into(),
+        "=tether-0197f198000070008000000000000001".into(),
+    ]));
+}
+
+#[test]
+fn owned_close_retries_closing_and_rejects_unknown_or_closed_records() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let (_temp, store, service, _log) = lifecycle_fixture("");
+    store
+        .update(|state| {
+            state.sessions[0].status = SessionStatus::Closing;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        service.close_owned(id()).unwrap().workload,
+        ClosedWorkload::Missing
+    );
+    assert!(matches!(
+        service.close_owned(id()),
+        Err(CloseOwnedError::AlreadyClosed(_))
+    ));
+    assert!(matches!(
+        service.close_owned("tether-0197f198000070008000000000000002".parse().unwrap()),
+        Err(CloseOwnedError::UnknownSession(_))
+    ));
+}
+
+#[test]
+fn owned_close_retry_from_closing_keeps_closing_on_unknown_inspect() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let (_temp, store, service, _log) = lifecycle_fixture("malformed");
+    store
+        .update(|state| {
+            state.sessions[0].status = SessionStatus::Closing;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        service.close_owned(id()),
+        Err(CloseOwnedError::WorkloadUnknown(_))
+    ));
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Closing);
+    assert_eq!(record.closed_at, None);
+}
+
+#[test]
+fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    for remove_record in [false, true] {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let store = StateStore::new(state_path);
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![owned_record(SessionStatus::Active)],
+            })
+            .unwrap();
+        let ready = temp.path().join("ready");
+        let proceed = temp.path().join("proceed");
+        let tmux = temp.path().join("tmux");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+            ready = ready.display(),
+            proceed = proceed.display(),
+        );
+        fs::write(&tmux, script).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let service = LifecycleService::new(
+            store.clone(),
+            ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+        );
+        let worker = std::thread::spawn(move || service.close_owned(id()));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ready.exists(), "close transport did not start");
+        store
+            .update(|state| {
+                if remove_record {
+                    state.sessions.clear();
+                } else {
+                    state.sessions[0].target = "changed.example".into();
+                }
+                Ok(())
+            })
+            .unwrap();
+        fs::write(proceed, "").unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(CloseOwnedError::ConcurrentModification(_))
+        ));
+        let state = store.load().unwrap();
+        if !remove_record {
+            assert_eq!(state.sessions[0].status, SessionStatus::Closing);
+            assert_eq!(state.sessions[0].closed_at, None);
+            assert_eq!(state.sessions[0].target, "changed.example");
+        }
+    }
+}
+
+#[test]
+fn owned_close_accepts_matching_record_already_finalized_by_peer() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let ready = temp.path().join("ready");
+    let proceed = temp.path().join("proceed");
+    let tmux = temp.path().join("tmux");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+        ready = ready.display(),
+        proceed = proceed.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+    let worker = std::thread::spawn(move || service.close_owned(id()));
+    for _ in 0..500 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(ready.exists(), "close transport did not start");
+    let peer_closed_at = Utc.with_ymd_and_hms(2026, 7, 10, 13, 0, 0).unwrap();
+    store
+        .update(|state| {
+            let record = &mut state.sessions[0];
+            record.status = SessionStatus::Closed;
+            record.last_used_at = peer_closed_at;
+            record.closed_at = Some(peer_closed_at);
+            Ok(())
+        })
+        .unwrap();
+    let peer_finalized = store.load().unwrap();
+    fs::write(proceed, "").unwrap();
+
+    assert_eq!(
+        worker.join().unwrap().unwrap().workload,
+        ClosedWorkload::Terminated
+    );
+    assert_eq!(
+        store.load().unwrap(),
+        peer_finalized,
+        "idempotent finalization must not rewrite a peer's closed record"
+    );
+}
+
+#[cfg(unix)]
+fn assert_process_group_gone(pid_path: &Path) {
+    let pid: libc::pid_t = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    for _ in 0..100 {
+        // SAFETY: signal 0 only probes the process group recorded by the test child.
+        let result = unsafe { libc::killpg(pid, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("bounded transport left process group {pid} alive");
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_close_times_out_hanging_inspect_without_mutating_active_record() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path.clone());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let before = fs::read(&state_path).unwrap();
+    let tmux = temp.path().join("tmux");
+    let process_group = temp.path().join("inspect.pgid");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 30 &\nwait\n",
+            process_group.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        service.close_owned(id()),
+        Err(CloseOwnedError::Inspect { .. })
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "inspect transport exceeded its fixed deadline"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), before);
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Active
+    );
+    assert_process_group_gone(&process_group);
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
+    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Active)],
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let process_group = temp.path().join("close.pgid");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
+            process_group.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        service.close_owned(id()),
+        Err(CloseOwnedError::Close { .. })
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "close transport exceeded its fixed deadline"
+    );
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Closing);
+    assert_eq!(record.closed_at, None);
+    assert_process_group_gone(&process_group);
 }
 
 #[test]

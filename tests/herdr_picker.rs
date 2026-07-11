@@ -6,14 +6,15 @@ use herdr_tether::{
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext},
+    lifecycle::CloseOwnedError,
     model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
     },
     tui::{
-        PickerEvent, PickerInput, PickerOptions, PickerOutcome, PickerSelection, PickerStage,
-        PickerState,
+        PickerCloseModal, PickerCloseResult, PickerEvent, PickerInput, PickerOptions,
+        PickerOutcome, PickerSelection, PickerStage, PickerState, format_close_error,
     },
 };
 use tempfile::tempdir;
@@ -680,4 +681,219 @@ fn cancelling_picker_produces_no_selection() {
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let mut picker = PickerState::new(options).unwrap();
     assert_eq!(picker.handle(PickerEvent::Cancel), PickerOutcome::Cancelled);
+}
+
+fn owned_close_picker() -> (PickerState, SessionId, SessionId) {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let ids = options.hosts[0]
+        .workloads
+        .iter()
+        .map(|workload| workload.id)
+        .collect::<Vec<_>>();
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(7);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    (picker, ids[0], ids[1])
+}
+
+#[test]
+fn owned_close_requires_explicit_confirmation_and_pending_close_cannot_be_abandoned() {
+    let (mut picker, selected_id, _) = owned_close_picker();
+
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: selected_id })
+    );
+    assert_eq!(picker.frame_title(), "Confirm close");
+    assert!(picker.footer_text().starts_with("y confirm · n/Esc keep"));
+    assert!(picker.footer_text().contains(&selected_id.to_string()));
+    assert_eq!(
+        picker.handle(PickerEvent::DismissClose),
+        PickerOutcome::Continue
+    );
+    assert!(picker.close_modal().is_none());
+    assert!(!picker.close_busy());
+
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested {
+            id: selected_id,
+            generation: 7,
+        }
+    );
+    assert!(picker.close_busy());
+    assert_eq!(picker.frame_title(), "Closing workload");
+    assert!(picker.footer_text().contains("wait"));
+    assert_eq!(picker.handle(PickerEvent::Cancel), PickerOutcome::Continue);
+    assert_eq!(picker.handle(PickerEvent::Back), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    assert_eq!(
+        picker.handle(PickerEvent::DismissClose),
+        PickerOutcome::Continue
+    );
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::Continue
+    );
+    assert_eq!(picker.handle(PickerEvent::Next), PickerOutcome::Continue);
+}
+
+#[test]
+fn close_is_owned_only_and_cached_status_never_skips_confirmation() {
+    let (mut picker, owned_id, _) = owned_close_picker();
+    assert!(picker.apply_status(StatusMessage::Workload {
+        generation: 7,
+        id: owned_id,
+        status: WorkloadStatus::Missing,
+        checked_at: SystemTime::now(),
+    }));
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: owned_id })
+    );
+    picker.handle(PickerEvent::DismissClose);
+
+    picker.begin_refresh(8);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: owned_id })
+    );
+    picker.handle(PickerEvent::DismissClose);
+
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(picker.close_modal().is_none());
+}
+
+#[test]
+fn close_success_removes_only_exact_row_and_chooses_deterministic_neighbor() {
+    let (mut picker, first_id, second_id) = owned_close_picker();
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested {
+            id: first_id,
+            generation: 7,
+        }
+    );
+    assert!(picker.apply_close_result(PickerCloseResult {
+        id: first_id,
+        generation: 7,
+        error: None,
+    }));
+
+    let labels = picker.resource_labels("build-box").unwrap();
+    assert_eq!(labels.len(), 2);
+    assert!(labels[0].contains("00000001"));
+    assert_eq!(labels[1], "Create new Tether workload");
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { id: second_id })
+    );
+    assert!(!picker.apply_close_result(PickerCloseResult {
+        id: first_id,
+        generation: 7,
+        error: None,
+    }));
+}
+
+#[test]
+fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() {
+    let (mut picker, id, _) = owned_close_picker();
+    picker.handle(PickerEvent::Close);
+    picker.handle(PickerEvent::ConfirmClose);
+    assert!(picker.apply_close_result(PickerCloseResult {
+        id,
+        generation: 7,
+        error: Some("backend\u{1b}[31m failed\nretry".into()),
+    }));
+    assert_eq!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Failed {
+            id,
+            error: "backend failed retry".into(),
+        })
+    );
+    assert_eq!(picker.frame_title(), "Close failed");
+    assert!(picker.footer_text().starts_with("y retry · n/Esc dismiss"));
+    assert!(
+        picker.resource_labels("build-box").unwrap()[0].starts_with("[close failed · c retry]")
+    );
+    picker.handle(PickerEvent::DismissClose);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+
+    picker.handle(PickerEvent::Close);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested { id, generation: 7 }
+    );
+}
+
+#[test]
+fn close_error_formatter_includes_source_chain_and_sanitizes_terminal_text() {
+    let (_, id, _) = owned_close_picker();
+    let text = format_close_error(CloseOwnedError::Inspect {
+        id,
+        source: anyhow::anyhow!("helper\u{1b}[31m source\u{1b}]0;spoof\u{7}\ncause"),
+    });
+
+    assert!(text.starts_with(&format!("inspect session `{id}`")));
+    assert!(text.contains("helper source cause"));
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\n'));
+    assert!(!text.contains("spoof"));
+}
+
+#[test]
+fn refresh_rejects_late_close_generation() {
+    let (mut picker, id, _) = owned_close_picker();
+    picker.handle(PickerEvent::Close);
+    picker.handle(PickerEvent::ConfirmClose);
+    picker.begin_refresh(8);
+    assert!(!picker.apply_close_result(PickerCloseResult {
+        id,
+        generation: 7,
+        error: None,
+    }));
+    assert_eq!(picker.resource_labels("build-box").unwrap().len(), 3);
+}
+
+#[test]
+fn external_and_create_resources_cannot_represent_close_requests() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(3);
+    assert!(picker.apply_status(StatusMessage::Catalog {
+        generation: 3,
+        host: "build-box".into(),
+        status: ExternalCatalogStatus::Available,
+        sessions: vec![ExternalSession {
+            name: "external-only".parse::<ExternalSessionName>().unwrap(),
+            attached: 0,
+        }],
+        hidden_reserved: 0,
+        hidden_unsafe: 0,
+        checked_at: SystemTime::now(),
+    }));
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Next);
+
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(picker.close_modal().is_none());
+    picker.handle(PickerEvent::Next);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(picker.close_modal().is_none());
+    assert!(!picker.close_busy());
 }
