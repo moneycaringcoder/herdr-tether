@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     io,
     path::PathBuf,
@@ -1982,6 +1983,11 @@ impl PickerState {
         }
     }
 
+    fn modal_close_action(&self, id: SessionId) -> PickerCloseAction {
+        self.close_modal_action
+            .unwrap_or_else(|| self.close_action(id))
+    }
+
     fn modal_text(&self) -> Option<String> {
         if let Some(error) = &self.operation_error {
             return Some(format!(
@@ -2006,9 +2012,7 @@ impl PickerState {
             });
         }
         match self.close_modal.as_ref()? {
-            PickerCloseModal::Confirm { id } => match self
-                .close_modal_action
-                .unwrap_or_else(|| self.close_action(*id))
+            PickerCloseModal::Confirm { id } => match self.modal_close_action(*id)
             {
                 PickerCloseAction::Stop => Some(format!(
                     "y confirm · n/Esc keep · Stop exact {id}? Ends its Tether workload."
@@ -2019,7 +2023,7 @@ impl PickerState {
             },
             PickerCloseModal::Failed { id, error } => Some(format!(
                 "y retry · n/Esc dismiss · {} failed: {error}",
-                match self.close_action(*id) {
+                match self.modal_close_action(*id) {
                     PickerCloseAction::Stop => "Stop",
                     PickerCloseAction::Remove => "Remove",
                 }
@@ -2036,11 +2040,11 @@ impl PickerState {
             (Some(PickerPruneModal::Failed { .. }), _, _) => "Prune failed".to_owned(),
             (_, Some(PickerPrunePending::Preview { .. }), _) => "Previewing prune".to_owned(),
             (_, Some(PickerPrunePending::Apply { .. }), _) => "Pruning metadata".to_owned(),
-            (_, _, Some(PickerCloseModal::Confirm { id })) => match self.close_action(*id) {
+            (_, _, Some(PickerCloseModal::Confirm { id })) => match self.modal_close_action(*id) {
                 PickerCloseAction::Stop => "Confirm Stop".to_owned(),
                 PickerCloseAction::Remove => "Confirm Remove".to_owned(),
             },
-            (_, _, Some(PickerCloseModal::Failed { id, .. })) => match self.close_action(*id) {
+            (_, _, Some(PickerCloseModal::Failed { id, .. })) => match self.modal_close_action(*id) {
                 PickerCloseAction::Stop => "Stop failed".to_owned(),
                 PickerCloseAction::Remove => "Remove failed".to_owned(),
             },
@@ -2144,6 +2148,14 @@ impl PickerState {
                 parts.join(" · ")
             }
         }
+    }
+}
+
+fn terminal_safe_text(text: &str) -> Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        Cow::Owned(sanitize_terminal_text(text))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -2671,18 +2683,19 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
         .skip(start)
         .take(max_rows)
         .map(|(index, label)| {
+            let label = terminal_safe_text(label);
             if has_selection && index == selected {
                 Line::from(vec![
                     Span::styled("> ", Style::default().fg(accent)),
                     Span::styled(
-                        *label,
+                        label,
                         Style::default()
                             .fg(selected_text)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
             } else {
-                Line::from(vec![Span::raw("  "), Span::styled(*label, secondary_text)])
+                Line::from(vec![Span::raw("  "), Span::styled(label, secondary_text)])
             }
         })
         .collect();
@@ -3277,6 +3290,38 @@ mod close_render_tests {
         );
     }
 
+    #[test]
+    fn failed_close_retry_keeps_the_confirmed_action_when_status_changes() {
+        let (mut picker, id) = close_picker();
+        assert_eq!(
+            picker.handle(PickerEvent::ConfirmClose),
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop,
+            }
+        );
+        picker.options.hosts[0].workloads[0].status = SessionStatus::Ended;
+
+        assert!(picker.apply_close_result(PickerCloseResult {
+            id,
+            generation: 9,
+            error: Some("transport failed after the workload ended".to_owned()),
+            record: None,
+        }));
+
+        assert_eq!(picker.frame_title(), "Stop failed");
+        assert!(picker.footer_text().contains("Stop failed"));
+        assert_eq!(
+            picker.handle(PickerEvent::ConfirmClose),
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop,
+            }
+        );
+    }
+
     fn prune_preview() -> PrunePreview {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::state::StateStore::new(temp.path().join("state.json"));
@@ -3428,6 +3473,24 @@ mod close_render_tests {
                 .iter()
                 .all(|cell| cell.fg == Color::Reset)
         );
+    }
+
+    #[test]
+    fn rendered_resource_labels_never_emit_terminal_control_sequences() {
+        let (mut picker, _) = close_picker();
+        let unsafe_label = "workload\u{1b}]0;spoof\u{7}\nnext".to_owned();
+        picker.options.hosts[0].workloads[0].label = unsafe_label.clone();
+        picker.options.hosts[0].workloads[0].base_label = unsafe_label;
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+
+        terminal
+            .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("workload next"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains("spoof"));
     }
 
     #[test]
