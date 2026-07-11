@@ -302,9 +302,11 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
     );
     println!("Configured targets: {}", config.hosts.len());
     println!("Prerequisites: Herdr, tmux, SSH, and Cargo must be installed and executable.");
-    println!("Herdr keybindings are not edited automatically.");
-    println!("Suggested binding: plugin_action moneycaringcoder.tether.open");
-    println!("Next: herdr-tether doctor");
+    println!("Herdr keybindings are changed only by the explicit keybinding command.");
+    println!("Binding to install: plugin_action moneycaringcoder.tether.open");
+    println!(
+        "Next: install prefix+t with `herdr-tether setup keybinding`, or run `herdr-tether open` now."
+    );
     Ok(())
 }
 
@@ -329,6 +331,7 @@ fn setup_keybinding(args: KeybindingArgs) -> Result<()> {
             println!("backup: {}", backup.display());
         }
     }
+    println!("Next: press prefix+t in Herdr to open Tether.");
     Ok(())
 }
 
@@ -455,8 +458,9 @@ fn list_hosts(paths: &AppPaths, config: &Config, json: bool) -> Result<()> {
 }
 
 fn check_host(name: &str, target: &str) -> Result<()> {
+    let binaries = ProcessBinaries::new("ssh", "tmux");
     if target == "local" {
-        let output = Command::new("tmux")
+        let output = Command::new(binaries.tmux())
             .arg("-V")
             .output()
             .context("run local tmux version probe")?;
@@ -465,11 +469,12 @@ fn check_host(name: &str, target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let tmux = ssh_probe(target, "tmux -V")?;
+    let tmux = ssh_probe(binaries.ssh(), target, "tmux -V")?;
     require_probe_success("remote tmux", &tmux)?;
     print!("{}", String::from_utf8_lossy(&tmux.stdout));
 
     let herdr = ssh_probe(
+        binaries.ssh(),
         target,
         "command -v herdr >/dev/null 2>&1 && herdr --version",
     )?;
@@ -481,8 +486,8 @@ fn check_host(name: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn ssh_probe(target: &str, remote_command: &str) -> Result<std::process::Output> {
-    Command::new("ssh")
+fn ssh_probe(ssh: &Path, target: &str, remote_command: &str) -> Result<std::process::Output> {
+    Command::new(ssh)
         .args(["-o", "BatchMode=yes", "--", target, remote_command])
         .output()
         .with_context(|| format!("probe SSH target `{target}`"))

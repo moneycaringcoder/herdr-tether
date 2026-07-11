@@ -191,6 +191,30 @@ fn host_commands_persist_explicit_hosts_and_surface_ssh_aliases() {
 }
 
 #[test]
+fn local_host_check_resolves_tmux_outside_restricted_gui_path() {
+    let sandbox = Sandbox::new();
+    let fallback = [
+        "/usr/bin/tmux",
+        "/bin/tmux",
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+    ]
+    .into_iter()
+    .find(|candidate| Path::new(candidate).is_file())
+    .expect("compatibility tests require tmux in a supported fallback location");
+
+    sandbox
+        .command()
+        .env("PATH", sandbox.path("restricted-gui-path"))
+        .args(["host", "check", "local"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tmux "));
+
+    assert!(Path::new(fallback).is_absolute());
+}
+
+#[test]
 fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
     let sandbox = Sandbox::new();
     let plugin_config = sandbox.path("plugin-config");
@@ -208,6 +232,21 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .success()
         .stdout(predicate::str::contains("plugin_action"))
         .stdout(predicate::str::contains("moneycaringcoder.tether.open"));
+
+    let first_config = fs::read(plugin_config.join("config.toml")).unwrap();
+    let first_state = fs::read(plugin_state.join("state.json")).unwrap();
+    sandbox
+        .command()
+        .env("HERDR_PLUGIN_CONFIG_DIR", &plugin_config)
+        .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Next: install prefix+t with `herdr-tether setup keybinding`",
+        ));
+    assert_eq!(fs::read(plugin_config.join("config.toml")).unwrap(), first_config);
+    assert_eq!(fs::read(plugin_state.join("state.json")).unwrap(), first_state);
 
     assert!(plugin_config.join("config.toml").exists());
     assert!(plugin_state.join("state.json").exists());
@@ -244,7 +283,10 @@ fn keybinding_setup_and_rollback_are_explicit_and_reload_after_writes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("prefix+t"))
-        .stdout(predicate::str::contains("moneycaringcoder.tether.open"));
+        .stdout(predicate::str::contains("moneycaringcoder.tether.open"))
+        .stdout(predicate::str::contains(
+            "Next: press prefix+t in Herdr to open Tether",
+        ));
     assert!(
         fs::read_to_string(&herdr_config)
             .unwrap()
@@ -925,7 +967,8 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
         .stdout(predicate::str::contains("Cargo"))
         .stdout(predicate::str::contains("Herdr"))
         .stdout(predicate::str::contains("plugin_action"))
-        .stdout(predicate::str::contains("herdr-tether doctor"));
+        .stdout(predicate::str::contains("herdr-tether setup keybinding"))
+        .stdout(predicate::str::contains("herdr-tether open"));
 
     assert_eq!(fs::read_to_string(herdr_config).unwrap(), "# unchanged\n");
 }
