@@ -206,7 +206,7 @@ closed_days = 30
     fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();
     let argv = sandbox.path("tmux.argv");
     sandbox.install("tmux", &format!(
-        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external\\t0\\ntether-0197f198000070008000000000000001\\t2\\na-external\\t1\\n'",
+        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external:0\\ntether-0197f198000070008000000000000001:2\\na-external:1\\n'",
         argv.display()
     ));
 

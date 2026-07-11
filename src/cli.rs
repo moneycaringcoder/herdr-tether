@@ -1,5 +1,10 @@
 use std::{
-    env, path::PathBuf, process::Command, sync::atomic::AtomicBool, time::Duration as StdDuration,
+    env,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::AtomicBool,
+    time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +14,10 @@ use serde::Serialize;
 
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries},
-    config::{CommandPreset, Config, ConfigStore, HostConfig},
+    config::{
+        CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
+        HostConfig,
+    },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
     lifecycle::{LifecycleService, PruneError, PruneService},
@@ -20,7 +28,10 @@ use crate::{
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
-    tui::{OpenSelection, PickerHostOrigin, PickerOptions, PickerSelection, run_picker},
+    tui::{
+        OpenSelection, PickerHostOrigin, PickerOptions, PickerSelection,
+        run_picker_with_operation_error,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -68,6 +79,21 @@ struct SetupArgs {
     /// Accept defaults without prompting.
     #[arg(long)]
     yes: bool,
+    #[command(subcommand)]
+    command: Option<SetupCommand>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum SetupCommand {
+    /// Install or roll back the prefix+t Tether plugin-action binding.
+    Keybinding(KeybindingArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct KeybindingArgs {
+    /// Restore the exact config saved by the keybinding installer.
+    #[arg(long)]
+    rollback: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -138,6 +164,7 @@ enum PlacementArg {
     SplitRight,
     SplitDown,
     NewTab,
+    ReplaceCurrentPane,
 }
 
 impl From<PlacementArg> for Placement {
@@ -146,6 +173,7 @@ impl From<PlacementArg> for Placement {
             PlacementArg::SplitRight => Self::SplitRight,
             PlacementArg::SplitDown => Self::SplitDown,
             PlacementArg::NewTab => Self::NewTab,
+            PlacementArg::ReplaceCurrentPane => Self::ReplaceCurrentPane,
         }
     }
 }
@@ -155,6 +183,7 @@ fn placement_name(placement: Placement) -> &'static str {
         Placement::SplitRight => "split-right",
         Placement::SplitDown => "split-down",
         Placement::NewTab => "new-tab",
+        Placement::ReplaceCurrentPane => "replace-current-pane",
     }
 }
 
@@ -203,7 +232,10 @@ pub fn run() -> Result<()> {
 
 fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
     match command {
-        TopLevel::Setup(args) => setup(paths, args),
+        TopLevel::Setup(args) => match args.command.clone() {
+            Some(SetupCommand::Keybinding(keybinding)) => setup_keybinding(keybinding),
+            None => setup(paths, args),
+        },
         TopLevel::Host { command } => host_command(paths, command),
         TopLevel::Open(args) => open(paths, args),
         TopLevel::Snapshot(args) => snapshot(paths, args),
@@ -272,6 +304,65 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
     println!("Suggested binding: plugin_action moneycaringcoder.tether.open");
     println!("Next: herdr-tether doctor");
     Ok(())
+}
+
+fn setup_keybinding(args: KeybindingArgs) -> Result<()> {
+    let path = HerdrKeybindingStore::path_from_env()?;
+    let store = HerdrKeybindingStore::new(path.clone());
+    if args.rollback {
+        store.rollback()?;
+        reload_herdr_config(&path, None)?;
+        println!("restored Herdr config from the Tether keybinding backup");
+        return Ok(());
+    }
+
+    match store.install()? {
+        HerdrKeybindingInstall::AlreadyInstalled => {
+            reload_herdr_config(&path, None)?;
+            println!("Herdr prefix+t is already bound to moneycaringcoder.tether.open");
+        }
+        HerdrKeybindingInstall::Installed { backup } => {
+            reload_herdr_config(&path, Some(backup.clone()))?;
+            println!("installed Herdr prefix+t binding for moneycaringcoder.tether.open");
+            println!("backup: {}", backup.display());
+        }
+    }
+    Ok(())
+}
+
+fn reload_herdr_config(config: &Path, backup: Option<PathBuf>) -> Result<()> {
+    let executable = env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let status = Command::new(&executable)
+        .args(["server", "reload-config"])
+        .status()
+        .with_context(|| {
+            format!(
+                "Herdr config at `{}` was updated but reload could not be started{}",
+                config.display(),
+                rollback_diagnostic(backup.as_deref())
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "Herdr config at `{}` was updated but reload failed with status {}{}",
+            config.display(),
+            status,
+            rollback_diagnostic(backup.as_deref())
+        );
+    }
+    Ok(())
+}
+
+fn rollback_diagnostic(backup: Option<&Path>) -> String {
+    backup.map_or_else(
+        || "; rerun `herdr server reload-config` when the server is available".to_owned(),
+        |backup| {
+            format!(
+                "; rollback remains available with `herdr-tether setup keybinding --rollback` from backup `{}`",
+                backup.display()
+            )
+        },
+    )
 }
 
 fn stdio_is_terminal() -> bool {
@@ -421,16 +512,37 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     let complete = args.host.is_some()
         && args.directory.is_some()
         && (args.command.is_some() || args.preset.is_some());
-    let selection = if complete {
-        PickerSelection::Create(selection_from_args(&config, &aliases, args)?)
-    } else {
-        let state = state_store.load()?;
-        selection_from_picker(&config, &aliases, &state_store, &state, args)?
-            .context("session selection was cancelled")?
-    };
+    if complete {
+        let selection = PickerSelection::Create(selection_from_args(&config, &aliases, args)?);
+        return execute_selection(paths, &config, selection);
+    }
 
+    let mut operation_error = None;
+    loop {
+        let state = state_store.load()?;
+        let Some(selection) = selection_from_picker(
+            &config,
+            &aliases,
+            &state_store,
+            &state,
+            args.clone(),
+            operation_error.take(),
+        )?
+        else {
+            return Ok(());
+        };
+        match execute_selection(paths, &config, selection.clone()) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                operation_error = Some((selection, format!("{error:#}")));
+            }
+        }
+    }
+}
+
+fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelection) -> Result<()> {
     match selection {
-        PickerSelection::Create(selection) => create_and_attach(paths, &config, selection),
+        PickerSelection::Create(selection) => create_and_attach(paths, config, selection),
         PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
         PickerSelection::AttachExternal {
             target,
@@ -467,6 +579,7 @@ fn selection_from_picker(
     state_store: &StateStore,
     state: &State,
     args: OpenArgs,
+    operation_error: Option<(PickerSelection, String)>,
 ) -> Result<Option<PickerSelection>> {
     let requested_host = args.host.as_deref();
     let mut picker_config = config.clone();
@@ -508,13 +621,14 @@ fn selection_from_picker(
     let lifecycle_service =
         LifecycleService::new(state_store.clone(), ProcessBinaries::new("ssh", "tmux"));
     let prune_service = PruneService::new(state_store.clone());
-    let Some(selection) = run_picker(
+    let Some(selection) = run_picker_with_operation_error(
         options,
         status_service,
         discovery_service,
         lifecycle_service,
         prune_service,
         config.retention.closed_days,
+        operation_error,
     )?
     else {
         return Ok(None);
@@ -608,14 +722,35 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         };
     }
 
-    println!("created {id}");
     if env::var_os("HERDR_BIN_PATH").is_some() {
-        let context = HerdrContext::from_env()?;
-        let executable = env::current_exe().context("locate the Tether executable")?;
-        let resume = resume_command(executable, id);
-        HerdrClient::new(context).place(&resume, selection.placement)?;
+        let placement_result = (|| {
+            let context = HerdrContext::from_env()?;
+            let executable = env::current_exe().context("locate the Tether executable")?;
+            let resume = resume_command(executable, id);
+            place_in_herdr(HerdrClient::new(context), &resume, selection.placement)
+        })();
+        if let Err(error) = placement_result {
+            if let Err(cleanup_error) = backend.close(&id) {
+                return Err(error).context(format!(
+                    "place newly created session `{id}`; rollback close also failed: {cleanup_error:#}; the workload remains recorded and may still be running"
+                ));
+            }
+            if let Err(cleanup_error) = store.update(|state| {
+                state.sessions.retain(|record| record.id != id);
+                Ok(())
+            }) {
+                return Err(error).context(format!(
+                    "place newly created session `{id}`; workload rollback succeeded but metadata cleanup failed: {cleanup_error:#}"
+                ));
+            }
+            return Err(error).context(format!(
+                "place newly created session `{id}`; the failed workload was rolled back"
+            ));
+        }
+        println!("created {id}");
         Ok(())
     } else {
+        println!("created {id}");
         run_attach(backend.attach_command(&id)?)
     }
 }
@@ -624,7 +759,7 @@ fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> R
         let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
         let resume = resume_command(executable, id);
-        HerdrClient::new(context).place(&resume, placement)?;
+        place_in_herdr(HerdrClient::new(context), &resume, placement)?;
         Ok(())
     } else {
         session_command(paths, SessionCommand::Resume { id })
@@ -665,12 +800,47 @@ fn attach_external(
         let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
         let attach = external_attach_command(executable, &target, &name);
-        HerdrClient::new(context).place(&attach, placement)?;
+        place_in_herdr(HerdrClient::new(context), &attach, placement)?;
         Ok(())
     } else {
         let backend = backend_for(&target)?;
         run_attach(backend.attach_external_command(&name)?)
     }
+}
+
+fn place_in_herdr(client: HerdrClient, command: &CommandSpec, placement: Placement) -> Result<()> {
+    if placement != Placement::ReplaceCurrentPane {
+        client.place(command, placement)?;
+        return Ok(());
+    }
+
+    let inspection = client.inspect_replacement_source()?;
+    if inspection.requires_confirmation() {
+        if !stdio_is_terminal() {
+            bail!(
+                "Replace current pane would terminate {}; an interactive confirmation is required and the source pane was preserved",
+                inspection.safe_summary()
+            );
+        }
+        print!(
+            "Replace current pane will terminate {}. Continue? [y/N] ",
+            inspection.safe_summary()
+        );
+        io::stdout()
+            .flush()
+            .context("show replacement confirmation")?;
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .context("read replacement confirmation")?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            bail!("Replace current pane was cancelled; the source pane was preserved");
+        }
+    }
+    if let Some(warning) = client.replace_current(command)?.warning {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
 }
 
 fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
@@ -695,29 +865,47 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             Ok(())
         }
         SessionCommand::Resume { id } => {
-            let attach = store.update(|state| {
-                let record = state
+            let record = store
+                .load()?
+                .sessions
+                .into_iter()
+                .find(|record| record.id == id)
+                .with_context(|| format!("unknown session `{id}`"))?;
+            match record.status {
+                SessionStatus::Active => {}
+                SessionStatus::Closing => bail!("session `{id}` is closing; retry close"),
+                SessionStatus::Closed => bail!("session `{id}` is closed"),
+            }
+            let backend = backend_for(&record.target)?;
+            match backend.inspect(&id)? {
+                crate::backend::WorkloadState::Running { .. } => {}
+                crate::backend::WorkloadState::Missing => {
+                    bail!("session `{id}` no longer exists")
+                }
+                crate::backend::WorkloadState::Unknown => {
+                    bail!("could not determine whether session `{id}` exists")
+                }
+            }
+            let attach = backend.attach_command(&id)?;
+            store.update(|state| {
+                let current = state
                     .sessions
                     .iter_mut()
-                    .find(|record| record.id == id)
-                    .with_context(|| format!("unknown session `{id}`"))?;
-                match record.status {
-                    SessionStatus::Active => {}
-                    SessionStatus::Closing => bail!("session `{id}` is closing; retry close"),
-                    SessionStatus::Closed => bail!("session `{id}` is closed"),
+                    .find(|current| current.id == id)
+                    .with_context(|| {
+                        format!("session `{id}` disappeared while preparing resume")
+                    })?;
+                if current.target != record.target {
+                    bail!("session `{id}` target changed while preparing resume");
                 }
-                let backend = backend_for(&record.target)?;
-                match backend.inspect(&id)? {
-                    crate::backend::WorkloadState::Running { .. } => {}
-                    crate::backend::WorkloadState::Missing => {
-                        bail!("session `{id}` no longer exists")
+                match current.status {
+                    SessionStatus::Active => current.last_used_at = Utc::now(),
+                    SessionStatus::Closing => {
+                        bail!("session `{id}` began closing while preparing resume")
                     }
-                    crate::backend::WorkloadState::Unknown => {
-                        bail!("could not determine whether session `{id}` exists")
-                    }
+                    SessionStatus::Closed => bail!("session `{id}` closed while preparing resume"),
                 }
-                record.last_used_at = Utc::now();
-                backend.attach_command(&id)
+                Ok(())
             })?;
             run_attach(attach)
         }
@@ -819,8 +1007,9 @@ fn doctor(paths: &AppPaths) -> Result<()> {
         }
     }
 
-    failures += usize::from(!report_binary("tmux", &["-V"]));
-    failures += usize::from(!report_binary("ssh", &["-V"]));
+    let binaries = ProcessBinaries::new("ssh", "tmux");
+    failures += usize::from(!report_binary_path(binaries.tmux().to_owned(), &["-V"]));
+    failures += usize::from(!report_binary_path(binaries.ssh().to_owned(), &["-V"]));
     failures += usize::from(!report_binary("cargo", &["--version"]));
 
     let herdr = env::var_os("HERDR_BIN_PATH")

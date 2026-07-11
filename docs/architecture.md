@@ -2,7 +2,7 @@
 
 ## Purpose and invariants
 
-Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.2.0 the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
+Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.2.1 the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
 
 The implementation preserves these invariants:
 
@@ -65,14 +65,16 @@ This trait owns durable workload lifecycle only. It does not own configuration, 
 
 ### `TmuxBackend`
 
-`src/tmux.rs` is the sole `DurableBackend` implementation in v0.2.0. Its location is either local or one validated explicit SSH target.
+`src/tmux.rs` is the sole `DurableBackend` implementation in v0.2.1. Its location is either local or one validated explicit SSH target running tmux 3.3 or newer.
 
 Local operations execute `tmux` with separated argv. Remote operations build one POSIX-quoted remote `tmux` command and pass it to OpenSSH after `--`:
 
-- create: detached `tmux new-session`, exact generated name, selected directory, then `/bin/sh -lc <command>`;
+- create: detached `tmux new-session`, exact generated name, selected directory, then a `/bin/sh -lc` login environment followed by an explicit `cd` back to the selected directory and `/bin/sh -c <command>`;
 - inspect: exact-name-filtered `tmux list-sessions` output with the attached-client count;
 - attach: `tmux attach-session` for the exact target;
 - close: `tmux kill-session` for the exact target.
+
+Bare `tmux` and `ssh` names are resolved first through absolute `PATH` entries, then through `/usr/bin`, `/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`, covering GUI launches whose environment omits Homebrew or standard binary directories while preferring system tools. Create captures tmux's internal `$session` and `%pane` identities, verifies that the pane cwd is the selected directory or the same directory inode, then enables `mouse on` for that exact `$session`. A cwd mismatch or mouse-setup failure triggers exact-session rollback. Owned resume resolves the `$session` through an exact-name filter and re-enables that session-scoped option; external attach never mutates tmux options.
 
 External attachment is an inherent, non-destructive `TmuxBackend` operation rather than part of `DurableBackend`: it accepts only `ExternalSessionName` and emits `attach-session -t =<name>`. `ExternalSessionName` accepts bounded printable ASCII only and rejects empty, leading-`$`, tmux-delimiter, and reserved `tether-*` values. Leading `$` is excluded because tmux resolves server session IDs before exact-name matching. The owned trait remains the only API with create/inspect/close.
 
@@ -113,9 +115,12 @@ Schema version 1 is deterministic presentation data: explorer host precedence; s
 - create and focus a tab, then extract its returned root pane ID from `tab_created`;
 - run one POSIX-quoted `CommandSpec` in the newly returned pane; Herdr 0.7.3 reports successful `pane run` with empty stdout;
 - remove inherited `HERDR_BIN_PATH` from the placed command so Tether attaches in that pane instead of recursively placing another pane, while forwarding authoritative plugin config/state directories;
-- validate every JSON-returning Herdr result type and returned pane identity.
+- validate every JSON-returning Herdr result type and returned pane identity;
+- implement Replace current pane by inspecting the captured source's foreground processes, creating a right-split destination, dispatching the exact command, polling until foreground-process readiness, and only then closing that exact source pane.
 
-`HerdrClient` never creates, inspects, or kills the durable workload. Conversely, `TmuxBackend` knows nothing about Herdr panes. The CLI is the orchestration layer joining these boundaries.
+`HerdrClient` never creates, inspects, or kills the durable workload. Conversely, `TmuxBackend` knows nothing about Herdr panes. The CLI joins these boundaries and passes its resolved current executable into placed resume/attach commands, so GUI or Homebrew launch environments do not depend on a pane-local `PATH`.
+
+Replacement requires interactive confirmation when source foreground processes would be terminated; a non-interactive request refuses and preserves the source. Cancellation also preserves it. Dispatch or readiness failure closes the empty or failed destination and preserves the source, reporting whether destination cleanup succeeded. If the final source close fails, the verified destination remains running and the error identifies both panes. Foreground-process readiness is the strongest evidence Herdr 0.7.3 exposes; it proves a process was launched, not a protocol-level remote tmux attachment handshake.
 
 ### Configuration, state, and discovery
 
@@ -124,6 +129,10 @@ Schema version 1 is deterministic presentation data: explorer host precedence; s
 `sshcfg` discovers only literal OpenSSH `Host` aliases for picker/list use. OpenSSH itself still interprets the selected alias and the rest of its configuration. An alias is synthesized as an ephemeral host option; it is not copied into Tether config.
 
 `State` is metadata, not a process registry. Each record retains the resolved target so removing a host configuration does not make an existing record unaddressable. Active records are not automatically reconciled when a workload vanishes.
+
+`HerdrKeybindingStore` is an explicit, advisory-locked integration path rather than install-time mutation. `setup keybinding` parses the Herdr config, refuses competing `prefix+t` definitions without displaying commands, treats the identical action as an idempotent no-op, validates the merged TOML, saves an exact sibling backup, atomically appends the action without changing an existing parent-directory mode, preserves file permissions, and requests `herdr server reload-config`. `--rollback` refuses to overwrite later edits, restores the exact backup, consumes it, and reloads. A matching stale backup from an interrupted attempt is safely replaced; invalid/unmergeable config, unrelated backups, and conflicts leave the source untouched.
+
+Herdr 0.7.3 has no generic plugin-action menu, so Tether cannot provide a zero-command first invocation without automatic install-time mutation. The manifest's explicitly invoked setup action is the one-time bootstrap: it initializes Tether's private stores, then runs the same keybinding transaction. Plain standalone setup and normal install/open remain non-mutating.
 
 ## Picker and placement boundary
 
@@ -142,6 +151,10 @@ The terminal loop polls input at 50 ms while draining status/catalog, repository
 
 Placement is meaningful only when Herdr context is available. In an ordinary terminal attachment happens in that terminal. In Herdr, placement focuses the requested split/tab and starts either exact-ID owned resume or the narrow exact external attach command. External attachment reads no state and invokes no lifecycle mutation. All tmux sessions remain independent of the Herdr view.
 
+Placement offers split right, split down, new tab, and Replace current pane. Replacement follows the confirmation, destination-first readiness, source-preservation, and cleanup ordering described above.
+
+A create, resume, external-attach, or placement failure becomes a sanitized, bounded, stable operation-error modal retaining the exact attempted selection. Only Enter retries that selection. Backspace or Esc dismisses the error and returns to Hosts; navigation, refresh, and other keys cannot accidentally retry it.
+
 ## Lifecycle and failure semantics
 
 ### Create
@@ -153,7 +166,7 @@ Placement is meaningful only when Herdr context is available. In an ordinary ter
 5. If save fails, best-effort `close` the just-created backend session. If rollback also fails, report both failures and the exact ID of the workload that may remain.
 6. Attach directly or place a Herdr resume command.
 
-A failure in step 6 leaves the workload and active metadata intact by design.
+A create-placement failure rolls back the exact newly created workload and metadata so Retry cannot duplicate it. Resume/external placement failures leave existing workloads untouched. A replacement source-close failure is a visible warning because the destination and workload are already verified running.
 
 ### Resume
 
@@ -180,13 +193,15 @@ Security is deliberately delegated at clear boundaries:
 - Tether validates targets, preserves argv, and quotes at the remote shell/Herdr command-line boundaries;
 - `tmux` owns workload durability;
 - Herdr owns local plugin context and pane creation;
-- `/bin/sh -lc` executes user-configured commands, which are trusted code rather than sandboxed data.
+- a login `/bin/sh -lc` loads the selected machine's command environment, then Tether restores the selected cwd and `/bin/sh -c` executes user-configured trusted code rather than sandboxed data.
 
 ## Current release boundary
 
-Version 0.2.0 implements only local and SSH-backed `TmuxBackend` workloads. Native remote Herdr federation, remote pane streaming, remote workspace identity, and backend capability negotiation are outside the current contract. The existing `DurableBackend` boundary avoids coupling durable workload lifecycle to local Herdr pane placement without claiming support for another backend.
+Version 0.2.1 implements only local and SSH-backed `TmuxBackend` workloads. Native remote Herdr federation, remote pane streaming, remote workspace identity, and backend capability negotiation are outside the current contract. The existing `DurableBackend` boundary avoids coupling durable workload lifecycle to local Herdr pane placement without claiming support for another backend.
 
-Herdr integration requires version 0.7.3 or newer. Plugin actions open the manifest-declared terminal overlay; after selection, Tether places the exact resume or external-attach command into a focused right split, down split, or new tab. The overlay is an intentional consequence of Herdr's current plugin UI surface, not the durable workload itself.
+Herdr integration requires version 0.7.3 or newer. Plugin actions open a manifest-declared terminal overlay; after selection, Tether places the exact resume or external-attach command into a focused right split, down split, new tab, or destination-first replacement. Titled Tether panes are the honest presentation fallback.
+
+Herdr 0.7.3 publicly exposes semantic `pane report-agent`, `report-agent-session`, `release-agent`, and `report-metadata` APIs. Those calls assert a known agent's lifecycle or session identity; they are not a generic nested-workload or sidebar registration protocol. Tether knows the outer tmux ID, host, directory, and attach lifetime, but cannot truthfully infer the lifecycle or native session identity of nested OMP or Hermes processes. Tmux detach is not agent completion, one pane has only one effective agent session, and Herdr preserves native identity fields only for recognized source/agent pairs. Tether therefore does not impersonate native hooks or fabricate sidebar/Agents support; an inner native hook must report its own lifecycle.
 
 ## Design influence
 

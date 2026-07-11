@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### v0.2.1 release candidate
+
+### Added
+
+- Added explicit `setup keybinding` and `--rollback` commands for an idempotent, backed-up `prefix+t` binding with conflict refusal, merged-TOML validation, later-edit protection, reusable rollback, and Herdr config reload.
+- Added Replace current pane with foreground-process confirmation, destination-first readiness checks, source preservation on pre-close failure, and explicit destination cleanup reporting.
+
+### Changed
+
+- Tether now resolves executables for reduced-path GUI/Homebrew launches, verifies the exact created tmux cwd, enables mouse only for owned sessions, and keeps failed explorer operations stable until Enter retries or Backspace/Esc cancels.
+- Workloads retain their login-shell command environment, then explicitly restore and inode-verify the selected local/remote directory before success.
+
+### Limitations
+
+- Tether requires tmux 3.3 or newer locally and on remote targets.
+- Herdr 0.7.3 requires one explicit **Install prefix+t launcher** action because it has no generic plugin-action menu. Normal plugin install/open and plain standalone setup remain non-mutating.
+- Herdr's semantic agent-report APIs cannot truthfully represent a nested OMP or Hermes lifecycle from Tether's outer tmux identity. Tether uses titled panes and does not claim native sidebar or Agents integration.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added
@@ -27,7 +45,7 @@
 ### Limitations
 
 - Remote workloads remain SSH-backed `tmux`; Tether does not provide native remote Herdr federation or pane streaming.
-- Herdr 0.7.3 exposes plugin interaction through a terminal overlay rather than a native sidebar or non-terminal plugin panel.
+- Herdr 0.7.3 provides semantic agent-report APIs, but Tether cannot infer a nested agent lifecycle or native session identity from an outer tmux session; titled Tether panes remain the honest fallback.
 - External sessions remain intentionally outside Tether ownership and lifecycle management.
 
 ## [0.1.0] - 2026-07-10
