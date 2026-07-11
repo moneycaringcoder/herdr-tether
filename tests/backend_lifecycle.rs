@@ -758,6 +758,8 @@ fn owned_resume_enables_mouse_but_external_attach_never_mutates_options() {
         attach_argv[5],
         "set-option -t $7 mouse on ; attach-session -t $7"
     );
+    assert!(attach_argv[6].contains("TETHER_OWNERSHIP_GUARD_REJECTED"));
+    assert!(attach_argv[6].contains("exit 75"));
 
     let external = "work".parse::<ExternalSessionName>().unwrap();
     let command = backend.attach_external_command(&external).unwrap();

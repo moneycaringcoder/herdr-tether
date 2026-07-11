@@ -215,7 +215,9 @@ impl TmuxBackend {
                 "-F".to_owned(),
                 condition,
                 guarded_command,
-                format!("display-message -p {OWNERSHIP_GUARD_REJECTED}"),
+                format!(
+                    "display-message -p {OWNERSHIP_GUARD_REJECTED} ; run-shell 'exit 75'"
+                ),
             ],
             interactive,
         )

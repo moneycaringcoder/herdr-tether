@@ -763,7 +763,7 @@ mod tests {
                 "-F".to_owned(),
                 "#{&&:proof-and-identity}".to_owned(),
                 "set-option -t $7 mouse on ; attach-session -t $7".to_owned(),
-                "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED".to_owned(),
+                "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'".to_owned(),
             ],
         );
         let external = CommandSpec::new(
@@ -789,7 +789,7 @@ mod tests {
                     "-F",
                     "#{&&:proof-and-identity}",
                     "set-option -t $7 mouse on ; attach-session -t $7",
-                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED",
+                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'",
                 ],
             ),
             &owned,
@@ -821,7 +821,7 @@ mod tests {
                     "-F",
                     "#{&&:proof-and-identity}",
                     "set-option -t $8 mouse on ; attach-session -t $8",
-                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED",
+                    "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'",
                 ],
             ),
             &owned,
