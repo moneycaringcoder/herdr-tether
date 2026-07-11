@@ -2,7 +2,7 @@
 
 ## Purpose and invariants
 
-Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.1 the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
+Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.2.0 the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
 
 The implementation preserves these invariants:
 
@@ -15,7 +15,7 @@ The implementation preserves these invariants:
 7. every attachment uses an exact tmux target derived from either an owned `SessionId` or a validated non-Tether external name;
 8. external sessions are cataloged and attached only; their type has no create, persist, rename, close, kill, or prune operation.
 
-Version 0.1 remote support is ordinary OpenSSH transport to remote `tmux`. It is not native remote Herdr federation.
+Remote support is ordinary OpenSSH transport to remote `tmux`. It is not native remote Herdr federation.
 
 ## Runtime flow
 
@@ -65,7 +65,7 @@ This trait owns durable workload lifecycle only. It does not own configuration, 
 
 ### `TmuxBackend`
 
-`src/tmux.rs` is the only v0.1 `DurableBackend` implementation. Its location is either local or one validated explicit SSH target.
+`src/tmux.rs` is the sole `DurableBackend` implementation in v0.2.0. Its location is either local or one validated explicit SSH target.
 
 Local operations execute `tmux` with separated argv. Remote operations build one POSIX-quoted remote `tmux` command and pass it to OpenSSH after `--`:
 
@@ -182,49 +182,11 @@ Security is deliberately delegated at clear boundaries:
 - Herdr owns local plugin context and pane creation;
 - `/bin/sh -lc` executes user-configured commands, which are trusted code rather than sandboxed data.
 
-## Capability evidence and manual boundaries
+## Current release boundary
 
-Automated tests exercise parsing/state, locked migrations/concurrency, host/repository/external discovery, bounded process cleanup, exact local/SSH argv, lifecycle recovery, actual Herdr 0.7.3 split/tab/run success and stderr-error contracts, invoking-context validation, exact placed-command environment forwarding, returned-identity mismatch rejection, explorer transitions, status generations, exact current/retained host-target grouping, host-scoped filtering, Active/Closing/Closed action gating, authoritative close reconciliation, stable close/prune selection, confirmed close/prune, and scriptable snapshot collection. Snapshot coverage includes schema/legacy compatibility, host-origin precedence, deterministic joins, typed partial states, retained removed/retargeted targets, wrong-target exclusion, state/config immutability, output privacy, bounded cancellation, and process-tree cleanup. The current run passed the complete automated suite and a locked release build.
+Version 0.2.0 implements only local and SSH-backed `TmuxBackend` workloads. Native remote Herdr federation, remote pane streaming, remote workspace identity, and backend capability negotiation are outside the current contract. The existing `DurableBackend` boundary avoids coupling durable workload lifecycle to local Herdr pane placement without claiming support for another backend.
 
-Live verification covered Herdr 0.7.3 development link, action list, and unlink. A strict-BatchMode SSH run from Hermes to `dev` exercised remote create, real-TTY attach, detach, same-PID counter continuity, resume, exact close, and prune isolation with an unrelated `tmux` session retained.
-
-The same strict-BatchMode run verified a directory containing spaces and literal shell metacharacters without creating an injected sentinel. A separate real-TTY run on Hermes verified the equivalent local create/attach/detach/resume/close lifecycle and unrelated-session isolation. Current-branch live Herdr 0.7.3 verification exposed and then covered installed-pane executable resolution, actual CLI response shapes, invoking-pane targeting, plugin-state forwarding, recursion prevention, focused right/down splits, focused new-tab root placement, attachment in the returned pane, and view-close durability. Mixed local/remote coexistence, picker Esc state immutability, setup's non-modification of Herdr config, and macOS live lifecycle remain acceptance checks. CI runs the complete Rust gates on Ubuntu 24.04 and macOS 14. Reproducible steps are maintained in the README's verification sections.
-
-## Future native federation path
-
-A future `RemoteHerdrBackend` should implement `DurableBackend`; it should not grow transport conditionals inside `HerdrClient` or replace state persistence with pane state. That backend would translate the same create/inspect/attach-command/close lifecycle into authenticated remote Herdr operations. Native federation additionally requires contracts that v0.1 does not have:
-
-- remote Herdr identity and trust establishment;
-- capability/version negotiation;
-- stable remote workload and workspace identifiers;
-- attachment semantics that can still produce a local `CommandSpec` or a deliberately revised backend interface;
-- precise timeout, partition, retry, and idempotency behavior;
-- reconciliation rules for local metadata versus remote truth.
-
-The likely selection/orchestration shape is:
-
-```mermaid
-flowchart TD
-    Selection[resolved host/backend selection] --> Factory[backend factory]
-    Factory --> LocalTmux[TmuxBackend: local]
-    Factory --> SshTmux[TmuxBackend: SSH tmux]
-    Factory --> Native[RemoteHerdrBackend: future]
-    LocalTmux --> Contract[DurableBackend lifecycle]
-    SshTmux --> Contract
-    Native --> Contract
-    Contract --> State[existing lifecycle + StateStore]
-    State --> Placement[local HerdrClient placement]
-```
-
-No `RemoteHerdrBackend` exists today. Naming it here is an architectural path, not a compatibility or delivery promise.
-
-## Roadmap
-
-1. Complete native Herdr placement, cancellation/config-integrity, and macOS live acceptance checks.
-2. Define native federation identity, capabilities, lifecycle, and failure semantics before changing the backend trait.
-3. Implement and test `RemoteHerdrBackend` only after those contracts are stable.
-4. Add explicit operator-driven reconciliation for missing active workloads without weakening conservative pruning.
-5. Expand release/distribution and Linux/macOS live matrices.
+Herdr integration requires version 0.7.3 or newer. Plugin actions open the manifest-declared terminal overlay; after selection, Tether places the exact resume or external-attach command into a focused right split, down split, or new tab. The overlay is an intentional consequence of Herdr's current plugin UI surface, not the durable workload itself.
 
 ## Design influence
 
