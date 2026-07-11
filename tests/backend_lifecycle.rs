@@ -12,7 +12,8 @@ use fs2::FileExt;
 use herdr_tether::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     lifecycle::{
-        CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, cleanup_eligibility,
+        CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, PruneError,
+        PruneService, cleanup_eligibility,
     },
     model::{ExternalSessionName, SessionId},
     quote::posix_quote,
@@ -806,6 +807,21 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         cleanup_eligibility(&record, WorkloadState::Unknown, now, Duration::days(7)),
         CleanupEligibility::KeepUnknown
     );
+    assert_eq!(
+        cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
+        CleanupEligibility::KeepActive
+    );
+    record.status = SessionStatus::Closing;
+    assert_eq!(
+        cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
+        CleanupEligibility::KeepActive
+    );
+    record.status = SessionStatus::Closed;
+    assert_eq!(
+        cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
+        CleanupEligibility::KeepRecent,
+        "closed metadata without closed_at is retained conservatively"
+    );
     record.status = SessionStatus::Closed;
     record.closed_at = Some(now - Duration::days(1));
     assert_eq!(
@@ -827,6 +843,208 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         CleanupEligibility::KeepActive,
         "prune must not kill a workload that still exists"
     );
+}
+
+fn prune_record(
+    id: &str,
+    status: SessionStatus,
+    closed_at: Option<chrono::DateTime<Utc>>,
+) -> SessionRecord {
+    let created_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+    SessionRecord {
+        id: id.parse().unwrap(),
+        host: "local".into(),
+        target: "local".into(),
+        directory: "/srv/code".into(),
+        preset: None,
+        status,
+        created_at,
+        last_used_at: closed_at.unwrap_or(created_at),
+        closed_at,
+    }
+}
+
+#[test]
+fn prune_preview_selects_exact_cutoff_and_excludes_ineligible_records() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let cutoff = now - Duration::days(7);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                prune_record(
+                    "tether-0197f198000070008000000000000011",
+                    SessionStatus::Closed,
+                    Some(cutoff),
+                ),
+                prune_record(
+                    "tether-0197f198000070008000000000000012",
+                    SessionStatus::Closed,
+                    Some(cutoff + Duration::seconds(1)),
+                ),
+                prune_record(
+                    "tether-0197f198000070008000000000000013",
+                    SessionStatus::Active,
+                    None,
+                ),
+                prune_record(
+                    "tether-0197f198000070008000000000000014",
+                    SessionStatus::Closing,
+                    None,
+                ),
+            ],
+        })
+        .unwrap();
+
+    let preview = PruneService::new(store).preview_at(7, now).unwrap();
+    assert_eq!(preview.older_than_days(), 7);
+    assert_eq!(preview.captured_at(), now);
+    assert_eq!(
+        preview.ids(),
+        &["tether-0197f198000070008000000000000011".parse().unwrap()]
+    );
+}
+
+#[test]
+fn prune_preview_accepts_explicit_zero_and_rejects_duration_overflow() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![prune_record(
+                "tether-0197f198000070008000000000000011",
+                SessionStatus::Closed,
+                Some(now),
+            )],
+        })
+        .unwrap();
+    let service = PruneService::new(store);
+
+    assert_eq!(service.preview_at(0, now).unwrap().ids().len(), 1);
+    assert!(matches!(
+        service.preview_at(u64::MAX, now),
+        Err(PruneError::RetentionTooLarge(u64::MAX))
+    ));
+}
+
+#[test]
+fn confirmed_prune_uses_stable_preview_and_never_removes_newly_eligible_records() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let first = "tether-0197f198000070008000000000000011";
+    let later = "tether-0197f198000070008000000000000012";
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                prune_record(first, SessionStatus::Closed, Some(now - Duration::days(8))),
+                prune_record(later, SessionStatus::Closed, Some(now - Duration::days(6))),
+            ],
+        })
+        .unwrap();
+    let service = PruneService::new(store.clone());
+    let preview = service.preview_at(7, now).unwrap();
+    store
+        .update(|state| {
+            state.sessions[1].closed_at = Some(now - Duration::days(9));
+            state.sessions[1].last_used_at = now - Duration::days(9);
+            Ok(())
+        })
+        .unwrap();
+
+    let result = service.apply(&preview).unwrap();
+    assert_eq!(result.removed_ids, vec![first.parse().unwrap()]);
+    assert!(result.skipped_ids.is_empty());
+    assert_eq!(
+        store.load().unwrap().sessions,
+        vec![prune_record(
+            later,
+            SessionStatus::Closed,
+            Some(now - Duration::days(9))
+        )]
+    );
+}
+
+#[test]
+fn confirmed_prune_skips_missing_and_changed_candidates_without_partial_lies() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let removed = "tether-0197f198000070008000000000000011";
+    let changed = "tether-0197f198000070008000000000000012";
+    let missing = "tether-0197f198000070008000000000000013";
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                prune_record(
+                    removed,
+                    SessionStatus::Closed,
+                    Some(now - Duration::days(8)),
+                ),
+                prune_record(
+                    changed,
+                    SessionStatus::Closed,
+                    Some(now - Duration::days(8)),
+                ),
+                prune_record(
+                    missing,
+                    SessionStatus::Closed,
+                    Some(now - Duration::days(8)),
+                ),
+            ],
+        })
+        .unwrap();
+    let service = PruneService::new(store.clone());
+    let preview = service.preview_at(7, now).unwrap();
+    store
+        .update(|state| {
+            state.sessions[1].directory = "/concurrently/changed".into();
+            state.sessions.remove(2);
+            Ok(())
+        })
+        .unwrap();
+
+    let result = service.apply(&preview).unwrap();
+    assert_eq!(result.removed_ids, vec![removed.parse().unwrap()]);
+    assert_eq!(
+        result.skipped_ids,
+        vec![changed.parse().unwrap(), missing.parse().unwrap()]
+    );
+    assert_eq!(
+        store.load().unwrap().sessions[0].directory,
+        "/concurrently/changed"
+    );
+}
+
+#[test]
+fn prune_service_has_no_transport_configuration_or_capability() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let service = PruneService::new(store);
+    let preview = service.preview(7).unwrap();
+    assert!(preview.ids().is_empty());
+    assert!(service.apply(&preview).unwrap().removed_ids.is_empty());
+}
+
+#[test]
+fn prune_state_failures_are_typed_and_apply_does_not_rewrite_bad_state() {
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path.clone());
+    store.save(&State::default()).unwrap();
+    let service = PruneService::new(store);
+    let preview = service.preview(7).unwrap();
+    let invalid = b"{ definitely not state }\n";
+    fs::write(&state_path, invalid).unwrap();
+
+    assert!(matches!(service.apply(&preview), Err(PruneError::State(_))));
+    assert_eq!(fs::read(state_path).unwrap(), invalid);
 }
 
 #[test]

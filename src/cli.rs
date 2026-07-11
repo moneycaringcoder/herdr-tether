@@ -3,7 +3,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -12,7 +12,7 @@ use crate::{
     config::{CommandPreset, Config, ConfigStore, HostConfig},
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
-    lifecycle::{CleanupEligibility, LifecycleService, cleanup_eligibility},
+    lifecycle::{LifecycleService, PruneError, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
     paths::AppPaths,
     sshcfg::discover_aliases,
@@ -465,11 +465,14 @@ fn selection_from_picker(
     );
     let lifecycle_service =
         LifecycleService::new(state_store.clone(), ProcessBinaries::new("ssh", "tmux"));
+    let prune_service = PruneService::new(state_store.clone());
     let Some(selection) = run_picker(
         options,
         status_service,
         discovery_service,
         lifecycle_service,
+        prune_service,
+        config.retention.closed_days,
     )?
     else {
         return Ok(None);
@@ -697,42 +700,28 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
 }
 
 fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result<()> {
-    let days = i64::try_from(days).with_context(|| format!("{source} is too large"))?;
-    let retention = Duration::try_days(days).with_context(|| format!("{source} is too large"))?;
-    let now = Utc::now();
-    let collect = |state: &State| {
-        state
-            .sessions
-            .iter()
-            .filter(|record| {
-                cleanup_eligibility(
-                    record,
-                    // A Closed record is written only after kill-session succeeds. Do
-                    // not reconnect merely to rediscover that intentional absence.
-                    crate::backend::WorkloadState::Missing,
-                    now,
-                    retention,
-                ) == CleanupEligibility::RemoveMetadata
-            })
-            .map(|record| record.id)
-            .collect::<Vec<_>>()
+    let service = PruneService::new(store.clone());
+    let preview = match service.preview(days) {
+        Ok(preview) => preview,
+        Err(PruneError::RetentionTooLarge(_)) => bail!("{source} is too large"),
+        Err(error) => return Err(error.into()),
     };
 
     if args.dry_run {
-        for id in collect(&store.load()?) {
+        for id in preview.ids() {
             println!("{id}");
         }
         return Ok(());
     }
 
-    store.update(|state| {
-        let remove = collect(state);
-        for id in &remove {
-            println!("{id}");
-        }
-        state.sessions.retain(|record| !remove.contains(&record.id));
-        Ok(())
-    })
+    let result = service.apply(&preview)?;
+    for id in result.removed_ids {
+        println!("{id}");
+    }
+    for id in result.skipped_ids {
+        eprintln!("skipped {id}: changed since preview");
+    }
+    Ok(())
 }
 
 fn plugin_command(command: PluginCommand) -> Result<()> {
