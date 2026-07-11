@@ -44,7 +44,6 @@ pub struct RemoveOwnedResult {
     pub workload: ClosedWorkload,
 }
 
-
 #[derive(Debug, Error)]
 pub enum CloseOwnedError {
     #[error("unknown session `{0}`")]
@@ -229,7 +228,6 @@ impl LifecycleService {
     }
 
     fn lookup_owned(&self, id: &SessionId) -> Result<SessionRecord, CloseOwnedError> {
-
         let record = self
             .store
             .load()
@@ -251,7 +249,6 @@ impl LifecycleService {
             .ownership_proof
             .ok_or(CloseOwnedError::MissingOwnershipProof(record.id))
     }
-
 
     fn ensure_stopping(
         &self,
@@ -401,7 +398,10 @@ impl LifecycleService {
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                if matches!(record.status, SessionStatus::Creating | SessionStatus::Running) {
+                if matches!(
+                    record.status,
+                    SessionStatus::Creating | SessionStatus::Running
+                ) {
                     self.store
                         .update(|state| {
                             let current = state
@@ -492,7 +492,10 @@ impl LifecycleService {
             WorkloadState::Missing => {}
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
         }
-        if !matches!(record.status, SessionStatus::Ended | SessionStatus::Creating) {
+        if !matches!(
+            record.status,
+            SessionStatus::Ended | SessionStatus::Creating
+        ) {
             return Err(CloseOwnedError::InvalidStatus {
                 id,
                 operation: "restarted",
@@ -553,8 +556,7 @@ impl LifecycleService {
         let backend = self.backend_for(&id, &record.target)?;
         let workload = match self.inspect_exact(&backend, &id, &ownership_proof)? {
             WorkloadState::Ended { identity, .. }
-                if record.tmux_session_id.is_none()
-                    || record.tmux_session_id == Some(identity) =>
+                if record.tmux_session_id.is_none() || record.tmux_session_id == Some(identity) =>
             {
                 match self.inspect_exact(&backend, &id, &ownership_proof)? {
                     WorkloadState::Ended {
@@ -675,10 +677,8 @@ fn bounded_transport_error(output: BoundedOutput, ownership_proof: &OwnershipPro
             stderr_truncated,
             ..
         } => {
-            let detail = sanitize_transport_detail(
-                &String::from_utf8_lossy(&stderr),
-                ownership_proof,
-            );
+            let detail =
+                sanitize_transport_detail(&String::from_utf8_lossy(&stderr), ownership_proof);
             let truncation = if stderr_truncated {
                 " [stderr truncated]"
             } else {
@@ -780,7 +780,6 @@ pub struct PruneResult {
 }
 /// Finalized removed metadata is retained for this many days by default.
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
-
 
 #[derive(Debug, Error)]
 pub enum PruneError {
@@ -885,10 +884,7 @@ impl PruneService {
         self.automatic_cleanup_at(Utc::now())
     }
 
-    pub fn automatic_cleanup_at(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<SessionId>, PruneError> {
+    pub fn automatic_cleanup_at(&self, now: DateTime<Utc>) -> Result<Vec<SessionId>, PruneError> {
         let retention = retention_duration(DEFAULT_RETENTION_DAYS)?;
         self.store
             .update(|state| {
@@ -897,12 +893,8 @@ impl PruneService {
                     .iter()
                     .filter(|record| {
                         record.status == SessionStatus::Removed
-                            && cleanup_eligibility(
-                                record,
-                                WorkloadState::Missing,
-                                now,
-                                retention,
-                            ) == CleanupEligibility::RemoveMetadata
+                            && cleanup_eligibility(record, WorkloadState::Missing, now, retention)
+                                == CleanupEligibility::RemoveMetadata
                     })
                     .map(|record| record.id)
                     .collect::<Vec<_>>();
@@ -945,10 +937,7 @@ pub fn cleanup_eligibility(
         WorkloadState::Missing | WorkloadState::Ended { .. } => {}
     }
 
-    if !matches!(
-        record.status,
-        SessionStatus::Ended | SessionStatus::Removed
-    ) {
+    if !matches!(record.status, SessionStatus::Ended | SessionStatus::Removed) {
         return CleanupEligibility::KeepActive;
     }
 

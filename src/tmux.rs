@@ -1,10 +1,4 @@
-use std::{
-    io,
-    path::PathBuf,
-    process::Output,
-    sync::atomic::AtomicBool,
-    time::Duration,
-};
+use std::{io, path::PathBuf, process::Output, sync::atomic::AtomicBool, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use thiserror::Error;
@@ -215,9 +209,7 @@ impl TmuxBackend {
                 "-F".to_owned(),
                 condition,
                 guarded_command,
-                format!(
-                    "display-message -p {OWNERSHIP_GUARD_REJECTED} ; run-shell 'exit 75'"
-                ),
+                format!("display-message -p {OWNERSHIP_GUARD_REJECTED} ; run-shell 'exit 75'"),
             ],
             interactive,
         )
@@ -229,7 +221,13 @@ impl TmuxBackend {
         output: &Output,
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, ownership_proof, output.status.code(), &output.stdout, stdout_truncated)
+        classify_exact_inspect(
+            id,
+            ownership_proof,
+            output.status.code(),
+            &output.stdout,
+            stdout_truncated,
+        )
     }
 
     pub(crate) fn classify_exact_inspect_parts(
@@ -281,7 +279,6 @@ impl TmuxBackend {
             output.status
         )
     }
-
 
     fn enable_mouse_for_target(&self, target: String) -> Result<()> {
         let spec = self.tmux_spec(
@@ -427,10 +424,7 @@ impl DurableBackend for TmuxBackend {
         };
         if !output.status.success() {
             let detail = sanitize_tmux_detail(&output.stderr, Some(&launch.ownership_proof));
-            bail!(
-                "tmux create failed with status {}: {detail}",
-                output.status
-            );
+            bail!("tmux create failed with status {}: {detail}", output.status);
         }
         let created = std::str::from_utf8(&output.stdout)
             .context("tmux returned non-UTF-8 created session identities")
@@ -455,21 +449,12 @@ impl DurableBackend for TmuxBackend {
             .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
             .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
             .map_err(|error| {
-                self.rollback_created(
-                    &launch.id,
-                    &launch.ownership_proof,
-                    session_target,
-                    error,
-                )
+                self.rollback_created(&launch.id, &launch.ownership_proof, session_target, error)
             })?;
         Ok(session_target)
     }
 
-    fn inspect(
-        &self,
-        id: &SessionId,
-        ownership_proof: &OwnershipProof,
-    ) -> Result<WorkloadState> {
+    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState> {
         let spec = self.inspect_exact_spec(id, ownership_proof)?;
         let output = self.output(&spec)?;
         Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
@@ -589,7 +574,15 @@ fn classify_exact_inspect(
             return WorkloadState::Missing;
         }
         let fields = line.split(':').collect::<Vec<_>>();
-        let [name, identity, attached, pane_dead, exit_status, observed_proof] = fields.as_slice() else {
+        let [
+            name,
+            identity,
+            attached,
+            pane_dead,
+            exit_status,
+            observed_proof,
+        ] = fields.as_slice()
+        else {
             return WorkloadState::Unknown;
         };
         if *name != id.to_string() {
@@ -641,7 +634,6 @@ fn validate_tmux_id(value: &str, sigil: char, kind: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-
 fn remote_tmux_command(arguments: &[String]) -> Result<String> {
     remote_command("tmux", arguments)
 }
@@ -684,12 +676,8 @@ mod tests {
     }
     #[test]
     fn exact_inspection_distinguishes_running_and_dead_panes_with_identity() {
-        let id = "tether-0197f198000070008000000000000001"
-            .parse()
-            .unwrap();
-        let proof = "0197f198000070008000000000000002"
-            .parse()
-            .unwrap();
+        let id = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let proof = "0197f198000070008000000000000002".parse().unwrap();
 
         assert_eq!(
             classify_exact_inspect(

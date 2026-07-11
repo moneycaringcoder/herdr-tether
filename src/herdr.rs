@@ -400,40 +400,44 @@ impl HerdrClient {
         })
     }
 
-fn is_attach_process(process: &ForegroundProcess, expected: &CommandSpec) -> bool {
-    let Some(program) = process.argv.first().and_then(|value| Path::new(value).file_name()) else {
-        return false;
-    };
-    let expected_program = expected.program.file_name();
-    if Some(program) == expected_program && process.argv[1..] == expected.args {
-        return true;
-    }
-
-    let target = match expected.args.as_slice() {
-        [session, attach, target_flag, _, separator, name]
-            if session == "session"
-                && attach == "attach-external"
-                && target_flag == "--target"
-                && separator == "--" =>
-        {
-            format!("={name}")
+    fn is_attach_process(process: &ForegroundProcess, expected: &CommandSpec) -> bool {
+        let Some(program) = process
+            .argv
+            .first()
+            .and_then(|value| Path::new(value).file_name())
+        else {
+            return false;
+        };
+        let expected_program = expected.program.file_name();
+        if Some(program) == expected_program && process.argv[1..] == expected.args {
+            return true;
         }
-        _ => return false,
-    };
-    if program == "tmux" {
-        return process.argv[1..] == ["attach-session", "-t", target.as_str()];
+
+        let target = match expected.args.as_slice() {
+            [session, attach, target_flag, _, separator, name]
+                if session == "session"
+                    && attach == "attach-external"
+                    && target_flag == "--target"
+                    && separator == "--" =>
+            {
+                format!("={name}")
+            }
+            _ => return false,
+        };
+        if program == "tmux" {
+            return process.argv[1..] == ["attach-session", "-t", target.as_str()];
+        }
+        if program != "ssh" {
+            return false;
+        }
+        let Ok(target) = posix_quote(&target) else {
+            return false;
+        };
+        process
+            .argv
+            .last()
+            .is_some_and(|argument| argument == &format!("'tmux' 'attach-session' '-t' {target}"))
     }
-    if program != "ssh" {
-        return false;
-    }
-    let Ok(target) = posix_quote(&target) else {
-        return false;
-    };
-    process
-        .argv
-        .last()
-        .is_some_and(|argument| argument == &format!("'tmux' 'attach-session' '-t' {target}"))
-}
 
     fn label_pane(&self, pane_id: &str) -> Result<()> {
         let response = self.invoke(
@@ -481,11 +485,7 @@ fn is_attach_process(process: &ForegroundProcess, expected: &CommandSpec) -> boo
 
     fn execute(&self, operation: &str, arguments: &[String]) -> Result<Output> {
         let spec = CommandSpec::new(&self.context.binary, arguments.to_vec());
-        match run_bounded(
-            &spec,
-            HERDR_COMMAND_TIMEOUT,
-            &AtomicBool::new(false),
-        ) {
+        match run_bounded(&spec, HERDR_COMMAND_TIMEOUT, &AtomicBool::new(false)) {
             BoundedOutput::Completed {
                 status,
                 stdout,
@@ -763,7 +763,8 @@ mod tests {
                 "-F".to_owned(),
                 "#{&&:proof-and-identity}".to_owned(),
                 "set-option -t $7 mouse on ; attach-session -t $7".to_owned(),
-                "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'".to_owned(),
+                "display-message -p TETHER_OWNERSHIP_GUARD_REJECTED ; run-shell 'exit 75'"
+                    .to_owned(),
             ],
         );
         let external = CommandSpec::new(

@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use uuid::Uuid;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -65,7 +65,10 @@ fn with_advisory_lock_mode<T>(
         .metadata()
         .with_context(|| format!("inspect storage lock `{}`", lock_path.display()))?;
     if !metadata.is_file() {
-        anyhow::bail!("storage lock `{}` is not a regular file", lock_path.display());
+        anyhow::bail!(
+            "storage lock `{}` is not a regular file",
+            lock_path.display()
+        );
     }
     #[cfg(unix)]
     if metadata.nlink() != 1 {
@@ -110,7 +113,6 @@ impl AtomicWriteError {
     }
 }
 
-
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     atomic_write_mode(path, contents, true)
 }
@@ -126,9 +128,13 @@ fn atomic_write_mode(
     contents: &[u8],
     private_parent: bool,
 ) -> Result<(), AtomicWriteError> {
-    atomic_write_mode_with(path, contents, private_parent, || Ok(()), |parent| {
-        File::open(parent).and_then(|directory| directory.sync_all())
-    })
+    atomic_write_mode_with(
+        path,
+        contents,
+        private_parent,
+        || Ok(()),
+        |parent| File::open(parent).and_then(|directory| directory.sync_all()),
+    )
 }
 
 fn atomic_write_mode_with(
@@ -165,9 +171,10 @@ fn atomic_write_mode_with(
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(AtomicWriteError::PreCommit(anyhow::Error::new(error).context(
-                    format!("create temporary file beside `{}`", path.display()),
-                )));
+                return Err(AtomicWriteError::PreCommit(
+                    anyhow::Error::new(error)
+                        .context(format!("create temporary file beside `{}`", path.display())),
+                ));
             }
         }
     }

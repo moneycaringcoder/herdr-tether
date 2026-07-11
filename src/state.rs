@@ -96,10 +96,7 @@ impl State {
                 (
                     SessionStatus::Creating | SessionStatus::Running | SessionStatus::Stopping,
                     Some(_),
-                ) => bail!(
-                    "non-ended session `{}` must not have closed_at",
-                    session.id
-                ),
+                ) => bail!("non-ended session `{}` must not have closed_at", session.id),
                 (SessionStatus::Ended | SessionStatus::Removed, None) => {
                     bail!("ended session `{}` must have closed_at", session.id)
                 }
@@ -110,7 +107,10 @@ impl State {
                 _ => {}
             }
             if session.exit_status.is_some()
-                && !matches!(session.status, SessionStatus::Ended | SessionStatus::Removed)
+                && !matches!(
+                    session.status,
+                    SessionStatus::Ended | SessionStatus::Removed
+                )
             {
                 bail!(
                     "non-ended session `{}` must not have exit_status",

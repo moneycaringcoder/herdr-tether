@@ -1222,8 +1222,14 @@ fn contextual_actions_survive_refresh_and_never_attach_ended_or_unreachable_work
         detail: None,
         checked_at: SystemTime::now(),
     }));
-    assert_eq!(unreachable.handle(PickerEvent::Confirm), PickerOutcome::Continue);
-    assert_eq!(unreachable.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        unreachable.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert_eq!(
+        unreachable.handle(PickerEvent::Close),
+        PickerOutcome::Continue
+    );
     assert!(unreachable.close_modal().is_none());
     assert!(unreachable.footer_text().contains("r Retry"));
 }
@@ -1338,7 +1344,11 @@ fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
     picker.handle(PickerEvent::Close);
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
-        PickerOutcome::CloseOwnedRequested { id, generation: 7, action: PickerCloseAction::Stop }
+        PickerOutcome::CloseOwnedRequested {
+            id,
+            generation: 7,
+            action: PickerCloseAction::Stop
+        }
     );
 
     assert!(picker.apply_close_result(PickerCloseResult {
@@ -1407,7 +1417,11 @@ fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() 
     );
     assert_eq!(
         picker.handle(PickerEvent::ConfirmClose),
-        PickerOutcome::CloseOwnedRequested { id, generation: 7, action: PickerCloseAction::Stop }
+        PickerOutcome::CloseOwnedRequested {
+            id,
+            generation: 7,
+            action: PickerCloseAction::Stop
+        }
     );
 }
 
@@ -1991,11 +2005,7 @@ fn herdr_inspection_rejects_oversized_process_output() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
-    fs::write(
-        &binary,
-        "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n",
-    )
-    .unwrap();
+    fs::write(&binary, "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
     let error = HerdrClient::new(context(&binary))

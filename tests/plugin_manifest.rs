@@ -45,7 +45,10 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
         ]
     );
     assert_eq!(actions[1]["id"].as_str(), Some("setup"));
-    assert_eq!(actions[1]["title"].as_str(), Some("Tether: Set up (start here)"));
+    assert_eq!(
+        actions[1]["title"].as_str(),
+        Some("Tether: Set up (start here)")
+    );
     assert_eq!(
         actions[1]["description"].as_str(),
         Some("Create Tether's private files and safely add the prefix+t shortcut.")

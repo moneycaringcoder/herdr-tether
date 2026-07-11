@@ -503,7 +503,9 @@ fn state_rejects_symlink_and_fifo_storage_paths() {
 fn replacing_lock_path_cannot_split_state_mutual_exclusion() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
-    StateStore::new(path.clone()).save(&State::default()).unwrap();
+    StateStore::new(path.clone())
+        .save(&State::default())
+        .unwrap();
     let lock_path = temp.path().join(".state.json.lock");
     let displaced_lock_path = temp.path().join(".state.json.lock.displaced");
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -744,7 +746,10 @@ fn state_lock_refuses_symlink_without_touching_victim() {
     let error = StateStore::new(state).load().unwrap_err().to_string();
     assert!(error.contains("open storage lock"));
     assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
-    assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
 }
 
 #[test]

@@ -222,7 +222,11 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     for (stdout, status, expected_unknown) in [
         ("malformed", 0, true),
-        ("tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002", 2, false),
+        (
+            "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002",
+            2,
+            false,
+        ),
     ] {
         let temp = tempdir().unwrap();
         let state_path = temp.path().join("state.json");
@@ -878,7 +882,6 @@ fn remote_create_error_redacts_ownership_proof_and_terminal_controls() {
     assert!(!error.contains("spoofed title"), "{error}");
 }
 
-
 #[test]
 fn attach_only_attaches_and_close_is_the_only_kill_path() {
     let _guard = FAKE_PROCESS_LOCK.lock();
@@ -970,12 +973,20 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     write_fake(&ssh, &temp.path().join("ssh.args"), "", 0);
-    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002", 0);
+    write_fake(
+        &tmux,
+        &log,
+        "tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002",
+        0,
+    );
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
     assert_eq!(
         backend.inspect(&id(), &proof()).unwrap(),
-        WorkloadState::Running { attached: 2, identity: "$7".parse().unwrap() }
+        WorkloadState::Running {
+            attached: 2,
+            identity: "$7".parse().unwrap()
+        }
     );
     assert_eq!(
         read_argv(&log),
@@ -1059,7 +1070,10 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
     assert_eq!(
         cleanup_eligibility(
             &record,
-            WorkloadState::Running { attached: 0, identity: "$7".parse().unwrap() },
+            WorkloadState::Running {
+                attached: 0,
+                identity: "$7".parse().unwrap()
+            },
             now,
             Duration::days(7)
         ),
@@ -1098,7 +1112,10 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
     assert_eq!(
         cleanup_eligibility(
             &record,
-            WorkloadState::Running { attached: 0, identity: "$7".parse().unwrap() },
+            WorkloadState::Running {
+                attached: 0,
+                identity: "$7".parse().unwrap()
+            },
             now,
             Duration::days(7)
         ),
@@ -1248,21 +1265,9 @@ fn confirmed_prune_skips_missing_and_changed_candidates_without_partial_lies() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![
-                prune_record(
-                    removed,
-                    SessionStatus::Ended,
-                    Some(now - Duration::days(8)),
-                ),
-                prune_record(
-                    changed,
-                    SessionStatus::Ended,
-                    Some(now - Duration::days(8)),
-                ),
-                prune_record(
-                    missing,
-                    SessionStatus::Ended,
-                    Some(now - Duration::days(8)),
-                ),
+                prune_record(removed, SessionStatus::Ended, Some(now - Duration::days(8))),
+                prune_record(changed, SessionStatus::Ended, Some(now - Duration::days(8))),
+                prune_record(missing, SessionStatus::Ended, Some(now - Duration::days(8))),
             ],
         })
         .unwrap();
@@ -1404,8 +1409,14 @@ fn stop_guard_rejects_identity_reuse_after_final_inspection() {
         service.stop_owned(id()),
         Err(CloseOwnedError::ConcurrentModification(_))
     ));
-    assert!(!killed.exists(), "guard failure must not execute kill-session");
-    assert_eq!(store.load().unwrap().sessions[0].status, SessionStatus::Stopping);
+    assert!(
+        !killed.exists(),
+        "guard failure must not execute kill-session"
+    );
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Stopping
+    );
     let calls = fs::read_to_string(calls).unwrap();
     assert!(calls.lines().any(|call| call == "if-shell"));
     assert!(!calls.lines().any(|call| call == "kill-session"));
@@ -1431,8 +1442,16 @@ fn creating_recovery_refuses_same_name_with_wrong_ownership_proof() {
     let record = &store.load().unwrap().sessions[0];
     assert_eq!(record.status, SessionStatus::Creating);
     assert_eq!(record.tmux_session_id, None);
-    assert!(!read_argv(&log).iter().any(|argument| argument == "new-session"));
-    assert!(!read_argv(&log).iter().any(|argument| argument == "kill-session"));
+    assert!(
+        !read_argv(&log)
+            .iter()
+            .any(|argument| argument == "new-session")
+    );
+    assert!(
+        !read_argv(&log)
+            .iter()
+            .any(|argument| argument == "kill-session")
+    );
 }
 
 #[test]
@@ -1466,7 +1485,11 @@ fn open_revalidates_proof_and_identity_at_mutation_boundary() {
         service.open_owned(id()),
         Err(CloseOwnedError::WorkloadUnknown(_))
     ));
-    assert!(!fs::read_to_string(calls).unwrap().contains("attach-session"));
+    assert!(
+        !fs::read_to_string(calls)
+            .unwrap()
+            .contains("attach-session")
+    );
 }
 
 #[test]
@@ -1512,8 +1535,15 @@ fn remove_never_kills_a_running_incarnation() {
         service.remove_owned(id()),
         Err(CloseOwnedError::ConcurrentModification(_))
     ));
-    assert!(!read_argv(&log).iter().any(|argument| argument == "kill-session"));
-    assert_eq!(store.load().unwrap().sessions[0].status, SessionStatus::Ended);
+    assert!(
+        !read_argv(&log)
+            .iter()
+            .any(|argument| argument == "kill-session")
+    );
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
 }
 
 #[test]
@@ -1545,12 +1575,13 @@ fn automatic_retention_removes_only_finalized_metadata_without_transport() {
         .unwrap();
     assert_eq!(
         removed_ids,
-        vec!["tether-0197f198000070008000000000000021"
-            .parse()
-            .unwrap()]
+        vec!["tether-0197f198000070008000000000000021".parse().unwrap()]
     );
     assert_eq!(store.load().unwrap().sessions.len(), 1);
-    assert_eq!(store.load().unwrap().sessions[0].status, SessionStatus::Ended);
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
 }
 
 #[test]
@@ -1571,14 +1602,9 @@ fn direct_backend_inspection_rejects_oversized_process_output() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let tmux = temp.path().join("tmux");
-    fs::write(
-        &tmux,
-        "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n",
-    )
-    .unwrap();
+    fs::write(&tmux, "#!/bin/sh\nhead -c 70000 /dev/zero\nexit 0\n").unwrap();
     fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
-    let backend =
-        TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
 
     let error = backend.inspect(&id(), &proof()).unwrap_err();
     assert!(error.to_string().contains("safe capture limit"));

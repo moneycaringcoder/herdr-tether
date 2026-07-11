@@ -781,12 +781,13 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let attach = backend.attach_command(&id, &ownership_proof, identity)?;
-        place_in_herdr(HerdrClient::new(context), &attach, selection.placement)
-            .with_context(|| {
+        place_in_herdr(HerdrClient::new(context), &attach, selection.placement).with_context(
+            || {
                 format!(
                     "place newly created session `{id}`; it remains running and recorded for retry"
                 )
-            })?;
+            },
+        )?;
         println!("created {id}");
         Ok(())
     } else {
@@ -814,7 +815,10 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
                 .with_context(|| format!("verify restarted session `{id}`"))?;
         }
         SessionStatus::Stopping | SessionStatus::Removed => {
-            bail!("session `{id}` cannot be restarted while it is {:?}", record.status);
+            bail!(
+                "session `{id}` cannot be restarted while it is {:?}",
+                record.status
+            );
         }
     }
     resume_and_attach(paths, id, placement)
@@ -951,18 +955,15 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 SessionStatus::Stopping => bail!(
                     "session `{id}` is stopping; retry `herdr-tether session open {id}` after Stop completes"
                 ),
-                SessionStatus::Ended => bail!(
-                    "session `{id}` has ended; run `herdr-tether session restart {id}`"
-                ),
+                SessionStatus::Ended => {
+                    bail!("session `{id}` has ended; run `herdr-tether session restart {id}`")
+                }
                 SessionStatus::Removed => bail!(
                     "session `{id}` was removed; run `herdr-tether open` to create a new workload"
                 ),
             }
-            let attach = LifecycleService::new(
-                store.clone(),
-                ProcessBinaries::new("ssh", "tmux"),
-            )
-            .open_owned(id)?;
+            let attach = LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+                .open_owned(id)?;
             run_attach(attach)
         }
         SessionCommand::AttachExternal { target, name } => {
@@ -970,9 +971,12 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             run_attach(backend.attach_external_command(&name)?)
         }
         SessionCommand::Restart { id, placement } => {
-            let placement = placement
-                .map(Placement::from)
-                .unwrap_or(ConfigStore::new(paths.config_file.clone()).load()?.ui.placement);
+            let placement = placement.map(Placement::from).unwrap_or(
+                ConfigStore::new(paths.config_file.clone())
+                    .load()?
+                    .ui
+                    .placement,
+            );
             restart_and_attach(paths, id, placement).with_context(|| {
                 format!(
                     "restart session `{id}`; retry `herdr-tether session restart {id}` after resolving the reported error"
@@ -1334,7 +1338,6 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn external_attach_command_preserves_target_and_name_as_arguments() {

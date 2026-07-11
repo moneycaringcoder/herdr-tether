@@ -891,6 +891,7 @@ class Smoke:
                 pane_id = self.wait_new_pane(before, "open action managed pane")
                 self.close_pane(pane_id)
             else:
+                self.wait_new_pane(before, "setup action managed pane")
                 plugin_config = (
                     self.root
                     / "config"
@@ -939,6 +940,9 @@ class Smoke:
                         "plugin doctor did not expose actionable missing-Cargo guidance: "
                         f"{doctor.stdout}"
                     )
+                if self.herdr_master is None:
+                    fail("Herdr PTY is unavailable while dismissing setup result")
+                os.write(self.herdr_master, b"\r")
                 self.wait_until(
                     "setup action managed pane exit",
                     lambda: not (self.pane_ids() - before),

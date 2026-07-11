@@ -1364,9 +1364,9 @@ impl PickerState {
         let Some(host) = self.options.hosts.get(self.host_index) else {
             return false;
         };
-        self.host_status.get(&host.name).is_some_and(|cell| {
-            !cell.stale && cell.value == Some(HostReachability::Reachable)
-        })
+        self.host_status
+            .get(&host.name)
+            .is_some_and(|cell| !cell.stale && cell.value == Some(HostReachability::Reachable))
     }
     fn current_host_unreachable(&self) -> bool {
         let Some(host) = self.options.hosts.get(self.host_index) else {
@@ -1379,7 +1379,6 @@ impl PickerState {
                     .is_some_and(|status| status != HostReachability::Reachable)
         })
     }
-
 
     fn current_owned_action(&self) -> Option<(SessionId, bool)> {
         if self.stage != PickerStage::Resource || !self.current_host_reachable() {
@@ -2097,26 +2096,25 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
-                let (primary_hint, destructive_hint) =
-                    if self.stage == PickerStage::Resource {
-                        match self.current_owned_action() {
-                            Some((_, false)) => ("Enter Open", " · x Stop"),
-                            Some((_, true)) => ("Enter Restart", " · x Remove"),
-                            None => match self.current_resource_identity() {
-                                Some(ResourceIdentity::External(_))
-                                | Some(ResourceIdentity::Create)
-                                    if !self.current_host_unreachable() =>
-                                {
-                                    ("Enter select", "")
-                                }
-                                _ => ("", ""),
-                            },
-                        }
-                    } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
-                        ("", "")
-                    } else {
-                        ("Enter select", "")
-                    };
+                let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
+                    match self.current_owned_action() {
+                        Some((_, false)) => ("Enter Open", " · x Stop"),
+                        Some((_, true)) => ("Enter Restart", " · x Remove"),
+                        None => match self.current_resource_identity() {
+                            Some(ResourceIdentity::External(_))
+                            | Some(ResourceIdentity::Create)
+                                if !self.current_host_unreachable() =>
+                            {
+                                ("Enter select", "")
+                            }
+                            _ => ("", ""),
+                        },
+                    }
+                } else if self.stage == PickerStage::Host && self.options.hosts.is_empty() {
+                    ("", "")
+                } else {
+                    ("Enter select", "")
+                };
                 let primary_hint = if primary_hint.is_empty() {
                     String::new()
                 } else {
@@ -2610,11 +2608,7 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     render_picker_with_color_mode(frame, state, std::env::var_os("NO_COLOR").is_none());
 }
 
-fn render_picker_with_color_mode(
-    frame: &mut Frame<'_>,
-    state: &PickerState,
-    colors_enabled: bool,
-) {
+fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, colors_enabled: bool) {
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
     let footer = state.footer_text();
@@ -2642,10 +2636,16 @@ fn render_picker_with_color_mode(
     } else {
         Color::Cyan
     };
-    let selected_text = colors_enabled.then_some(Color::White).unwrap_or(Color::Reset);
-    let secondary_text = colors_enabled
-        .then_some(Color::DarkGray)
-        .unwrap_or(Color::Reset);
+    let selected_text = if colors_enabled {
+        Color::White
+    } else {
+        Color::Reset
+    };
+    let secondary_text = if colors_enabled {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
     let block = Block::default()
         .title(format!(" Tether · {} ", state.frame_title()))
         .title_alignment(Alignment::Center)
@@ -3007,17 +3007,11 @@ mod tests {
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
         ] {
             assert_eq!(
-                map_key(
-                    key,
-                    &PickerInput::None,
-                    PickerStage::Resource,
-                    false,
-                ),
+                map_key(key, &PickerInput::None, PickerStage::Resource, false,),
                 None
             );
         }
     }
-
 
     fn navigation_picker() -> PickerState {
         PickerState::new(PickerOptions {
@@ -3235,7 +3229,11 @@ mod close_render_tests {
 
         assert_eq!(
             picker.handle(PickerEvent::ConfirmClose),
-            PickerOutcome::CloseOwnedRequested { id, generation: 9, action: PickerCloseAction::Stop }
+            PickerOutcome::CloseOwnedRequested {
+                id,
+                generation: 9,
+                action: PickerCloseAction::Stop
+            }
         );
         terminal
             .draw(|frame| render_picker_with_color_mode(frame, &picker, true))
@@ -3422,12 +3420,14 @@ mod close_render_tests {
         assert!(rendered.contains('>'));
         assert!(rendered.contains("y confirm"));
         assert!(rendered.contains("n/Esc keep"));
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .all(|cell| cell.fg == Color::Reset));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset)
+        );
     }
 
     #[test]
@@ -3449,10 +3449,15 @@ mod close_render_tests {
                 .unwrap();
             if width >= 20 {
                 let picker_text = rendered_text(&terminal);
-                assert!(picker_text.contains("Enter Open"), "{width}x{height}: {picker_text:?}");
-                assert!(picker_text.contains("Esc back"), "{width}x{height}: {picker_text:?}");
+                assert!(
+                    picker_text.contains("Enter Open"),
+                    "{width}x{height}: {picker_text:?}"
+                );
+                assert!(
+                    picker_text.contains("Esc back"),
+                    "{width}x{height}: {picker_text:?}"
+                );
             }
         }
     }
-
 }

@@ -278,8 +278,14 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .stdout(predicate::str::contains(
             "Next: install prefix+t with `herdr-tether setup keybinding`",
         ));
-    assert_eq!(fs::read(plugin_config.join("config.toml")).unwrap(), first_config);
-    assert_eq!(fs::read(plugin_state.join("state.json")).unwrap(), first_state);
+    assert_eq!(
+        fs::read(plugin_config.join("config.toml")).unwrap(),
+        first_config
+    );
+    assert_eq!(
+        fs::read(plugin_state.join("state.json")).unwrap(),
+        first_state
+    );
 
     assert!(plugin_config.join("config.toml").exists());
     assert!(plugin_state.join("state.json").exists());
@@ -743,7 +749,10 @@ fn ended_sessions_have_obvious_restart_stop_and_remove_actions() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
     let ended = active_state(SESSION_ID)
-        .replace(r#""directory": "/tmp""#, r#""directory": "/tmp/project with spaces""#)
+        .replace(
+            r#""directory": "/tmp""#,
+            r#""directory": "/tmp/project with spaces""#,
+        )
         .replace(r#""status": "running""#, r#""status": "ended""#)
         .replace(
             r#""closed_at": null"#,
@@ -756,10 +765,9 @@ fn ended_sessions_have_obvious_restart_stop_and_remove_actions() {
     let log = sandbox.path("tmux.log");
     write_fake_tmux(&tmux, &log);
     let original_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(std::env::split_paths(&original_path)),
-    )
-    .unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
+            .unwrap();
 
     sandbox
         .command()
@@ -798,12 +806,21 @@ fn legacy_record_without_proof_fails_closed_before_transport() {
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
     let legacy = active_state(SESSION_ID)
         .replace(r#""version": 2"#, r#""version": 1"#)
-        .replace(r#"    "command": "true",
-"#, "")
-        .replace(r#"    "tmux_session_id": 7,
-"#, "")
-        .replace(r#"    "ownership_proof": "0197f198000070008000000000000099",
-"#, "")
+        .replace(
+            r#"    "command": "true",
+"#,
+            "",
+        )
+        .replace(
+            r#"    "tmux_session_id": 7,
+"#,
+            "",
+        )
+        .replace(
+            r#"    "ownership_proof": "0197f198000070008000000000000099",
+"#,
+            "",
+        )
         .replace(r#""status": "running""#, r#""status": "active""#);
     fs::write(sandbox.state_file(), legacy).unwrap();
     let log = sandbox.path("tmux.log");

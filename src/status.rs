@@ -430,7 +430,8 @@ fn classify_ssh_failure(stderr: &[u8]) -> &'static str {
         "SSH authentication failed; check the configured user and credentials"
     } else if lower.contains("host key verification failed") {
         "SSH host verification failed; verify the host key before retrying"
-    } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known")
+    } else if lower.contains("could not resolve hostname")
+        || lower.contains("name or service not known")
     {
         "SSH could not resolve the host name; check the configured target"
     } else if lower.contains("timed out") || lower.contains("no route to host") {

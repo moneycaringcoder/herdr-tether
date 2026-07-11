@@ -649,11 +649,7 @@ mod tests {
     fn large_directory_candidates_retain_only_the_lexically_first_entry_budget() {
         let mut children = BinaryHeap::new();
         for index in (0..10_000).rev() {
-            retain_bounded_child(
-                &mut children,
-                PathBuf::from(format!("{index:05}")),
-                3,
-            );
+            retain_bounded_child(&mut children, PathBuf::from(format!("{index:05}")), 3);
         }
         let mut children = children.into_vec();
         children.sort();

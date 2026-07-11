@@ -153,10 +153,7 @@ impl FromStr for TmuxSessionId {
         if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid());
         }
-        encoded
-            .parse()
-            .map(Self)
-            .map_err(|_| invalid())
+        encoded.parse().map(Self).map_err(|_| invalid())
     }
 }
 
