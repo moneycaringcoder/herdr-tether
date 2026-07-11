@@ -50,6 +50,15 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install tmux on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS'
+        run: brew install tmux
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
@@ -62,9 +71,22 @@ jobs:
 
       - name: Run serialized tests
         run: cargo test --locked --all-targets --all-features -- --test-threads=1
+      - name: Run deterministic compatibility harness tests
+        run: python3 tools/test_live_product_smoke.py
 
       - name: Build installed release artifact
         run: cargo build --release --locked
+      - name: Package and test the publishable source artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          package_manifests=(target/package/herdr-tether-*/Cargo.toml)
+          if [[ "${#package_manifests[@]}" -ne 1 || ! -f "${package_manifests[0]}" ]]; then
+            echo "expected exactly one packaged herdr-tether manifest" >&2
+            exit 1
+          fi
+          cargo test --locked --manifest-path "${package_manifests[0]}" -- --test-threads=1
 
   msrv:
     name: rust-1.88 release

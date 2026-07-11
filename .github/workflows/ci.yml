@@ -42,6 +42,16 @@ jobs:
             ~/.cargo/git/db
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install tmux on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
@@ -53,6 +63,9 @@ jobs:
 
       - name: Run tests without cross-test process contention
         run: cargo test --locked --all-targets --all-features -- --test-threads=1
+
+      - name: Run deterministic compatibility harness tests
+        run: python3 tools/test_live_product_smoke.py
 
       - name: Build the installed release artifact
         run: cargo build --release --locked

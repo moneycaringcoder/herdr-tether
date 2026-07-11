@@ -127,6 +127,65 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 )
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
+    def test_cleanup_targets_only_exact_owned_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            valid_id = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.update(
+                {
+                    valid_id,
+                    "not-a-tether-session",
+                    "tether-0123456789abcdef0123456789abcdef:other",
+                }
+            )
+            try:
+                completed = mock.Mock(returncode=0, stdout="", stderr="")
+                with mock.patch.object(
+                    smoke, "run", return_value=completed
+                ) as run:
+                    smoke.cleanup()
+
+                commands = [call.args[0] for call in run.call_args_list]
+                tether_close_commands = [
+                    command
+                    for command in commands
+                    if command[1:3] == ["session", "close"]
+                ]
+                self.assertEqual(
+                    tether_close_commands,
+                    [[str(smoke.tether), "session", "close", valid_id]],
+                )
+                self.assertFalse(
+                    any(
+                        command[1:] == ["kill-server"]
+                        for command in commands
+                    ),
+                    commands,
+                )
+                kill_targets = [
+                    command
+                    for command in commands
+                    if len(command) > 1 and command[1] == "kill-session"
+                ]
+                self.assertEqual(
+                    kill_targets,
+                    [
+                        [
+                            str(smoke.tmux),
+                            "kill-session",
+                            "-t",
+                            f"={smoke.external_session}",
+                        ]
+                    ],
+                )
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
 
 
 

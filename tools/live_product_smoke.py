@@ -32,6 +32,7 @@ HERDR_VERSION = "0.7.3"
 COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
+OWNED_SESSION_RE = re.compile(r"^tether-[0-9a-f]{32}$")
 
 
 class SmokeFailure(RuntimeError):
@@ -1270,7 +1271,11 @@ class Smoke:
         self._cleaned = True
         # Close exact Tether-owned workloads first. The deliberately external
         # session is cleaned separately and is never passed to Tether close.
-        for session_id in sorted(self.owned_ids):
+        for session_id in sorted(
+            session_id
+            for session_id in self.owned_ids
+            if OWNED_SESSION_RE.fullmatch(session_id)
+        ):
             try:
                 self.run(
                     [str(self.tether), "session", "close", session_id],
@@ -1281,7 +1286,6 @@ class Smoke:
                 print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
         cleanup_commands = (
             ([str(self.tmux), "kill-session", "-t", f"={self.external_session}"], 5.0),
-            ([str(self.tmux), "kill-server"], 5.0),
             ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
             ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
