@@ -22,10 +22,10 @@ command = ["target/release/herdr-tether", "plugin", "setup"]
 id = "picker"
 title = "Tether: Open"
 placement = "overlay"
-command = ["target/release/herdr-tether", "open"]
+command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" open"]
 
 [[panes]]
 id = "setup"
 title = "Tether: Setup"
 placement = "overlay"
-command = ["target/release/herdr-tether", "setup"]
+command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup"]
