@@ -2,7 +2,7 @@
 
 ## Purpose and invariants
 
-Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.2.1 the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
+Tether makes the lifetime of a terminal workload independent of the Herdr pane or SSH connection viewing it. In v0.2.x the durable unit is one exactly named `tmux` session. A pane is an attach client, not the workload owner.
 
 The implementation preserves these invariants:
 
@@ -65,7 +65,7 @@ This trait owns durable workload lifecycle only. It does not own configuration, 
 
 ### `TmuxBackend`
 
-`src/tmux.rs` is the sole `DurableBackend` implementation in v0.2.1. Its location is either local or one validated explicit SSH target running tmux 3.3 or newer.
+`src/tmux.rs` is the sole `DurableBackend` implementation in v0.2.x. Its location is either local or one validated explicit SSH target running tmux 3.3 or newer.
 
 Local operations execute `tmux` with separated argv. Remote operations build one POSIX-quoted remote `tmux` command and pass it to OpenSSH after `--`:
 

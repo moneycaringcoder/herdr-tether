@@ -669,15 +669,21 @@ fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() 
 
         let calls = fs::read_to_string(log).unwrap();
         assert!(calls.contains(
-            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -P -F #{session_id}:#{pane_id} -- /bin/sh -lc cd -- \"$1\" && exec /bin/sh -c \"$2\" tether-launch /work/repo printf ready"
+            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -P -F #{session_id}:#{pane_id} -- /bin/sh -lc"
         ));
+        assert!(
+            calls.contains(
+                "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\""
+            ),
+            "{calls:?}"
+        );
         assert!(calls.contains("display-message -p -t %3 #{pane_current_path}"));
         if succeeds {
             assert!(calls.contains("set-option -t $7 mouse on"));
             assert!(!calls.contains("kill-session"));
         } else {
             assert!(result.unwrap_err().to_string().contains("cwd mismatch"));
-            assert!(calls.contains("kill-session -t =tether-0197f198000070008000000000000001"));
+            assert!(calls.contains("kill-session -t $7"));
             assert!(!calls.contains("set-option"));
         }
     }
@@ -749,7 +755,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     let calls = temp.path().join("ssh.calls");
     let directory = "/srv/it's $(touch /tmp/nope)\nline";
     let command = "printf '%s\\n' \"$HOME\"; echo `id`";
-    let escaped_directory = directory.replace('\'', "'\\''");
+    let escaped_directory = "/canonical/repo";
     let script = format!(
         "#!/bin/sh\nremote=$9\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
         log = log.display(),
@@ -775,7 +781,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
 
     let argv = read_argv(&log);
     assert_eq!(
-        &argv[..9],
+        &argv[..8],
         [
             "-o",
             "BatchMode=yes",
@@ -785,7 +791,6 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
             "ServerAliveCountMax=3",
             "--",
             "ssh://builder@example.test:2222",
-            "'tmux' 'new-session' '-d' '-s' 'tether-0197f198000070008000000000000001' '-c' '/srv/it'\\''s $(touch /tmp/nope)\nline' '-P' '-F' '#{session_id}:#{pane_id}' '--' '/bin/sh' '-lc' 'cd -- \"$1\" && exec /bin/sh -c \"$2\"' 'tether-launch' '/srv/it'\\''s $(touch /tmp/nope)\nline' 'printf '\\''%s\\n'\\'' \"$HOME\"; echo `id`'",
         ]
     );
     assert_eq!(
@@ -793,7 +798,23 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
         9,
         "ssh must receive one remote command argument"
     );
+    let launch_script = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
+    let remote = &argv[8];
+    for expected in [
+        "'tmux' 'new-session' '-d'",
+        &posix_quote(directory).unwrap(),
+        &posix_quote(launch_script).unwrap(),
+        &posix_quote(command).unwrap(),
+    ] {
+        assert!(
+            remote.contains(expected),
+            "missing {expected:?} in {remote:?}"
+        );
+    }
     let calls = fs::read_to_string(calls).unwrap();
+    let compare_script = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
+    assert!(calls.contains(&posix_quote(launch_script).unwrap()));
+    assert!(calls.contains(&posix_quote(compare_script).unwrap()));
     assert!(calls.contains("'tmux' 'display-message' '-p' '-t' '%3' '#{pane_current_path}'"));
     assert!(calls.contains("'tmux' 'set-option' '-t' '$7' 'mouse' 'on'"));
 }

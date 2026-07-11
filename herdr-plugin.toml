@@ -1,6 +1,6 @@
 id = "moneycaringcoder.tether"
 name = "Tether for Herdr"
-version = "0.2.1"
+version = "0.2.2"
 min_herdr_version = "0.7.3"
 platforms = ["linux", "macos"]
 
