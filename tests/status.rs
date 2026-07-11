@@ -21,7 +21,7 @@ fn write_fake_ssh(path: &Path, fast_id: SessionId) {
     let script = format!(
         r#"#!/bin/sh
 case " $* " in
-  *" fast "*) printf '%s\t2\n' '{fast_id}' ;;
+  *" fast "*) printf '%s:2\n' '{fast_id}' ;;
   *" slow "*) sleep 5 ;;
   *) exit 99 ;;
 esac
@@ -118,7 +118,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nprintf '%s\\t0\\n%s\\t2\\n%s\\t0\\ntether-malformed\\t0\\n' 'work box' '{owned}' '{collision}'\n"
+            "#!/bin/sh\nprintf '%s:0\\n%s:2\\n%s:0\\ntether-malformed:0\\n' 'work box' '{owned}' '{collision}'\n"
         ),
     )
     .unwrap();
@@ -189,8 +189,8 @@ for argument do
   case "$argument" in duplicate|unsafe) target=$argument ;; esac
 done
 case "$target" in
-  duplicate) printf 'work\t0\nwork\t1\n' ;;
-  unsafe) printf 'good\t0\nbad:name\t0\n' ;;
+  duplicate) printf 'work:0\nwork:1\n' ;;
+  unsafe) printf 'good:0\nbad:name:0\n' ;;
   *) exit 99 ;;
 esac
 "#,
@@ -315,7 +315,7 @@ done
 case "$target" in
   offline) exit 255 ;;
   empty) exit 1 ;;
-  malformed) printf 'tether-not-an-id\t0\n' ;;
+  malformed) printf 'tether-not-an-id:0\n' ;;
   *) exit 99 ;;
 esac
 "#,
@@ -410,4 +410,38 @@ esac
             ..
         } if host == "malformed"
     )));
+}
+
+#[test]
+fn local_spawn_error_includes_actionable_tool_locations() {
+    let temp = tempdir().unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(
+            temp.path().join("missing-ssh"),
+            temp.path().join("missing-tmux"),
+        ),
+        Duration::from_millis(100),
+        1,
+    );
+    let run = service.start(StatusRequest {
+        generation: 9,
+        hosts: vec![StatusHost {
+            name: "local".into(),
+            target: None,
+            workloads: Vec::new(),
+        }],
+    });
+
+    let message = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    let StatusMessage::Host {
+        status: HostReachability::Error,
+        detail: Some(detail),
+        ..
+    } = message
+    else {
+        panic!("expected actionable local host error");
+    };
+    assert!(detail.contains("could not start tmux"));
+    assert!(detail.contains("/opt/homebrew/bin"));
+    assert!(detail.contains("/usr/local/bin"));
 }

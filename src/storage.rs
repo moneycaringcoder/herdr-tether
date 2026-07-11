@@ -15,8 +15,23 @@ pub(crate) fn with_advisory_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    with_advisory_lock_mode(path, operation, true)
+}
+
+pub(crate) fn with_advisory_lock_preserving_parent<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_advisory_lock_mode(path, operation, false)
+}
+
+fn with_advisory_lock_mode<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T>,
+    private_parent: bool,
+) -> Result<T> {
     let parent = usable_parent(path);
-    ensure_private_directory(parent)?;
+    ensure_directory(parent, private_parent)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
@@ -45,9 +60,16 @@ pub(crate) fn with_advisory_lock<T>(
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = usable_parent(path);
-    ensure_private_directory(parent)?;
+    atomic_write_mode(path, contents, true)
+}
 
+pub(crate) fn atomic_write_preserving_parent(path: &Path, contents: &[u8]) -> Result<()> {
+    atomic_write_mode(path, contents, false)
+}
+
+fn atomic_write_mode(path: &Path, contents: &[u8], private_parent: bool) -> Result<()> {
+    let parent = usable_parent(path);
+    ensure_directory(parent, private_parent)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("storage path `{}` has no file name", path.display()))?;
@@ -106,12 +128,13 @@ fn usable_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn ensure_private_directory(path: &Path) -> Result<()> {
+fn ensure_directory(path: &Path, enforce_private: bool) -> Result<()> {
+    let existed = path.exists();
     fs::create_dir_all(path)
         .with_context(|| format!("create storage directory `{}`", path.display()))?;
 
     #[cfg(unix)]
-    if path != Path::new(".") {
+    if path != Path::new(".") && (enforce_private || !existed) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("set private permissions on `{}`", path.display()))?;
     }

@@ -2,7 +2,6 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
-    sync::Mutex,
     thread,
     time::Duration as StdDuration,
 };
@@ -20,6 +19,7 @@ use herdr_tether::{
     state::{SessionRecord, SessionStatus, State, StateStore},
     tmux::TmuxBackend,
 };
+use parking_lot::Mutex;
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -155,7 +155,7 @@ fn owned_record_reread_is_authoritative_and_transport_free() {
 
 #[test]
 fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let lock_path = temp.path().join(".state.json.lock");
@@ -202,7 +202,7 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
         [
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_attached}",
+            "#{session_name}:#{session_attached}",
             "-f",
             "#{==:#{session_name},tether-0197f198000070008000000000000001}",
         ]
@@ -211,10 +211,10 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
 
 #[test]
 fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     for (stdout, status, expected_unknown) in [
         ("malformed", 0, true),
-        ("tether-0197f198000070008000000000000001\t0", 2, false),
+        ("tether-0197f198000070008000000000000001:0", 2, false),
     ] {
         let temp = tempdir().unwrap();
         let state_path = temp.path().join("state.json");
@@ -267,7 +267,7 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
 
 #[test]
 fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let lock_path = temp.path().join(".state.json.lock");
@@ -278,7 +278,7 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  printf ok > '{inspect_started}'\n  while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n  printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"closing\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  printf ok > '{inspect_started}'\n  while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"active\"'*) : ;; *) exit 70;; esac\n  printf 'tether-0197f198000070008000000000000001:0';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"closing\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
         inspect_started = inspect_started.display(),
         inspect_release = inspect_release.display(),
         close_started = close_started.display(),
@@ -326,7 +326,7 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
 
 #[test]
 fn owned_close_retries_closing_and_rejects_unknown_or_closed_records() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let (_temp, store, service, _log) = lifecycle_fixture("");
     store
         .update(|state| {
@@ -350,7 +350,7 @@ fn owned_close_retries_closing_and_rejects_unknown_or_closed_records() {
 
 #[test]
 fn owned_close_retry_from_closing_keeps_closing_on_unknown_inspect() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let (_temp, store, service, _log) = lifecycle_fixture("malformed");
     store
         .update(|state| {
@@ -370,7 +370,7 @@ fn owned_close_retry_from_closing_keeps_closing_on_unknown_inspect() {
 
 #[test]
 fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     for remove_record in [false, true] {
         let temp = tempdir().unwrap();
         let state_path = temp.path().join("state.json");
@@ -385,7 +385,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
         let proceed = temp.path().join("proceed");
         let tmux = temp.path().join("tmux");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
             ready = ready.display(),
             proceed = proceed.display(),
         );
@@ -425,7 +425,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
 
 #[test]
 fn owned_close_accepts_matching_record_already_finalized_by_peer() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let store = StateStore::new(state_path);
@@ -439,7 +439,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
     let proceed = temp.path().join("proceed");
     let tmux = temp.path().join("tmux");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:0';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
         ready = ready.display(),
         proceed = proceed.display(),
     );
@@ -497,7 +497,7 @@ fn assert_process_group_gone(pid_path: &Path) {
 #[cfg(unix)]
 #[test]
 fn owned_close_times_out_hanging_inspect_without_mutating_active_record() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let store = StateStore::new(state_path.clone());
@@ -544,7 +544,7 @@ fn owned_close_times_out_hanging_inspect_without_mutating_active_record() {
 #[cfg(unix)]
 #[test]
 fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let state_path = temp.path().join("state.json");
     let store = StateStore::new(state_path);
@@ -559,7 +559,7 @@ fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
     fs::write(
         &tmux,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001\\t0';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:0';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
             process_group.display()
         ),
     )
@@ -606,21 +606,164 @@ fn posix_quote_handles_adversarial_values_without_interpolation() {
 }
 
 #[test]
+fn process_binaries_resolve_tools_from_a_restricted_absolute_path() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let tmux = temp.path().join("tmux");
+    write_fake(&ssh, &temp.path().join("ssh.args"), "", 0);
+    write_fake(&tmux, &temp.path().join("tmux.args"), "", 0);
+    let previous_path = std::env::var_os("PATH");
+    // SAFETY: process environment mutation is serialized by FAKE_PROCESS_LOCK.
+    unsafe { std::env::set_var("PATH", temp.path()) };
+    let binaries = ProcessBinaries::new("ssh", "tmux");
+    match previous_path {
+        Some(path) => {
+            // SAFETY: process environment mutation is serialized by FAKE_PROCESS_LOCK.
+            unsafe { std::env::set_var("PATH", path) };
+        }
+        None => {
+            // SAFETY: process environment mutation is serialized by FAKE_PROCESS_LOCK.
+            unsafe { std::env::remove_var("PATH") };
+        }
+    }
+
+    assert_eq!(binaries.ssh(), ssh);
+    assert_eq!(binaries.tmux(), tmux);
+}
+
+#[test]
+fn missing_local_tmux_reports_install_and_search_guidance() {
+    let backend = TmuxBackend::local(ProcessBinaries::new(
+        "unused-ssh-for-missing-tool-test",
+        "tmux-that-does-not-exist-for-test",
+    ));
+    let error = backend.inspect(&id()).unwrap_err().to_string();
+    assert!(error.contains("tmux-that-does-not-exist-for-test"));
+    assert!(error.contains("install the tool or make it executable"));
+    assert!(error.contains("/opt/homebrew/bin"));
+}
+
+#[test]
+fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    for (reported_cwd, succeeds) in [("/work/repo", true), ("/work/other", false)] {
+        let temp = tempdir().unwrap();
+        let tmux = temp.path().join("tmux");
+        let log = temp.path().join("calls");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3'; elif [ \"$1\" = display-message ]; then printf '%s' '{reported_cwd}'; fi\n",
+            log = log.display(),
+        );
+        fs::write(&tmux, script).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let backend =
+            TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+        let result = backend.create(&LaunchSpec {
+            id: id(),
+            directory: "/work/repo".into(),
+            command: "printf ready".into(),
+        });
+        assert_eq!(result.is_ok(), succeeds);
+
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains(
+            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -P -F #{session_id}:#{pane_id} -- /bin/sh -lc cd -- \"$1\" && exec /bin/sh -c \"$2\" tether-launch /work/repo printf ready"
+        ));
+        assert!(calls.contains("display-message -p -t %3 #{pane_current_path}"));
+        if succeeds {
+            assert!(calls.contains("set-option -t $7 mouse on"));
+            assert!(!calls.contains("kill-session"));
+        } else {
+            assert!(result.unwrap_err().to_string().contains("cwd mismatch"));
+            assert!(calls.contains("kill-session -t =tether-0197f198000070008000000000000001"));
+            assert!(!calls.contains("set-option"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_create_accepts_symlinked_directory_with_same_inode() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let real = temp.path().join("real-repo");
+    let selected = temp.path().join("selected-repo");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &selected).unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("calls");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3'; elif [ \"$1\" = display-message ]; then printf '%s' '{real}'; fi\n",
+        log = log.display(),
+        real = real.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    backend
+        .create(&LaunchSpec {
+            id: id(),
+            directory: selected.to_string_lossy().into_owned(),
+            command: "sleep 10".into(),
+        })
+        .unwrap();
+
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("set-option -t $7 mouse on")
+    );
+}
+
+#[test]
+fn owned_resume_enables_mouse_but_external_attach_never_mutates_options() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    let target = format!("{}:$7", id());
+    write_fake(&tmux, &log, &target, 0);
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let owned = backend.attach_command(&id()).unwrap();
+    assert_eq!(read_argv(&log), ["set-option", "-t", "$7", "mouse", "on"]);
+    assert_eq!(owned.args[0], "attach-session");
+
+    fs::remove_file(&log).unwrap();
+    let external = "work".parse::<ExternalSessionName>().unwrap();
+    let command = backend.attach_external_command(&external).unwrap();
+    assert_eq!(command.args, ["attach-session", "-t", "=work"]);
+    assert!(!log.exists(), "external attach must not execute set-option");
+}
+
+#[test]
 fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("ssh.args");
-    write_fake(&ssh, &log, "", 0);
+    let calls = temp.path().join("ssh.calls");
+    let directory = "/srv/it's $(touch /tmp/nope)\nline";
+    let command = "printf '%s\\n' \"$HOME\"; echo `id`";
+    let escaped_directory = directory.replace('\'', "'\\''");
+    let script = format!(
+        "#!/bin/sh\nremote=$9\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
+        log = log.display(),
+        calls = calls.display(),
+    );
+    fs::write(&ssh, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     write_fake(&tmux, &temp.path().join("tmux.args"), "", 0);
     let backend = TmuxBackend::remote(
         "ssh://builder@example.test:2222",
         ProcessBinaries::new(ssh, tmux),
     )
     .unwrap();
-    let directory = "/srv/it's $(touch /tmp/nope)\nline";
-    let command = "printf '%s\\n' \"$HOME\"; echo `id`";
 
     backend
         .create(&LaunchSpec {
@@ -642,7 +785,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
             "ServerAliveCountMax=3",
             "--",
             "ssh://builder@example.test:2222",
-            "'tmux' 'new-session' '-d' '-s' 'tether-0197f198000070008000000000000001' '-c' '/srv/it'\\''s $(touch /tmp/nope)\nline' '--' '/bin/sh' '-lc' 'printf '\\''%s\\n'\\'' \"$HOME\"; echo `id`'",
+            "'tmux' 'new-session' '-d' '-s' 'tether-0197f198000070008000000000000001' '-c' '/srv/it'\\''s $(touch /tmp/nope)\nline' '-P' '-F' '#{session_id}:#{pane_id}' '--' '/bin/sh' '-lc' 'cd -- \"$1\" && exec /bin/sh -c \"$2\"' 'tether-launch' '/srv/it'\\''s $(touch /tmp/nope)\nline' 'printf '\\''%s\\n'\\'' \"$HOME\"; echo `id`'",
         ]
     );
     assert_eq!(
@@ -650,16 +793,20 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
         9,
         "ssh must receive one remote command argument"
     );
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("'tmux' 'display-message' '-p' '-t' '%3' '#{pane_current_path}'"));
+    assert!(calls.contains("'tmux' 'set-option' '-t' '$7' 'mouse' 'on'"));
 }
 
 #[test]
 fn attach_only_attaches_and_close_is_the_only_kill_path() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("ssh.args");
-    write_fake(&ssh, &log, "", 0);
+    let target = format!("{}:$7", id());
+    write_fake(&ssh, &log, &target, 0);
     write_fake(&tmux, &temp.path().join("tmux.args"), "", 0);
     let backend = TmuxBackend::remote("build-box", ProcessBinaries::new(ssh, tmux)).unwrap();
 
@@ -734,13 +881,13 @@ fn unsafe_or_reserved_external_names_are_rejected() {
 
 #[test]
 fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     write_fake(&ssh, &temp.path().join("ssh.args"), "", 0);
-    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001\t2", 0);
+    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001:2", 0);
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
     assert_eq!(
@@ -752,7 +899,7 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
         [
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_attached}",
+            "#{session_name}:#{session_attached}",
             "-f",
             "#{==:#{session_name},tether-0197f198000070008000000000000001}",
         ]
@@ -761,7 +908,7 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
 
 #[test]
 fn inspect_maps_missing_and_failure_results() {
-    let _guard = FAKE_PROCESS_LOCK.lock().unwrap();
+    let _guard = FAKE_PROCESS_LOCK.lock();
     for (status, expected) in [
         (0, WorkloadState::Missing),
         (1, WorkloadState::Missing),

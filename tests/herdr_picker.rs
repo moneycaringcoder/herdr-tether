@@ -35,6 +35,8 @@ if [ "$1 $2" = "pane split" ]; then
   printf '%s' '{{"id":"cli-1","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
 elif [ "$1 $2" = "tab create" ]; then
   printf '%s' '{{"id":"cli-2","result":{{"type":"tab_created","tab":{{"tab_id":"w1:t9","workspace_id":"w1"}},"root_pane":{{"pane_id":"w1:p10","workspace_id":"w1","tab_id":"w1:t9"}}}}}}'
+elif [ "$1 $2" = "pane rename" ]; then
+  printf '%s' '{{"id":"rename","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
 elif [ "$1 $2" = "pane run" ]; then
   {pane_run}
 elif [ "$1 $2 $3" = "plugin pane open" ]; then
@@ -46,6 +48,50 @@ fi
 "#,
         log = log.display(),
         pane_run = pane_run,
+    );
+    let mut file = fs::File::create(path).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+const CLOSE_OK: &str = r#"printf '%s' '{"id":"close","result":{"type":"ok"}}'"#;
+
+fn write_fake_replace_herdr(
+    path: &Path,
+    log: &Path,
+    destination_processes: &str,
+    close_result: &str,
+) {
+    let script = format!(
+        r#"#!/bin/sh
+printf 'CALL' >> '{log}'
+for arg do printf '\t%s' "$arg" >> '{log}'; done
+printf '\n' >> '{log}'
+if [ "$1 $2 $3" = "pane process-info --pane" ]; then
+  if [ "$4" = "w1:p1" ]; then
+    printf '%s' '{{"id":"source","result":{{"type":"pane_process_info","process_info":{{"pane_id":"w1:p1","shell_pid":101,"foreground_processes":[{{"pid":202,"name":"vim","argv":["vim","notes.txt"],"cwd":"/tmp"}}]}}}}}}'
+  else
+    {destination_processes}
+  fi
+elif [ "$1 $2" = "pane split" ]; then
+  printf '%s' '{{"id":"split","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
+elif [ "$1 $2" = "pane rename" ]; then
+  printf '%s' '{{"id":"rename","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
+elif [ "$1 $2" = "pane run" ]; then
+  printf '%s' '{{"id":"run","result":{{"type":"pane_ran","pane_id":"w1:p9"}}}}'
+elif [ "$1 $2" = "pane close" ]; then
+  {close_result}
+else
+  printf '%s' '{{"id":"bad","error":{{"message":"unexpected fake invocation"}}}}'
+  exit 2
+fi
+"#,
+        log = log.display(),
+        destination_processes = destination_processes,
+        close_result = close_result,
     );
     let mut file = fs::File::create(path).unwrap();
     file.write_all(script.as_bytes()).unwrap();
@@ -93,6 +139,8 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
     assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright\t--focus"));
     assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tdown\t--focus"));
     assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1\t--focus"));
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\tTether session"));
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p10\tTether session"));
     assert!(transcript.contains("CALL\tpane\trun\tw1:p9\t'env' '-u' 'HERDR_BIN_PATH'"));
     assert!(transcript.contains(
         "'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
@@ -127,6 +175,108 @@ fn placement_rejects_failed_or_mismatched_pane_run() {
             "unexpected placement error: {error:#}"
         );
     }
+}
+
+#[test]
+fn replacement_inspects_source_then_closes_it_only_after_destination_is_running() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_replace_herdr(
+        &binary,
+        &log,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[{"pid":404,"name":"tmux","argv":["tmux","attach-session"],"cwd":"/tmp"}]}}}'"#,
+        CLOSE_OK,
+    );
+    let client = HerdrClient::new(context(&binary));
+
+    let inspection = client.inspect_replacement_source().unwrap();
+    assert_eq!(inspection.pane_id, "w1:p1");
+    assert!(inspection.requires_confirmation());
+    assert!(inspection.safe_summary().contains("vim"));
+    let pane = client
+        .replace_current(&CommandSpec::new(
+            "/plugin/herdr-tether",
+            vec!["session".into(), "resume".into(), "tether-id".into()],
+        ))
+        .unwrap();
+    assert_eq!(pane.pane_id, "w1:p9");
+
+    let transcript = fs::read_to_string(log).unwrap();
+    let source_info = transcript
+        .find("CALL\tpane\tprocess-info\t--pane\tw1:p1")
+        .unwrap();
+    let split = transcript.find("CALL\tpane\tsplit").unwrap();
+    let run = transcript.find("CALL\tpane\trun\tw1:p9").unwrap();
+    let destination_info = transcript
+        .find("CALL\tpane\tprocess-info\t--pane\tw1:p9")
+        .unwrap();
+    let close = transcript.find("CALL\tpane\tclose\tw1:p1").unwrap();
+    assert!(
+        source_info < split && split < run && run < destination_info && destination_info < close
+    );
+}
+
+#[test]
+fn replacement_close_failure_warns_without_invalidating_running_destination() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_replace_herdr(
+        &binary,
+        &log,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","foreground_processes":[{"pid":404,"name":"tmux"}]}}}'"#,
+        "exit 9",
+    );
+
+    let pane = HerdrClient::new(context(&binary))
+        .replace_current(&CommandSpec::new(
+            "/plugin/herdr-tether",
+            vec!["session".into(), "resume".into(), "tether-id".into()],
+        ))
+        .unwrap();
+
+    assert_eq!(pane.pane_id, "w1:p9");
+    let warning = pane.warning.expect("source close failure is visible");
+    assert!(warning.contains("destination `w1:p9` is running"));
+    assert!(warning.contains("source pane `w1:p1` could not be closed"));
+}
+
+#[test]
+fn replacement_preserves_source_when_destination_cannot_be_verified() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_replace_herdr(
+        &binary,
+        &log,
+        r#"printf '%s' '{"id":"destination","result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p9","shell_pid":303,"foreground_processes":[]}}}'"#,
+        CLOSE_OK,
+    );
+    let error = HerdrClient::new(context(&binary))
+        .replace_current(&CommandSpec::new(
+            "/plugin/herdr-tether",
+            vec!["session".into(), "resume".into(), "tether-id".into()],
+        ))
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("source pane `w1:p1` was preserved")
+    );
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("CALL\tpane\tclose\tw1:p9"));
+    assert!(!transcript.contains("CALL\tpane\tclose\tw1:p1"));
 }
 
 #[test]
@@ -670,6 +820,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         generation: 1,
         host: "build-box".into(),
         status: HostReachability::Reachable,
+        detail: None,
         checked_at: SystemTime::UNIX_EPOCH,
     }));
     assert_eq!(explorer.host_label("build-box"), Some("[online] build-box"));
@@ -696,6 +847,7 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         generation: 1,
         host: "build-box".into(),
         status: HostReachability::Unreachable,
+        detail: None,
         checked_at: SystemTime::UNIX_EPOCH,
     }));
     assert_eq!(
@@ -706,11 +858,12 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
         generation: 2,
         host: "build-box".into(),
         status: HostReachability::TimedOut,
+        detail: Some("tmux missing; install it".into()),
         checked_at: SystemTime::UNIX_EPOCH,
     }));
     assert_eq!(
         explorer.host_label("build-box"),
-        Some("[timeout] build-box")
+        Some("[timeout] build-box · tmux missing; install it")
     );
 }
 

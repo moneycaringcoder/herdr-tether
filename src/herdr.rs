@@ -1,4 +1,4 @@
-use std::{env, ffi::OsString, path::PathBuf, process::Command};
+use std::{env, ffi::OsString, path::PathBuf, process::Command, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -83,6 +83,51 @@ fn require_nonempty_env(name: &str, value: String) -> Result<String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacedPane {
     pub pane_id: String,
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundProcess {
+    pub pid: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplacementInspection {
+    pub pane_id: String,
+    pub foreground_processes: Vec<ForegroundProcess>,
+}
+
+impl ReplacementInspection {
+    pub fn requires_confirmation(&self) -> bool {
+        !self.foreground_processes.is_empty()
+    }
+
+    pub fn safe_summary(&self) -> String {
+        self.foreground_processes
+            .iter()
+            .take(3)
+            .map(|process| {
+                let name = process
+                    .name
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>();
+                format!(
+                    "{} (PID {})",
+                    name.split_whitespace().collect::<Vec<_>>().join(" "),
+                    process.pid
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,8 +146,101 @@ impl HerdrClient {
             Placement::SplitRight => self.split("right")?,
             Placement::SplitDown => self.split("down")?,
             Placement::NewTab => self.create_tab()?,
+            Placement::ReplaceCurrentPane => {
+                bail!("replace-current placement requires explicit replacement confirmation")
+            }
+        };
+        // Presentation metadata must never block a working attach.
+        let _ = self.label_pane(&pane_id);
+        match self.run_in_pane(command, pane_id.clone()) {
+            Ok(placed) => Ok(placed),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                match self.close_pane(&pane_id) {
+                    Ok(()) => Err(error).context(format!(
+                        "placement failed ({detail}); empty destination `{pane_id}` was removed"
+                    )),
+                    Err(cleanup_error) => Err(error).context(format!(
+                        "placement failed ({detail}) and empty destination `{pane_id}` could not be removed: {cleanup_error:#}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Reports foreground processes that replacement would terminate.
+    pub fn inspect_replacement_source(&self) -> Result<ReplacementInspection> {
+        self.process_info(&self.context.pane_id)
+            .context("inspect the pane that Replace current pane would close")
+    }
+
+    /// Creates and verifies a destination before closing the exact invoking pane.
+    pub fn replace_current(&self, command: &CommandSpec) -> Result<PlacedPane> {
+        const VERIFY_ATTEMPTS: usize = 20;
+        const VERIFY_INTERVAL: Duration = Duration::from_millis(50);
+
+        let source_pane_id = self.context.pane_id.clone();
+        let destination_pane_id = self.split("right")?;
+        // Presentation metadata must never block a working replacement.
+        let _ = self.label_pane(&destination_pane_id);
+        let placed = match self.run_in_pane(command, destination_pane_id.clone()) {
+            Ok(placed) => placed,
+            Err(error) => {
+                let cleanup = self.close_pane(&destination_pane_id);
+                return Err(error).context(replacement_failure_context(
+                    &source_pane_id,
+                    &destination_pane_id,
+                    cleanup.as_ref().err(),
+                ));
+            }
         };
 
+        let mut last_verification_error = None;
+        let mut destination_ready = false;
+        for attempt in 0..VERIFY_ATTEMPTS {
+            match self.process_info(&destination_pane_id) {
+                Ok(destination) if !destination.foreground_processes.is_empty() => {
+                    destination_ready = true;
+                    break;
+                }
+                Ok(_) => {
+                    last_verification_error =
+                        Some("no foreground attach process was reported".to_owned());
+                }
+                Err(error) => {
+                    last_verification_error = Some(format!("{error:#}"));
+                }
+            }
+            if attempt + 1 < VERIFY_ATTEMPTS {
+                thread::sleep(VERIFY_INTERVAL);
+            }
+        }
+        if !destination_ready {
+            let cleanup = self.close_pane(&destination_pane_id);
+            let verification = last_verification_error
+                .unwrap_or_else(|| "destination verification did not complete".to_owned());
+            bail!(
+                "{}; verification failed: {verification}",
+                replacement_failure_context(
+                    &source_pane_id,
+                    &destination_pane_id,
+                    cleanup.as_ref().err()
+                )
+            );
+        }
+
+        let warning = self.close_pane(&source_pane_id).err().map(|error| {
+            format!(
+                "replacement destination `{destination_pane_id}` is running, but source pane `{source_pane_id}` could not be closed: {error:#}"
+            )
+        });
+        Ok(PlacedPane {
+            pane_id: placed.pane_id,
+            warning,
+        })
+    }
+
+    fn run_in_pane(&self, command: &CommandSpec, pane_id: String) -> Result<PlacedPane> {
         let command_line = placed_command(command)?.posix_command_line()?;
         let arguments = [
             "pane".to_owned(),
@@ -123,8 +261,10 @@ impl HerdrClient {
                 );
             }
         }
-
-        Ok(PlacedPane { pane_id })
+        Ok(PlacedPane {
+            pane_id,
+            warning: None,
+        })
     }
 
     /// Opens one of this plugin's manifest-declared managed overlay panes.
@@ -166,6 +306,79 @@ impl HerdrClient {
         result_string(&response, &["pane", "pane_id"], "split response pane_id")
     }
 
+    fn process_info(&self, pane_id: &str) -> Result<ReplacementInspection> {
+        let response = self.invoke(
+            "inspect pane process",
+            &[
+                "pane".to_owned(),
+                "process-info".to_owned(),
+                "--pane".to_owned(),
+                pane_id.to_owned(),
+            ],
+        )?;
+        require_result_type(&response, "pane_process_info")?;
+        let process_info = response
+            .get("result")
+            .and_then(|result| result.get("process_info"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Herdr process response did not contain process_info")
+            })?;
+        let reported_pane_id = process_info
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Herdr process response did not contain pane_id"))?;
+        if reported_pane_id != pane_id {
+            bail!("Herdr inspected pane `{reported_pane_id}`, not requested pane `{pane_id}`");
+        }
+        let foreground_processes = process_info
+            .get("foreground_processes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|process| {
+                let pid = process.get("pid").and_then(Value::as_u64).ok_or_else(|| {
+                    anyhow::anyhow!("Herdr foreground process did not contain pid")
+                })?;
+                let name = process
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Herdr foreground process did not contain name")
+                    })?;
+                Ok(ForegroundProcess {
+                    pid,
+                    name: name.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReplacementInspection {
+            pane_id: pane_id.to_owned(),
+            foreground_processes,
+        })
+    }
+
+    fn label_pane(&self, pane_id: &str) -> Result<()> {
+        let response = self.invoke(
+            "label Tether pane",
+            &[
+                "pane".to_owned(),
+                "rename".to_owned(),
+                pane_id.to_owned(),
+                "Tether session".to_owned(),
+            ],
+        )?;
+        require_result_type(&response, "pane_info")
+    }
+
+    fn close_pane(&self, pane_id: &str) -> Result<()> {
+        let response = self.invoke(
+            "close replaced pane",
+            &["pane".to_owned(), "close".to_owned(), pane_id.to_owned()],
+        )?;
+        require_result_type(&response, "ok")
+    }
+
     fn create_tab(&self) -> Result<String> {
         let response = self.invoke(
             "create tab",
@@ -199,6 +412,21 @@ impl HerdrClient {
                     self.context.binary.display()
                 )
             })
+    }
+}
+
+fn replacement_failure_context(
+    source_pane_id: &str,
+    destination_pane_id: &str,
+    cleanup_error: Option<&anyhow::Error>,
+) -> String {
+    match cleanup_error {
+        Some(error) => format!(
+            "replacement destination `{destination_pane_id}` failed and cleanup also failed ({error:#}); source pane `{source_pane_id}` was preserved"
+        ),
+        None => format!(
+            "replacement destination `{destination_pane_id}` failed and was removed; source pane `{source_pane_id}` was preserved"
+        ),
     }
 }
 

@@ -7,7 +7,7 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
-    assert_eq!(value["version"].as_str(), Some("0.2.0"));
+    assert_eq!(value["version"].as_str(), Some("0.2.1"));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
     assert_eq!(
         value["platforms"].as_array().unwrap(),
@@ -41,6 +41,10 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
         ]
     );
     assert_eq!(actions[1]["id"].as_str(), Some("setup"));
+    assert_eq!(
+        actions[1]["title"].as_str(),
+        Some("Tether: Install prefix+t launcher")
+    );
 
     let panes = value["panes"].as_array().unwrap();
     assert_eq!(panes.len(), 2);
@@ -57,6 +61,10 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
         ]
     );
     assert_eq!(panes[1]["id"].as_str(), Some("setup"));
+    assert_eq!(
+        panes[1]["title"].as_str(),
+        Some("Tether: Install prefix+t launcher")
+    );
     assert_eq!(panes[1]["placement"].as_str(), Some("overlay"));
     assert_eq!(
         panes[1]["command"].as_array().unwrap(),
@@ -64,7 +72,7 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
             toml::Value::String("sh".into()),
             toml::Value::String("-c".into()),
             toml::Value::String(
-                "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup".into(),
+                "\"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup --yes && exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup keybinding".into(),
             ),
         ]
     );

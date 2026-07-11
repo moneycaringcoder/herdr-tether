@@ -11,7 +11,7 @@ Tether complements [Herdr](https://github.com/ogulcancelik/herdr) and `herdr-mir
 - Linux or macOS.
 - [Herdr](https://github.com/ogulcancelik/herdr) 0.7.3 or newer.
 - Git, Rust 1.88 or newer, and Cargo. Herdr clones the repository and Cargo builds the plugin from source.
-- `tmux` locally and on every remote target used by Tether.
+- `tmux` 3.3 or newer locally and on every remote target used by Tether.
 - OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes` under your normal keys, agent, and `known_hosts` policy.
 - Network access to GitHub and Cargo's configured registry during installation, unless both sources and dependencies are already cached.
 
@@ -29,17 +29,27 @@ cargo install --git https://github.com/moneycaringcoder/herdr-tether \
   --tag v0.2.0 --locked herdr-tether
 ```
 
-Run **Tether: Setup** once from Herdr, or invoke it explicitly:
+Run **Tether: Install prefix+t launcher** once from Herdr, or invoke the action explicitly:
 
 ```sh
 herdr plugin action invoke setup --plugin moneycaringcoder.tether
 ```
 
-`setup` creates private configuration and state files but does not modify Herdr or SSH configuration. A suitable Herdr keybinding action is:
+That explicit action creates Tether's private configuration/state, then installs `prefix+t` for `moneycaringcoder.tether.open`. It first saves the exact Herdr config to a sibling Tether backup. An identical binding is an idempotent content no-op that still requests Herdr config reload. A conflicting `prefix+t` binding, invalid/unmergeable config, or unrelated existing backup stops without overwriting the config or exposing the conflicting command. A matching backup from an interrupted attempt is safely replaced. After reload, `prefix+t` opens Tether.
 
-```text
-plugin_action moneycaringcoder.tether.open
+The standalone equivalent is:
+
+```sh
+herdr-tether setup keybinding
 ```
+
+Restore the exact backup, consume it, and reload Herdr with the command below. Rollback refuses if the config has changed since installation, preserving later user edits:
+
+```sh
+herdr-tether setup keybinding --rollback
+```
+
+Plain standalone `herdr-tether setup` and normal install/open remain non-mutating. Herdr 0.7.3 has no generic plugin-action menu, so zero-command first invocation is unavailable; the single explicit setup action above is the supported one-time bootstrap.
 
 ### Update, reinstall, uninstall, and rollback
 
@@ -79,9 +89,13 @@ herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
 
 For local development, clone the repository, run `cargo build --release --locked`, and use `herdr plugin link "$(pwd)"`; remove that link with `herdr plugin unlink moneycaringcoder.tether`.
 
+### v0.2.1 release candidate
+
+The branch metadata is v0.2.1, but v0.2.0 remains the pinned stable install above until v0.2.1 is accepted and tagged. The candidate adds explicit keybinding installation and rollback, Replace current pane, more reliable executable and working-directory handling, stable in-picker retry/cancel errors, and session-scoped mouse support for Tether-owned sessions.
+
 ## Quick start
 
-Open **Tether: Open** in Herdr. Choose a host, then an owned workload, a safely discovered **external** `tmux` session, or **Create new Tether workload**. Creation proceeds through directory, command, and split-right/split-down/new-tab placement.
+Open **Tether: Open** in Herdr. Choose a host, then an owned workload, a safely discovered **external** `tmux` session, or **Create new Tether workload**. Creation proceeds through directory, command, and split-right/split-down/new-tab/Replace current pane placement.
 
 Herdr injects plugin-owned configuration and state directories into actions. Point the standalone CLI at those same Linux/macOS directories before configuring data that **Tether: Open** must read:
 
@@ -113,7 +127,7 @@ After configuring the `build` host above, invoke **Tether: Open** and choose:
 build → Create new Tether workload → <discovered repository> → editor → Split right
 ```
 
-Tether scans configured roots within bounded limits, creates a uniquely named detached `tmux` session in the selected directory, records its exact host and target, creates the requested Herdr view, and attaches there. Closing that view or losing SSH leaves the workload running. Reopen Tether and select its `[active]` row to resume it in any placement.
+Tether scans configured roots within bounded limits, creates a uniquely named detached `tmux` session in the selected directory, verifies the created pane's exact working directory, enables mouse support only on that owned session, records its exact host and target, creates the requested Herdr view, and attaches there. A directory mismatch fails creation and triggers exact-session cleanup instead of recording a workload in the wrong directory. Closing that view or losing SSH leaves the workload running. Reopen Tether and select its `[active]` row to resume it in any placement; resume re-enables mouse only for the owned session, while external attachment never changes session options.
 
 Manually, this requires remembering the SSH destination and directory, naming and later finding the `tmux` session, opening the Herdr pane, and composing the exact attach command. `herdr-mirror` can mirror a remote Herdr pane, but it does not discover arbitrary `tmux` work or provide Tether's owned lifecycle and metadata cleanup.
 
@@ -158,14 +172,17 @@ The explorer stages are host → resource; creation continues through directory 
 
 On an Active or Closing row, press `c`, then `y` to confirm exact close. Press uppercase `P`, then `y` to prune eligible Closed metadata globally. Prune has no SSH or `tmux` capability and removes only unchanged records from the confirmed preview. Closing cannot be started from external rows, and prune never affects external sessions or running workloads.
 
-Explorer keys: `↑`/`k`/`Shift-Tab`, `↓`/`j`/`Tab`, `Enter`/`→`, `Backspace`/`←`, `r` refresh, and `Esc`/`Ctrl-C` cancel. On the directory stage, `/` filters and lowercase `p` accepts a literal path.
+Explorer keys: `↑`/`k`/`Shift-Tab`, `↓`/`j`/`Tab`, `Enter` to select, `Backspace` to go back, `r` refresh, and `Esc`/`Ctrl-C` cancel. Left and Right never select, advance, or launch. On the directory stage, `/` filters and lowercase `p` accepts a literal path. A failed create, resume, attach, or placement remains as a stable modal: only Enter retries the exact selection, while Backspace or Esc dismisses the error and returns to Hosts.
 
-Herdr actions initially open a manifest-declared terminal overlay. Herdr 0.7.3 does not provide native non-terminal plugin UI or sidebar extensions, so the explorer cannot be embedded as a native panel. After selection, Tether focuses the invoking pane's requested split or new tab and starts the exact resume/attach command there. The `tmux` workload remains independent of that Herdr view.
+Herdr actions initially open a manifest-declared terminal overlay. After selection, Tether focuses the invoking pane's requested split or tab and starts the exact resume/attach command there. **Replace current pane** first inspects foreground processes and requires interactive confirmation before terminating any it finds. It then creates a destination, dispatches the attachment, waits for foreground-process readiness, and only then closes the captured source pane. Dispatch or readiness failure cleans up the destination and preserves the source; a source-close failure preserves the running destination. Non-interactive replacement refuses when foreground processes require confirmation, and cancelling preserves the source.
+
+Herdr 0.7.3 does expose public semantic reporting commands (`pane report-agent`, `report-agent-session`, `release-agent`, and `report-metadata`), but those APIs are assertions about a known agent lifecycle rather than generic nested-workload registration. Tether knows its outer `tmux` identity and attach lifetime; it cannot truthfully infer a nested OMP or Hermes lifecycle or native session identity, and tmux detach is not agent completion. Tether therefore uses honestly titled terminal panes as its fallback and does not fabricate native sidebar or Agents support. A native inner hook must make any OMP or Hermes report itself.
 
 ## Command reference
 
 ```text
 herdr-tether setup [--yes]
+herdr-tether setup keybinding [--rollback]
 herdr-tether doctor
 herdr-tether host add <NAME> <TARGET> [--root <DIR>]... [--preset <NAME=COMMAND>]...
 herdr-tether host list [--json]
@@ -173,7 +190,7 @@ herdr-tether host remove <NAME>
 herdr-tether host check <NAME>
 herdr-tether open [--host <NAME>] [--directory <DIR>]
                   [--command <COMMAND> | --preset <NAME>]
-                  [--placement split-right|split-down|new-tab]
+                  [--placement split-right|split-down|new-tab|replace-current-pane]
 herdr-tether session list [--json]
 herdr-tether session resume <ID>
 herdr-tether session close <ID>
@@ -181,7 +198,9 @@ herdr-tether session prune [--dry-run] [--older-than-days <DAYS>]
 herdr-tether snapshot [--pretty]
 ```
 
-A fully specified `open` request bypasses the explorer. Outside Herdr, its attachment runs in the current terminal. Commands and presets are trusted code executed with `/bin/sh -lc` on the selected machine.
+A fully specified `open` request bypasses the explorer. Outside Herdr, its attachment runs in the current terminal. Commands and presets are trusted code: Tether starts `/bin/sh -lc` to load the selected machine's login environment, then explicitly restores the selected directory before executing the command through `/bin/sh -c`.
+
+When launched from a GUI with a reduced `PATH`, Tether resolves bare `tmux` and `ssh` names through absolute `PATH` entries, then `/usr/bin`, `/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`. Commands placed into Herdr use the resolved current Tether executable rather than assuming `herdr-tether` is on the pane's `PATH`.
 
 `session close` inspects and closes only the exact owned ID. An indeterminate inspection leaves Active metadata unchanged. A recoverable `closing` marker prevents a failed or timed-out kill/save from masquerading as Active; rerun close to reconcile it. Closing a Herdr pane or a failed attachment never implicitly kills the workload.
 

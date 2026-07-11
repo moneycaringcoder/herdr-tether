@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from live_product_smoke import Smoke
+from live_product_smoke import Smoke, terminal_screen_text
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
@@ -63,7 +63,86 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 self.assertLess(len(os.fsencode(client_socket)), 104)
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
+    def test_gui_runtime_path_is_restricted_after_tmux_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+            try:
+                self.assertEqual(
+                    smoke.env["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin"
+                )
+                self.assertNotIn("homebrew", smoke.env["PATH"].lower())
+                self.assertNotIn("/usr/local/bin", smoke.env["PATH"])
+                self.assertTrue(smoke.tmux.is_absolute())
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
 
+    def test_owned_tmux_contract_queries_exact_id_without_touching_external(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+            try:
+                directory = smoke.root / "work"
+                with mock.patch.object(
+                    smoke,
+                    "tmux_value",
+                    side_effect=["%42", str(directory), "on"],
+                ) as tmux_value:
+                    smoke.verify_owned_tmux_contract(
+                        "tether-0123456789abcdef0123456789abcdef", directory
+                    )
+                self.assertEqual(
+                    tmux_value.call_args_list,
+                    [
+                        mock.call(
+                            "list-panes",
+                            "-t",
+                            "=tether-0123456789abcdef0123456789abcdef",
+                            "-F",
+                            "#{pane_id}",
+                        ),
+                        mock.call(
+                            "display-message",
+                            "-p",
+                            "-t",
+                            "%42",
+                            "#{pane_current_path}",
+                        ),
+                        mock.call(
+                            "show-options",
+                            "-v",
+                            "-t",
+                            "tether-0123456789abcdef0123456789abcdef",
+                            "mouse",
+                        ),
+                    ],
+                )
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
+
+
+    def test_terminal_screen_tracks_ratatui_cursor_updates(self) -> None:
+        output = (
+            b"\x1b[2J\x1b[1;1H"
+            b"Tether - Hosts"
+            b"\x1b[1;10HResources"
+            b"\x1b[2;1HCreate new Tether workload"
+            b"\x1b[3;1H\x1b[31mSplit right\x1b[0m"
+        )
+        screen = terminal_screen_text(output, rows=4, columns=60)
+        self.assertIn("Tether - Resources", screen)
+        self.assertNotIn("Tether - Hosts", screen)
+        self.assertIn("Create new Tether workload", screen)
+        self.assertIn("Split right", screen)
 
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:

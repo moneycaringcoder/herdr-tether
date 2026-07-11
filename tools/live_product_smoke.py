@@ -45,21 +45,115 @@ def fail(message: str) -> "NoReturn":
 def format_command(argv: Iterable[str]) -> str:
     return " ".join(repr(arg) for arg in argv)
 
+def terminal_screen_text(data: bytes, rows: int = 40, columns: int = 140) -> str:
+    """Apply the small ANSI cursor/erase subset emitted by ratatui."""
+    screen = [[" " for _ in range(columns)] for _ in range(rows)]
+    row = 0
+    column = 0
+    text = data.decode("utf-8", "replace")
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\x1b" and index + 1 < len(text):
+            if text[index + 1] == "[":
+                end = index + 2
+                while end < len(text) and not ("@" <= text[end] <= "~"):
+                    end += 1
+                if end >= len(text):
+                    break
+                final = text[end]
+                raw = text[index + 2 : end].lstrip("?")
+                values = [
+                    int(value) if value.isdigit() else 0
+                    for value in raw.split(";")
+                ] if raw else []
+                first = values[0] if values else 0
+                if final in ("H", "f"):
+                    row = max(0, (values[0] if values and values[0] else 1) - 1)
+                    column = max(
+                        0, (values[1] if len(values) > 1 and values[1] else 1) - 1
+                    )
+                elif final == "A":
+                    row = max(0, row - (first or 1))
+                elif final == "B":
+                    row = min(rows - 1, row + (first or 1))
+                elif final == "C":
+                    column = min(columns - 1, column + (first or 1))
+                elif final == "D":
+                    column = max(0, column - (first or 1))
+                elif final == "G":
+                    column = max(0, (first or 1) - 1)
+                elif final == "d":
+                    row = max(0, (first or 1) - 1)
+                elif final == "J" and first in (2, 3):
+                    screen = [[" " for _ in range(columns)] for _ in range(rows)]
+                    row = 0
+                    column = 0
+                elif final == "K":
+                    if first == 2:
+                        screen[row] = [" " for _ in range(columns)]
+                    elif first == 1:
+                        for position in range(0, min(column + 1, columns)):
+                            screen[row][position] = " "
+                    else:
+                        for position in range(column, columns):
+                            screen[row][position] = " "
+                index = end + 1
+                continue
+            if text[index + 1] == "]":
+                end = text.find("\x07", index + 2)
+                terminator = 1
+                if end == -1:
+                    end = text.find("\x1b\\", index + 2)
+                    terminator = 2
+                if end == -1:
+                    break
+                index = end + terminator
+                continue
+            index += 2
+            continue
+        if character == "\r":
+            column = 0
+        elif character == "\n":
+            row = min(rows - 1, row + 1)
+        elif character == "\b":
+            column = max(0, column - 1)
+        elif character >= " " and character != "\x7f":
+            if row < rows and column < columns:
+                screen[row][column] = character
+            column = min(columns - 1, column + 1)
+        index += 1
+    return "\n".join("".join(line).rstrip() for line in screen)
+
 
 class Smoke:
-    def __init__(self, herdr: Path, tether: Path, repo_root: Path, keep: bool) -> None:
+    def __init__(
+        self,
+        herdr: Path,
+        tether: Path,
+        repo_root: Path,
+        keep: bool,
+        remote_target: str | None = None,
+        remote_directory: str | None = None,
+    ) -> None:
         self.herdr = herdr.resolve()
         self.tether = tether.resolve()
         self.repo_root = repo_root.resolve()
         self.keep = keep
+        self.remote_target = remote_target
+        self.remote_directory = remote_directory
         self.root = Path(tempfile.mkdtemp(prefix="tether-smoke-", dir="/tmp"))
         self.session = f"tether-smoke-{os.getpid()}"
+        self.external_session = f"external-smoke-{os.getpid()}"
         self.herdr_client: subprocess.Popen[bytes] | None = None
         self.herdr_master: int | None = None
         self.herdr_output = bytearray()
         self._reader: threading.Thread | None = None
         self._cleaned = False
-
+        self.owned_ids: set[str] = set()
+        inherited_path = os.environ.get("PATH", "")
+        resolved_tmux = shutil.which("tmux", path=inherited_path)
+        self.tmux = Path(resolved_tmux).resolve() if resolved_tmux else Path("tmux")
         home = self.root / "home"
         for directory in (
             home,
@@ -112,6 +206,12 @@ class Smoke:
                 "NO_COLOR": "1",
                 "TERM": "xterm-256color",
             }
+        )
+        # Herdr's GUI plugin runtime does not inherit an interactive Homebrew
+        # PATH. Product commands deliberately run under that same restriction;
+        # Tether must resolve standard macOS package-manager locations itself.
+        self.env["PATH"] = os.pathsep.join(
+            ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
         )
         # A wrapper gives Tether's Herdr client the exact disposable named
         # session even outside a Herdr-launched plugin process.
@@ -294,6 +394,236 @@ class Smoke:
                 diagnostics = f"<unavailable: {log_error}>"
             fail(f"{error}\nHerdr server log ({server_log}):\n{diagnostics}")
 
+    def interact(
+        self,
+        argv: list[str],
+        env: dict[str, str],
+        steps: list[tuple[str, bytes]],
+    ) -> str:
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
+        output = bytearray()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=self.repo_root,
+                env=env,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+            )
+        except OSError as error:
+            os.close(master)
+            os.close(slave)
+            fail(f"could not start interactive command {format_command(argv)}: {error}")
+        os.close(slave)
+
+        def drain() -> None:
+            while True:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                output.extend(chunk)
+                if b"\x1b[6n" in chunk:
+                    os.write(master, b"\x1b[1;1R")
+
+        reader = threading.Thread(target=drain, name="tether-picker-reader", daemon=True)
+        reader.start()
+        try:
+            for marker, keys in steps:
+                def visible() -> bool:
+                    rendered = terminal_screen_text(bytes(output))
+                    if process.poll() is not None and marker not in rendered:
+                        fail(
+                            f"interactive command exited ({process.returncode}) before marker "
+                            f"{marker!r}: {format_command(argv)}\n{rendered}"
+                        )
+                    return marker in rendered
+
+                try:
+                    self.wait_until(f"interactive picker marker {marker!r}", visible)
+                except SmokeFailure as error:
+                    rendered = terminal_screen_text(bytes(output))
+                    fail(
+                        f"{error}; process={process.poll()}\n"
+                        f"interactive screen:\n{rendered}"
+                    )
+                os.write(master, keys)
+            try:
+                returncode = process.wait(timeout=STATE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                fail(f"interactive command did not exit: {format_command(argv)}")
+            rendered = output.decode("utf-8", "replace")
+            if returncode != 0:
+                fail(
+                    f"interactive command failed ({returncode}): "
+                    f"{format_command(argv)}\n{rendered[-8000:]}"
+                )
+            return rendered
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    def picker_event_contract(self, workspace_id: str, invoking_pane: str) -> None:
+        picker_env = self.tether_env(workspace_id, invoking_pane)
+        before_panes = self.pane_ids()
+        before_tmux = self.tmux_sessions()
+        missing = self.root / "work" / "missing-create-directory"
+        rendered = self.interact(
+            [
+                str(self.tether),
+                "open",
+                "--directory",
+                str(missing),
+                "--command",
+                "true",
+            ],
+            picker_env,
+            [
+                ("Hosts", b"\r"),
+                ("Create new Tether workload", b"\r"),
+                (str(self.root / "home"), b"\r"),
+                ("Shell", b"\r"),
+                ("Split right", b"\x1b[B\x1b[B\r"),
+                ("Enter retry", b"\x1b"),
+                ("Hosts", b"\x1b"),
+            ],
+        )
+        if "Backspace/Esc cancel" not in rendered or "Operation failed" not in rendered:
+            fail("failed local new-tab create was not visible in the picker overlay")
+        if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
+            fail("failed local new-tab create leaked a pane or tmux session")
+
+        self.tmux_run(
+            "new-session",
+            "-d",
+            "-s",
+            self.external_session,
+            "-c",
+            str(self.root / "work"),
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec sleep 300",
+        )
+        external_inventory = self.tmux_sessions()
+        if self.external_session not in external_inventory:
+            fail(
+                "external fixture session exited immediately after creation; "
+                f"isolated inventory: {sorted(external_inventory)}"
+            )
+        self.tmux_run(
+            "set-option", "-t", self.external_session, "mouse", "off"
+        )
+        before_panes = self.pane_ids()
+        self.interact(
+            [str(self.tether), "open", "--host", "local"],
+            picker_env,
+            [
+                ("Hosts", b"\r"),
+                (self.external_session, b"\r"),
+                ("Split right", b"\x1b[B\x1b[B\r"),
+            ],
+        )
+        external_pane = self.wait_new_pane(before_panes, "external session new-tab pane")
+        self.verify_placement("new-tab", invoking_pane, external_pane)
+        mouse = self.tmux_value(
+            "show-options", "-v", "-t", self.external_session, "mouse"
+        )
+        if mouse != "off":
+            fail(f"external session mouse option was mutated to {mouse!r}")
+        self.close_pane(external_pane)
+        if self.external_session not in self.tmux_sessions():
+            fail("closing an external Tether view killed the external tmux session")
+
+    def replacement_contract(self, workspace_id: str, invoking_pane: str) -> None:
+        split = self.result_object(
+            self.decode_json(
+                self.herdr_run(
+                    "pane", "split", "--pane", invoking_pane, "--direction", "right", "--focus"
+                ),
+                "replacement source split",
+            ),
+            "replacement source split",
+        )
+        source_ids = self.collect_strings(split, "pane_id")
+        if not source_ids:
+            fail(f"Herdr omitted the replacement source identity: {split}")
+        source = source_ids[-1]
+        self.herdr_run("pane", "run", source, "exec sleep 300")
+        def source_is_non_shell() -> bool:
+            response = self.result_object(
+                self.decode_json(
+                    self.herdr_run("pane", "process-info", "--pane", source),
+                    "replacement source process info",
+                ),
+                "replacement source process info",
+            )
+            names = self.collect_strings(response, "name")
+            return "sleep" in names
+
+        self.wait_until("replacement source foreground process", source_is_non_shell)
+        source_env = self.tether_env(workspace_id, source)
+        command = [
+            str(self.tether),
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            str(self.root / "work"),
+            "--command",
+            "exec cat",
+            "--placement",
+            "replace-current-pane",
+        ]
+
+        before_ids = {item.get("id") for item in self.state_records()}
+        before_tmux = self.tmux_sessions()
+        refused = self.run(command, env=source_env, check=False)
+        if refused.returncode == 0 or "source pane was preserved" not in refused.stderr:
+            fail("noninteractive replacement did not preserve a non-shell source")
+        if source not in self.pane_ids():
+            fail("refused replacement closed its exact source pane")
+        refused_ids = {
+            item.get("id") for item in self.state_records()
+        } - before_ids
+        if refused_ids:
+            fail(f"refused replacement leaked owned metadata: {refused_ids}")
+        if self.tmux_sessions() != before_tmux:
+            fail("refused replacement leaked or removed a tmux session")
+
+        before_panes = self.pane_ids()
+        before_ids = {item.get("id") for item in self.state_records()}
+        self.interact(command, source_env, [("Continue? [y/N]", b"yes\r")])
+        created_ids = {
+            item.get("id") for item in self.state_records()
+        } - before_ids
+        if len(created_ids) != 1:
+            fail(f"confirmed replacement did not create one exact record: {created_ids}")
+        replacement_id = next(iter(created_ids))
+        if not isinstance(replacement_id, str) or not re.fullmatch(
+            r"tether-[0-9a-f]{32}", replacement_id
+        ):
+            fail(f"confirmed replacement produced a non-Tether ID: {replacement_id!r}")
+        self.owned_ids.add(replacement_id)
+        destination = self.wait_new_pane(before_panes - {source}, "replacement destination")
+        if source in self.pane_ids():
+            fail("confirmed replacement left the exact source pane open")
+        self.verify_owned_tmux_contract(replacement_id, self.root / "work")
+        self.close_pane(destination)
+        self.run([str(self.tether), "session", "close", replacement_id])
+        self.owned_ids.discard(replacement_id)
+
     def workspace_and_pane(self) -> tuple[str, str]:
         workspaces = self.result_object(
             self.decode_json(self.herdr_run("workspace", "list"), "workspace list"),
@@ -387,6 +717,65 @@ class Smoke:
         self.herdr_run("pane", "close", pane_id, check=False)
         self.wait_until(f"pane {pane_id} closure", lambda: pane_id not in self.pane_ids())
 
+    def keybinding_contract(self) -> None:
+        original = self.herdr_config.read_bytes() if self.herdr_config.exists() else b""
+        backup = self.herdr_config.with_name(
+            self.herdr_config.name + ".tether-keybinding.bak"
+        )
+        key_env = self.env.copy()
+        key_env["HERDR_BIN_PATH"] = str(self.herdr_wrapper)
+
+        installed = self.run(
+            [str(self.tether), "setup", "keybinding"], env=key_env
+        )
+        if "installed Herdr prefix+t" not in installed.stdout:
+            fail(f"keybinding install did not report installation: {installed.stdout}")
+        installed_bytes = self.herdr_config.read_bytes()
+        if b'key = "prefix+t"' not in installed_bytes or PLUGIN_ID.encode() not in installed_bytes:
+            fail("keybinding install omitted the exact prefix+t Tether plugin action")
+        if backup.read_bytes() != original:
+            fail("keybinding backup did not preserve the exact disposable Herdr config")
+
+        fingerprint = self.file_fingerprint(self.herdr_config)
+        idempotent = self.run(
+            [str(self.tether), "setup", "keybinding"], env=key_env
+        )
+        if "already bound" not in idempotent.stdout:
+            fail(f"idempotent keybinding install was not reported: {idempotent.stdout}")
+        if self.file_fingerprint(self.herdr_config) != fingerprint:
+            fail("idempotent keybinding install rewrote Herdr config")
+
+        rolled_back = self.run(
+            [str(self.tether), "setup", "keybinding", "--rollback"], env=key_env
+        )
+        if "restored Herdr config" not in rolled_back.stdout:
+            fail(f"keybinding rollback was not reported: {rolled_back.stdout}")
+        if self.herdr_config.read_bytes() != original:
+            fail("keybinding rollback did not restore the exact Herdr config bytes")
+
+        backup_fingerprint = self.file_fingerprint(backup)
+        conflict = (
+            original
+            + (b"\n" if original and not original.endswith(b"\n") else b"")
+            + b'[[keys.command]]\nkey = "prefix+t"\ntype = "command"\ncommand = "echo conflict"\n'
+        )
+        self.herdr_config.write_bytes(conflict)
+        rejected = self.run(
+            [str(self.tether), "setup", "keybinding"], env=key_env, check=False
+        )
+        if rejected.returncode == 0 or "already bound" not in rejected.stderr:
+            fail(
+                "conflicting prefix+t binding was not rejected with an actionable diagnostic"
+            )
+        if (
+            self.herdr_config.read_bytes() != conflict
+            or self.file_fingerprint(backup) != backup_fingerprint
+        ):
+            fail("conflicting keybinding attempt mutated config or backup")
+        self.herdr_config.write_bytes(original)
+        self.herdr_run("server", "reload-config")
+        backup.unlink(missing_ok=True)
+
 
     def plugin_contract(self) -> None:
         linked = self.result_object(
@@ -464,7 +853,22 @@ class Smoke:
                         "HERDR_PLUGIN_STATE_DIR": str(plugin_state.parent),
                     }
                 )
-                self.run([str(self.tether), "doctor"], env=plugin_env)
+                doctor = self.run(
+                    [str(self.tether), "doctor"], env=plugin_env, check=False
+                )
+                if doctor.returncode == 0:
+                    fail("restricted-path plugin doctor unexpectedly found Cargo")
+                for executable in ("tmux", "ssh"):
+                    if f"{executable}: ok" not in doctor.stdout:
+                        fail(
+                            f"plugin doctor did not resolve {executable} under the restricted GUI PATH: "
+                            f"{doctor.stdout}"
+                        )
+                if "cargo: missing (install it or add it to PATH)" not in doctor.stdout:
+                    fail(
+                        "plugin doctor did not expose actionable missing-Cargo guidance: "
+                        f"{doctor.stdout}"
+                    )
                 self.wait_until(
                     "setup action managed pane exit",
                     lambda: not (self.pane_ids() - before),
@@ -479,9 +883,14 @@ class Smoke:
             if action not in json.dumps(logs, sort_keys=True):
                 fail(f"Herdr plugin logs did not record the {action} action: {logs}")
 
-        config_after = self.file_fingerprint(self.herdr_config)
-        if config_after != config_before:
-            fail("Tether setup action altered Herdr's config file")
+        config_after = self.herdr_config.read_bytes()
+        if b'key = "prefix+t"' not in config_after or PLUGIN_ID.encode() not in config_after:
+            fail("explicit Tether launcher setup action did not install prefix+t")
+        backup = self.herdr_config.with_name(
+            self.herdr_config.name + ".tether-keybinding.bak"
+        )
+        if not backup.exists() or self.file_fingerprint(backup) != config_before:
+            fail("explicit Tether launcher setup action did not preserve the exact config backup")
 
     @staticmethod
     def file_fingerprint(path: Path) -> tuple[bool, str]:
@@ -505,22 +914,22 @@ class Smoke:
         )
         return env
 
+    def tmux_run(
+        self, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run([str(self.tmux), *args], check=check)
+
     def tmux_sessions(self) -> set[str]:
-        result = self.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"], check=False
-        )
+        result = self.tmux_run("list-sessions", "-F", "#{session_name}", check=False)
         if result.returncode not in (0, 1):
             fail(f"isolated tmux list failed: {result.stderr}")
         return {line for line in result.stdout.splitlines() if line}
 
     def tmux_attached(self, session_id: str) -> int:
-        result = self.run(
-            [
-                "tmux",
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_attached}",
-            ],
+        result = self.tmux_run(
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_attached}",
             check=False,
         )
         if result.returncode == 1:
@@ -539,6 +948,28 @@ class Smoke:
                     )
         return -1
 
+    def tmux_value(self, *args: str) -> str:
+        result = self.tmux_run(*args)
+        return result.stdout.rstrip("\r\n")
+
+    def verify_owned_tmux_contract(self, session_id: str, directory: Path) -> None:
+        pane_id = self.tmux_value("list-panes", "-t", f"={session_id}", "-F", "#{pane_id}")
+        actual_cwd = self.tmux_value(
+            "display-message", "-p", "-t", pane_id, "#{pane_current_path}"
+        )
+        try:
+            same_directory = os.path.samefile(actual_cwd, directory)
+        except OSError:
+            same_directory = False
+        if not same_directory:
+            fail(
+                f"owned session {session_id} cwd mismatch: "
+                f"selected {directory}, got {actual_cwd!r}"
+            )
+        mouse = self.tmux_value("show-options", "-v", "-t", session_id, "mouse")
+        if mouse != "on":
+            fail(f"owned session {session_id} did not enable mouse; got {mouse!r}")
+
     def state_records(self) -> list[dict[str, Any]]:
         payload = self.decode_json(
             self.run([str(self.tether), "session", "list", "--json"]),
@@ -549,8 +980,14 @@ class Smoke:
         return payload
 
     def create_placed_session(
-        self, placement: str, workspace_id: str, invoking_pane: str, command: str
+        self,
+        placement: str,
+        workspace_id: str,
+        invoking_pane: str,
+        command: str,
+        directory: Path | None = None,
     ) -> tuple[str, str, str]:
+        directory = directory or self.root / "work"
         before_panes = self.pane_ids()
         before_tmux = self.tmux_sessions()
         result = self.run(
@@ -560,7 +997,7 @@ class Smoke:
                 "--host",
                 "local",
                 "--directory",
-                str(self.root / "work"),
+                str(directory),
                 "--command",
                 command,
                 "--placement",
@@ -572,6 +1009,7 @@ class Smoke:
         if not match:
             fail(f"Tether {placement} create did not print a session ID: {result.stdout}")
         session_id = match.group(1)
+        self.owned_ids.add(session_id)
         pane_id = self.wait_new_pane(before_panes, f"Tether {placement} pane")
         tmux_created = self.wait_until(
             f"Tether {placement} tmux session",
@@ -585,6 +1023,7 @@ class Smoke:
             f"Tether {placement} tmux attachment",
             lambda: self.tmux_attached(session_id) > 0,
         )
+        self.verify_owned_tmux_contract(session_id, directory)
         if self.focused_pane() != pane_id:
             fail(
                 f"Tether {placement} pane {pane_id} was not focused; "
@@ -596,12 +1035,103 @@ class Smoke:
             fail(f"Tether did not persist one active record for {session_id}: {records}")
         return session_id, pane_id, str(tmux_created)
 
+    def remote_cwd_contract(self, workspace_id: str, invoking_pane: str) -> None:
+        if self.remote_target is None or self.remote_directory is None:
+            return
+        host_name = "tether-smoke-remote"
+        self.run(
+            [
+                str(self.tether),
+                "host",
+                "add",
+                host_name,
+                self.remote_target,
+                "--root",
+                self.remote_directory,
+            ]
+        )
+        before = {item.get("id") for item in self.state_records()}
+        before_panes = self.pane_ids()
+        created = self.run(
+            [
+                str(self.tether),
+                "open",
+                "--host",
+                host_name,
+                "--directory",
+                self.remote_directory,
+                "--command",
+                "exec cat",
+                "--placement",
+                "new-tab",
+            ],
+            env=self.tether_env(workspace_id, invoking_pane),
+        )
+        match = re.search(r"^created (tether-[0-9a-f]{32})$", created.stdout, re.MULTILINE)
+        if not match:
+            fail(f"remote create did not report an exact Tether ID: {created.stdout}")
+        session_id = match.group(1)
+        if session_id in before:
+            fail(f"remote create reused existing ID {session_id}")
+        self.owned_ids.add(session_id)
+        pane = self.wait_new_pane(before_panes, "remote new-tab pane")
+        self.verify_placement("new-tab", invoking_pane, pane)
+
+        def remote_tmux(*args: str) -> str:
+            remote_command = " ".join(self._shell_quote(value) for value in ("tmux", *args))
+            return self.run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "--",
+                    self.remote_target or "",
+                    remote_command,
+                ]
+            ).stdout.rstrip("\r\n")
+
+        actual_cwd = remote_tmux(
+            "display-message", "-p", "-t", f"={session_id}:0.0", "#{pane_current_path}"
+        )
+        if actual_cwd != self.remote_directory:
+            fail(
+                f"remote session {session_id} cwd mismatch: expected "
+                f"{self.remote_directory!r}, got {actual_cwd!r}"
+            )
+        if remote_tmux("show-options", "-v", "-t", session_id, "mouse") != "on":
+            fail(f"remote owned session {session_id} did not enable mouse")
+        self.close_pane(pane)
+        self.run([str(self.tether), "session", "close", session_id])
+        self.owned_ids.discard(session_id)
+
     def product_lifecycle(self) -> None:
         setup = self.run([str(self.tether), "setup", "--yes"])
         if "Tether configuration:" not in setup.stdout or "Tether state:" not in setup.stdout:
             fail(f"Tether setup did not report its configuration and state paths: {setup.stdout}")
+        doctor_env = self.env.copy()
+        doctor_env["HERDR_BIN_PATH"] = str(self.herdr_wrapper)
+        doctor = self.run([str(self.tether), "doctor"], env=doctor_env, check=False)
+        if doctor.returncode == 0:
+            fail("incomplete local Herdr context unexpectedly passed doctor")
+        for executable in ("tmux", "ssh"):
+            if f"{executable}: ok" not in doctor.stdout:
+                fail(
+                    f"doctor did not resolve {executable} under the restricted GUI PATH: "
+                    f"{doctor.stdout}"
+                )
+        if "cargo: missing (install it or add it to PATH)" not in doctor.stdout:
+            fail(
+                "doctor did not expose actionable missing-tool guidance under "
+                f"the restricted GUI PATH: {doctor.stdout}"
+            )
+        if "Herdr context: incomplete" not in doctor.stdout:
+            fail(
+                "standalone local doctor did not provide actionable incomplete "
+                "plugin-context diagnostics"
+            )
 
         workspace_id, initial_pane = self.workspace_and_pane()
+        self.picker_event_contract(workspace_id, initial_pane)
         pid_file = self.root / "work" / "continuity.pid"
         workload = (
             f"exec {self._shell_quote(sys.executable)} -c "
@@ -682,28 +1212,52 @@ class Smoke:
             lambda: self.tmux_attached(third_id) == 0,
         )
 
-        for session_id in (first_id, second_id, third_id):
+        symlink_directory = self.root / "selected-work-link"
+        symlink_directory.symlink_to(self.root / "work", target_is_directory=True)
+        symlink_id, symlink_pane, _ = self.create_placed_session(
+            "split-right",
+            workspace_id,
+            initial_pane,
+            "exec cat",
+            directory=symlink_directory,
+        )
+        self.close_pane(symlink_pane)
+        self.wait_until(
+            "symlink-cwd tmux detach after Herdr view close",
+            lambda: self.tmux_attached(symlink_id) == 0,
+        )
+
+        for session_id in (first_id, second_id, third_id, symlink_id):
             self.run([str(self.tether), "session", "close", session_id])
-        self.wait_until("all Tether tmux sessions to close", lambda: not self.tmux_sessions())
+        self.wait_until(
+            "all Tether tmux sessions to close",
+            lambda: not ({first_id, second_id, third_id, symlink_id} & self.tmux_sessions()),
+        )
         records = {item.get("id"): item for item in self.state_records()}
-        for session_id in (first_id, second_id, third_id):
+        for session_id in (first_id, second_id, third_id, symlink_id):
             status = str(records.get(session_id, {}).get("status", "")).lower()
             if status != "closed":
                 fail(f"exact close did not persist closed status for {session_id}: {status!r}")
+        self.replacement_contract(workspace_id, initial_pane)
+        self.remote_cwd_contract(workspace_id, initial_pane)
 
     def validate_inputs(self) -> None:
         for label, path in (("Herdr", self.herdr), ("Tether", self.tether)):
             if not path.is_file() or not os.access(path, os.X_OK):
                 fail(f"{label} executable is missing or not executable: {path}")
+        if self.remote_directory is not None and not self.remote_directory.startswith("/"):
+            fail("--remote-directory must be an absolute disposable POSIX path")
         if not (self.repo_root / "herdr-plugin.toml").is_file():
             fail(f"repository root has no herdr-plugin.toml: {self.repo_root}")
-        for command in ("tmux",):
-            if shutil.which(command, path=self.env.get("PATH")) is None:
-                fail(f"required executable is not on PATH: {command}")
-        tmux_version = self.run(["tmux", "-V"]).stdout.strip()
+        if not self.tmux.is_file() or not os.access(self.tmux, os.X_OK):
+            fail(
+                "required executable tmux could not be resolved before entering "
+                "the restricted GUI PATH"
+            )
+        tmux_version = self.run([str(self.tmux), "-V"]).stdout.strip()
         match = re.fullmatch(r"tmux (\d+)\.(\d+)[a-z]?", tmux_version)
-        if not match or tuple(map(int, match.groups())) < (3, 2):
-            fail(f"live smoke requires tmux 3.2 or newer; got {tmux_version!r}")
+        if not match or tuple(map(int, match.groups())) < (3, 3):
+            fail(f"live smoke requires tmux 3.3 or newer; got {tmux_version!r}")
         version = self.run([str(self.herdr), "--version"])
         if version.stdout.strip() != f"herdr {HERDR_VERSION}":
             fail(
@@ -714,9 +1268,20 @@ class Smoke:
         if self._cleaned:
             return
         self._cleaned = True
-        # Close product workloads first, then both persistent multiplexers.
+        # Close exact Tether-owned workloads first. The deliberately external
+        # session is cleaned separately and is never passed to Tether close.
+        for session_id in sorted(self.owned_ids):
+            try:
+                self.run(
+                    [str(self.tether), "session", "close", session_id],
+                    check=False,
+                    timeout=5.0,
+                )
+            except SmokeFailure as error:
+                print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
         cleanup_commands = (
-            (["tmux", "kill-server"], 5.0),
+            ([str(self.tmux), "kill-session", "-t", f"={self.external_session}"], 5.0),
+            ([str(self.tmux), "kill-server"], 5.0),
             ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
             ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
@@ -747,6 +1312,7 @@ class Smoke:
     def execute(self) -> None:
         self.validate_inputs()
         self.start_herdr()
+        self.keybinding_contract()
         self.plugin_contract()
         self.product_lifecycle()
 
@@ -761,12 +1327,34 @@ def parse_args() -> argparse.Namespace:
         "--repo-root", type=Path, default=Path.cwd(), help="checkout containing herdr-plugin.toml"
     )
     parser.add_argument("--keep", action="store_true", help="retain the disposable root for debugging")
+    parser.add_argument(
+        "--remote-target",
+        help="optional disposable SSH target for the remote cwd branch",
+    )
+    parser.add_argument(
+        "--remote-directory",
+        help="existing disposable absolute directory on --remote-target",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    smoke = Smoke(args.herdr, args.tether, args.repo_root, args.keep)
+    if (args.remote_target is None) != (args.remote_directory is None):
+        print(
+            "live product smoke FAILED: --remote-target and --remote-directory "
+            "must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+    smoke = Smoke(
+        args.herdr,
+        args.tether,
+        args.repo_root,
+        args.keep,
+        args.remote_target,
+        args.remote_directory,
+    )
     atexit.register(smoke.cleanup)
 
     def interrupted(signum: int, _frame: Any) -> None:

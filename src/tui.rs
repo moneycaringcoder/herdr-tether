@@ -365,6 +365,17 @@ pub enum PickerOutcome {
     Cancelled,
 }
 
+/// A failed create, resume, attach, or placement attempt retained by the picker.
+///
+/// Integrations should pass the exact attempted selection back with a
+/// user-safe diagnostic. Confirming retries that same selection; cancelling
+/// dismisses the error without executing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PickerOperationError {
+    pub attempted: PickerSelection,
+    pub diagnostic: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerInput {
     None,
@@ -582,6 +593,7 @@ pub struct PickerState {
     external_name: Option<ExternalSessionName>,
     generation: u64,
     host_status: HashMap<String, StatusCell<HostReachability>>,
+    host_error_details: HashMap<String, String>,
     workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
     catalogs: HashMap<String, CatalogCell>,
     discovery_generation: u64,
@@ -597,6 +609,7 @@ pub struct PickerState {
     prune_modal: Option<PickerPruneModal>,
     pending_prune: Option<PickerPrunePending>,
     prune_notice: Option<String>,
+    operation_error: Option<PickerOperationError>,
 }
 
 impl PickerState {
@@ -636,6 +649,7 @@ impl PickerState {
             external_name: None,
             generation: 0,
             host_status: HashMap::new(),
+            host_error_details: HashMap::new(),
             workload_status: HashMap::new(),
             catalogs: HashMap::new(),
             discovery_generation: 0,
@@ -651,6 +665,7 @@ impl PickerState {
             prune_modal: None,
             pending_prune: None,
             prune_notice: None,
+            operation_error: None,
         })
     }
 
@@ -660,6 +675,22 @@ impl PickerState {
 
     pub fn input(&self) -> &PickerInput {
         &self.input
+    }
+
+    pub fn operation_error(&self) -> Option<&PickerOperationError> {
+        self.operation_error.as_ref()
+    }
+
+    pub fn set_operation_error(&mut self, attempted: PickerSelection, diagnostic: impl AsRef<str>) {
+        let diagnostic = bounded_error_text(&sanitize_terminal_text(diagnostic.as_ref()));
+        self.operation_error = Some(PickerOperationError {
+            attempted,
+            diagnostic: if diagnostic.is_empty() {
+                "Operation failed".to_owned()
+            } else {
+                diagnostic
+            },
+        });
     }
 
     pub fn close_modal(&self) -> Option<&PickerCloseModal> {
@@ -1181,12 +1212,24 @@ impl PickerState {
             StatusMessage::Host {
                 host,
                 status,
+                detail,
                 checked_at,
                 ..
-            } => self.host_status.get_mut(&host).is_some_and(|cell| {
-                cell.apply(status, checked_at);
-                true
-            }),
+            } => {
+                let applied = self.host_status.get_mut(&host).is_some_and(|cell| {
+                    cell.apply(status, checked_at);
+                    true
+                });
+                if applied {
+                    if let Some(detail) = detail {
+                        self.host_error_details
+                            .insert(host, bounded_error_text(&sanitize_terminal_text(&detail)));
+                    } else {
+                        self.host_error_details.remove(&host);
+                    }
+                }
+                applied
+            }
             StatusMessage::Workload {
                 id,
                 status,
@@ -1301,6 +1344,10 @@ impl PickerState {
                     self.host_status.get(&host.name),
                     host_status_text,
                 );
+                if let Some(detail) = self.host_error_details.get(&host.name) {
+                    host.label.push_str(" · ");
+                    host.label.push_str(detail);
+                }
             }
             for workload in &mut host.workloads {
                 workload.label = if workload.status == SessionStatus::Active {
@@ -1326,6 +1373,22 @@ impl PickerState {
     }
 
     pub fn handle(&mut self, event: PickerEvent) -> PickerOutcome {
+        if self.operation_error.is_some() {
+            return match event {
+                PickerEvent::Confirm => {
+                    let error = self
+                        .operation_error
+                        .take()
+                        .expect("operation error was checked");
+                    PickerOutcome::Selected(error.attempted)
+                }
+                PickerEvent::Back | PickerEvent::Cancel => {
+                    self.operation_error = None;
+                    PickerOutcome::Continue
+                }
+                _ => PickerOutcome::Continue,
+            };
+        }
         if self.pending_close.is_some()
             && !matches!(event, PickerEvent::Previous | PickerEvent::Next)
         {
@@ -1841,6 +1904,12 @@ impl PickerState {
     }
 
     fn modal_text(&self) -> Option<String> {
+        if let Some(error) = &self.operation_error {
+            return Some(format!(
+                "Enter retry · Backspace/Esc cancel · Operation failed: {}",
+                error.diagnostic
+            ));
+        }
         if let Some(modal) = &self.prune_modal {
             return Some(match modal {
                 PickerPruneModal::Confirm { preview } => format!(
@@ -1868,6 +1937,9 @@ impl PickerState {
     }
 
     pub fn frame_title(&self) -> String {
+        if self.operation_error.is_some() {
+            return "Operation failed".to_owned();
+        }
         match (&self.prune_modal, &self.pending_prune, &self.close_modal) {
             (Some(PickerPruneModal::Confirm { .. }), _, _) => "Confirm prune".to_owned(),
             (Some(PickerPruneModal::Failed { .. }), _, _) => "Prune failed".to_owned(),
@@ -1967,7 +2039,7 @@ impl PickerState {
                     " · Enter select"
                 };
                 parts.push(format!(
-                    "↑/↓ navigate{select_hint}{close_hint}{path_hint} · P prune closed metadata · r refresh · ← back · Esc cancel"
+                    "↑/↓ navigate{select_hint}{close_hint}{path_hint} · P prune closed metadata · r refresh · Backspace back · Esc cancel"
                 ));
                 parts.join(" · ")
             }
@@ -2033,18 +2105,25 @@ fn format_prune_error(error: crate::lifecycle::PruneError) -> String {
     sanitize_terminal_text(&format!("{:#}", anyhow::Error::new(error)))
 }
 
-const PLACEMENTS: [Placement; 3] = [
+const PLACEMENTS: [Placement; 4] = [
     Placement::SplitRight,
     Placement::SplitDown,
     Placement::NewTab,
+    Placement::ReplaceCurrentPane,
 ];
-const PLACEMENT_LABELS: [&str; 3] = ["Split right", "Split down", "New tab"];
+const PLACEMENT_LABELS: [&str; 4] = [
+    "Split right",
+    "Split down",
+    "New tab",
+    "Replace current pane (closes it after verified attach)",
+];
 
 fn placement_index(placement: Placement) -> usize {
     match placement {
         Placement::SplitRight => 0,
         Placement::SplitDown => 1,
         Placement::NewTab => 2,
+        Placement::ReplaceCurrentPane => 3,
     }
 }
 
@@ -2059,7 +2138,30 @@ pub fn run_picker(
     prune_service: PruneService,
     retention_days: u64,
 ) -> Result<Option<PickerSelection>> {
+    run_picker_with_operation_error(
+        options,
+        status_service,
+        discovery_service,
+        lifecycle_service,
+        prune_service,
+        retention_days,
+        None,
+    )
+}
+
+pub fn run_picker_with_operation_error(
+    options: PickerOptions,
+    status_service: StatusService,
+    discovery_service: DiscoveryService,
+    lifecycle_service: LifecycleService,
+    prune_service: PruneService,
+    retention_days: u64,
+    operation_error: Option<(PickerSelection, String)>,
+) -> Result<Option<PickerSelection>> {
     let mut state = PickerState::with_retention(options, retention_days)?;
+    if let Some((attempted, diagnostic)) = operation_error {
+        state.set_operation_error(attempted, diagnostic);
+    }
     enable_raw_mode().context("enable terminal raw mode")?;
     if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
         let _ = disable_raw_mode();
@@ -2326,8 +2428,8 @@ fn map_key_with_modals(
         KeyCode::Esc => Some(PickerEvent::Cancel),
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Some(PickerEvent::Previous),
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Some(PickerEvent::Next),
-        KeyCode::Backspace | KeyCode::Left => Some(PickerEvent::Back),
-        KeyCode::Enter | KeyCode::Right => Some(PickerEvent::Confirm),
+        KeyCode::Backspace => Some(PickerEvent::Back),
+        KeyCode::Enter => Some(PickerEvent::Confirm),
         KeyCode::Char('/') if stage == PickerStage::Directory => Some(PickerEvent::BeginFilter),
         KeyCode::Char('P')
             if key.kind == KeyEventKind::Press
@@ -2378,7 +2480,8 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
     let destructive = state.close_modal.is_some()
         || state.pending_close.is_some()
         || state.prune_modal.is_some()
-        || state.pending_prune.is_some();
+        || state.pending_prune.is_some()
+        || state.operation_error.is_some();
     let accent = if destructive { Color::Red } else { Color::Cyan };
     let block = Block::default()
         .title(format!(" Tether · {} ", state.frame_title()))
@@ -2654,6 +2757,132 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn arrows_never_advance_or_go_back() {
+        for code in [KeyCode::Left, KeyCode::Right] {
+            assert_eq!(
+                map_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    &PickerInput::None,
+                    PickerStage::Host,
+                    false,
+                ),
+                None
+            );
+        }
+        for (code, event) in [
+            (KeyCode::Up, PickerEvent::Previous),
+            (KeyCode::Down, PickerEvent::Next),
+        ] {
+            assert_eq!(
+                map_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    &PickerInput::None,
+                    PickerStage::Host,
+                    false,
+                ),
+                Some(event)
+            );
+        }
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+                false,
+            ),
+            Some(PickerEvent::Back)
+        );
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Host,
+                false,
+            ),
+            Some(PickerEvent::Confirm)
+        );
+    }
+
+    fn navigation_picker() -> PickerState {
+        PickerState::new(PickerOptions {
+            hosts: ["first", "second"]
+                .into_iter()
+                .map(|name| PickerHost {
+                    name: name.to_owned(),
+                    label: name.to_owned(),
+                    target: None,
+                    origin: PickerHostOrigin::Effective,
+                    directories: vec!["/work".to_owned()],
+                    scan_roots: Vec::new(),
+                    commands: vec![PickerCommand::Shell],
+                    workloads: Vec::new(),
+                    allow_existing: false,
+                    allow_create: true,
+                })
+                .collect(),
+            default_placement: Placement::SplitRight,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn enter_advances_the_arrow_selected_item_and_controls_advertise_it() {
+        let mut picker = navigation_picker();
+        let controls = picker.footer_text();
+        assert!(controls.contains("↑/↓ navigate"));
+        assert!(controls.contains("Enter select"));
+        assert!(controls.contains("Backspace back"));
+        assert!(!controls.contains("← back"));
+
+        assert_eq!(picker.handle(PickerEvent::Next), PickerOutcome::Continue);
+        assert_eq!(picker.stage(), PickerStage::Host);
+        assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+        assert_eq!(picker.stage(), PickerStage::Resource);
+        picker.handle(PickerEvent::Confirm);
+        picker.handle(PickerEvent::Confirm);
+        picker.handle(PickerEvent::Confirm);
+        let PickerOutcome::Selected(PickerSelection::Create(selection)) =
+            picker.handle(PickerEvent::Confirm)
+        else {
+            panic!("Enter should launch the selected create operation");
+        };
+        assert_eq!(selection.host, "second");
+    }
+
+    #[test]
+    fn operation_error_is_stable_until_retry_or_cancel() {
+        let mut picker = navigation_picker();
+        picker.handle(PickerEvent::Confirm);
+        picker.handle(PickerEvent::Confirm);
+        picker.handle(PickerEvent::Confirm);
+        picker.handle(PickerEvent::Confirm);
+        let PickerOutcome::Selected(selection) = picker.handle(PickerEvent::Confirm) else {
+            panic!("Enter at placement should select");
+        };
+
+        picker.set_operation_error(selection.clone(), "create failed\u{1b}[31m\nsecond line");
+        let visible = picker.operation_error().unwrap().diagnostic.clone();
+        assert!(!visible.contains('\u{1b}'));
+        assert!(!visible.contains('\n'));
+        assert!(picker.footer_text().contains("Enter retry"));
+        assert!(picker.footer_text().contains("Backspace/Esc cancel"));
+
+        assert_eq!(picker.handle(PickerEvent::Next), PickerOutcome::Continue);
+        assert_eq!(picker.operation_error().unwrap().diagnostic, visible);
+        assert_eq!(picker.handle(PickerEvent::Refresh), PickerOutcome::Continue);
+        assert_eq!(picker.operation_error().unwrap().diagnostic, visible);
+        assert_eq!(
+            picker.handle(PickerEvent::Confirm),
+            PickerOutcome::Selected(selection.clone())
+        );
+        assert!(picker.operation_error().is_none());
+
+        picker.set_operation_error(selection, "still failed");
+        assert_eq!(picker.handle(PickerEvent::Back), PickerOutcome::Continue);
+        assert!(picker.operation_error().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2854,6 +3083,39 @@ mod close_render_tests {
         assert!(failed.contains("Prune failed"));
         assert!(failed.contains("y retry"));
         assert!(failed.contains("n/Esc dismiss"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.fg == Color::Red)
+        );
+    }
+    #[test]
+    fn operation_error_renders_safe_diagnostic_and_explicit_actions() {
+        let (mut picker, id) = close_picker();
+        picker.set_operation_error(
+            PickerSelection::Resume {
+                id,
+                placement: Placement::SplitRight,
+            },
+            "placement unavailable",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+
+        terminal
+            .draw(|frame| render_picker(frame, &picker))
+            .unwrap();
+        let rendered = rendered_text(&terminal)
+            .replace(['│', '┌', '─', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("Operation failed"));
+        assert!(rendered.contains("placement unavailable"));
+        assert!(rendered.contains("Enter retry"));
+        assert!(rendered.contains("Backspace/Esc cancel"));
         assert!(
             terminal
                 .backend()

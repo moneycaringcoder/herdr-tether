@@ -9,8 +9,8 @@ use chrono::{TimeZone, Utc};
 use fs2::FileExt;
 use herdr_tether::{
     config::{
-        CommandPreset, Config, ConfigStore, DiscoveryDefaults, HostConfig, RetentionDefaults,
-        UiDefaults,
+        CommandPreset, Config, ConfigStore, DiscoveryDefaults, HerdrKeybindingInstall,
+        HerdrKeybindingRollback, HerdrKeybindingStore, HostConfig, RetentionDefaults, UiDefaults,
     },
     model::Placement,
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -455,4 +455,225 @@ fn concurrent_state_updates_preserve_both_records() {
 
     let state = StateStore::new(path).load().unwrap();
     assert_eq!(state.sessions.len(), 2);
+}
+
+const TETHER_BINDING: &str = r#"[[keys.command]]
+key = "prefix+t"
+type = "plugin_action"
+command = "moneycaringcoder.tether.open"
+description = "Tether: Open"
+"#;
+
+#[test]
+fn herdr_keybinding_install_preserves_source_and_backup_bytes() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("herdr/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o750)).unwrap();
+    let original = b"# keep this byte-for-byte\n[theme]\nname = \"custom\"\n";
+    fs::write(&path, original).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let store = HerdrKeybindingStore::new(path.clone());
+    let installed = store.install().unwrap();
+    let backup = match installed {
+        HerdrKeybindingInstall::Installed { backup } => backup,
+        other => panic!("unexpected install result: {other:?}"),
+    };
+
+    let installed_bytes = fs::read(&path).unwrap();
+    assert!(installed_bytes.starts_with(original));
+    assert!(installed_bytes.ends_with(TETHER_BINDING.as_bytes()));
+    assert_eq!(fs::read(&backup).unwrap(), original);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+}
+
+#[test]
+fn herdr_keybinding_install_is_idempotent_without_rewriting() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = format!("# exact\n{TETHER_BINDING}");
+    fs::write(&path, &original).unwrap();
+
+    let result = HerdrKeybindingStore::new(path.clone()).install().unwrap();
+
+    assert_eq!(result, HerdrKeybindingInstall::AlreadyInstalled);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn herdr_keybinding_conflict_refuses_all_mutation_with_safe_diagnostic() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original =
+        b"[[keys.command]]\nkey = \"prefix+t\"\ntype = \"command\"\ncommand = \"echo secret\"\n";
+    fs::write(&path, original).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("prefix+t"));
+    assert!(error.contains("already bound"));
+    assert!(!error.contains("echo secret"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn herdr_keybinding_rollback_restores_backup_exactly() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"# original\r\nonboarding = false\r\n";
+    fs::write(&path, original).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let store = HerdrKeybindingStore::new(path.clone());
+    store.install().unwrap();
+
+    let result = store.rollback().unwrap();
+
+    assert_eq!(result, HerdrKeybindingRollback::Restored);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+    assert!(matches!(
+        store.install().unwrap(),
+        HerdrKeybindingInstall::Installed { .. }
+    ));
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn herdr_keybinding_rejects_invalid_toml_without_creating_backup() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"[keys\n";
+    fs::write(&path, original).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("parse Herdr config"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn herdr_keybinding_backup_collision_leaves_both_files_unchanged() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"onboarding = false\n";
+    fs::write(&path, original).unwrap();
+    let backup = HerdrKeybindingStore::backup_path_for(&path);
+    let prior_backup = b"unrelated prior backup\n";
+    fs::write(&backup, prior_backup).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("backup"));
+    assert!(error.contains("config was not changed"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read(&backup).unwrap(), prior_backup);
+}
+
+#[test]
+fn herdr_keybinding_consumes_matching_stale_backup_before_retry() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"onboarding = false\n";
+    fs::write(&path, original).unwrap();
+    let backup = HerdrKeybindingStore::backup_path_for(&path);
+    fs::write(&backup, original).unwrap();
+
+    let result = HerdrKeybindingStore::new(path.clone()).install().unwrap();
+
+    assert!(matches!(result, HerdrKeybindingInstall::Installed { .. }));
+    assert!(
+        fs::read(&path)
+            .unwrap()
+            .ends_with(TETHER_BINDING.as_bytes())
+    );
+}
+
+#[test]
+fn herdr_keybinding_rollback_refuses_to_overwrite_later_edits() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, b"onboarding = false\n").unwrap();
+    let store = HerdrKeybindingStore::new(path.clone());
+    store.install().unwrap();
+    let edited = b"onboarding = true\n";
+    fs::write(&path, edited).unwrap();
+
+    let error = store.rollback().unwrap_err().to_string();
+
+    assert!(error.contains("changed after Tether installed"));
+    assert_eq!(fs::read(&path).unwrap(), edited);
+    assert!(HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn herdr_keybinding_rejects_unmergeable_toml_before_backup() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"keys = { prefix = \"ctrl+b\" }\n";
+    fs::write(&path, original).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("cannot be merged"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn herdr_keybinding_detects_conflicts_in_builtin_action_fields() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"[keys]\nworkspace_picker = [\"prefix+w\", \"prefix+t\"]\n";
+    fs::write(&path, original).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("prefix+t"));
+    assert!(error.contains("already bound"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
 }

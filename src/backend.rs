@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Component, Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
@@ -39,15 +42,15 @@ impl CommandSpec {
 /// Process locations used to invoke OpenSSH and local tmux.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessBinaries {
-    pub ssh: PathBuf,
-    pub tmux: PathBuf,
+    ssh: PathBuf,
+    tmux: PathBuf,
 }
 
 impl ProcessBinaries {
     pub fn new(ssh: impl Into<PathBuf>, tmux: impl Into<PathBuf>) -> Self {
         Self {
-            ssh: ssh.into(),
-            tmux: tmux.into(),
+            ssh: resolve_executable(ssh.into()),
+            tmux: resolve_executable(tmux.into()),
         }
     }
 
@@ -57,6 +60,49 @@ impl ProcessBinaries {
 
     pub fn tmux(&self) -> &Path {
         &self.tmux
+    }
+}
+
+fn resolve_executable(program: PathBuf) -> PathBuf {
+    if program.components().count() != 1
+        || !matches!(program.components().next(), Some(Component::Normal(_)))
+    {
+        return program;
+    }
+
+    let search_name = program.as_os_str();
+    let path_directories = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .filter(|directory| directory.is_absolute());
+    let standard_directories = [
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+        Path::new("/opt/homebrew/bin"),
+        Path::new("/usr/local/bin"),
+    ];
+    path_directories
+        .chain(standard_directories.into_iter().map(Path::to_path_buf))
+        .map(|directory| directory.join(search_name))
+        .find(|candidate| is_executable(candidate))
+        .unwrap_or(program)
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 

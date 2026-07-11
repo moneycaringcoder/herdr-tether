@@ -75,6 +75,7 @@ pub enum StatusMessage {
         generation: u64,
         host: String,
         status: HostReachability,
+        detail: Option<String>,
         checked_at: SystemTime,
     },
     Workload {
@@ -225,6 +226,7 @@ fn probe_host(
             generation,
             host: host.name.clone(),
             status: classified.reachability,
+            detail: classified.detail,
             checked_at,
         })
         .is_err()
@@ -266,6 +268,7 @@ fn probe_host(
 
 struct ClassifiedResult {
     reachability: HostReachability,
+    detail: Option<String>,
     workloads: Vec<(SessionId, WorkloadStatus)>,
     catalog_status: ExternalCatalogStatus,
     external: Vec<ExternalSession>,
@@ -283,6 +286,7 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
         } if status.success() => match parse_sessions(&stdout) {
             Some(catalog) => ClassifiedResult {
                 reachability: HostReachability::Reachable,
+                detail: None,
                 workloads: host
                     .workloads
                     .iter()
@@ -309,21 +313,28 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                         .count(),
                 hidden_unsafe: catalog.unsafe_names,
             },
-            None => classified_failure(
+            None => with_detail(
+                classified_failure(
+                    host,
+                    HostReachability::Reachable,
+                    WorkloadStatus::Unknown,
+                    ExternalCatalogStatus::Error,
+                ),
+                "tmux returned an invalid status response".to_owned(),
+            ),
+        },
+        BoundedOutput::Completed { status, .. } if status.success() => with_detail(
+            classified_failure(
                 host,
                 HostReachability::Reachable,
                 WorkloadStatus::Unknown,
                 ExternalCatalogStatus::Error,
             ),
-        },
-        BoundedOutput::Completed { status, .. } if status.success() => classified_failure(
-            host,
-            HostReachability::Reachable,
-            WorkloadStatus::Unknown,
-            ExternalCatalogStatus::Error,
+            "tmux status response exceeded the safe capture limit".to_owned(),
         ),
         BoundedOutput::Completed { status, .. } if status.code() == Some(1) => ClassifiedResult {
             reachability: HostReachability::Reachable,
+            detail: None,
             workloads: uniform_workloads(&host.workloads, WorkloadStatus::Missing),
             catalog_status: ExternalCatalogStatus::Available,
             external: Vec::new(),
@@ -340,18 +351,59 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                 ExternalCatalogStatus::Unavailable,
             )
         }
-        BoundedOutput::TimedOut => classified_failure(
-            host,
-            HostReachability::TimedOut,
-            WorkloadStatus::TimedOut,
-            ExternalCatalogStatus::TimedOut,
+        BoundedOutput::TimedOut => with_detail(
+            classified_failure(
+                host,
+                HostReachability::TimedOut,
+                WorkloadStatus::TimedOut,
+                ExternalCatalogStatus::TimedOut,
+            ),
+            "status probe timed out; retry after checking the host connection".to_owned(),
         ),
-        BoundedOutput::Error | BoundedOutput::SpawnError(_) | BoundedOutput::Completed { .. } => {
+        BoundedOutput::SpawnError(kind) => {
+            let program = if host.target.is_some() { "ssh" } else { "tmux" };
+            with_detail(
+                classified_failure(
+                    host,
+                    HostReachability::Error,
+                    WorkloadStatus::Error,
+                    ExternalCatalogStatus::Error,
+                ),
+                format!(
+                    "could not start {program} ({kind:?}); install it or make it executable in PATH, /opt/homebrew/bin, or /usr/local/bin"
+                ),
+            )
+        }
+        BoundedOutput::Error => with_detail(
             classified_failure(
                 host,
                 HostReachability::Error,
                 WorkloadStatus::Error,
                 ExternalCatalogStatus::Error,
+            ),
+            "status probe failed while reading process output; retry or run `herdr-tether doctor`"
+                .to_owned(),
+        ),
+        BoundedOutput::Completed {
+            status,
+            stderr,
+            stderr_truncated,
+            ..
+        } => {
+            let mut detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+            if detail.is_empty() {
+                detail = format!("status probe exited with {status}");
+            } else if stderr_truncated {
+                detail.push('…');
+            }
+            with_detail(
+                classified_failure(
+                    host,
+                    HostReachability::Error,
+                    WorkloadStatus::Error,
+                    ExternalCatalogStatus::Error,
+                ),
+                detail,
             )
         }
         BoundedOutput::Cancelled => unreachable!("cancelled probes do not publish"),
@@ -365,6 +417,7 @@ fn classified_failure(
     catalog_status: ExternalCatalogStatus,
 ) -> ClassifiedResult {
     ClassifiedResult {
+        detail: None,
         reachability,
         workloads: uniform_workloads(&host.workloads, workload_status),
         catalog_status,
@@ -372,6 +425,11 @@ fn classified_failure(
         hidden_reserved: 0,
         hidden_unsafe: 0,
     }
+}
+
+fn with_detail(mut classified: ClassifiedResult, detail: String) -> ClassifiedResult {
+    classified.detail = Some(detail);
+    classified
 }
 
 fn uniform_workloads(
@@ -401,8 +459,8 @@ fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
         if names.len() >= MAX_SESSIONS {
             return None;
         }
-        let (name, attached) = line.split_once('\t')?;
-        if attached.contains('\t') || !names.insert(name.to_owned()) {
+        let (name, attached) = line.rsplit_once(':')?;
+        if attached.contains(':') || !names.insert(name.to_owned()) {
             return None;
         }
         let attached = attached.parse::<u32>().ok()?;

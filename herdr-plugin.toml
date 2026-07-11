@@ -1,6 +1,6 @@
 id = "moneycaringcoder.tether"
 name = "Tether for Herdr"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.3"
 platforms = ["linux", "macos"]
 
@@ -15,7 +15,7 @@ command = ["target/release/herdr-tether", "plugin", "open"]
 
 [[actions]]
 id = "setup"
-title = "Tether: Setup"
+title = "Tether: Install prefix+t launcher"
 command = ["target/release/herdr-tether", "plugin", "setup"]
 
 [[panes]]
@@ -26,6 +26,6 @@ command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tethe
 
 [[panes]]
 id = "setup"
-title = "Tether: Setup"
+title = "Tether: Install prefix+t launcher"
 placement = "overlay"
-command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup"]
+command = ["sh", "-c", "\"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup --yes && exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" setup keybinding"]

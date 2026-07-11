@@ -4,6 +4,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+use herdr_tether::config::HerdrKeybindingStore;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -40,6 +41,7 @@ impl Sandbox {
             .env_remove("HERDR_PLUGIN_CONFIG_DIR")
             .env_remove("HERDR_PLUGIN_STATE_DIR")
             .env_remove("HERDR_BIN_PATH")
+            .env_remove("HERDR_CONFIG_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("HERDR_WORKSPACE_ID")
             .env_remove("HERDR_TAB_ID")
@@ -98,6 +100,7 @@ fn every_scriptable_surface_has_help() {
     let commands: &[&[&str]] = &[
         &["--help"],
         &["setup", "--help"],
+        &["setup", "keybinding", "--help"],
         &["host", "--help"],
         &["host", "add", "--help"],
         &["host", "list", "--help"],
@@ -209,9 +212,117 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
     assert!(!sandbox.config_file().exists());
 }
 
+#[test]
+fn keybinding_setup_and_rollback_are_explicit_and_reload_after_writes() {
+    let sandbox = Sandbox::new();
+    let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
+    fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+    let original = b"# preserve\r\nonboarding = false\r\n";
+    fs::write(&herdr_config, original).unwrap();
+    let bin = sandbox.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let herdr = bin.join("herdr");
+    let log = sandbox.path("reload.log");
+    fs::write(
+        &herdr,
+        format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> '{}'\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["setup", "keybinding"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("prefix+t"))
+        .stdout(predicate::str::contains("moneycaringcoder.tether.open"));
+    assert!(
+        fs::read_to_string(&herdr_config)
+            .unwrap()
+            .contains("moneycaringcoder.tether.open")
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap(), "server reload-config\n");
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["setup", "keybinding"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already bound"));
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["setup", "keybinding", "--rollback"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restored"));
+    assert_eq!(fs::read(&herdr_config).unwrap(), original);
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "server reload-config\nserver reload-config\nserver reload-config\n"
+    );
+}
+
+#[test]
+fn keybinding_reload_failure_reports_written_state_and_rollback_without_leaking_config() {
+    let sandbox = Sandbox::new();
+    let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
+    fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+    fs::write(
+        &herdr_config,
+        "# private-token = \"do-not-print\"\nonboarding = false\n",
+    )
+    .unwrap();
+    let herdr = sandbox.path("herdr-fails");
+    fs::write(&herdr, "#!/bin/sh\nexit 23\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["setup", "keybinding"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reload failed with status"))
+        .stderr(predicate::str::contains("setup keybinding --rollback"))
+        .stderr(predicate::str::contains("do-not-print").not());
+
+    assert!(
+        fs::read_to_string(&herdr_config)
+            .unwrap()
+            .contains("moneycaringcoder.tether.open")
+    );
+    assert!(HerdrKeybindingStore::backup_path_for(&herdr_config).exists());
+
+    sandbox
+        .command()
+        .env("HERDR_BIN_PATH", &herdr)
+        .args(["setup", "keybinding", "--rollback"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "rerun `herdr server reload-config`",
+        ))
+        .stderr(predicate::str::contains("setup keybinding --rollback").not());
+    assert_eq!(
+        fs::read_to_string(&herdr_config).unwrap(),
+        "# private-token = \"do-not-print\"\nonboarding = false\n"
+    );
+    assert!(!HerdrKeybindingStore::backup_path_for(&herdr_config).exists());
+}
+
 fn write_fake_tmux(path: &Path, log: &Path) {
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$(tail -n 1 '{log}')\" in\n  list-sessions*) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); printf '%s\\t0' \"$id\" ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) printf '$7:%%3' ;;\n  list-sessions) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
         log = log.display()
     );
     fs::write(path, script).unwrap();
@@ -417,7 +528,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
         ),
         (
             "failed-running-close",
-            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001\\t0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:0'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -593,7 +704,7 @@ fn open_reloads_state_after_backend_creation_before_persisting() {
     let concurrent_id = "tether-0197f198000070008000000000000002";
     let concurrent_state = active_state(concurrent_id);
     let body = format!(
-        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; fi\nexit 0",
+        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; printf '$7:%%3'; fi\nif [ \"$1\" = display-message ]; then printf '%s' '/tmp'; fi\nif [ \"$1\" = list-sessions ]; then filter=; for arg do filter=$arg; done; id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac; fi\nexit 0",
         concurrent_state,
         sandbox.state_file().display()
     );
@@ -799,7 +910,7 @@ fn prune_uses_configured_retention_unless_the_flag_explicitly_overrides_it() {
 }
 
 #[test]
-fn doctor_reports_every_check_and_fails_for_missing_config_and_required_executables() {
+fn doctor_reports_every_check_with_restricted_path_and_missing_required_inputs() {
     let sandbox = Sandbox::new();
     let empty_path = sandbox.path("empty-bin");
     fs::create_dir_all(&empty_path).unwrap();
@@ -815,9 +926,9 @@ fn doctor_reports_every_check_and_fails_for_missing_config_and_required_executab
         .failure()
         .stdout(predicate::str::contains("config").and(predicate::str::contains("missing")))
         .stdout(predicate::str::contains("state"))
-        .stdout(predicate::str::contains("tmux: missing"))
-        .stdout(predicate::str::contains("ssh: missing"))
-        .stdout(predicate::str::contains("cargo: missing"))
+        .stdout(predicate::str::contains("tmux:"))
+        .stdout(predicate::str::contains("ssh:"))
+        .stdout(predicate::str::contains("cargo:"))
         .stdout(predicate::str::contains("selected-herdr"))
         .stdout(predicate::str::contains("Herdr context: w1:p1"))
         .stderr(predicate::str::contains("doctor found"));

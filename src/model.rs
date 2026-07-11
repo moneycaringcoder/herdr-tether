@@ -12,6 +12,7 @@ pub enum Placement {
     SplitRight,
     SplitDown,
     NewTab,
+    ReplaceCurrentPane,
 }
 
 /// A stable, Tether-owned identifier for a durable session.
