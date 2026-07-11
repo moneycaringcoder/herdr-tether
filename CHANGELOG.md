@@ -15,7 +15,7 @@
 
 ### Changed
 
-- Herdr 0.7.3 is now the minimum supported Herdr version. Plugin actions open a managed terminal overlay, then create and focus the selected split-right, split-down, or new-tab placement using the invoking pane context.
+- Plugin integration is validated against Herdr 0.7.3, the declared minimum. Plugin actions open a managed terminal overlay, then create and focus the selected split-right, split-down, or new-tab placement using the invoking pane context.
 - Status, discovery, close, and snapshot collection use bounded concurrent workers with deadlines, capped output, cancellation, and child-process cleanup so slow targets do not block completed results.
 - Owned state is grouped by its persisted host and target. Removed or retargeted groups remain visible for lifecycle recovery but are never probed or scanned through changed configuration.
 

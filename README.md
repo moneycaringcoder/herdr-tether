@@ -15,11 +15,18 @@ Tether complements [Herdr](https://github.com/ogulcancelik/herdr) and `herdr-mir
 - OpenSSH `ssh`. Remote access must already work non-interactively with `BatchMode=yes` under your normal keys, agent, and `known_hosts` policy.
 - Network access to GitHub and Cargo's configured registry during installation, unless both sources and dependencies are already cached.
 
-Install the immutable v0.2.0 source through Herdr:
+Install the pinned v0.2.0 release tag through Herdr:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
 herdr plugin action list --plugin moneycaringcoder.tether
+```
+
+Herdr uses its managed checkout for plugin actions; it does not add the built binary to `PATH`. Install the same tagged source with Cargo when you also want the standalone `herdr-tether` commands used below:
+
+```sh
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.2.0 --locked herdr-tether
 ```
 
 Run **Tether: Setup** once from Herdr, or invoke it explicitly:
@@ -36,16 +43,20 @@ plugin_action moneycaringcoder.tether.open
 
 ### Update, reinstall, uninstall, and rollback
 
-Installing the same pinned ref again rebuilds and reinstalls that version; use this after repairing a toolchain or dependency cache:
+Installing the same pinned ref again rebuilds and reinstalls the plugin. Reinstall the standalone binary with `--force` after repairing a toolchain or dependency cache:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.2.0 --yes
+cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.2.0 --locked herdr-tether
 ```
 
-To update, replace `v0.2.0` with a newer released tag. To roll back, reinstall an older released tag, for example:
+To update, replace `v0.2.0` in both install commands with a newer released tag. To roll back, reinstall an older released tag, for example:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.1.0 --yes
+cargo install --force --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.1.0 --locked herdr-tether
 ```
 
 Configuration and state are retained independently of the plugin checkout. Back them up before moving to an older release because migrated data may not be understood by that release.
@@ -56,7 +67,9 @@ Uninstall the plugin with:
 herdr plugin uninstall moneycaringcoder.tether
 ```
 
-Uninstalling does not intentionally terminate `tmux` workloads. Close owned workloads first if you no longer need them. Remove the config/state directories shown by `herdr-tether setup --yes` separately if you also want to discard metadata.
+Remove the standalone binary, if installed, with `cargo uninstall herdr-tether`.
+
+Uninstalling does not intentionally terminate `tmux` workloads. Close owned workloads first if you no longer need them. Remove the configuration and state files shown by `herdr-tether setup --yes` (and their parent `herdr-tether` directories) separately if you also want to discard metadata.
 
 Installing from mutable `main` is development-only and may contain unreleased changes:
 
@@ -142,7 +155,7 @@ The explorer stages are host → resource; creation continues through directory 
 - **Closed:** metadata only; eligible for pruning after the retention period.
 - **External:** attachable but never owned or destructively managed by Tether.
 
-On an Active or Closing row, press `c`, then `y` to confirm exact close. Press uppercase `P`, then `y` to prune eligible Closed metadata globally. Prune has no SSH or `tmux` capability and removes only unchanged records from the confirmed preview. Closing or pruning cannot be started from external rows.
+On an Active or Closing row, press `c`, then `y` to confirm exact close. Press uppercase `P`, then `y` to prune eligible Closed metadata globally. Prune has no SSH or `tmux` capability and removes only unchanged records from the confirmed preview. Closing cannot be started from external rows, and prune never affects external sessions or running workloads.
 
 Explorer keys: `↑`/`k`/`Shift-Tab`, `↓`/`j`/`Tab`, `Enter`/`→`, `Backspace`/`←`, `r` refresh, and `Esc`/`Ctrl-C` cancel. On the directory stage, `/` filters and lowercase `p` accepts a literal path.
 

@@ -8,7 +8,11 @@ import os
 from pathlib import Path
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("release identity error: check_release.py requires Python 3.11+", file=sys.stderr)
+    raise SystemExit(1)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +41,8 @@ def main() -> None:
         fail(f"tag {args.tag!r} is not v<major>.<minor>.<patch>")
     version = args.tag[1:]
 
-    cargo_version = load_toml(ROOT / "Cargo.toml")["package"]["version"]
+    cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
+    cargo_version = cargo_package["version"]
     plugin_version = load_toml(ROOT / "herdr-plugin.toml")["version"]
     lock_packages = load_toml(ROOT / "Cargo.lock")["package"]
     lock_versions = [
@@ -53,6 +58,9 @@ def main() -> None:
     ]:
         if actual != version:
             fail(f"{surface} version {actual!r} != {version!r}")
+    documentation = cargo_package.get("documentation", "")
+    if f"/blob/{args.tag}/" not in documentation:
+        fail(f"Cargo.toml documentation URL {documentation!r} is not pinned to {args.tag}")
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     if not re.search(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", changelog, re.MULTILINE):

@@ -52,7 +52,7 @@ class Smoke:
         self.tether = tether.resolve()
         self.repo_root = repo_root.resolve()
         self.keep = keep
-        self.root = Path(tempfile.mkdtemp(prefix="tether-live-smoke-"))
+        self.root = Path(tempfile.mkdtemp(prefix="tether-smoke-", dir="/tmp"))
         self.session = f"tether-smoke-{os.getpid()}"
         self.herdr_client: subprocess.Popen[bytes] | None = None
         self.herdr_master: int | None = None
@@ -72,13 +72,26 @@ class Smoke:
             self.root / "work",
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # macOS/Linux zsh otherwise blocks the first disposable shell on its
+        # interactive new-user wizard before Herdr can run the pane command.
+        (home / ".zshrc").write_text("# isolated live product smoke\n", encoding="utf-8")
 
         self.herdr_config = self.root / "config" / "herdr" / "config.toml"
         self.env = os.environ.copy()
-        # A smoke launched from inside tmux must never inherit its parent's
-        # socket. TMUX overrides TMUX_TMPDIR and would make cleanup kill the
-        # operator's server instead of this disposable one.
-        self.env.pop("TMUX", None)
+        # Never inherit the caller's tmux socket or Herdr plugin/pane context:
+        # every product and cleanup operation must stay under this smoke root.
+        for variable in (
+            "TMUX",
+            "HERDR_BIN_PATH",
+            "HERDR_PANE_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            "HERDR_PLUGIN_CONFIG_DIR",
+            "HERDR_PLUGIN_STATE_DIR",
+            "PANE_ID",
+            "WORKSPACE_ID",
+        ):
+            self.env.pop(variable, None)
         original_home = Path(self.env.get("HOME", str(Path.home())))
         for variable, directory in (
             ("CARGO_HOME", original_home / ".cargo"),
@@ -202,7 +215,7 @@ class Smoke:
                 value = predicate()
                 if value:
                     return value
-            except (OSError, ValueError, SmokeFailure, json.JSONDecodeError) as error:
+            except (OSError, ValueError, json.JSONDecodeError) as error:
                 last_error = error
             remaining = deadline - time.monotonic()
             if remaining > 0:
@@ -250,14 +263,36 @@ class Smoke:
         self._reader = threading.Thread(target=drain, name="herdr-pty-reader", daemon=True)
         self._reader.start()
 
+        ready_since: float | None = None
+
         def ready() -> bool:
+            nonlocal ready_since
             if self.herdr_client and self.herdr_client.poll() is not None:
                 output = self.herdr_output.decode("utf-8", "replace")
                 fail(f"Herdr PTY process exited early ({self.herdr_client.returncode})\n{output}")
             result = self.herdr_run("status", "server", check=False)
-            return result.returncode == 0
+            if result.returncode != 0:
+                ready_since = None
+                return False
+            if ready_since is None:
+                ready_since = time.monotonic()
+                return False
+            return time.monotonic() - ready_since >= 0.5
 
-        self.wait_until("Herdr server readiness", ready, START_TIMEOUT)
+        try:
+            self.wait_until("Herdr server readiness", ready, START_TIMEOUT)
+        except SmokeFailure as error:
+            server_log = (
+                self.herdr_config.parent
+                / "sessions"
+                / self.session
+                / "herdr-server.log"
+            )
+            try:
+                diagnostics = server_log.read_text(encoding="utf-8")
+            except OSError as log_error:
+                diagnostics = f"<unavailable: {log_error}>"
+            fail(f"{error}\nHerdr server log ({server_log}):\n{diagnostics}")
 
     def workspace_and_pane(self) -> tuple[str, str]:
         workspaces = self.result_object(
@@ -614,11 +649,12 @@ class Smoke:
             self._shell_quote(str(self.tether)) + " session resume " + self._shell_quote(first_id)
         )
         self.herdr_run("pane", "run", resumed_pane, resume_command)
-        self.wait_until("resumed Tether view focus", lambda: self.focused_pane() == resumed_pane)
         self.wait_until(
             "resumed tmux attachment",
             lambda: self.tmux_attached(first_id) > 0,
         )
+        if self.focused_pane() != resumed_pane:
+            fail(f"resumed Tether view {resumed_pane} was not focused after attachment")
         if pid_file.read_text(encoding="utf-8").strip() != original_pid:
             fail("resuming the Tether session replaced the workload process")
         self.close_pane(resumed_pane)
@@ -664,6 +700,10 @@ class Smoke:
         for command in ("tmux",):
             if shutil.which(command, path=self.env.get("PATH")) is None:
                 fail(f"required executable is not on PATH: {command}")
+        tmux_version = self.run(["tmux", "-V"]).stdout.strip()
+        match = re.fullmatch(r"tmux (\d+)\.(\d+)[a-z]?", tmux_version)
+        if not match or tuple(map(int, match.groups())) < (3, 2):
+            fail(f"live smoke requires tmux 3.2 or newer; got {tmux_version!r}")
         version = self.run([str(self.herdr), "--version"])
         if version.stdout.strip() != f"herdr {HERDR_VERSION}":
             fail(
@@ -675,17 +715,16 @@ class Smoke:
             return
         self._cleaned = True
         # Close product workloads first, then both persistent multiplexers.
-        self.run(["tmux", "kill-server"], check=False, timeout=5.0)
-        self.run(
-            [str(self.herdr), "session", "stop", self.session, "--json"],
-            check=False,
-            timeout=10.0,
+        cleanup_commands = (
+            (["tmux", "kill-server"], 5.0),
+            ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
+            ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
-        self.run(
-            [str(self.herdr), "session", "delete", self.session, "--json"],
-            check=False,
-            timeout=10.0,
-        )
+        for command, timeout in cleanup_commands:
+            try:
+                self.run(command, check=False, timeout=timeout)
+            except SmokeFailure as error:
+                print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
         if self.herdr_client and self.herdr_client.poll() is None:
             try:
                 os.killpg(self.herdr_client.pid, signal.SIGTERM)
@@ -693,7 +732,8 @@ class Smoke:
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 try:
                     os.killpg(self.herdr_client.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    self.herdr_client.wait(timeout=5.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
                     pass
         if self.herdr_master is not None:
             try:
@@ -728,10 +768,19 @@ def main() -> int:
     args = parse_args()
     smoke = Smoke(args.herdr, args.tether, args.repo_root, args.keep)
     atexit.register(smoke.cleanup)
+
+    def interrupted(signum: int, _frame: Any) -> None:
+        fail(f"received signal {signum}")
+
+    signal.signal(signal.SIGHUP, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         smoke.execute()
     except SmokeFailure as error:
         print(f"live product smoke FAILED: {error}", file=sys.stderr)
+        output = smoke.herdr_output.decode("utf-8", "replace").strip()
+        if output:
+            print(f"Herdr PTY tail:\n{output[-8000:]}", file=sys.stderr)
         if args.keep:
             print(f"disposable root retained at {smoke.root}", file=sys.stderr)
         return 1
