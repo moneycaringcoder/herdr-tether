@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::{ExternalSessionName, SessionId},
+    model::{ExternalSessionName, SessionId, TmuxSessionId},
     quote::posix_quote,
     sshcfg::validate_ssh_target,
 };
@@ -114,7 +114,8 @@ impl TmuxBackend {
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_attached}".to_owned(),
+                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}"
+                    .to_owned(),
                 "-f".to_owned(),
                 format!("#{{==:#{{session_name}},{id_text}}}"),
             ],
@@ -122,9 +123,13 @@ impl TmuxBackend {
         )
     }
 
-    pub(crate) fn close_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
+    pub(crate) fn close_exact_spec(&self, identity: TmuxSessionId) -> Result<CommandSpec> {
         self.tmux_spec(
-            vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
+            vec![
+                "kill-session".to_owned(),
+                "-t".to_owned(),
+                identity.to_string(),
+            ],
             false,
         )
     }
@@ -187,9 +192,8 @@ impl TmuxBackend {
         )
     }
 
-    fn enable_owned_mouse(&self, id: &SessionId) -> Result<()> {
-        let target = self.owned_session_target(id)?;
-        self.enable_mouse_for_target(target)
+    fn enable_owned_mouse(&self, identity: TmuxSessionId) -> Result<()> {
+        self.enable_mouse_for_target(identity.to_string())
     }
 
     fn enable_mouse_for_target(&self, target: String) -> Result<()> {
@@ -206,37 +210,19 @@ impl TmuxBackend {
         self.require_success("enable session mouse support", &spec)
     }
 
-    fn owned_session_target(&self, id: &SessionId) -> Result<String> {
-        let id_text = id.to_string();
+    fn enable_remain_on_exit(&self, pane_target: &str) -> Result<()> {
         let spec = self.tmux_spec(
             vec![
-                "list-sessions".to_owned(),
-                "-F".to_owned(),
-                "#{session_name}:#{session_id}".to_owned(),
-                "-f".to_owned(),
-                format!("#{{==:#{{session_name}},{id_text}}}"),
+                "set-option".to_owned(),
+                "-p".to_owned(),
+                "-t".to_owned(),
+                pane_target.to_owned(),
+                "remain-on-exit".to_owned(),
+                "on".to_owned(),
             ],
             false,
         )?;
-        let output = self.output(&spec)?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "tmux resolve exact owned session ID failed with status {}: {}",
-                output.status,
-                detail.trim()
-            );
-        }
-        let line = std::str::from_utf8(&output.stdout)
-            .context("tmux returned a non-UTF-8 internal session ID")?
-            .trim_end_matches(['\r', '\n']);
-        let (reported_name, target) = line
-            .split_once(':')
-            .context("tmux did not return the exact owned session ID")?;
-        if reported_name != id_text {
-            bail!("tmux returned session `{reported_name}`, not exact owned session `{id}`");
-        }
-        validate_tmux_id(target, '$', "session")
+        self.require_success("retain ended pane status", &spec)
     }
 
     fn paths_refer_to_same_directory(&self, actual: &str, expected: &str) -> Result<bool> {
@@ -303,24 +289,19 @@ impl TmuxBackend {
     fn rollback_created(
         &self,
         id: &SessionId,
-        internal_target: Option<&str>,
+        internal_target: Option<TmuxSessionId>,
         cause: anyhow::Error,
     ) -> anyhow::Error {
-        let rollback = internal_target
-            .map_or_else(
-                || self.close_exact_spec(id),
-                |target| {
-                    self.tmux_spec(
-                        vec![
-                            "kill-session".to_owned(),
-                            "-t".to_owned(),
-                            target.to_owned(),
-                        ],
-                        false,
-                    )
-                },
-            )
-            .and_then(|spec| self.require_success("rollback created session", &spec));
+        let rollback = internal_target.map_or_else(
+            || {
+                self.tmux_spec(
+                    vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
+                    false,
+                )
+            },
+            |target| self.close_exact_spec(target),
+        );
+        let rollback = rollback.and_then(|spec| self.require_success("rollback created session", &spec));
         match rollback {
             Ok(()) => cause,
             Err(rollback) => cause.context(format!(
@@ -331,7 +312,7 @@ impl TmuxBackend {
 }
 
 impl DurableBackend for TmuxBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<()> {
+    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId> {
         let spec = self.tmux_spec(
             vec![
                 "new-session".to_owned(),
@@ -369,7 +350,7 @@ impl DurableBackend for TmuxBackend {
             let (session_target, pane_target) = created
                 .split_once(':')
                 .context("tmux create did not return session and pane identities")?;
-            let session_target = validate_tmux_id(session_target, '$', "session")?;
+            let session_target = session_target.parse::<TmuxSessionId>()?;
             let pane_target = validate_tmux_id(pane_target, '%', "pane")?;
             Ok::<_, anyhow::Error>((session_target, pane_target))
         })();
@@ -377,9 +358,11 @@ impl DurableBackend for TmuxBackend {
             Ok(identities) => identities,
             Err(error) => return Err(self.rollback_created(&launch.id, None, error)),
         };
-        self.verify_created_cwd(&pane_target, &launch.directory)
-            .and_then(|()| self.enable_mouse_for_target(session_target.clone()))
-            .map_err(|error| self.rollback_created(&launch.id, Some(&session_target), error))
+        self.enable_remain_on_exit(&pane_target)
+            .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
+            .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
+            .map_err(|error| self.rollback_created(&launch.id, Some(session_target), error))?;
+        Ok(session_target)
     }
 
     fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
@@ -388,20 +371,20 @@ impl DurableBackend for TmuxBackend {
         Ok(self.classify_exact_inspect(id, &output, false))
     }
 
-    fn attach_command(&self, id: &SessionId) -> Result<CommandSpec> {
-        self.enable_owned_mouse(id)?;
+    fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec> {
+        self.enable_owned_mouse(identity)?;
         self.tmux_spec(
             vec![
                 "attach-session".to_owned(),
                 "-t".to_owned(),
-                exact_target(id),
+                identity.to_string(),
             ],
             true,
         )
     }
 
-    fn close(&self, id: &SessionId) -> Result<()> {
-        let spec = self.close_exact_spec(id)?;
+    fn close(&self, identity: TmuxSessionId) -> Result<()> {
+        let spec = self.close_exact_spec(identity)?;
         self.require_success("close", &spec)
     }
 }
@@ -423,19 +406,38 @@ fn classify_exact_inspect(
         if line.is_empty() {
             return WorkloadState::Missing;
         }
-        let Some((name, attached)) = line.split_once(':') else {
+        let fields = line.split(':').collect::<Vec<_>>();
+        let [name, identity, attached, pane_dead, exit_status] = fields.as_slice() else {
             return WorkloadState::Unknown;
         };
-        if name != id.to_string() {
+        if *name != id.to_string() {
             return WorkloadState::Unknown;
         }
-        return match attached.parse::<u32>() {
-            Ok(attached) => WorkloadState::Running { attached },
-            Err(_) => WorkloadState::Unknown,
+        let Ok(identity) = identity.parse::<TmuxSessionId>() else {
+            return WorkloadState::Unknown;
         };
-    }
-
-    if exit_code == Some(1) {
+        let Ok(attached) = attached.parse::<u32>() else {
+            return WorkloadState::Unknown;
+        };
+        match *pane_dead {
+            "0" => WorkloadState::Running { attached, identity },
+            "1" => {
+                let exit_status = if exit_status.is_empty() {
+                    None
+                } else {
+                    match exit_status.parse::<i32>() {
+                        Ok(status) => Some(status),
+                        Err(_) => return WorkloadState::Unknown,
+                    }
+                };
+                WorkloadState::Ended {
+                    identity,
+                    exit_status,
+                }
+            }
+            _ => WorkloadState::Unknown,
+        }
+    } else if exit_code == Some(1) {
         WorkloadState::Missing
     } else {
         WorkloadState::Unknown
@@ -497,5 +499,36 @@ mod tests {
             .status()
             .unwrap();
         assert!(comparison.success());
+    }
+    #[test]
+    fn exact_inspection_distinguishes_running_and_dead_panes_with_identity() {
+        let id = "tether-0197f198000070008000000000000001"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            classify_exact_inspect(
+                &id,
+                Some(0),
+                b"tether-0197f198000070008000000000000001:$7:2:0:\n",
+                false,
+            ),
+            WorkloadState::Running {
+                attached: 2,
+                identity: "$7".parse().unwrap(),
+            }
+        );
+        assert_eq!(
+            classify_exact_inspect(
+                &id,
+                Some(0),
+                b"tether-0197f198000070008000000000000001:$7:0:1:130\n",
+                false,
+            ),
+            WorkloadState::Ended {
+                identity: "$7".parse().unwrap(),
+                exit_status: Some(130),
+            }
+        );
     }
 }

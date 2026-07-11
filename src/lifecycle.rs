@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::{
     backend::{ProcessBinaries, WorkloadState},
-    model::SessionId,
+    model::{SessionId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, StateStore},
     status::{BoundedOutput, run_bounded},
     tmux::TmuxBackend,
@@ -92,24 +92,52 @@ impl LifecycleService {
             .map(|state| state.sessions.into_iter().find(|record| record.id == id))
             .map_err(CloseOwnedError::State)
     }
-    pub fn close_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
-        let (target, initial_status) = self.lookup_owned(&id)?;
-        let backend = self.backend_for(&id, &target)?;
+    pub fn stop_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
+        let record = self.lookup_owned(&id)?;
+        let backend = self.backend_for(&id, &record.target)?;
         let inspected = self.inspect_exact(&backend, &id)?;
         if inspected == WorkloadState::Unknown {
             return Err(CloseOwnedError::WorkloadUnknown(id));
         }
-        self.ensure_closing(&id, &target, initial_status)?;
-        let workload = match inspected {
-            WorkloadState::Missing => ClosedWorkload::Missing,
-            WorkloadState::Running { .. } => {
-                self.close_exact(&backend, &id)?;
-                ClosedWorkload::Terminated
+        let identity = match inspected {
+            WorkloadState::Running { identity, .. } | WorkloadState::Ended { identity, .. } => {
+                if record
+                    .tmux_session_id
+                    .is_some_and(|expected| expected != identity)
+                {
+                    return Err(CloseOwnedError::ConcurrentModification(id));
+                }
+                Some(identity)
             }
-            WorkloadState::Unknown => unreachable!("handled before state transition"),
+            WorkloadState::Missing => None,
+            WorkloadState::Unknown => unreachable!("handled above"),
         };
-        self.finish_close(&id, &target)?;
+        self.ensure_stopping(&record, identity)?;
+
+        let workload = if let Some(identity) = identity {
+            match self.inspect_exact(&backend, &id)? {
+                WorkloadState::Running {
+                    identity: current, ..
+                }
+                | WorkloadState::Ended {
+                    identity: current, ..
+                } if current == identity => {
+                    self.close_exact(&backend, id, identity)?;
+                    ClosedWorkload::Terminated
+                }
+                WorkloadState::Missing => ClosedWorkload::Missing,
+                WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+                _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+            }
+        } else {
+            ClosedWorkload::Missing
+        };
+        self.finish_close(&id, &record.target, None)?;
         Ok(CloseOwnedResult { id, workload })
+    }
+
+    pub fn close_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
+        self.stop_owned(id)
     }
 
     fn inspect_exact(
@@ -140,21 +168,26 @@ impl LifecycleService {
         }
     }
 
-    fn close_exact(&self, backend: &TmuxBackend, id: &SessionId) -> Result<(), CloseOwnedError> {
+    fn close_exact(
+        &self,
+        backend: &TmuxBackend,
+        id: SessionId,
+        identity: TmuxSessionId,
+    ) -> Result<(), CloseOwnedError> {
         let spec = backend
-            .close_exact_spec(id)
-            .map_err(|source| CloseOwnedError::Close { id: *id, source })?;
+            .close_exact_spec(identity)
+            .map_err(|source| CloseOwnedError::Close { id, source })?;
         let cancelled = AtomicBool::new(false);
         match run_bounded(&spec, LIFECYCLE_TRANSPORT_TIMEOUT, &cancelled) {
             BoundedOutput::Completed { status, .. } if status.success() => Ok(()),
             output => Err(CloseOwnedError::Close {
-                id: *id,
+                id,
                 source: bounded_transport_error(output),
             }),
         }
     }
 
-    fn lookup_owned(&self, id: &SessionId) -> Result<(String, SessionStatus), CloseOwnedError> {
+    fn lookup_owned(&self, id: &SessionId) -> Result<SessionRecord, CloseOwnedError> {
         let record = self
             .store
             .load()
@@ -163,44 +196,55 @@ impl LifecycleService {
             .into_iter()
             .find(|record| record.id == *id)
             .ok_or_else(|| CloseOwnedError::UnknownSession(*id))?;
-        if record.status == SessionStatus::Closed {
+        if matches!(record.status, SessionStatus::Ended | SessionStatus::Removed) {
             return Err(CloseOwnedError::AlreadyClosed(*id));
         }
-        Ok((record.target, record.status))
+        Ok(record)
     }
 
-    fn ensure_closing(
+    fn ensure_stopping(
         &self,
-        id: &SessionId,
-        target: &str,
-        initial_status: SessionStatus,
+        snapshot: &SessionRecord,
+        identity: Option<TmuxSessionId>,
     ) -> Result<(), CloseOwnedError> {
         self.store
             .exclusive(|store| {
                 let mut state = store.load()?;
-                let Some(record) = state.sessions.iter_mut().find(|record| record.id == *id) else {
+                let Some(record) = state
+                    .sessions
+                    .iter_mut()
+                    .find(|record| record.id == snapshot.id)
+                else {
                     return Ok(false);
                 };
-                if record.target != target || record.status != initial_status {
+                if record != snapshot {
                     return Ok(false);
                 }
-                if record.status == SessionStatus::Active {
-                    record.status = SessionStatus::Closing;
-                    store.save(&state)?;
+                if !matches!(
+                    record.status,
+                    SessionStatus::Running | SessionStatus::Creating | SessionStatus::Stopping
+                ) {
+                    return Ok(false);
                 }
+                record.tmux_session_id = identity.or(record.tmux_session_id);
+                record.status = SessionStatus::Stopping;
+                store.save(&state)?;
                 Ok(true)
             })
             .map_err(CloseOwnedError::State)
             .and_then(|transitioned| {
-                if transitioned {
-                    Ok(())
-                } else {
-                    Err(CloseOwnedError::ConcurrentModification(*id))
-                }
+                transitioned
+                    .then_some(())
+                    .ok_or(CloseOwnedError::ConcurrentModification(snapshot.id))
             })
     }
 
-    fn finish_close(&self, id: &SessionId, target: &str) -> Result<(), CloseOwnedError> {
+    fn finish_close(
+        &self,
+        id: &SessionId,
+        target: &str,
+        exit_status: Option<i32>,
+    ) -> Result<(), CloseOwnedError> {
         self.store
             .exclusive(|store| {
                 let mut state = store.load()?;
@@ -210,26 +254,25 @@ impl LifecycleService {
                 if record.target != target {
                     return Ok(false);
                 }
-                if record.status == SessionStatus::Closed {
+                if record.status == SessionStatus::Ended {
                     return Ok(true);
                 }
-                if record.status != SessionStatus::Closing {
+                if record.status != SessionStatus::Stopping {
                     return Ok(false);
                 }
                 let now = Utc::now();
-                record.status = SessionStatus::Closed;
+                record.status = SessionStatus::Ended;
                 record.last_used_at = now;
                 record.closed_at = Some(now);
+                record.exit_status = exit_status;
                 store.save(&state)?;
                 Ok(true)
             })
             .map_err(CloseOwnedError::State)
             .and_then(|finalized| {
-                if finalized {
-                    Ok(())
-                } else {
-                    Err(CloseOwnedError::ConcurrentModification(*id))
-                }
+                finalized
+                    .then_some(())
+                    .ok_or(CloseOwnedError::ConcurrentModification(*id))
             })
     }
 
@@ -476,10 +519,13 @@ pub fn cleanup_eligibility(
     match workload {
         WorkloadState::Running { .. } => return CleanupEligibility::KeepActive,
         WorkloadState::Unknown => return CleanupEligibility::KeepUnknown,
-        WorkloadState::Missing => {}
+        WorkloadState::Missing | WorkloadState::Ended { .. } => {}
     }
 
-    if record.status != SessionStatus::Closed {
+    if !matches!(
+        record.status,
+        SessionStatus::Ended | SessionStatus::Removed
+    ) {
         return CleanupEligibility::KeepActive;
     }
 

@@ -274,9 +274,11 @@ fn workload_label(session: &SessionRecord) -> String {
     let id = session.id.to_string();
     let short_id = &id[id.len().saturating_sub(8)..];
     let (lifecycle, action) = match session.status {
-        SessionStatus::Active => ("active", "Resume"),
-        SessionStatus::Closing => ("closing · c retry", "Metadata"),
-        SessionStatus::Closed => ("closed · metadata", "Metadata"),
+        SessionStatus::Creating => ("creating", "Retry"),
+        SessionStatus::Running => ("running", "Open"),
+        SessionStatus::Stopping => ("stopping · retry", "Metadata"),
+        SessionStatus::Ended => ("ended", "Restart"),
+        SessionStatus::Removed => ("removed", "Metadata"),
     };
     format!(
         "[{lifecycle}] Tether · {action} …{} · {} · {}",
@@ -1186,7 +1188,7 @@ impl PickerState {
             for workload in host
                 .workloads
                 .iter()
-                .filter(|workload| workload.status == SessionStatus::Active)
+                .filter(|workload| workload.status == SessionStatus::Running)
             {
                 self.workload_status
                     .entry(workload.id)
@@ -1328,7 +1330,7 @@ impl PickerState {
                     workloads: host
                         .workloads
                         .iter()
-                        .filter(|workload| workload.status == SessionStatus::Active)
+                        .filter(|workload| workload.status == SessionStatus::Running)
                         .map(|workload| workload.id)
                         .collect(),
                 })
@@ -1350,7 +1352,7 @@ impl PickerState {
                 }
             }
             for workload in &mut host.workloads {
-                workload.label = if workload.status == SessionStatus::Active {
+                workload.label = if workload.status == SessionStatus::Running {
                     format_status_label(
                         &workload.base_label,
                         self.workload_status.get(&workload.id),
@@ -1532,7 +1534,7 @@ impl PickerState {
         else {
             return PickerOutcome::Continue;
         };
-        if workload.status == SessionStatus::Closed {
+        if workload.status == SessionStatus::Ended {
             return PickerOutcome::Continue;
         }
         self.close_modal = Some(PickerCloseModal::Confirm { id });
@@ -1551,7 +1553,7 @@ impl PickerState {
         if !self.options.hosts.iter().any(|host| {
             host.workloads
                 .iter()
-                .any(|workload| workload.id == id && workload.status != SessionStatus::Closed)
+                .any(|workload| workload.id == id && workload.status != SessionStatus::Ended)
         }) {
             self.close_modal = None;
             return PickerOutcome::Continue;
@@ -1652,7 +1654,7 @@ impl PickerState {
             PickerStage::Resource => {
                 let host = &self.options.hosts[self.host_index];
                 if let Some(workload) = host.workloads.get(self.resource_index) {
-                    if workload.status != SessionStatus::Active
+                    if workload.status != SessionStatus::Running
                         || self.close_failed.contains_key(&workload.id)
                         || self
                             .pending_close
@@ -2007,7 +2009,7 @@ impl PickerState {
                                 .workloads
                                 .iter()
                                 .find(|workload| workload.id == id)
-                                .is_some_and(|workload| workload.status != SessionStatus::Closed),
+                                .is_some_and(|workload| workload.status != SessionStatus::Ended),
                             _ => false,
                         }) {
                     " · c close"
@@ -2027,7 +2029,7 @@ impl PickerState {
                                 .workloads
                                 .iter()
                                 .find(|workload| workload.id == id)
-                                .is_some_and(|workload| workload.status == SessionStatus::Active),
+                                .is_some_and(|workload| workload.status == SessionStatus::Running),
                             ResourceIdentity::External(_) | ResourceIdentity::Create => true,
                         }) {
                     " · Enter select"

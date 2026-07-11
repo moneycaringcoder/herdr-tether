@@ -78,6 +78,43 @@ impl FromStr for SessionId {
     }
 }
 
+/// The immutable tmux server identity captured when an owned session is created.
+///
+/// Destructive operations target this identity, never a reusable session name.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct TmuxSessionId(u64);
+
+impl fmt::Display for TmuxSessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "${}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid tmux session identity `{value}`")]
+pub struct TmuxSessionIdError {
+    value: String,
+}
+
+impl FromStr for TmuxSessionId {
+    type Err = TmuxSessionIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || TmuxSessionIdError {
+            value: value.to_owned(),
+        };
+        let encoded = value.strip_prefix('$').ok_or_else(invalid)?;
+        if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        encoded
+            .parse()
+            .map(Self)
+            .map_err(|_| invalid())
+    }
+}
+
 /// A validated, non-Tether tmux session name that may only be attached.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExternalSessionName(String);

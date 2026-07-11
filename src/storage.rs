@@ -116,9 +116,11 @@ fn atomic_write_mode(path: &Path, contents: &[u8], private_parent: bool) -> Resu
         .with_context(|| format!("atomically replace `{}`", path.display()))?;
     cleanup.disarm();
 
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync directory `{}`", parent.display()))?;
+    // The rename above is the commit point. A parent-directory sync failure is
+    // a durability warning, not proof that the old document remains: reporting
+    // failure would invite callers to destructively roll back a workload whose
+    // metadata is already visible at `path`.
+    let _ = File::open(parent).and_then(|directory| directory.sync_all());
     Ok(())
 }
 

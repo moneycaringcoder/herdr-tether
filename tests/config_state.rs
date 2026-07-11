@@ -437,7 +437,7 @@ fn concurrent_state_updates_preserve_both_records() {
                         target: "local".into(),
                         directory: "/tmp".into(),
                         preset: None,
-                        status: SessionStatus::Active,
+                        status: SessionStatus::Running,
                         created_at: now,
                         last_used_at: now,
                         closed_at: None,

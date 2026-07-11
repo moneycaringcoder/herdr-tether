@@ -392,13 +392,13 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
         target: "removed@example.test".into(),
         directory: "/srv/removed".into(),
         preset: None,
-        status: SessionStatus::Active,
+        status: SessionStatus::Running,
         created_at: now,
         last_used_at: now,
         closed_at: None,
     });
-    state.sessions[0].status = SessionStatus::Closing;
-    state.sessions[1].status = SessionStatus::Closed;
+    state.sessions[0].status = SessionStatus::Stopping;
+    state.sessions[1].status = SessionStatus::Ended;
     state.sessions[1].closed_at = Some(now);
 
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
@@ -567,7 +567,7 @@ fn explorer_resumes_an_existing_workload_without_create_steps() {
     closed.id = "tether-0197f198000070008000000000000003"
         .parse::<SessionId>()
         .unwrap();
-    closed.status = SessionStatus::Closed;
+    closed.status = SessionStatus::Ended;
     closed.closed_at = Some(closed.last_used_at);
     state.sessions.push(closed);
 
@@ -1089,7 +1089,7 @@ fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
         .into_iter()
         .find(|record| record.id == first_id)
         .unwrap();
-    record.status = SessionStatus::Closed;
+    record.status = SessionStatus::Ended;
     record.closed_at = Some(record.last_used_at);
     picker.handle(PickerEvent::Close);
     assert_eq!(
@@ -1188,7 +1188,7 @@ fn close_failure_is_sanitized_persistence_neutral_non_resumable_and_retryable() 
         .into_iter()
         .find(|record| record.id == id)
         .unwrap();
-    record.status = SessionStatus::Closing;
+    record.status = SessionStatus::Stopping;
     picker.handle(PickerEvent::Close);
     picker.handle(PickerEvent::ConfirmClose);
     assert!(picker.apply_close_result(PickerCloseResult {
@@ -1295,7 +1295,7 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
             target: "nobody@example.test".into(),
             directory: "/closed".into(),
             preset: None,
-            status: SessionStatus::Closed,
+            status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
@@ -1323,7 +1323,7 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
             target: "removed@example.test".into(),
             directory: "/closed".into(),
             preset: None,
-            status: SessionStatus::Closed,
+            status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
@@ -1369,9 +1369,9 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
     let now = Utc::now();
     let mut records = Vec::new();
     for (suffix, status, age) in [
-        (200, SessionStatus::Closed, 40),
-        (201, SessionStatus::Closing, 41),
-        (202, SessionStatus::Active, 42),
+        (200, SessionStatus::Ended, 40),
+        (201, SessionStatus::Stopping, 41),
+        (202, SessionStatus::Running, 42),
     ] {
         records.push(SessionRecord {
             id: format!("tether-0197f198000070008000000000000{suffix:03}")
@@ -1384,7 +1384,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
             status,
             created_at: now - Duration::days(60),
             last_used_at: now - Duration::days(age),
-            closed_at: (status == SessionStatus::Closed).then_some(now - Duration::days(age)),
+            closed_at: (status == SessionStatus::Ended).then_some(now - Duration::days(age)),
         });
     }
     let state = State {
@@ -1429,7 +1429,7 @@ fn prune_of_final_retained_host_resets_empty_picker_to_safe_host_stage() {
     state.sessions.truncate(1);
     state.sessions[0].host = "removed".into();
     state.sessions[0].target = "removed@example.test".into();
-    state.sessions[0].status = SessionStatus::Closed;
+    state.sessions[0].status = SessionStatus::Ended;
     state.sessions[0].closed_at = Some(state.sessions[0].last_used_at);
     state.sessions[0].last_used_at = Utc::now() - Duration::days(40);
     state.sessions[0].created_at = Utc::now() - Duration::days(60);

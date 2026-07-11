@@ -94,7 +94,7 @@ fn owned_record(status: SessionStatus) -> SessionRecord {
         status,
         created_at: now,
         last_used_at: now,
-        closed_at: (status == SessionStatus::Closed).then_some(now),
+        closed_at: (status == SessionStatus::Ended).then_some(now),
     }
 }
 
@@ -129,7 +129,7 @@ fn lifecycle_fixture(
 fn owned_record_reread_is_authoritative_and_transport_free() {
     let temp = tempdir().unwrap();
     let store = StateStore::new(temp.path().join("state.json"));
-    let record = owned_record(SessionStatus::Closing);
+    let record = owned_record(SessionStatus::Stopping);
     store
         .save(&State {
             version: State::CURRENT_VERSION,
@@ -330,7 +330,7 @@ fn owned_close_retries_closing_and_rejects_unknown_or_closed_records() {
     let (_temp, store, service, _log) = lifecycle_fixture("");
     store
         .update(|state| {
-            state.sessions[0].status = SessionStatus::Closing;
+            state.sessions[0].status = SessionStatus::Stopping;
             Ok(())
         })
         .unwrap();
@@ -354,7 +354,7 @@ fn owned_close_retry_from_closing_keeps_closing_on_unknown_inspect() {
     let (_temp, store, service, _log) = lifecycle_fixture("malformed");
     store
         .update(|state| {
-            state.sessions[0].status = SessionStatus::Closing;
+            state.sessions[0].status = SessionStatus::Stopping;
             Ok(())
         })
         .unwrap();
@@ -456,7 +456,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
     store
         .update(|state| {
             let record = &mut state.sessions[0];
-            record.status = SessionStatus::Closed;
+            record.status = SessionStatus::Ended;
             record.last_used_at = peer_closed_at;
             record.closed_at = Some(peer_closed_at);
             Ok(())
@@ -984,7 +984,7 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         target: "builder@example.test".into(),
         directory: "/srv/code".into(),
         preset: Some("shell".into()),
-        status: SessionStatus::Active,
+        status: SessionStatus::Running,
         created_at: now - Duration::days(30),
         last_used_at: now - Duration::days(30),
         closed_at: None,
@@ -1007,18 +1007,18 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
         CleanupEligibility::KeepActive
     );
-    record.status = SessionStatus::Closing;
+    record.status = SessionStatus::Stopping;
     assert_eq!(
         cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
         CleanupEligibility::KeepActive
     );
-    record.status = SessionStatus::Closed;
+    record.status = SessionStatus::Ended;
     assert_eq!(
         cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),
         CleanupEligibility::KeepRecent,
         "closed metadata without closed_at is retained conservatively"
     );
-    record.status = SessionStatus::Closed;
+    record.status = SessionStatus::Ended;
     record.closed_at = Some(now - Duration::days(1));
     assert_eq!(
         cleanup_eligibility(&record, WorkloadState::Missing, now, Duration::days(7)),

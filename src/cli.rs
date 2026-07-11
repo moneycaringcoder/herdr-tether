@@ -692,10 +692,8 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     let launch = LaunchSpec {
         id,
         directory: selection.directory.clone(),
-        command: selection.command,
+        command: selection.command.clone(),
     };
-    backend.create(&launch)?;
-
     let now = Utc::now();
     let record = SessionRecord {
         id,
@@ -703,55 +701,70 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         target: host.target,
         directory: selection.directory,
         preset: selection.preset,
-        status: SessionStatus::Active,
+        command: Some(selection.command),
+        tmux_session_id: None,
+        status: SessionStatus::Creating,
         created_at: now,
         last_used_at: now,
         closed_at: None,
+        exit_status: None,
     };
     let store = StateStore::new(paths.state_file.clone());
-    if let Err(error) = store.update(|state| {
+    store.update(|state| {
         state.sessions.push(record);
         Ok(())
-    }) {
-        let cleanup = backend.close(&id);
-        return match cleanup {
-            Ok(()) => Err(error).context("persist newly created session"),
-            Err(cleanup_error) => Err(error).context(format!(
-                "persist newly created session; rollback close for `{id}` also failed: {cleanup_error:#}; the workload may still be running"
-            )),
-        };
-    }
+    })?;
+
+    let identity = match backend.create(&launch) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = store.update(|state| {
+                state.sessions.retain(|record| {
+                    record.id != id
+                        || record.status != SessionStatus::Creating
+                        || record.tmux_session_id.is_some()
+                });
+                Ok(())
+            });
+            return Err(error).context(format!("create reserved session `{id}`"));
+        }
+    };
+    store
+        .update(|state| {
+            let current = state
+                .sessions
+                .iter_mut()
+                .find(|record| record.id == id)
+                .with_context(|| format!("reserved session `{id}` disappeared after creation"))?;
+            if current.status != SessionStatus::Creating || current.tmux_session_id.is_some() {
+                bail!("reserved session `{id}` changed while it was being created");
+            }
+            current.tmux_session_id = Some(identity);
+            current.status = SessionStatus::Running;
+            current.last_used_at = Utc::now();
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "record created session `{id}`; the workload remains safely recoverable from its creating reservation"
+            )
+        })?;
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
-        let placement_result = (|| {
-            let context = HerdrContext::from_env()?;
-            let executable = env::current_exe().context("locate the Tether executable")?;
-            let resume = resume_command(executable, id);
-            place_in_herdr(HerdrClient::new(context), &resume, selection.placement)
-        })();
-        if let Err(error) = placement_result {
-            if let Err(cleanup_error) = backend.close(&id) {
-                return Err(error).context(format!(
-                    "place newly created session `{id}`; rollback close also failed: {cleanup_error:#}; the workload remains recorded and may still be running"
-                ));
-            }
-            if let Err(cleanup_error) = store.update(|state| {
-                state.sessions.retain(|record| record.id != id);
-                Ok(())
-            }) {
-                return Err(error).context(format!(
-                    "place newly created session `{id}`; workload rollback succeeded but metadata cleanup failed: {cleanup_error:#}"
-                ));
-            }
-            return Err(error).context(format!(
-                "place newly created session `{id}`; the failed workload was rolled back"
-            ));
-        }
+        let context = HerdrContext::from_env()?;
+        let executable = env::current_exe().context("locate the Tether executable")?;
+        let resume = resume_command(executable, id);
+        place_in_herdr(HerdrClient::new(context), &resume, selection.placement)
+            .with_context(|| {
+                format!(
+                    "place newly created session `{id}`; it remains running and recorded for retry"
+                )
+            })?;
         println!("created {id}");
         Ok(())
     } else {
         println!("created {id}");
-        run_attach(backend.attach_command(&id)?)
+        run_attach(backend.attach_command(identity)?)
     }
 }
 fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
@@ -872,38 +885,53 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 .find(|record| record.id == id)
                 .with_context(|| format!("unknown session `{id}`"))?;
             match record.status {
-                SessionStatus::Active => {}
-                SessionStatus::Closing => bail!("session `{id}` is closing; retry close"),
-                SessionStatus::Closed => bail!("session `{id}` is closed"),
+                SessionStatus::Running => {}
+                SessionStatus::Creating => {
+                    bail!("session `{id}` creation is incomplete; retry restart")
+                }
+                SessionStatus::Stopping => bail!("session `{id}` is stopping; retry"),
+                SessionStatus::Ended => bail!("session `{id}` has ended; restart it"),
+                SessionStatus::Removed => bail!("session `{id}` was removed"),
             }
             let backend = backend_for(&record.target)?;
-            match backend.inspect(&id)? {
-                crate::backend::WorkloadState::Running { .. } => {}
-                crate::backend::WorkloadState::Missing => {
-                    bail!("session `{id}` no longer exists")
+            let identity = match backend.inspect(&id)? {
+                crate::backend::WorkloadState::Running { identity, .. } => identity,
+                crate::backend::WorkloadState::Ended { .. }
+                | crate::backend::WorkloadState::Missing => {
+                    bail!("session `{id}` has ended; restart it")
                 }
                 crate::backend::WorkloadState::Unknown => {
-                    bail!("could not determine whether session `{id}` exists")
+                    bail!("could not determine whether session `{id}` is reachable")
                 }
+            };
+            if record
+                .tmux_session_id
+                .is_some_and(|expected| expected != identity)
+            {
+                bail!("session `{id}` identity changed; refusing to attach");
             }
-            let attach = backend.attach_command(&id)?;
+            let attach = backend.attach_command(identity)?;
             store.update(|state| {
                 let current = state
                     .sessions
                     .iter_mut()
                     .find(|current| current.id == id)
                     .with_context(|| {
-                        format!("session `{id}` disappeared while preparing resume")
+                        format!("session `{id}` disappeared while preparing open")
                     })?;
-                if current.target != record.target {
-                    bail!("session `{id}` target changed while preparing resume");
+                if current.target != record.target
+                    || current
+                        .tmux_session_id
+                        .is_some_and(|expected| expected != identity)
+                {
+                    bail!("session `{id}` identity changed while preparing open");
                 }
                 match current.status {
-                    SessionStatus::Active => current.last_used_at = Utc::now(),
-                    SessionStatus::Closing => {
-                        bail!("session `{id}` began closing while preparing resume")
+                    SessionStatus::Running => {
+                        current.tmux_session_id = Some(identity);
+                        current.last_used_at = Utc::now();
                     }
-                    SessionStatus::Closed => bail!("session `{id}` closed while preparing resume"),
+                    _ => bail!("session `{id}` changed while preparing open"),
                 }
                 Ok(())
             })?;

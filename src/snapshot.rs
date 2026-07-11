@@ -140,7 +140,7 @@ pub fn collect(
         .sessions
         .iter()
         .filter(|record| {
-            record.status == SessionStatus::Active
+            record.status == SessionStatus::Running
                 && effective_keys.contains(&(record.host.clone(), record.target.clone()))
         })
         .map(|record| (record.id, record.host.clone()))
@@ -157,7 +157,7 @@ pub fn collect(
                 .filter(|record| {
                     record.host == host.name
                         && record.target == effective_target(host.target.as_deref())
-                        && record.status == SessionStatus::Active
+                        && record.status == SessionStatus::Running
                 })
                 .map(|record| record.id)
                 .collect(),
@@ -282,7 +282,7 @@ pub fn collect(
                 .filter(|record| {
                     record.host == host.name
                         && record.target == retained_target
-                        && record.status == SessionStatus::Active
+                        && record.status == SessionStatus::Running
                 })
                 .map(|record| record.id)
                 .collect();
@@ -421,7 +421,7 @@ fn owned_session(
     workload: Option<WorkloadStatus>,
 ) -> OwnedSession {
     let (workload_status, attached) = match (record.status, workload) {
-        (SessionStatus::Closing | SessionStatus::Closed, _) => ("not_checked".to_owned(), None),
+        (SessionStatus::Stopping | SessionStatus::Ended, _) => ("not_checked".to_owned(), None),
         (_, Some(WorkloadStatus::Running { attached })) => ("running".to_owned(), Some(attached)),
         (_, Some(status)) => (workload_name(status).to_owned(), None),
         _ => ("not_collected".to_owned(), None),
@@ -569,9 +569,11 @@ fn apply_discovery(
 
 fn metadata_name(status: SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Active => "active",
-        SessionStatus::Closing => "closing",
-        SessionStatus::Closed => "closed",
+        SessionStatus::Creating => "creating",
+        SessionStatus::Running => "running",
+        SessionStatus::Stopping => "stopping",
+        SessionStatus::Ended => "ended",
+        SessionStatus::Removed => "removed",
     }
 }
 fn workload_name(status: WorkloadStatus) -> &'static str {

@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{model::SessionId, quote::posix_quote};
+use crate::{
+    model::{SessionId, TmuxSessionId},
+    quote::posix_quote,
+};
 
 /// An executable and its already-separated argument vector.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,14 +119,21 @@ pub struct LaunchSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadState {
     Missing,
-    Running { attached: u32 },
+    Running {
+        attached: u32,
+        identity: TmuxSessionId,
+    },
+    Ended {
+        identity: TmuxSessionId,
+        exit_status: Option<i32>,
+    },
     Unknown,
 }
 
 /// Operations required from a durable session backend.
 pub trait DurableBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<()>;
+    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId>;
     fn inspect(&self, id: &SessionId) -> Result<WorkloadState>;
-    fn attach_command(&self, id: &SessionId) -> Result<CommandSpec>;
-    fn close(&self, id: &SessionId) -> Result<()>;
+    fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec>;
+    fn close(&self, identity: TmuxSessionId) -> Result<()>;
 }
