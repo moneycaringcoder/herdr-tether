@@ -61,7 +61,8 @@ scan() {
   find_root=$1
   case "$find_root" in -*) find_root=./$find_root ;; esac
   find "$find_root" -mindepth 1 -maxdepth 1 -print |
-    head -n "$((remaining + 1))" > "$listing"
+    head -n "$((remaining + 1))" |
+    sort > "$listing"
   while IFS= read -r child; do
     if [ ! -e "$child" ] && [ ! -L "$child" ]; then
       continue
