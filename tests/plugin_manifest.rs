@@ -7,7 +7,7 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
-    assert_eq!(value["version"].as_str(), Some("0.2.2"));
+    assert_eq!(value["version"].as_str(), Some("0.3.0"));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
     assert_eq!(
         value["platforms"].as_array().unwrap(),

@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
+import os
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 
-from check_package import PackageError, validate_entries, validate_lock_packages
+from check_package import (
+    PackageError,
+    validate_archive_members,
+    validate_entries,
+    validate_lock_packages,
+    validate_source_paths,
+)
 
 
 class PackageContentsTests(unittest.TestCase):
@@ -41,6 +51,72 @@ class PackageContentsTests(unittest.TestCase):
             with self.subTest(leaked=leaked):
                 with self.assertRaises(PackageError):
                     validate_entries(baseline | {leaked}, set())
+
+    def test_unlisted_top_level_and_malicious_paths_are_rejected(self) -> None:
+        baseline = {
+            "Cargo.lock",
+            "Cargo.toml",
+            "CHANGELOG.md",
+            "CONTRIBUTING.md",
+            "LICENSE",
+            "README.md",
+            "SECURITY.md",
+            "docs/architecture.md",
+            "herdr-plugin.toml",
+            "src/main.rs",
+        }
+        for path in (
+            "secrets.txt",
+            "../outside",
+            "src/../../.omp/mission/private.txt",
+            "/absolute/path",
+            r"src\..\private",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(PackageError):
+                    validate_entries(baseline | {path}, set())
+
+    def test_source_symlinks_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "outside").write_text("private", encoding="utf-8")
+            os.symlink(root / "outside", root / "src" / "linked.rs")
+            with self.assertRaises(PackageError):
+                validate_source_paths(root, {"src/linked.rs"})
+
+    def test_archive_rejects_traversal_and_link_members(self) -> None:
+        regular = SimpleNamespace(
+            name="herdr-tether-0.3.0/src/main.rs",
+            isfile=lambda: True,
+            isdir=lambda: False,
+        )
+        directory = SimpleNamespace(
+            name="herdr-tether-0.3.0/src/",
+            isfile=lambda: False,
+            isdir=lambda: True,
+        )
+        validate_archive_members([directory, regular], "herdr-tether-0.3.0")
+        for malicious in (
+            SimpleNamespace(
+                name="herdr-tether-0.3.0/../../private",
+                isfile=lambda: True,
+                isdir=lambda: False,
+            ),
+            SimpleNamespace(
+                name="other-package/src/main.rs",
+                isfile=lambda: True,
+                isdir=lambda: False,
+            ),
+            SimpleNamespace(
+                name="herdr-tether-0.3.0/src/linked.rs",
+                isfile=lambda: False,
+                isdir=lambda: False,
+            ),
+        ):
+            with self.subTest(name=malicious.name):
+                with self.assertRaises(PackageError):
+                    validate_archive_members([malicious], "herdr-tether-0.3.0")
 
     def test_missing_manifest_doc_or_asset_is_rejected(self) -> None:
         baseline = {

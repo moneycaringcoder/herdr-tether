@@ -7,6 +7,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 try:
     import tomllib
@@ -48,6 +49,48 @@ def load_toml(path: Path) -> dict:
 
 class ReleaseIdentityError(ValueError):
     pass
+
+
+def validate_release_context(
+    tag: str,
+    *,
+    head_commit: str,
+    tagged_commit: str | None,
+    github_actions: bool,
+    github_ref_type: str | None,
+    github_ref_name: str | None,
+) -> None:
+    if tagged_commit is None or tagged_commit != head_commit:
+        raise ReleaseIdentityError(
+            f"--release requires HEAD to be the exact local {tag} tag"
+        )
+    if github_actions and (
+        github_ref_type != "tag" or github_ref_name != tag
+    ):
+        raise ReleaseIdentityError(
+            "--release must run from the exact GitHub tag being validated"
+        )
+
+
+def resolve_git_commit(ref: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseIdentityError(f"could not inspect Git release context: {error}") from error
+    if result.returncode != 0:
+        return None
+    commit = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise ReleaseIdentityError(f"Git returned invalid commit identity {commit!r}")
+    return commit
 
 
 def validate_readme_install(readme: str, tag: str, release: bool) -> None:
@@ -95,12 +138,21 @@ def main() -> None:
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", args.tag):
         fail(f"tag {args.tag!r} is not v<major>.<minor>.<patch>")
     version = args.tag[1:]
-    if args.release and os.environ.get("GITHUB_ACTIONS") == "true":
-        if (
-            os.environ.get("GITHUB_REF_TYPE") != "tag"
-            or os.environ.get("GITHUB_REF_NAME") != args.tag
-        ):
-            fail("--release must run from the exact GitHub tag being validated")
+    if args.release:
+        try:
+            head_commit = resolve_git_commit("HEAD")
+            if head_commit is None:
+                raise ReleaseIdentityError("could not resolve Git HEAD")
+            validate_release_context(
+                args.tag,
+                head_commit=head_commit,
+                tagged_commit=resolve_git_commit(f"refs/tags/{args.tag}"),
+                github_actions=os.environ.get("GITHUB_ACTIONS") == "true",
+                github_ref_type=os.environ.get("GITHUB_REF_TYPE"),
+                github_ref_name=os.environ.get("GITHUB_REF_NAME"),
+            )
+        except ReleaseIdentityError as error:
+            fail(str(error))
 
     cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
     cargo_version = cargo_package["version"]

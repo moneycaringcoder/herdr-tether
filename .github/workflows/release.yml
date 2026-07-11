@@ -18,7 +18,9 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Verify tag and public version surfaces
-        run: python3 tools/check_release.py --release --tag "${GITHUB_REF_NAME}"
+        run: |
+          python3 tools/test_check_release.py
+          python3 tools/check_release.py --release --tag "${GITHUB_REF_NAME}"
 
   gates:
     name: ${{ matrix.os }} release
@@ -45,7 +47,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -77,6 +79,7 @@ jobs:
         run: |
           python3 tools/test_live_product_smoke.py
           python3 tools/test_check_package.py
+          python3 tools/test_check_release.py
           python3 tools/check_package.py
 
       - name: Build installed release artifact
@@ -96,6 +99,10 @@ jobs:
             echo "expected exactly one packaged herdr-tether manifest" >&2
             exit 1
           fi
+          cp "${package_crates[0]}" "$RUNNER_TEMP/first.crate"
+          rm "${package_crates[0]}"
+          cargo package --locked
+          cmp "$RUNNER_TEMP/first.crate" "${package_crates[0]}"
           cargo test --locked --manifest-path "${package_manifests[0]}" -- --test-threads=1
           cargo install \
             --path "$(dirname "${package_manifests[0]}")" \
