@@ -157,6 +157,16 @@ pub enum WorkloadState {
 pub trait DurableBackend {
     fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId>;
     fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState>;
-    fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec>;
-    fn close(&self, identity: TmuxSessionId) -> Result<()>;
+    fn attach_command(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec>;
+    fn close(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<()>;
 }

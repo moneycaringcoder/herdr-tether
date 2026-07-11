@@ -745,11 +745,20 @@ fn owned_resume_enables_mouse_but_external_attach_never_mutates_options() {
     write_fake(&tmux, &log, &target, 0);
     let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
 
-    let owned = backend.attach_command("$7".parse().unwrap()).unwrap();
-    assert_eq!(read_argv(&log), ["set-option", "-t", "$7", "mouse", "on"]);
-    assert_eq!(owned.args[0], "attach-session");
+    let owned = backend
+        .attach_command(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap();
+    let attach_argv = owned.args;
+    assert_eq!(attach_argv[0], "if-shell");
+    assert_eq!(attach_argv[2], "$7");
+    assert!(attach_argv[4].contains("#{session_id},$7"));
+    assert!(attach_argv[4].contains(&id().to_string()));
+    assert!(attach_argv[4].contains(&proof().to_string()));
+    assert_eq!(
+        attach_argv[5],
+        "set-option -t $7 mouse on ; attach-session -t $7"
+    );
 
-    fs::remove_file(&log).unwrap();
     let external = "work".parse::<ExternalSessionName>().unwrap();
     let command = backend.attach_external_command(&external).unwrap();
     assert_eq!(command.args, ["attach-session", "-t", "=work"]);
@@ -880,20 +889,22 @@ fn attach_only_attaches_and_close_is_the_only_kill_path() {
     write_fake(&tmux, &temp.path().join("tmux.args"), "", 0);
     let backend = TmuxBackend::remote("build-box", ProcessBinaries::new(ssh, tmux)).unwrap();
 
-    let attach = backend.attach_command("$7".parse().unwrap()).unwrap();
+    let attach = backend
+        .attach_command(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap();
     assert_eq!(attach.program.file_name().unwrap(), "ssh");
-    assert_eq!(
-        attach.args.last().unwrap(),
-        "'tmux' 'attach-session' '-t' '$7'"
-    );
-    assert!(!attach.args.iter().any(|arg| arg.contains("kill")));
+    let remote_attach = attach.args.last().unwrap();
+    assert!(remote_attach.contains("'tmux' 'if-shell' '-t' '$7' '-F'"));
+    assert!(remote_attach.contains("'set-option -t $7 mouse on ; attach-session -t $7'"));
+    assert!(!remote_attach.contains("'kill-session"));
 
-    backend.close("$7".parse().unwrap()).unwrap();
+    backend
+        .close(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap();
     let close_argv = read_argv(&log);
-    assert_eq!(
-        close_argv.last().unwrap(),
-        "'tmux' 'kill-session' '-t' '$7'"
-    );
+    let remote_close = close_argv.last().unwrap();
+    assert!(remote_close.contains("'tmux' 'if-shell' '-t' '$7' '-F'"));
+    assert!(remote_close.contains("'kill-session -t $7'"));
 }
 
 #[test]
@@ -1356,6 +1367,46 @@ fn stop_refuses_replacement_incarnation_without_sending_kill() {
     let record = &store.load().unwrap().sessions[0];
     assert_eq!(record.status, SessionStatus::Stopping);
     assert_eq!(record.tmux_session_id, Some("$7".parse().unwrap()));
+}
+
+#[test]
+fn stop_guard_rejects_identity_reuse_after_final_inspection() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let killed = temp.path().join("killed");
+    let tmux = temp.path().join("tmux");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{calls}'\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nif-shell) printf 'TETHER_OWNERSHIP_GUARD_REJECTED\\n';;\nkill-session) : > '{killed}';;\nesac\n",
+        calls = calls.display(),
+        killed = killed.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    assert!(matches!(
+        service.stop_owned(id()),
+        Err(CloseOwnedError::ConcurrentModification(_))
+    ));
+    assert!(!killed.exists(), "guard failure must not execute kill-session");
+    assert_eq!(store.load().unwrap().sessions[0].status, SessionStatus::Stopping);
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(calls.lines().any(|call| call == "if-shell"));
+    assert!(!calls.lines().any(|call| call == "kill-session"));
 }
 
 #[test]

@@ -10,7 +10,7 @@ use crate::{
     model::{OwnershipProof, SessionId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, StateStore},
     status::{BoundedOutput, run_bounded},
-    tmux::TmuxBackend,
+    tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend},
 };
 
 /// Exact lifecycle inspection and close transports get three seconds each.
@@ -151,7 +151,7 @@ impl LifecycleService {
                 | WorkloadState::Ended {
                     identity: current, ..
                 } if current == identity => {
-                    self.close_exact(&backend, id, identity)?;
+                    self.close_exact(&backend, id, &ownership_proof, identity)?;
                     ClosedWorkload::Terminated
                 }
                 WorkloadState::Missing => ClosedWorkload::Missing,
@@ -203,14 +203,24 @@ impl LifecycleService {
         &self,
         backend: &TmuxBackend,
         id: SessionId,
+        ownership_proof: &OwnershipProof,
         identity: TmuxSessionId,
     ) -> Result<(), CloseOwnedError> {
         let spec = backend
-            .close_exact_spec(identity)
+            .close_exact_spec(&id, ownership_proof, identity)
             .map_err(|source| CloseOwnedError::Close { id, source })?;
         let cancelled = AtomicBool::new(false);
         match run_bounded(&spec, LIFECYCLE_TRANSPORT_TIMEOUT, &cancelled) {
-            BoundedOutput::Completed { status, .. } if status.success() => Ok(()),
+            BoundedOutput::Completed { status, stdout, .. }
+                if status.success() && stdout.is_empty() =>
+            {
+                Ok(())
+            }
+            BoundedOutput::Completed { stdout, .. }
+                if String::from_utf8_lossy(&stdout).contains(OWNERSHIP_GUARD_REJECTED) =>
+            {
+                Err(CloseOwnedError::ConcurrentModification(id))
+            }
             output => Err(CloseOwnedError::Close {
                 id,
                 source: bounded_transport_error(output),
@@ -367,7 +377,7 @@ impl LifecycleService {
             WorkloadState::Running {
                 identity: current, ..
             } if current == identity => backend
-                .attach_command(identity)
+                .attach_command(&id, &ownership_proof, identity)
                 .map_err(|source| CloseOwnedError::Inspect { id, source }),
             WorkloadState::Unknown => Err(CloseOwnedError::WorkloadUnknown(id)),
             _ => Err(CloseOwnedError::ConcurrentModification(id)),
@@ -469,7 +479,9 @@ impl LifecycleService {
                 match self.inspect_exact(&backend, &id, &ownership_proof)? {
                     WorkloadState::Ended {
                         identity: current, ..
-                    } if current == identity => self.close_exact(&backend, id, identity)?,
+                    } if current == identity => {
+                        self.close_exact(&backend, id, &ownership_proof, identity)?
+                    }
                     WorkloadState::Missing => {}
                     WorkloadState::Unknown => {
                         return Err(CloseOwnedError::WorkloadUnknown(id));
@@ -547,7 +559,9 @@ impl LifecycleService {
                 match self.inspect_exact(&backend, &id, &ownership_proof)? {
                     WorkloadState::Ended {
                         identity: current, ..
-                    } if current == identity => self.close_exact(&backend, id, identity)?,
+                    } if current == identity => {
+                        self.close_exact(&backend, id, &ownership_proof, identity)?
+                    }
                     WorkloadState::Missing => {}
                     WorkloadState::Unknown => {
                         return Err(CloseOwnedError::WorkloadUnknown(id));

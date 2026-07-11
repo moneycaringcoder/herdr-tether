@@ -23,6 +23,7 @@ use crate::{
 const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
 const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OWNERSHIP_GUARD_REJECTED: &str = "TETHER_OWNERSHIP_GUARD_REJECTED";
 
 #[derive(Debug, Error)]
 enum BoundedExecutionError {
@@ -180,17 +181,45 @@ impl TmuxBackend {
         )
     }
 
-    pub(crate) fn close_exact_spec(&self, identity: TmuxSessionId) -> Result<CommandSpec> {
-        self.tmux_spec(
-            vec![
-                "kill-session".to_owned(),
-                "-t".to_owned(),
-                identity.to_string(),
-            ],
+    pub(crate) fn close_exact_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec> {
+        self.guarded_spec(
+            id,
+            ownership_proof,
+            identity,
+            format!("kill-session -t {identity}"),
             false,
         )
     }
 
+    fn guarded_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+        guarded_command: String,
+        interactive: bool,
+    ) -> Result<CommandSpec> {
+        let condition = format!(
+            "#{{&&:#{{==:#{{session_id}},{identity}}},#{{&&:#{{==:#{{session_name}},{id}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}}}"
+        );
+        self.tmux_spec(
+            vec![
+                "if-shell".to_owned(),
+                "-t".to_owned(),
+                identity.to_string(),
+                "-F".to_owned(),
+                condition,
+                guarded_command,
+                format!("display-message -p {OWNERSHIP_GUARD_REJECTED}"),
+            ],
+            interactive,
+        )
+    }
     pub(crate) fn classify_exact_inspect(
         &self,
         id: &SessionId,
@@ -251,9 +280,6 @@ impl TmuxBackend {
         )
     }
 
-    fn enable_owned_mouse(&self, identity: TmuxSessionId) -> Result<()> {
-        self.enable_mouse_for_target(identity.to_string())
-    }
 
     fn enable_mouse_for_target(&self, target: String) -> Result<()> {
         let spec = self.tmux_spec(
@@ -351,9 +377,7 @@ impl TmuxBackend {
         cause: anyhow::Error,
     ) -> anyhow::Error {
         let cause = sanitize_tmux_error(cause, ownership_proof);
-        let rollback = self
-            .close_exact_spec(internal_target)
-            .and_then(|spec| self.require_success("rollback created session", &spec));
+        let rollback = self.close(id, ownership_proof, internal_target);
         match rollback {
             Ok(()) => cause,
             Err(rollback) => {
@@ -449,21 +473,35 @@ impl DurableBackend for TmuxBackend {
         Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
     }
 
-    fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec> {
-        self.enable_owned_mouse(identity)?;
-        self.tmux_spec(
-            vec![
-                "attach-session".to_owned(),
-                "-t".to_owned(),
-                identity.to_string(),
-            ],
+    fn attach_command(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec> {
+        self.guarded_spec(
+            id,
+            ownership_proof,
+            identity,
+            format!("set-option -t {identity} mouse on ; attach-session -t {identity}"),
             true,
         )
     }
 
-    fn close(&self, identity: TmuxSessionId) -> Result<()> {
-        let spec = self.close_exact_spec(identity)?;
-        self.require_success("close", &spec)
+    fn close(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<()> {
+        let spec = self.close_exact_spec(id, ownership_proof, identity)?;
+        let output = self.output(&spec)?;
+        if output.status.success()
+            && !String::from_utf8_lossy(&output.stdout).contains(OWNERSHIP_GUARD_REJECTED)
+        {
+            return Ok(());
+        }
+        bail!("exact owned tmux identity changed before close")
     }
 }
 

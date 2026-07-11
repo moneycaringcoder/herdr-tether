@@ -792,7 +792,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         Ok(())
     } else {
         println!("created {id}");
-        run_attach(backend.attach_command(identity)?)
+        run_attach(backend.attach_command(&id, &ownership_proof, identity)?)
     }
 }
 fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
