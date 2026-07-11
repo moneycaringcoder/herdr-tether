@@ -21,3 +21,7 @@ cargo +1.88.0 check --locked --all-targets --all-features
 ```
 
 Do not commit credentials, host details, generated state, or build output. Describe which local, SSH, tmux, and Herdr paths you actually exercised; call out paths that were not verified. Changes to process invocation, quoting, persistence, session lifecycle, or host handling need boundary and failure-path tests.
+
+## Public documentation boundary
+
+README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep temporary planning, release coordination, test-machine details, review transcripts, local usernames, and local paths out of tracked product documentation. Use pull requests or untracked working notes for temporary coordination.

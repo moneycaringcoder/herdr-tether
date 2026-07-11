@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-### v0.2.1 release candidate
+## [0.2.1] - 2026-07-11
 
 ### Added
 
@@ -18,7 +18,7 @@
 
 - Tether requires tmux 3.3 or newer locally and on remote targets.
 - Herdr 0.7.3 requires one explicit **Install prefix+t launcher** action because it has no generic plugin-action menu. Normal plugin install/open and plain standalone setup remain non-mutating.
-- Herdr's semantic agent-report APIs cannot truthfully represent a nested OMP or Hermes lifecycle from Tether's outer tmux identity. Tether uses titled panes and does not claim native sidebar or Agents integration.
+- Nested tools behind SSH and `tmux` may not appear in Herdr's Agents sidebar. Tether uses titled panes and does not fabricate native agent state.
 
 ## [0.2.0] - 2026-07-11
 

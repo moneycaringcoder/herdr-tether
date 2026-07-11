@@ -201,7 +201,7 @@ Version 0.2.1 implements only local and SSH-backed `TmuxBackend` workloads. Nati
 
 Herdr integration requires version 0.7.3 or newer. Plugin actions open a manifest-declared terminal overlay; after selection, Tether places the exact resume or external-attach command into a focused right split, down split, new tab, or destination-first replacement. Titled Tether panes are the honest presentation fallback.
 
-Herdr 0.7.3 publicly exposes semantic `pane report-agent`, `report-agent-session`, `release-agent`, and `report-metadata` APIs. Those calls assert a known agent's lifecycle or session identity; they are not a generic nested-workload or sidebar registration protocol. Tether knows the outer tmux ID, host, directory, and attach lifetime, but cannot truthfully infer the lifecycle or native session identity of nested OMP or Hermes processes. Tmux detach is not agent completion, one pane has only one effective agent session, and Herdr preserves native identity fields only for recognized source/agent pairs. Tether therefore does not impersonate native hooks or fabricate sidebar/Agents support; an inner native hook must report its own lifecycle.
+Herdr 0.7.3's semantic agent-reporting commands describe known native agent lifecycles; they are not a generic nested-workload registration protocol. Tether knows the outer tmux ID, host, directory, and attach lifetime, but cannot infer the native identity or lifecycle of an arbitrary process behind SSH and `tmux`. Tether therefore uses titled panes rather than fabricating sidebar state; nested tools must report their own lifecycle through a native integration.
 
 ## Design influence
 
