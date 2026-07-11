@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::{SessionId, TmuxSessionId},
+    model::{OwnershipProof, SessionId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, StateStore},
     status::{BoundedOutput, run_bounded},
     tmux::TmuxBackend,
@@ -75,6 +75,8 @@ pub enum CloseOwnedError {
         #[source]
         source: AnyError,
     },
+    #[error("session `{0}` has no private ownership proof; refusing to inspect or mutate it")]
+    MissingOwnershipProof(SessionId),
     #[error("session `{0}` has no retained command and cannot be restarted")]
     MissingCommand(SessionId),
     #[error("session `{id}` cannot be {operation} while it is {status:?}")]
@@ -120,8 +122,9 @@ impl LifecycleService {
     }
     pub fn stop_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
         let record = self.lookup_owned(&id)?;
+        let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let inspected = self.inspect_exact(&backend, &id)?;
+        let inspected = self.inspect_exact(&backend, &id, &ownership_proof)?;
         if inspected == WorkloadState::Unknown {
             return Err(CloseOwnedError::WorkloadUnknown(id));
         }
@@ -141,7 +144,7 @@ impl LifecycleService {
         self.ensure_stopping(&record, identity)?;
 
         let workload = if let Some(identity) = identity {
-            match self.inspect_exact(&backend, &id)? {
+            match self.inspect_exact(&backend, &id, &ownership_proof)? {
                 WorkloadState::Running {
                     identity: current, ..
                 }
@@ -170,9 +173,10 @@ impl LifecycleService {
         &self,
         backend: &TmuxBackend,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
     ) -> Result<WorkloadState, CloseOwnedError> {
         let spec = backend
-            .inspect_exact_spec(id)
+            .inspect_exact_spec(id, ownership_proof)
             .map_err(|source| CloseOwnedError::Inspect { id: *id, source })?;
         let cancelled = AtomicBool::new(false);
         match run_bounded(&spec, LIFECYCLE_TRANSPORT_TIMEOUT, &cancelled) {
@@ -183,6 +187,7 @@ impl LifecycleService {
                 ..
             } => Ok(backend.classify_exact_inspect_parts(
                 id,
+                ownership_proof,
                 status.code(),
                 &stdout,
                 stdout_truncated,
@@ -214,6 +219,7 @@ impl LifecycleService {
     }
 
     fn lookup_owned(&self, id: &SessionId) -> Result<SessionRecord, CloseOwnedError> {
+
         let record = self
             .store
             .load()
@@ -227,6 +233,15 @@ impl LifecycleService {
         }
         Ok(record)
     }
+    fn require_ownership_proof(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<OwnershipProof, CloseOwnedError> {
+        record
+            .ownership_proof
+            .ok_or(CloseOwnedError::MissingOwnershipProof(record.id))
+    }
+
 
     fn ensure_stopping(
         &self,
@@ -314,13 +329,18 @@ impl LifecycleService {
                 status: record.status,
             });
         }
+        let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let WorkloadState::Running { identity, .. } = self.inspect_exact(&backend, &id)? else {
-            return Err(CloseOwnedError::InvalidStatus {
-                id,
-                operation: "opened",
-                status: SessionStatus::Ended,
-            });
+        let identity = match self.inspect_exact(&backend, &id, &ownership_proof)? {
+            WorkloadState::Running { identity, .. } => identity,
+            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+            WorkloadState::Missing | WorkloadState::Ended { .. } => {
+                return Err(CloseOwnedError::InvalidStatus {
+                    id,
+                    operation: "opened",
+                    status: SessionStatus::Ended,
+                });
+            }
         };
         if record
             .tmux_session_id
@@ -343,9 +363,15 @@ impl LifecycleService {
                 Ok(())
             })
             .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
-        backend
-            .attach_command(identity)
-            .map_err(|source| CloseOwnedError::Inspect { id, source })
+        match self.inspect_exact(&backend, &id, &ownership_proof)? {
+            WorkloadState::Running {
+                identity: current, ..
+            } if current == identity => backend
+                .attach_command(identity)
+                .map_err(|source| CloseOwnedError::Inspect { id, source }),
+            WorkloadState::Unknown => Err(CloseOwnedError::WorkloadUnknown(id)),
+            _ => Err(CloseOwnedError::ConcurrentModification(id)),
+        }
     }
 
     /// Reconciles persisted metadata with a truthful exact tmux observation.
@@ -353,8 +379,9 @@ impl LifecycleService {
         let record = self
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
+        let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let observed = self.inspect_exact(&backend, &id)?;
+        let observed = self.inspect_exact(&backend, &id, &ownership_proof)?;
         match observed {
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
             WorkloadState::Running { identity, .. } => {
@@ -409,6 +436,7 @@ impl LifecycleService {
         let record = self
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
+        let ownership_proof = self.require_ownership_proof(&record)?;
         if record.status == SessionStatus::Removed {
             return Err(CloseOwnedError::InvalidStatus {
                 id,
@@ -421,7 +449,7 @@ impl LifecycleService {
             .clone()
             .ok_or(CloseOwnedError::MissingCommand(id))?;
         let backend = self.backend_for(&id, &record.target)?;
-        match self.inspect_exact(&backend, &id)? {
+        match self.inspect_exact(&backend, &id, &ownership_proof)? {
             WorkloadState::Running { identity, .. } => {
                 if record.status != SessionStatus::Creating
                     && record.tmux_session_id != Some(identity)
@@ -473,6 +501,7 @@ impl LifecycleService {
         let identity = backend
             .create(&LaunchSpec {
                 id,
+                ownership_proof,
                 directory: reservation.directory.clone(),
                 command,
             })
@@ -486,6 +515,7 @@ impl LifecycleService {
         let record = self
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
+        let ownership_proof = self.require_ownership_proof(&record)?;
         if record.status == SessionStatus::Removed {
             return Ok(RemoveOwnedResult {
                 id,
@@ -500,12 +530,21 @@ impl LifecycleService {
             });
         }
         let backend = self.backend_for(&id, &record.target)?;
-        let workload = match self.inspect_exact(&backend, &id)? {
+        let workload = match self.inspect_exact(&backend, &id, &ownership_proof)? {
             WorkloadState::Ended { identity, .. }
                 if record.tmux_session_id.is_none()
                     || record.tmux_session_id == Some(identity) =>
             {
-                self.close_exact(&backend, id, identity)?;
+                match self.inspect_exact(&backend, &id, &ownership_proof)? {
+                    WorkloadState::Ended {
+                        identity: current, ..
+                    } if current == identity => self.close_exact(&backend, id, identity)?,
+                    WorkloadState::Missing => {}
+                    WorkloadState::Unknown => {
+                        return Err(CloseOwnedError::WorkloadUnknown(id));
+                    }
+                    _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+                }
                 ClosedWorkload::Terminated
             }
             WorkloadState::Missing => ClosedWorkload::Missing,

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::{ExternalSessionName, SessionId, TmuxSessionId},
+    model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
     sshcfg::validate_ssh_target,
 };
@@ -108,16 +108,22 @@ impl TmuxBackend {
             })
     }
 
-    pub(crate) fn inspect_exact_spec(&self, id: &SessionId) -> Result<CommandSpec> {
+    pub(crate) fn inspect_exact_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+    ) -> Result<CommandSpec> {
         let id_text = id.to_string();
         self.tmux_spec(
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}"
+                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}"
                     .to_owned(),
                 "-f".to_owned(),
-                format!("#{{==:#{{session_name}},{id_text}}}"),
+                format!(
+                    "#{{&&:#{{==:#{{session_name}},{id_text}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}"
+                ),
             ],
             false,
         )
@@ -137,20 +143,22 @@ impl TmuxBackend {
     pub(crate) fn classify_exact_inspect(
         &self,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
         output: &Output,
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, output.status.code(), &output.stdout, stdout_truncated)
+        classify_exact_inspect(id, ownership_proof, output.status.code(), &output.stdout, stdout_truncated)
     }
 
     pub(crate) fn classify_exact_inspect_parts(
         &self,
         id: &SessionId,
+        ownership_proof: &OwnershipProof,
         exit_code: Option<i32>,
         stdout: &[u8],
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, exit_code, stdout, stdout_truncated)
+        classify_exact_inspect(id, ownership_proof, exit_code, stdout, stdout_truncated)
     }
 
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
@@ -290,19 +298,12 @@ impl TmuxBackend {
     fn rollback_created(
         &self,
         id: &SessionId,
-        internal_target: Option<TmuxSessionId>,
+        internal_target: TmuxSessionId,
         cause: anyhow::Error,
     ) -> anyhow::Error {
-        let rollback = internal_target.map_or_else(
-            || {
-                self.tmux_spec(
-                    vec!["kill-session".to_owned(), "-t".to_owned(), exact_target(id)],
-                    false,
-                )
-            },
-            |target| self.close_exact_spec(target),
-        );
-        let rollback = rollback.and_then(|spec| self.require_success("rollback created session", &spec));
+        let rollback = self
+            .close_exact_spec(internal_target)
+            .and_then(|spec| self.require_success("rollback created session", &spec));
         match rollback {
             Ok(()) => cause,
             Err(rollback) => cause.context(format!(
@@ -322,6 +323,8 @@ impl DurableBackend for TmuxBackend {
                 launch.id.to_string(),
                 "-c".to_owned(),
                 launch.directory.clone(),
+                "-e".to_owned(),
+                format!("TETHER_OWNERSHIP_PROOF={}", launch.ownership_proof),
                 "-P".to_owned(),
                 "-F".to_owned(),
                 "#{session_id}:#{pane_id}".to_owned(),
@@ -357,19 +360,25 @@ impl DurableBackend for TmuxBackend {
         })();
         let (session_target, pane_target) = match identities {
             Ok(identities) => identities,
-            Err(error) => return Err(self.rollback_created(&launch.id, None, error)),
+            // Creation may already be committed, but without a trustworthy
+            // internal identity destructive compensation would be unsafe.
+            Err(error) => return Err(error),
         };
         self.enable_remain_on_exit(&pane_target)
             .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
             .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
-            .map_err(|error| self.rollback_created(&launch.id, Some(session_target), error))?;
+            .map_err(|error| self.rollback_created(&launch.id, session_target, error))?;
         Ok(session_target)
     }
 
-    fn inspect(&self, id: &SessionId) -> Result<WorkloadState> {
-        let spec = self.inspect_exact_spec(id)?;
+    fn inspect(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+    ) -> Result<WorkloadState> {
+        let spec = self.inspect_exact_spec(id, ownership_proof)?;
         let output = self.output(&spec)?;
-        Ok(self.classify_exact_inspect(id, &output, false))
+        Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
     }
 
     fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec> {
@@ -392,6 +401,7 @@ impl DurableBackend for TmuxBackend {
 
 fn classify_exact_inspect(
     id: &SessionId,
+    ownership_proof: &OwnershipProof,
     exit_code: Option<i32>,
     stdout: &[u8],
     stdout_truncated: bool,
@@ -408,10 +418,13 @@ fn classify_exact_inspect(
             return WorkloadState::Missing;
         }
         let fields = line.split(':').collect::<Vec<_>>();
-        let [name, identity, attached, pane_dead, exit_status] = fields.as_slice() else {
+        let [name, identity, attached, pane_dead, exit_status, observed_proof] = fields.as_slice() else {
             return WorkloadState::Unknown;
         };
         if *name != id.to_string() {
+            return WorkloadState::Unknown;
+        }
+        if observed_proof.parse::<OwnershipProof>().ok() != Some(*ownership_proof) {
             return WorkloadState::Unknown;
         }
         let Ok(identity) = identity.parse::<TmuxSessionId>() else {
@@ -457,9 +470,6 @@ fn validate_tmux_id(value: &str, sigil: char, kind: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn exact_target(id: &SessionId) -> String {
-    format!("={id}")
-}
 
 fn remote_tmux_command(arguments: &[String]) -> Result<String> {
     remote_command("tmux", arguments)

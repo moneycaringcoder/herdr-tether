@@ -14,7 +14,7 @@ use herdr_tether::{
         CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, PruneError,
         PruneService, cleanup_eligibility,
     },
-    model::{ExternalSessionName, SessionId},
+    model::{ExternalSessionName, OwnershipProof, SessionId},
     quote::posix_quote,
     state::{SessionRecord, SessionStatus, State, StateStore},
     tmux::TmuxBackend,
@@ -83,6 +83,10 @@ fn id() -> SessionId {
     "tether-0197f198000070008000000000000001".parse().unwrap()
 }
 
+fn proof() -> OwnershipProof {
+    "0197f198000070008000000000000002".parse().unwrap()
+}
+
 fn owned_record(status: SessionStatus) -> SessionRecord {
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     SessionRecord {
@@ -93,6 +97,7 @@ fn owned_record(status: SessionStatus) -> SessionRecord {
         preset: Some("shell".into()),
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        ownership_proof: Some(proof()),
         status,
         created_at: now,
         last_used_at: now,
@@ -205,9 +210,9 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
         [
             "list-sessions",
             "-F",
-            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}",
+            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}",
             "-f",
-            "#{==:#{session_name},tether-0197f198000070008000000000000001}",
+            "#{&&:#{==:#{session_name},tether-0197f198000070008000000000000001},#{==:#{TETHER_OWNERSHIP_PROOF},0197f198000070008000000000000002}}",
         ]
     );
 }
@@ -217,7 +222,7 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     for (stdout, status, expected_unknown) in [
         ("malformed", 0, true),
-        ("tether-0197f198000070008000000000000001:$7:0:0:", 2, false),
+        ("tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002", 2, false),
     ] {
         let temp = tempdir().unwrap();
         let state_path = temp.path().join("state.json");
@@ -281,7 +286,7 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  if [ ! -e '{inspect_started}' ]; then\n    case \"$(cat '{state}')\" in *'\"status\": \"running\"'*) : ;; *) exit 70;; esac\n    printf ok > '{inspect_started}'\n    while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  fi\n  printf 'tether-0197f198000070008000000000000001:$7:0:0:';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"stopping\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  if [ ! -e '{inspect_started}' ]; then\n    case \"$(cat '{state}')\" in *'\"status\": \"running\"'*) : ;; *) exit 70;; esac\n    printf ok > '{inspect_started}'\n    while [ ! -e '{inspect_release}' ]; do sleep 0.01; done\n  fi\n  printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session)\n  printf ok > '{close_started}'\n  while [ ! -e '{close_release}' ]; do sleep 0.01; done\n  case \"$(cat '{state}')\" in *'\"status\": \"stopping\"'*) : ;; *) exit 72;; esac;;\nesac\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nexit 0\n",
         inspect_started = inspect_started.display(),
         inspect_release = inspect_release.display(),
         close_started = close_started.display(),
@@ -388,7 +393,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
         let proceed = temp.path().join("proceed");
         let tmux = temp.path().join("tmux");
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0:';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
             ready = ready.display(),
             proceed = proceed.display(),
         );
@@ -442,7 +447,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
     let proceed = temp.path().join("proceed");
     let tmux = temp.path().join("tmux");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0:';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf ready > '{ready}'; while test ! -e '{proceed}'; do sleep 0.01; done;;\nesac\nexit 0\n",
         ready = ready.display(),
         proceed = proceed.display(),
     );
@@ -562,7 +567,7 @@ fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
     fs::write(
         &tmux,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0:';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002';;\nkill-session) printf '%s' \"$$\" > '{}'; sleep 30 & wait;;\nesac\n",
             process_group.display()
         ),
     )
@@ -641,7 +646,7 @@ fn missing_local_tmux_reports_install_and_search_guidance() {
         "unused-ssh-for-missing-tool-test",
         "tmux-that-does-not-exist-for-test",
     ));
-    let error = backend.inspect(&id()).unwrap_err().to_string();
+    let error = backend.inspect(&id(), &proof()).unwrap_err().to_string();
     assert!(error.contains("tmux-that-does-not-exist-for-test"));
     assert!(error.contains("install the tool or make it executable"));
     assert!(error.contains("/opt/homebrew/bin"));
@@ -665,6 +670,7 @@ fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() 
             TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
         let result = backend.create(&LaunchSpec {
             id: id(),
+            ownership_proof: proof(),
             directory: "/work/repo".into(),
             command: "printf ready".into(),
         });
@@ -672,7 +678,7 @@ fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() 
 
         let calls = fs::read_to_string(log).unwrap();
         assert!(calls.contains(
-            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -P -F #{session_id}:#{pane_id} -- /bin/sh -lc"
+            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -e TETHER_OWNERSHIP_PROOF=0197f198000070008000000000000002 -P -F #{session_id}:#{pane_id} -- /bin/sh -lc"
         ));
         assert!(
             calls.contains(
@@ -716,6 +722,7 @@ fn owned_create_accepts_symlinked_directory_with_same_inode() {
     backend
         .create(&LaunchSpec {
             id: id(),
+            ownership_proof: proof(),
             directory: selected.to_string_lossy().into_owned(),
             command: "sleep 10".into(),
         })
@@ -778,6 +785,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     backend
         .create(&LaunchSpec {
             id: id(),
+            ownership_proof: proof(),
             directory: directory.into(),
             command: command.into(),
         })
@@ -913,11 +921,11 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
     write_fake(&ssh, &temp.path().join("ssh.args"), "", 0);
-    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001:$7:2:0:", 0);
+    write_fake(&tmux, &log, "tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002", 0);
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
     assert_eq!(
-        backend.inspect(&id()).unwrap(),
+        backend.inspect(&id(), &proof()).unwrap(),
         WorkloadState::Running { attached: 2, identity: "$7".parse().unwrap() }
     );
     assert_eq!(
@@ -925,9 +933,9 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
         [
             "list-sessions",
             "-F",
-            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}",
+            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}",
             "-f",
-            "#{==:#{session_name},tether-0197f198000070008000000000000001}",
+            "#{&&:#{==:#{session_name},tether-0197f198000070008000000000000001},#{==:#{TETHER_OWNERSHIP_PROOF},0197f198000070008000000000000002}}",
         ]
     );
 }
@@ -948,7 +956,7 @@ fn inspect_maps_missing_and_failure_results() {
             TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
 
         assert_eq!(
-            backend.inspect(&id()).unwrap(),
+            backend.inspect(&id(), &proof()).unwrap(),
             expected,
             "unexpected inspect state for exit status {status}"
         );
@@ -991,6 +999,7 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         preset: Some("shell".into()),
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        ownership_proof: Some(proof()),
         status: SessionStatus::Running,
         created_at: now - Duration::days(30),
         last_used_at: now - Duration::days(30),
@@ -1063,6 +1072,7 @@ fn prune_record(
         preset: None,
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        ownership_proof: Some(proof()),
         status,
         created_at,
         last_used_at: closed_at.unwrap_or(created_at),
@@ -1258,7 +1268,7 @@ fn prune_state_failures_are_typed_and_apply_does_not_rewrite_bad_state() {
 fn ended_observation_persists_exit_context_and_exact_identity() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let (temp, store, service, _) = lifecycle_fixture(
-        "tether-0197f198000070008000000000000001:$7:0:1:130\n",
+        "tether-0197f198000070008000000000000001:$7:0:1:130:0197f198000070008000000000000002\n",
     );
 
     assert_eq!(
@@ -1283,7 +1293,7 @@ fn stop_refuses_replacement_incarnation_without_sending_kill() {
     let calls = temp.path().join("calls");
     let tmux = temp.path().join("tmux");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$1 $2 $3\" >> '{calls}'\ncase \"$1\" in\nlist-sessions)\n  count=$(grep -c list-sessions '{calls}')\n  if [ \"$count\" -eq 1 ]; then identity='$7'; else identity='$8'; fi\n  printf 'tether-0197f198000070008000000000000001:%s:0:0:' \"$identity\";;\nkill-session) exit 99;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$1 $2 $3\" >> '{calls}'\ncase \"$1\" in\nlist-sessions)\n  count=$(grep -c list-sessions '{calls}')\n  if [ \"$count\" -eq 1 ]; then identity='$7'; else identity='$8'; fi\n  printf 'tether-0197f198000070008000000000000001:%s:0:0::0197f198000070008000000000000002' \"$identity\";;\nkill-session) exit 99;;\nesac\n",
         calls = calls.display(),
     );
     fs::write(&tmux, script).unwrap();
@@ -1313,10 +1323,68 @@ fn stop_refuses_replacement_incarnation_without_sending_kill() {
 }
 
 #[test]
+fn creating_recovery_refuses_same_name_with_wrong_ownership_proof() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let (_temp, store, service, log) = lifecycle_fixture(
+        "tether-0197f198000070008000000000000001:$9:0:0::0197f198000070008000000000000099\n",
+    );
+    store
+        .update(|state| {
+            state.sessions[0].status = SessionStatus::Creating;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        service.restart_owned(id()),
+        Err(CloseOwnedError::WorkloadUnknown(_))
+    ));
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Creating);
+    assert_eq!(record.tmux_session_id, None);
+    assert!(!read_argv(&log).iter().any(|argument| argument == "new-session"));
+    assert!(!read_argv(&log).iter().any(|argument| argument == "kill-session"));
+}
+
+#[test]
+fn open_revalidates_proof_and_identity_at_mutation_boundary() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let tmux = temp.path().join("tmux");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{calls}'\ncase \"$1\" in\nlist-sessions)\n  count=$(grep -c list-sessions '{calls}')\n  if [ \"$count\" -eq 1 ]; then proof='0197f198000070008000000000000002'; else proof='0197f198000070008000000000000099'; fi\n  printf 'tether-0197f198000070008000000000000001:$7:0:0::%s' \"$proof\";;\nattach-session) exit 99;;\nesac\n",
+        calls = calls.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store,
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    assert!(matches!(
+        service.open_owned(id()),
+        Err(CloseOwnedError::WorkloadUnknown(_))
+    ));
+    assert!(!fs::read_to_string(calls).unwrap().contains("attach-session"));
+}
+
+#[test]
 fn restart_recovers_existing_creating_incarnation_idempotently() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let (_temp, store, service, _) = lifecycle_fixture(
-        "tether-0197f198000070008000000000000001:$9:0:0:\n",
+        "tether-0197f198000070008000000000000001:$9:0:0::0197f198000070008000000000000002\n",
     );
     store
         .update(|state| {
@@ -1339,7 +1407,7 @@ fn restart_recovers_existing_creating_incarnation_idempotently() {
 fn remove_never_kills_a_running_incarnation() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let (_temp, store, service, log) = lifecycle_fixture(
-        "tether-0197f198000070008000000000000001:$7:0:0:\n",
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002\n",
     );
     store
         .update(|state| {

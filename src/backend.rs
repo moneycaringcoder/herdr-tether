@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use crate::{
-    model::{SessionId, TmuxSessionId},
+    model::{OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
 };
 
@@ -112,6 +112,7 @@ fn is_executable(path: &Path) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchSpec {
     pub id: SessionId,
+    pub ownership_proof: OwnershipProof,
     pub directory: String,
     pub command: String,
 }
@@ -133,7 +134,7 @@ pub enum WorkloadState {
 /// Operations required from a durable session backend.
 pub trait DurableBackend {
     fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId>;
-    fn inspect(&self, id: &SessionId) -> Result<WorkloadState>;
+    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState>;
     fn attach_command(&self, identity: TmuxSessionId) -> Result<CommandSpec>;
     fn close(&self, identity: TmuxSessionId) -> Result<()>;
 }

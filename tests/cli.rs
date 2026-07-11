@@ -72,6 +72,8 @@ fn active_state(id: &str) -> String {
     "directory": "/tmp",
     "preset": null,
     "command": "exec true",
+    "tmux_session_id": 7,
+    "ownership_proof": "0197f198000070008000000000000099",
     "status": "running",
     "created_at": "2026-01-01T00:00:00Z",
     "last_used_at": "2026-01-01T00:00:00Z",
@@ -322,9 +324,13 @@ fn keybinding_reload_failure_reports_written_state_and_rollback_without_leaking_
 }
 
 fn write_fake_tmux(path: &Path, log: &Path) {
+    let proof_file = log.with_extension("proof");
+    let id_file = log.with_extension("id");
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) printf '$7:%%3' ;;\n  list-sessions) filter=$(tail -n 1 '{log}' | sed -n 's/.* <\\(#[^>]*\\)>$/\\1/p'); id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7:0:0:' \"$id\" ;; *) printf '%s:$7:0:0:' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
-        log = log.display()
+        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) previous=; for arg do if [ \"$previous\" = '-s' ]; then printf '%s' \"$arg\" > '{id_file}'; fi; case \"$arg\" in TETHER_OWNERSHIP_PROOF=*) printf '%s' \"${{arg#*=}}\" > '{proof_file}' ;; esac; previous=$arg; done; printf '$7:%%3' ;;\n  list-sessions) id=$(cat '{id_file}' 2>/dev/null); proof=$(cat '{proof_file}' 2>/dev/null); case \"$*\" in *TETHER_OWNERSHIP_PROOF*) printf '%s:$7:0:0::%s' \"$id\" \"$proof\" ;; *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
+        log = log.display(),
+        proof_file = proof_file.display(),
+        id_file = id_file.display(),
     );
     fs::write(path, script).unwrap();
     #[cfg(unix)]
@@ -529,7 +535,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
         ),
         (
             "failed-running-close",
-            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0:'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
+            "case \"$1\" in\n  list-sessions) printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000099'; exit 0 ;;\n  kill-session) printf 'still running' >&2; exit 2 ;;\nesac\nexit 0",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -578,7 +584,7 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
             "missing",
             active_state(SESSION_ID),
             "case \"$1\" in list-sessions) exit 0;; esac\nexit 0",
-            "has ended; restart it",
+            "cannot be opened",
         ),
         (
             "unknown",
@@ -698,7 +704,7 @@ fn open_rejects_whitespace_directory_and_command_before_backend_create() {
 }
 
 #[test]
-fn open_fails_safely_when_concurrent_state_replaces_its_reservation() {
+fn open_fails_closed_when_reservation_disappears_after_backend_creation() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
     fs::write(sandbox.state_file(), r#"{"version":2,"sessions":[]}"#).unwrap();

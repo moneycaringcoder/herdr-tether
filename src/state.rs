@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{SessionId, TmuxSessionId},
+    model::{OwnershipProof, SessionId, TmuxSessionId},
     storage::{atomic_write, with_advisory_lock},
 };
 
@@ -33,6 +33,12 @@ pub struct SessionRecord {
     /// Immutable tmux incarnation captured after successful creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session_id: Option<TmuxSessionId>,
+    /// Private capability shared only with the exact tmux incarnation.
+    ///
+    /// Legacy records deliberately have no proof and therefore cannot confer
+    /// destructive ownership until safely recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_proof: Option<OwnershipProof>,
     pub status: SessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
@@ -293,6 +299,7 @@ impl StateV1 {
                         preset: session.preset,
                         command: None,
                         tmux_session_id: None,
+                        ownership_proof: None,
                         status,
                         created_at: session.created_at,
                         last_used_at: session.last_used_at,
@@ -338,6 +345,7 @@ impl StateV0 {
                     preset: None,
                     command: None,
                     tmux_session_id: None,
+                    ownership_proof: None,
                     status: SessionStatus::Running,
                     created_at: session.created_at,
                     last_used_at: session.last_used_at,

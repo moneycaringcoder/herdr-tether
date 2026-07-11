@@ -78,6 +78,51 @@ impl FromStr for SessionId {
     }
 }
 
+/// A private, unguessable capability proving that a tmux incarnation was
+/// created for one persisted Tether reservation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct OwnershipProof(Uuid);
+
+impl OwnershipProof {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for OwnershipProof {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for OwnershipProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0.simple().to_string())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid ownership proof")]
+pub struct OwnershipProofError;
+
+impl FromStr for OwnershipProof {
+    type Err = OwnershipProofError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(OwnershipProofError);
+        }
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| OwnershipProofError)
+    }
+}
+
 /// The immutable tmux server identity captured when an owned session is created.
 ///
 /// Destructive operations target this identity, never a reusable session name.

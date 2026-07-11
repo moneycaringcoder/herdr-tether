@@ -21,7 +21,7 @@ use crate::{
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext},
     lifecycle::{LifecycleService, PruneError, PruneService},
-    model::{ExternalSessionName, Placement, SessionId},
+    model::{ExternalSessionName, OwnershipProof, Placement, SessionId},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
@@ -696,9 +696,11 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let host = resolve_host_from(config, &aliases, &selection.host)?;
     let id = SessionId::new();
+    let ownership_proof = OwnershipProof::new();
     let backend = backend_for(&host.target)?;
     let launch = LaunchSpec {
         id,
+        ownership_proof,
         directory: selection.directory.clone(),
         command: selection.command.clone(),
     };
@@ -711,6 +713,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         preset: selection.preset,
         command: Some(selection.command),
         tmux_session_id: None,
+        ownership_proof: Some(ownership_proof),
         status: SessionStatus::Creating,
         created_at: now,
         last_used_at: now,
@@ -927,48 +930,11 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 SessionStatus::Ended => bail!("session `{id}` has ended; restart it"),
                 SessionStatus::Removed => bail!("session `{id}` was removed"),
             }
-            let backend = backend_for(&record.target)?;
-            let identity = match backend.inspect(&id)? {
-                crate::backend::WorkloadState::Running { identity, .. } => identity,
-                crate::backend::WorkloadState::Ended { .. }
-                | crate::backend::WorkloadState::Missing => {
-                    bail!("session `{id}` has ended; restart it")
-                }
-                crate::backend::WorkloadState::Unknown => {
-                    bail!("could not determine whether session `{id}` is reachable")
-                }
-            };
-            if record
-                .tmux_session_id
-                .is_some_and(|expected| expected != identity)
-            {
-                bail!("session `{id}` identity changed; refusing to attach");
-            }
-            let attach = backend.attach_command(identity)?;
-            store.update(|state| {
-                let current = state
-                    .sessions
-                    .iter_mut()
-                    .find(|current| current.id == id)
-                    .with_context(|| {
-                        format!("session `{id}` disappeared while preparing open")
-                    })?;
-                if current.target != record.target
-                    || current
-                        .tmux_session_id
-                        .is_some_and(|expected| expected != identity)
-                {
-                    bail!("session `{id}` identity changed while preparing open");
-                }
-                match current.status {
-                    SessionStatus::Running => {
-                        current.tmux_session_id = Some(identity);
-                        current.last_used_at = Utc::now();
-                    }
-                    _ => bail!("session `{id}` changed while preparing open"),
-                }
-                Ok(())
-            })?;
+            let attach = LifecycleService::new(
+                store.clone(),
+                ProcessBinaries::new("ssh", "tmux"),
+            )
+            .open_owned(id)?;
             run_attach(attach)
         }
         SessionCommand::AttachExternal { target, name } => {
