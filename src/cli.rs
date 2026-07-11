@@ -193,8 +193,15 @@ fn placement_name(placement: Placement) -> &'static str {
 enum SessionCommand {
     /// List persisted session metadata.
     List(OutputArgs),
-    /// Attach to an existing durable session without creating it.
-    Resume { id: SessionId },
+    /// Open an existing running session without creating it.
+    Open { id: SessionId },
+    /// Restart an ended session and open it.
+    Restart {
+        id: SessionId,
+        /// Placement used when invoked from a Herdr plugin pane.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
+    },
     /// Attach to a discovered non-owned external tmux session.
     #[command(hide = true)]
     AttachExternal {
@@ -202,9 +209,11 @@ enum SessionCommand {
         target: String,
         name: ExternalSessionName,
     },
-    /// Kill a durable session and mark its metadata closed.
-    Close { id: SessionId },
-    /// Remove old, closed metadata whose workload was killed.
+    /// Stop the exact Tether-owned workload and retain its history.
+    Stop { id: SessionId },
+    /// Remove an ended workload from normal history without touching live work.
+    Remove { id: SessionId },
+    /// Clear old ended or removed history without touching workloads.
     Prune(PruneArgs),
 }
 
@@ -820,13 +829,13 @@ fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> R
         place_in_herdr(HerdrClient::new(context), &resume, placement)?;
         Ok(())
     } else {
-        session_command(paths, SessionCommand::Resume { id })
+        session_command(paths, SessionCommand::Open { id })
     }
 }
 fn resume_command(executable: PathBuf, id: SessionId) -> CommandSpec {
     CommandSpec::new(
         executable,
-        vec!["session".to_owned(), "resume".to_owned(), id.to_string()],
+        vec!["session".to_owned(), "open".to_owned(), id.to_string()],
     )
 }
 
@@ -931,7 +940,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             }
             Ok(())
         }
-        SessionCommand::Resume { id } => {
+        SessionCommand::Open { id } => {
             let record = store
                 .load()?
                 .sessions
@@ -940,12 +949,18 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 .with_context(|| format!("unknown session `{id}`"))?;
             match record.status {
                 SessionStatus::Running => {}
-                SessionStatus::Creating => {
-                    bail!("session `{id}` creation is incomplete; retry restart")
-                }
-                SessionStatus::Stopping => bail!("session `{id}` is stopping; retry"),
-                SessionStatus::Ended => bail!("session `{id}` has ended; restart it"),
-                SessionStatus::Removed => bail!("session `{id}` was removed"),
+                SessionStatus::Creating => bail!(
+                    "session `{id}` creation is incomplete; run `herdr-tether session restart {id}`"
+                ),
+                SessionStatus::Stopping => bail!(
+                    "session `{id}` is stopping; retry `herdr-tether session open {id}` after Stop completes"
+                ),
+                SessionStatus::Ended => bail!(
+                    "session `{id}` has ended; run `herdr-tether session restart {id}`"
+                ),
+                SessionStatus::Removed => bail!(
+                    "session `{id}` was removed; run `herdr-tether open` to create a new workload"
+                ),
             }
             let attach = LifecycleService::new(
                 store.clone(),
@@ -958,10 +973,36 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             let backend = backend_for(&target)?;
             run_attach(backend.attach_external_command(&name)?)
         }
-        SessionCommand::Close { id } => {
+        SessionCommand::Restart { id, placement } => {
+            let placement = placement
+                .map(Placement::from)
+                .unwrap_or(ConfigStore::new(paths.config_file.clone()).load()?.ui.placement);
+            restart_and_attach(paths, id, placement).with_context(|| {
+                format!(
+                    "restart session `{id}`; retry `herdr-tether session restart {id}` after resolving the reported error"
+                )
+            })
+        }
+        SessionCommand::Stop { id } => {
             LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
-                .close_owned(id)?;
-            println!("closed {id}");
+                .close_owned(id)
+                .with_context(|| {
+                    format!(
+                        "stop session `{id}`; retry `herdr-tether session stop {id}` after resolving the reported error"
+                    )
+                })?;
+            println!("stopped {id}");
+            Ok(())
+        }
+        SessionCommand::Remove { id } => {
+            LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+                .remove_owned(id)
+                .with_context(|| {
+                    format!(
+                        "remove ended session `{id}`; retry `herdr-tether session remove {id}` after resolving the reported error"
+                    )
+                })?;
+            println!("removed {id}");
             Ok(())
         }
         SessionCommand::Prune(args) => {
@@ -1311,7 +1352,7 @@ mod tests {
             command.args,
             [
                 "session",
-                "resume",
+                "open",
                 "tether-0197f198000070008000000000000001"
             ]
         );

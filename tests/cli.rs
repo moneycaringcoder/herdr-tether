@@ -113,8 +113,10 @@ fn every_scriptable_surface_has_help() {
         &["snapshot", "--help"],
         &["session", "--help"],
         &["session", "list", "--help"],
-        &["session", "resume", "--help"],
-        &["session", "close", "--help"],
+        &["session", "open", "--help"],
+        &["session", "restart", "--help"],
+        &["session", "stop", "--help"],
+        &["session", "remove", "--help"],
         &["session", "prune", "--help"],
         &["doctor", "--help"],
     ];
@@ -369,7 +371,7 @@ fn write_fake_tmux(path: &Path, log: &Path) {
     let proof_file = log.with_extension("proof");
     let id_file = log.with_extension("id");
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) previous=; for arg do if [ \"$previous\" = '-s' ]; then printf '%s' \"$arg\" > '{id_file}'; fi; case \"$arg\" in TETHER_OWNERSHIP_PROOF=*) printf '%s' \"${{arg#*=}}\" > '{proof_file}' ;; esac; previous=$arg; done; printf '$7:%%3' ;;\n  list-sessions) id=$(cat '{id_file}' 2>/dev/null); proof=$(cat '{proof_file}' 2>/dev/null); case \"$*\" in *TETHER_OWNERSHIP_PROOF*) printf '%s:$7:0:0::%s' \"$id\" \"$proof\" ;; *'#{{session_id}}'*) printf '%s:$7' \"$id\" ;; *) printf '%s:0' \"$id\" ;; esac ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s' \"$1\" >> '{log}'\ncommand=$1\nshift\nfor arg do printf ' <%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$command\" in\n  new-session) previous=; for arg do if [ \"$previous\" = '-s' ]; then printf '%s' \"$arg\" > '{id_file}'; fi; case \"$arg\" in TETHER_OWNERSHIP_PROOF=*) printf '%s' \"${{arg#*=}}\" > '{proof_file}' ;; esac; previous=$arg; done; printf '$7:%%3' ;;\n  list-sessions) id=$(cat '{id_file}' 2>/dev/null); proof=$(cat '{proof_file}' 2>/dev/null); case \"$*\" in *TETHER_OWNERSHIP_PROOF*) if [ -n \"$id\" ]; then printf '%s:$7:0:0::%s' \"$id\" \"$proof\"; fi ;; *'#{{session_id}}'*) if [ -n \"$id\" ]; then printf '%s:$7' \"$id\"; fi ;; *) if [ -n \"$id\" ]; then printf '%s:0' \"$id\"; fi ;; esac ;;\n  kill-session) rm -f '{id_file}' '{proof_file}' ;;\n  display-message) printf '%s' '/tmp/project with spaces' ;;\nesac\nexit 0\n",
         log = log.display(),
         proof_file = proof_file.display(),
         id_file = id_file.display(),
@@ -439,13 +441,13 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
     sandbox
         .command()
         .env("PATH", &path)
-        .args(["session", "resume", &session_id])
+        .args(["session", "open", &session_id])
         .assert()
         .success();
     sandbox
         .command()
         .env("PATH", &path)
-        .args(["session", "close", &session_id])
+        .args(["session", "stop", &session_id])
         .assert()
         .success();
     assert!(fs::read_to_string(&log).unwrap().contains("kill-session"));
@@ -541,7 +543,7 @@ fn host_check_reports_remote_tmux_and_read_only_herdr_discovery() {
 }
 
 #[test]
-fn close_marks_a_missing_workload_closed_without_killing_it() {
+fn stop_marks_a_missing_workload_ended_without_killing_it() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
     fs::write(sandbox.state_file(), active_state(SESSION_ID)).unwrap();
@@ -555,10 +557,10 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
     sandbox
         .command()
         .env("PATH", path)
-        .args(["session", "close", SESSION_ID])
+        .args(["session", "stop", SESSION_ID])
         .assert()
         .success()
-        .stdout(format!("closed {SESSION_ID}\n"));
+        .stdout(format!("stopped {SESSION_ID}\n"));
 
     let transcript = fs::read_to_string(log).unwrap();
     assert!(transcript.contains("list-sessions"));
@@ -569,7 +571,7 @@ fn close_marks_a_missing_workload_closed_without_killing_it() {
 }
 
 #[test]
-fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
+fn stop_unknown_preserves_running_and_failed_stop_is_recoverable() {
     for (name, body) in [
         (
             "unknown",
@@ -591,7 +593,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
         sandbox
             .command()
             .env("PATH", path)
-            .args(["session", "close", SESSION_ID])
+            .args(["session", "stop", SESSION_ID])
             .assert()
             .failure();
 
@@ -605,7 +607,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
             let persisted = String::from_utf8(after).unwrap();
             assert!(
                 persisted.contains(r#""status": "stopping""#),
-                "failed close must persist a recoverable closing marker"
+                "failed stop must persist a recoverable stopping marker"
             );
             let document: serde_json::Value = serde_json::from_str(&persisted).unwrap();
             assert!(document["sessions"][0]["closed_at"].is_null());
@@ -620,7 +622,7 @@ fn close_unknown_preserves_active_and_failed_running_close_is_recoverable() {
 }
 
 #[test]
-fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
+fn open_rejects_missing_unknown_and_ended_sessions_without_mutation() {
     for (name, state, body, expected) in [
         (
             "missing",
@@ -649,7 +651,7 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
                     r#""closed_at": "2026-01-01T00:00:01Z""#,
                 ),
             "exit 99",
-            "has ended; restart it",
+            "has ended; run `herdr-tether session restart",
         ),
     ] {
         let sandbox = Sandbox::new();
@@ -661,7 +663,7 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
         sandbox
             .command()
             .env("PATH", path)
-            .args(["session", "resume", SESSION_ID])
+            .args(["session", "open", SESSION_ID])
             .assert()
             .failure()
             .stderr(predicate::str::contains(expected));
@@ -672,6 +674,60 @@ fn resume_rejects_missing_unknown_and_closed_sessions_without_mutation() {
             "{name} must not mutate metadata"
         );
     }
+}
+
+#[test]
+fn ended_sessions_have_obvious_restart_stop_and_remove_actions() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let ended = active_state(SESSION_ID)
+        .replace(r#""directory": "/tmp""#, r#""directory": "/tmp/project with spaces""#)
+        .replace(r#""status": "running""#, r#""status": "ended""#)
+        .replace(
+            r#""closed_at": null"#,
+            r#""closed_at": "2026-01-01T00:00:01Z""#,
+        );
+    fs::write(sandbox.state_file(), ended).unwrap();
+    let bin = sandbox.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tmux = bin.join("tmux");
+    let log = sandbox.path("tmux.log");
+    write_fake_tmux(&tmux, &log);
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+
+    sandbox
+        .command()
+        .env("PATH", &path)
+        .args(["session", "restart", SESSION_ID])
+        .assert()
+        .success();
+    let restarted = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(restarted.contains(r#""status": "running""#));
+    assert!(fs::read_to_string(&log).unwrap().contains("new-session"));
+
+    sandbox
+        .command()
+        .env("PATH", &path)
+        .args(["session", "stop", SESSION_ID])
+        .assert()
+        .success()
+        .stdout(format!("stopped {SESSION_ID}\n"));
+    let stopped = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(stopped.contains(r#""status": "ended""#));
+
+    sandbox
+        .command()
+        .env("PATH", &path)
+        .args(["session", "remove", SESSION_ID])
+        .assert()
+        .success()
+        .stdout(format!("removed {SESSION_ID}\n"));
+    let removed = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(removed.contains(r#""status": "removed""#));
 }
 
 #[test]
@@ -695,7 +751,7 @@ fn legacy_record_without_proof_fails_closed_before_transport() {
     sandbox
         .command()
         .env("PATH", path)
-        .args(["session", "close", SESSION_ID])
+        .args(["session", "stop", SESSION_ID])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no private ownership proof"));
