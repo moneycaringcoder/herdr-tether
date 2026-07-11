@@ -601,3 +601,26 @@ fn safe_relative(path: &str) -> bool {
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_remote_records_fail_closed_without_a_process_harness() {
+        let roots = vec!["/safe".to_owned()];
+        let cases: [&[u8]; 4] = [
+            b"R\x000\x00../escape\x00",
+            b"R\x000\x00/etc\x00",
+            b"R\x001\x00repo\x00",
+            b"R\x000\x00repo",
+        ];
+
+        for output in cases {
+            assert_eq!(
+                parse_remote(output, &roots, 10),
+                (Vec::new(), DiscoveryCompletion::Malformed)
+            );
+        }
+    }
+}

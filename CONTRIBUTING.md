@@ -15,7 +15,9 @@ Before submitting, run the same gates as CI from the repository root:
 cargo fetch --locked
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features -- --test-threads=1
+cargo build --release --locked
+cargo +1.88.0 check --locked --all-targets --all-features
 ```
 
 Do not commit credentials, host details, generated state, or build output. Describe which local, SSH, tmux, and Herdr paths you actually exercised; call out paths that were not verified. Changes to process invocation, quoting, persistence, session lifecycle, or host handling need boundary and failure-path tests.
