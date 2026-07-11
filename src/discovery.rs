@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     fs,
     path::{Component, Path, PathBuf},
     sync::{
@@ -17,6 +17,8 @@ use crate::{
     status::{BoundedOutput, run_bounded},
 };
 const MAX_DISCOVERY_WORKERS: usize = 16;
+const MAX_DISCOVERY_ENTRIES: usize = 100_000;
+const MAX_DISCOVERY_RESULTS: usize = 4_096;
 
 const REMOTE_SCAN_SCRIPT: &str = r#"max_depth=$1
 result_limit=$2
@@ -154,6 +156,8 @@ pub struct DiscoveryService {
 impl DiscoveryService {
     pub fn new(binaries: ProcessBinaries, mut limits: DiscoveryLimits) -> Self {
         limits.workers = limits.workers.clamp(1, MAX_DISCOVERY_WORKERS);
+        limits.max_entries = limits.max_entries.clamp(1, MAX_DISCOVERY_ENTRIES);
+        limits.max_results = limits.max_results.clamp(1, MAX_DISCOVERY_RESULTS);
         Self { binaries, limits }
     }
 
@@ -364,14 +368,21 @@ impl LocalScan<'_> {
         if depth >= self.limits.max_depth {
             return Ok(());
         }
-        let mut children = Vec::new();
+        let remaining_entries = self.limits.max_entries.saturating_sub(self.entries);
+        let mut children = BinaryHeap::new();
         for entry in fs::read_dir(path)? {
+            if self.stopped() {
+                break;
+            }
             match entry {
-                Ok(entry) => children.push(entry.path()),
+                Ok(entry) => {
+                    retain_bounded_child(&mut children, entry.path(), remaining_entries);
+                }
                 Err(error) if ignorable_scan_error(&error) => {}
                 Err(error) => return Err(error),
             }
         }
+        let mut children = children.into_vec();
         children.sort();
         for child in children {
             if self.stopped() {
@@ -384,6 +395,18 @@ impl LocalScan<'_> {
             }
         }
         Ok(())
+    }
+}
+
+fn retain_bounded_child(children: &mut BinaryHeap<PathBuf>, child: PathBuf, capacity: usize) {
+    if capacity == 0 {
+        return;
+    }
+    if children.len() < capacity {
+        children.push(child);
+    } else if children.peek().is_some_and(|largest| child < *largest) {
+        children.pop();
+        children.push(child);
     }
 }
 
@@ -608,16 +631,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_worker_count_has_an_internal_ceiling() {
+    fn configured_work_limits_have_internal_ceilings() {
         let limits = DiscoveryLimits {
             max_depth: 1,
-            max_entries: 1,
-            max_results: 1,
+            max_entries: usize::MAX,
+            max_results: usize::MAX,
             timeout: Duration::from_secs(1),
             workers: usize::MAX,
         };
         let service = DiscoveryService::new(ProcessBinaries::new("ssh", "tmux"), limits);
         assert_eq!(service.limits.workers, MAX_DISCOVERY_WORKERS);
+        assert_eq!(service.limits.max_entries, MAX_DISCOVERY_ENTRIES);
+        assert_eq!(service.limits.max_results, MAX_DISCOVERY_RESULTS);
+    }
+
+    #[test]
+    fn large_directory_candidates_retain_only_the_lexically_first_entry_budget() {
+        let mut children = BinaryHeap::new();
+        for index in (0..10_000).rev() {
+            retain_bounded_child(
+                &mut children,
+                PathBuf::from(format!("{index:05}")),
+                3,
+            );
+        }
+        let mut children = children.into_vec();
+        children.sort();
+        assert_eq!(
+            children,
+            [
+                PathBuf::from("00000"),
+                PathBuf::from("00001"),
+                PathBuf::from("00002"),
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_local_scan_stops_before_touching_the_filesystem() {
+        let (sender, _receiver) = mpsc::channel();
+        let cancelled = AtomicBool::new(false);
+        let mut scan = LocalScan {
+            generation: 1,
+            host: "local",
+            sender: &sender,
+            cancelled: &cancelled,
+            limits: DiscoveryLimits {
+                max_depth: 4,
+                max_entries: 100,
+                max_results: 10,
+                timeout: Duration::ZERO,
+                workers: 1,
+            },
+            started: Instant::now(),
+            entries: 0,
+            results: 0,
+            seen: HashSet::new(),
+            completion: DiscoveryCompletion::Complete,
+        };
+
+        scan.visit(
+            Path::new("/path-that-must-not-be-read"),
+            Path::new("/path-that-must-not-be-read"),
+            Path::new("/path-that-must-not-be-read"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(scan.entries, 0);
+        assert_eq!(scan.completion, DiscoveryCompletion::TimedOut);
     }
 
     #[test]
