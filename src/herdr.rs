@@ -118,6 +118,11 @@ impl PaneTitle {
         Self::from_components([(host != "local").then_some(host), Some(session), None])
     }
 
+    /// Builds a bounded title for an orchestration Observer pane.
+    pub fn observer(group_title: &str) -> Self {
+        Self::from_components([Some("Observer"), Some(group_title)])
+    }
+
     /// Supplies the deterministic title used when no safe context is available.
     pub fn fallback() -> Self {
         Self("Tether session".to_owned())
@@ -219,6 +224,23 @@ impl HerdrClient {
         title: &PaneTitle,
         placement: Placement,
     ) -> Result<PlacedPane> {
+        self.place_with_destination(title, placement, |_| Ok(command.clone()))
+    }
+
+    /// Creates a destination and builds its command from the exact resulting Herdr context.
+    ///
+    /// This is intended for commands whose runtime must know the pane it occupies. The builder
+    /// runs only after Herdr returns the new pane ID. A builder or launch failure removes the
+    /// otherwise empty destination.
+    pub fn place_with_destination<F>(
+        &self,
+        title: &PaneTitle,
+        placement: Placement,
+        build: F,
+    ) -> Result<PlacedPane>
+    where
+        F: FnOnce(&HerdrContext) -> Result<CommandSpec>,
+    {
         let pane_id = match placement {
             Placement::SplitRight => self.split("right")?,
             Placement::SplitDown => self.split("down")?,
@@ -227,9 +249,28 @@ impl HerdrClient {
                 bail!("replace-current placement requires explicit replacement confirmation")
             }
         };
+        let destination = HerdrContext {
+            binary: self.context.binary.clone(),
+            pane_id: pane_id.clone(),
+            workspace_id: self.context.workspace_id.clone(),
+        };
+        let command = match build(&destination) {
+            Ok(command) => command,
+            Err(error) => {
+                let detail = format!("{error:#}");
+                return match self.close_pane(&pane_id) {
+                    Ok(()) => Err(error).context(format!(
+                        "build destination command failed ({detail}); empty destination `{pane_id}` was removed"
+                    )),
+                    Err(cleanup_error) => Err(error).context(format!(
+                        "build destination command failed ({detail}) and empty destination `{pane_id}` could not be removed: {cleanup_error:#}"
+                    )),
+                };
+            }
+        };
         // Presentation metadata must never block a working attach.
         let _ = self.label_pane(&pane_id, title);
-        match self.run_in_pane(command, pane_id.clone()) {
+        match self.run_in_pane(&command, pane_id.clone()) {
             Ok(placed) => Ok(placed),
             Err(error) => {
                 let detail = format!("{error:#}");
@@ -253,6 +294,18 @@ impl HerdrClient {
 
     /// Creates and verifies a destination before closing the exact invoking pane.
     pub fn replace_current(&self, command: &CommandSpec, title: &PaneTitle) -> Result<PlacedPane> {
+        self.replace_current_with_destination(title, |_| Ok(command.clone()))
+    }
+
+    /// Replaces the invoking pane with a command built from the exact destination context.
+    pub fn replace_current_with_destination<F>(
+        &self,
+        title: &PaneTitle,
+        build: F,
+    ) -> Result<PlacedPane>
+    where
+        F: FnOnce(&HerdrContext) -> Result<CommandSpec>,
+    {
         const VERIFY_ATTEMPTS: usize = 20;
         const VERIFY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -261,9 +314,25 @@ impl HerdrClient {
             .process_info(&source_pane_id)
             .context("capture the exact source pane occupant before replacement")?;
         let destination_pane_id = self.split("right")?;
+        let destination = HerdrContext {
+            binary: self.context.binary.clone(),
+            pane_id: destination_pane_id.clone(),
+            workspace_id: self.context.workspace_id.clone(),
+        };
+        let command = match build(&destination) {
+            Ok(command) => command,
+            Err(error) => {
+                let cleanup = self.close_pane(&destination_pane_id);
+                return Err(error).context(replacement_failure_context(
+                    &source_pane_id,
+                    &destination_pane_id,
+                    cleanup.as_ref().err(),
+                ));
+            }
+        };
         // Presentation metadata must never block a working replacement.
         let _ = self.label_pane(&destination_pane_id, title);
-        let placed = match self.run_in_pane(command, destination_pane_id.clone()) {
+        let placed = match self.run_in_pane(&command, destination_pane_id.clone()) {
             Ok(placed) => placed,
             Err(error) => {
                 let cleanup = self.close_pane(&destination_pane_id);
@@ -283,7 +352,7 @@ impl HerdrClient {
                     if destination
                         .foreground_processes
                         .iter()
-                        .any(|process| Self::is_attach_process(process, command)) =>
+                        .any(|process| Self::is_attach_process(process, &command)) =>
                 {
                     destination_ready = true;
                     break;

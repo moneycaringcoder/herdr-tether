@@ -97,8 +97,8 @@ See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollb
 
 ### Optional Hermes skill
 
-Hermes users can install Tether's first-party, runtime-independent orchestration
-guide directly from this repository.
+Hermes users can install Tether's optional, runtime-independent reference guide
+directly from this repository.
 
 **Stable v0.3.0:**
 
@@ -119,8 +119,9 @@ TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED
 hermes skills install "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/${TETHER_SKILL_REF}/integrations/hermes/SKILL.md"
 ```
 
-The [skill source](integrations/hermes/SKILL.md) uses Tether's public snapshot
-and lifecycle commands; Hermes is not a Tether runtime dependency.
+The [skill source](integrations/hermes/SKILL.md) describes Tether's public
+snapshot, lifecycle, and development orchestration commands. Hermes is a
+reference adapter, not a Tether runtime dependency.
 
 ## The `prefix+t` workflow
 
@@ -140,6 +141,42 @@ The picker keeps actions contextual:
 | **External** | `Enter` **Open** | None—external sessions are never owned |
 
 `Esc` backs out or closes Tether. See [Lifecycle](docs/lifecycle.md) for interrupted operations, cleanup, and ownership details.
+
+## Development orchestration and Observer
+
+The opt-in orchestration-group and Observer commands are currently available on
+development `main` and immutable reviewed commits, not in stable v0.3.0. They
+organize existing Tether session references; they do not launch, adopt, stop, or
+remove workloads.
+
+```sh
+herdr-tether orchestration create GROUP --title TITLE --orchestrator SESSION
+herdr-tether orchestration add-worker GROUP SESSION --title TITLE \
+  --observe-output --open-interactive
+herdr-tether orchestration list --json
+herdr-tether orchestration observe GROUP --placement split-right
+```
+
+Supply exact group, title, orchestrator-session, and worker-session values.
+Every worker must receive at least one explicit capability:
+`--observe-output` permits bounded read-only output capture, while
+`--open-interactive` permits `Enter` to open a running exact-owned worker as a
+normal Tether view. Use `remove-worker GROUP SESSION` to remove membership and
+`delete GROUP` to remove group metadata; neither command touches sessions or
+panes.
+
+Observer creates one outer Herdr pane and renders at most four worker captures
+per page: one worker fills the page, two split side by side, and three or four
+use a 2×2 grid. More workers use deterministic pages. Membership and lifecycle
+labels refresh while Observer is open. Output is never forwarded as worker
+input.
+
+Launch `orchestration observe` from a Herdr pane so Tether receives Herdr's
+placement context. A process nested inside a Tether `tmux` workload does not
+automatically inherit that plugin context; it should request or hand off the
+explicit launch to a Herdr pane. Prefer a split or new tab for this companion
+view; Tether normalizes `replace-current-pane` to `split-right` so the invoking
+pane remains available.
 
 ## Terminal and accessibility notes
 

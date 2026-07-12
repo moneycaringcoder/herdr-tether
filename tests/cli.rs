@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use herdr_tether::config::HerdrKeybindingStore;
+use herdr_tether::{config::HerdrKeybindingStore, model::SessionId as GeneratedSessionId};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -64,7 +64,7 @@ const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
 fn active_state(id: &str) -> String {
     format!(
         r#"{{
-  "version": 2,
+  "version": 4,
   "sessions": [{{
     "id": "{id}",
     "host": "local",
@@ -78,7 +78,8 @@ fn active_state(id: &str) -> String {
     "created_at": "2026-01-01T00:00:00Z",
     "last_used_at": "2026-01-01T00:00:00Z",
     "closed_at": null
-  }}]
+  }}],
+  "orchestration_groups": []
 }}"#
     )
 }
@@ -119,6 +120,13 @@ fn every_scriptable_surface_has_help() {
         &["session", "remove", "--help"],
         &["session", "prune", "--help"],
         &["doctor", "--help"],
+        &["orchestration", "--help"],
+        &["orchestration", "create", "--help"],
+        &["orchestration", "delete", "--help"],
+        &["orchestration", "list", "--help"],
+        &["orchestration", "add-worker", "--help"],
+        &["orchestration", "remove-worker", "--help"],
+        &["orchestration", "observe", "--help"],
     ];
 
     for arguments in commands {
@@ -131,6 +139,153 @@ fn every_scriptable_surface_has_help() {
     }
 }
 
+#[test]
+fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
+    let sandbox = Sandbox::new();
+    let worker = "tether-0197f198000070008000000000000002";
+
+    sandbox
+        .command()
+        .args([
+            "orchestration",
+            "create",
+            "build-fleet",
+            "--title",
+            "Build fleet",
+            "--orchestrator",
+            SESSION_ID,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created build-fleet"));
+    sandbox
+        .command()
+        .args([
+            "orchestration",
+            "add-worker",
+            "build-fleet",
+            worker,
+            "--title",
+            "Compiler",
+            "--observe-output",
+            "--open-interactive",
+        ])
+        .assert()
+        .success();
+    sandbox
+        .command()
+        .args(["orchestration", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\": \"build-fleet\""))
+        .stdout(predicate::str::contains("\"session_id\""))
+        .stdout(predicate::str::contains("\"membership_id\""))
+        .stdout(predicate::str::contains("\"observe_output\": true"))
+        .stdout(predicate::str::contains("\"open_interactive\": true"));
+
+    sandbox
+        .command()
+        .args(["orchestration", "remove-worker", "build-fleet", SESSION_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "worker `{SESSION_ID}` is not a member"
+        )));
+    sandbox
+        .command()
+        .args(["orchestration", "add-worker", "build-fleet", SESSION_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "must declare at least one capability",
+        ));
+    sandbox
+        .command()
+        .args(["orchestration", "remove-worker", "build-fleet", worker])
+        .assert()
+        .success();
+    sandbox
+        .command()
+        .args(["orchestration", "delete", "build-fleet"])
+        .assert()
+        .success();
+    sandbox
+        .command()
+        .args(["orchestration", "delete", "build-fleet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unknown orchestration group `build-fleet`",
+        ));
+
+    let state = fs::read_to_string(sandbox.state_file()).unwrap();
+    assert!(state.contains("\"version\": 4"));
+    assert!(state.contains("\"orchestration_groups\": []"));
+}
+
+#[test]
+fn orchestration_group_and_worker_limits_are_enforced_without_pane_side_effects() {
+    let sandbox = Sandbox::new();
+    for index in 0..32 {
+        sandbox
+            .command()
+            .args([
+                "orchestration",
+                "create",
+                &format!("group-{index}"),
+                "--title",
+                &format!("Group {index}"),
+                "--orchestrator",
+                SESSION_ID,
+            ])
+            .assert()
+            .success();
+    }
+    sandbox
+        .command()
+        .args([
+            "orchestration",
+            "create",
+            "group-overflow",
+            "--title",
+            "Overflow",
+            "--orchestrator",
+            SESSION_ID,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "orchestration group limit of 32 has been reached",
+        ));
+
+    for worker in (0..64).map(|_| GeneratedSessionId::new().to_string()) {
+        sandbox
+            .command()
+            .args([
+                "orchestration",
+                "add-worker",
+                "group-0",
+                &worker,
+                "--observe-output",
+            ])
+            .assert()
+            .success();
+    }
+    sandbox
+        .command()
+        .args([
+            "orchestration",
+            "add-worker",
+            "group-0",
+            &GeneratedSessionId::new().to_string(),
+            "--observe-output",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "orchestration worker limit of 64 has been reached",
+        ));
+}
 #[test]
 fn help_uses_the_same_lifecycle_vocabulary_as_the_picker() {
     let sandbox = Sandbox::new();
@@ -848,7 +1003,7 @@ fn migrated_v022_record_can_only_remove_metadata_without_transport() {
         ));
     assert!(!log.exists(), "legacy Remove must not invoke tmux");
     let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(migrated.contains(r#""version": 2"#));
+    assert!(migrated.contains(r#""version": 4"#));
     assert!(migrated.contains(r#""status": "removed""#));
     assert!(!migrated.contains("ownership_proof"));
 }
@@ -873,12 +1028,12 @@ fn session_list_json_never_exposes_private_ownership_proof() {
 fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":2,"sessions":[
+    let state = r#"{"version":4,"sessions":[
 {"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/ended","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/older-active","preset":null,"status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
 {"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/newer-active","preset":null,"status":"creating","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":null}
-]}"#;
+],"orchestration_groups":[]}"#;
     fs::write(sandbox.state_file(), state).unwrap();
 
     let json_output = sandbox

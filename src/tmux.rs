@@ -17,6 +17,7 @@ use crate::{
 const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
 const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const TMUX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const OWNERSHIP_GUARD_REJECTED: &str = "TETHER_OWNERSHIP_GUARD_REJECTED";
 
 #[derive(Debug, Error)]
@@ -40,6 +41,38 @@ impl BoundedExecutionError {
     fn outcome_uncertain(&self) -> bool {
         !matches!(self, Self::Spawn { .. })
     }
+}
+
+/// Plain terminal text captured from the single pane of an exact owned session.
+///
+/// Terminal control bytes are intentionally preserved as text so the renderer
+/// can apply its own sanitization policy at the presentation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedPaneCapture {
+    text: String,
+}
+
+impl OwnedPaneCapture {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
+/// A bounded failure returned while capturing an exact owned tmux pane.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum OwnedCaptureError {
+    #[error("exact owned tmux identity changed before capture")]
+    IdentityChanged,
+    #[error("tmux capture timed out")]
+    TimedOut,
+    #[error("tmux capture exceeded the safe output limit")]
+    OutputLimit,
+    #[error("tmux capture failed: {0}")]
+    Transport(String),
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +161,15 @@ impl TmuxBackend {
     }
 
     fn bounded_output(&self, spec: &CommandSpec) -> Result<Output, BoundedExecutionError> {
-        match run_bounded(spec, TMUX_COMMAND_TIMEOUT, &AtomicBool::new(false)) {
+        self.bounded_output_with_timeout(spec, TMUX_COMMAND_TIMEOUT)
+    }
+
+    fn bounded_output_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> Result<Output, BoundedExecutionError> {
+        match run_bounded(spec, timeout, &AtomicBool::new(false)) {
             BoundedOutput::Completed {
                 status,
                 stdout,
@@ -189,6 +230,65 @@ impl TmuxBackend {
             format!("kill-session -t {identity}"),
             false,
         )
+    }
+
+    pub(crate) fn capture_exact_spec(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<CommandSpec> {
+        self.guarded_spec(
+            id,
+            ownership_proof,
+            identity,
+            format!("capture-pane -p -J -S -200 -t {identity}"),
+            false,
+        )
+    }
+
+    /// Captures recent joined text from the sole workload pane after checking
+    /// the stored tmux identity, public session name, and ownership proof.
+    pub fn capture_owned(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        identity: TmuxSessionId,
+    ) -> Result<OwnedPaneCapture, OwnedCaptureError> {
+        let spec = self
+            .capture_exact_spec(id, ownership_proof, identity)
+            .map_err(|error| {
+                OwnedCaptureError::Transport(sanitize_tmux_detail(
+                    format!("{error:#}").as_bytes(),
+                    Some(ownership_proof),
+                ))
+            })?;
+        let output = self
+            .bounded_output_with_timeout(&spec, TMUX_CAPTURE_TIMEOUT)
+            .map_err(|error| match error {
+                BoundedExecutionError::TimedOut => OwnedCaptureError::TimedOut,
+                BoundedExecutionError::OutputLimit => OwnedCaptureError::OutputLimit,
+                error => OwnedCaptureError::Transport(sanitize_tmux_detail(
+                    format!("{error:#}").as_bytes(),
+                    Some(ownership_proof),
+                )),
+            })?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success()
+            && text.trim_end_matches(['\r', '\n']) == OWNERSHIP_GUARD_REJECTED
+        {
+            return Err(OwnedCaptureError::IdentityChanged);
+        }
+        if !output.status.success() {
+            let detail = sanitize_tmux_detail(&output.stderr, Some(ownership_proof));
+            let message = if detail.is_empty() {
+                format!("process exited with status {}", output.status)
+            } else {
+                format!("process exited with status {}: {detail}", output.status)
+            };
+            return Err(OwnedCaptureError::Transport(message));
+        }
+        Ok(OwnedPaneCapture { text })
     }
 
     fn guarded_spec(

@@ -132,6 +132,59 @@ herdr-tether host check build
 
 Tether also discovers literal aliases in the primary `~/.ssh/config`. It does not traverse `Include` directives for alias discovery; add an included-only alias explicitly.
 
+## 6. Create an Observer group (development only)
+
+Orchestration groups and Observer are available from development `main` or an
+immutable reviewed commit; stable v0.3.0 remains the durable-workload workflow
+described above. Install the standalone CLI from the matching development
+source using the commands in step 5.
+
+Groups opt existing session references into presentation only. Obtain exact
+Tether-owned IDs from `herdr-tether snapshot`, then supply the values chosen by
+the user or adapter:
+
+```sh
+herdr-tether orchestration create GROUP --title TITLE --orchestrator SESSION
+herdr-tether orchestration add-worker GROUP SESSION \
+  --title TITLE --observe-output --open-interactive
+herdr-tether orchestration list --json
+```
+
+Each worker must declare `--observe-output`, `--open-interactive`, or both.
+Output observation is bounded and read-only. Interactive open is independently
+authorized and is available only while that exact owned worker is running.
+Group membership does not create, adopt, stop, restart, remove, or send input to
+the referenced session. Up to 32 groups and 64 workers per group are accepted.
+
+From a Herdr pane, open the companion Observer:
+
+```sh
+herdr-tether orchestration observe GROUP --placement split-right
+```
+
+One outer pane renders one worker full-size, two side by side, or three to four
+in a 2×2 grid. Additional workers appear on deterministic four-worker pages.
+Use arrows to select, Page Up/Page Down, `Tab`/`Shift+Tab`, or `[`/`]` to
+page; use `r` to refresh and `Enter` to open an authorized running worker as a
+normal Tether view. Press `q`, `Esc`, or `Ctrl+C` to leave Observer.
+Membership and lifecycle labels refresh while it runs; worker input is never
+forwarded.
+
+`observe` requires the environment of an invoking Herdr pane. An agent or other
+process nested inside a Tether `tmux` workload cannot assume that context is
+available; it should ask a Herdr-pane operator to run the command or explicitly
+hand off the launch there. Use a split or new tab for this companion view.
+`replace-current-pane` is normalized to `split-right` so the invoking pane remains available.
+
+Membership cleanup is metadata-only:
+
+```sh
+herdr-tether orchestration remove-worker GROUP SESSION
+herdr-tether orchestration delete GROUP
+```
+
+Neither command touches a workload or pane.
+
 ## Update or remove Tether
 
 Reinstall the desired reviewed revision to update both managed checkout and

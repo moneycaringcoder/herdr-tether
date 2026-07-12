@@ -380,6 +380,122 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
 }
 
 #[test]
+fn placement_builder_receives_exact_destination_context_before_command_is_run() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log, ":");
+    let client = HerdrClient::new(context(&binary));
+
+    let placed = client
+        .place_with_destination(&PaneTitle::fallback(), Placement::NewTab, |destination| {
+            Ok(CommandSpec::new(
+                "/plugin/herdr-tether",
+                vec![
+                    "orchestration".into(),
+                    "observer-runtime".into(),
+                    "--pane-id".into(),
+                    destination.pane_id.clone(),
+                    "--workspace-id".into(),
+                    destination.workspace_id.clone(),
+                    "--herdr-bin".into(),
+                    destination.binary.display().to_string(),
+                ],
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(placed.pane_id, "w1:p10");
+    let transcript = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        transcript
+            .lines()
+            .filter(|line| line.starts_with("CALL\tpane\trun"))
+            .count(),
+        1
+    );
+    assert!(transcript.contains("CALL\ttab\tcreate\t--workspace\tw1\t--focus"));
+    assert!(
+        transcript.contains(
+            "'observer-runtime' '--pane-id' 'w1:p10' '--workspace-id' 'w1' '--herdr-bin'"
+        )
+    );
+    assert!(!transcript.contains("'--pane-id' 'w1:p1'"));
+}
+
+#[test]
+fn orchestration_observe_creates_one_outer_pane_with_exact_destination_context() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log, ":");
+    let state_file = temp.path().join("state/herdr-tether/state.json");
+    fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    fs::write(
+        state_file,
+        r#"{
+  "version": 4,
+  "sessions": [],
+  "orchestration_groups": [{
+    "id": "build-fleet",
+    "title": "Build fleet",
+    "orchestrator_session_id": "tether-0197f198000070008000000000000001",
+    "workers": []
+  }]
+}"#,
+    )
+    .unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+
+    let output = run_real_open(
+        temp.path(),
+        &binary,
+        &path,
+        &[
+            "orchestration",
+            "observe",
+            "build-fleet",
+            "--placement",
+            "replace-current-pane",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let transcript = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        transcript
+            .lines()
+            .filter(|line| line.starts_with("CALL\tpane\tsplit"))
+            .count(),
+        1
+    );
+    assert!(transcript.contains("CALL\tpane\tsplit\t--pane\tw1:p1\t--direction\tright\t--focus"));
+    assert!(
+        !transcript.contains("CALL\tpane\tclose"),
+        "Observer launch must preserve its source pane: {transcript}"
+    );
+    assert_eq!(
+        transcript
+            .lines()
+            .filter(|line| line.starts_with("CALL\tpane\trun"))
+            .count(),
+        1
+    );
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\tObserver · Build fleet"));
+    assert!(transcript.contains(
+        "'observer-runtime' 'build-fleet' '--pane-id' 'w1:p9' '--workspace-id' 'w1' '--herdr-bin'"
+    ));
+}
+#[test]
 fn placement_titles_use_available_context_and_bound_hostile_input() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
@@ -749,6 +865,7 @@ fn picker_fixture() -> (Config, State) {
                 exit_status: None,
             },
         ],
+        orchestration_groups: Vec::new(),
     };
     (config, state)
 }
@@ -2097,6 +2214,7 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions,
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     PruneService::new(store).preview(days).unwrap()
@@ -2128,6 +2246,7 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
     let state = State {
         version: State::CURRENT_VERSION,
         sessions: records.clone(),
+        orchestration_groups: Vec::new(),
     };
     let temp = tempdir().unwrap();
     let store = StateStore::new(temp.path().join("state.json"));
@@ -2190,6 +2309,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
     let state = State {
         version: State::CURRENT_VERSION,
         sessions: records.clone(),
+        orchestration_groups: Vec::new(),
     };
     let temp = tempdir().unwrap();
     let store = StateStore::new(temp.path().join("state.json"));

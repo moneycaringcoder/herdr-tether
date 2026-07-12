@@ -37,7 +37,74 @@ The boundaries are intentionally one-way:
 5. Remove and automatic cleanup affect only metadata already proven safe to finalize.
 6. Unknown or unreachable is not treated as dead.
 7. External `tmux` sessions are validated, exact-name, attach-only resources.
-8. Configuration and state migrations occur under the same private lock and atomic-write rules as ordinary mutations.
+8. Mutating configuration and state migrations occur under the same private lock and atomic-write rules as ordinary mutations; snapshot observation migrates legacy data in memory without rewriting its files.
+
+## Opt-in orchestration groups
+
+Development state schema version 4 stores an `orchestration_groups` collection
+and a unique membership epoch for every worker entry. Stable schema versions
+migrate with an empty collection, so no session is grouped implicitly.
+Development schema version 3 groups migrate by assigning and persisting fresh
+membership epochs. Each group stores a bounded, harness-neutral ID and title,
+one exact orchestrator session reference, and an ordered worker-membership
+list. Each worker stores its opaque epoch, an exact session reference, an
+optional display title, and two independent capabilities:
+
+- `observe_output` authorizes bounded, read-only output capture; and
+- `open_interactive` authorizes opening that worker from Observer.
+
+A worker must have at least one capability. The orchestrator reference records
+the coordinating role but does not grant lifecycle or capture authority.
+Creating or deleting a group and adding or removing a worker mutate only group
+metadata: they never create, adopt, stop, remove, or send input to a session.
+State admits at most 32 groups and 64 workers per group. Identifiers and titles
+are validated and bounded; references carry no host, path, command, or
+orchestration-runtime assumptions.
+
+## Observer projection
+
+`orchestration observe` creates exactly one outer Herdr pane. Inside that pane,
+Observer projects the selected group's current workers into at most four
+read-only tiles per page. Layout is deterministic and row-major: one tile uses
+the full canvas, two divide it side by side, and three or four use a 2×2 grid.
+Additional workers remain in membership order on deterministic pages; the
+footer reports overflow. The persisted 64-worker limit also bounds projection
+work.
+
+Observer reloads group and session metadata while it runs, so membership,
+selection, and lifecycle labels follow state changes without creating one Herdr
+pane per worker. Labels distinguish `STARTING`, `RUNNING`, `STOPPING`, `ENDED`,
+`MISSING`, `REMOVED`, and `UNKNOWN`; stopping is never reported as ended.
+Deleting the observed group ends refresh with an explicit
+error rather than retaining a stale authority view.
+
+Capture requires all of the following at refresh time: the exact persisted
+membership epoch, `observe_output`, running status, and a Tether record with
+both ownership proof and exact internal `tmux` identity. Tether captures only
+the visible page, checks the same complete authorization fingerprint again
+after each asynchronous capture, and rejects results if membership,
+capabilities, session identity, ownership proof, or internal `tmux` identity
+changed while capture was in flight. Each request reads at most the recent 200
+joined lines. Rendering strips terminal escape sequences and unsafe formatting
+and caps each capture at 200 logical lines, 16 KiB, and 16,384 display cells.
+Capture failure is shown as unavailable; it does not broaden the target or make
+the worker interactive. Observer has no worker-input path.
+
+`Enter` is a separate, capability-checked transition. It succeeds only when the
+selected member still has `open_interactive` and still resolves to a running
+exact-owned session. Tether then opens it through the ordinary lifecycle and
+Herdr placement boundary while Observer remains available. Both the outer
+Observer launch and an interactive worker open normalize configured or explicit
+`replace-current-pane` to `split-right`, preserving the companion/source pane.
+Observer terminal teardown independently attempts to restore cursor visibility,
+leave the alternate screen, and disable raw mode on every guarded exit path;
+one restoration error cannot prevent the remaining attempts.
+
+The outer `observe` launch itself requires an invoking Herdr pane context.
+Processes nested inside a Tether `tmux` workload must not assume that Herdr's
+plugin environment is inherited; they must request or hand off an explicit
+launch from a Herdr pane. This keeps pane placement authority at the Herdr
+boundary and prevents a harness adapter from becoming a runtime dependency.
 
 ## Durable workload backend
 

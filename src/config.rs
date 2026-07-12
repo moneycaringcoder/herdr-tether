@@ -447,11 +447,20 @@ impl ConfigStore {
         with_advisory_lock(&self.path, || self.load_unlocked())
     }
 
+    /// Loads and validates config while migrating legacy schemas only in memory.
+    pub fn load_read_only(&self) -> Result<Config> {
+        with_advisory_lock(&self.path, || self.load_unlocked_with_migration(false))
+    }
+
     pub fn save(&self, config: &Config) -> Result<()> {
         with_advisory_lock(&self.path, || self.save_unlocked(config))
     }
 
     fn load_unlocked(&self) -> Result<Config> {
+        self.load_unlocked_with_migration(true)
+    }
+
+    fn load_unlocked_with_migration(&self, persist_migration: bool) -> Result<Config> {
         let source = match fs::read_to_string(&self.path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
@@ -499,7 +508,7 @@ impl ConfigStore {
             ),
         };
         config.validate()?;
-        if migrated {
+        if migrated && persist_migration {
             self.save_unlocked(&config)
                 .with_context(|| format!("rewrite migrated config `{}`", self.path.display()))?;
         }

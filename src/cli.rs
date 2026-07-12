@@ -23,12 +23,17 @@ use crate::{
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
     lifecycle::{LifecycleService, PruneError, PruneService},
-    model::{ExternalSessionName, OwnershipProof, Placement, SessionId},
+    model::{
+        ExternalSessionName, OrchestrationGroupId, OrchestrationTitle, OwnershipProof, Placement,
+        SessionId,
+    },
+    orchestration::{OrchestrationService, companion_placement},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
     state::{
-        SessionRecord, SessionStatus, State, StateStore, compare_normal_sessions, is_normal_session,
+        OrchestrationCapabilities, SessionRecord, SessionStatus, State, StateStore,
+        compare_normal_sessions, is_normal_session,
     },
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
@@ -67,6 +72,11 @@ enum TopLevel {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Manage opt-in orchestration groups and observe their workers.
+    Orchestration {
+        #[command(subcommand)]
+        command: OrchestrationCommand,
     },
     /// Report local installation and configuration health.
     Doctor,
@@ -219,6 +229,55 @@ enum SessionCommand {
     Prune(PruneArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum OrchestrationCommand {
+    /// Create an empty orchestration group without launching panes.
+    Create {
+        id: OrchestrationGroupId,
+        #[arg(long)]
+        title: OrchestrationTitle,
+        #[arg(long)]
+        orchestrator: SessionId,
+    },
+    /// Delete one exact orchestration group without touching sessions or panes.
+    Delete { id: OrchestrationGroupId },
+    /// List persisted orchestration groups.
+    List(OutputArgs),
+    /// Add one exact worker membership with explicit capabilities.
+    AddWorker {
+        group: OrchestrationGroupId,
+        session: SessionId,
+        #[arg(long)]
+        title: Option<OrchestrationTitle>,
+        #[arg(long)]
+        observe_output: bool,
+        #[arg(long)]
+        open_interactive: bool,
+    },
+    /// Remove one exact worker membership without touching its session or panes.
+    RemoveWorker {
+        group: OrchestrationGroupId,
+        session: SessionId,
+    },
+    /// Launch one read-only Observer pane for an orchestration group.
+    Observe {
+        group: OrchestrationGroupId,
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
+    },
+    /// Run Observer inside an already-created exact Herdr pane.
+    #[command(hide = true)]
+    ObserverRuntime {
+        group: OrchestrationGroupId,
+        #[arg(long)]
+        pane_id: String,
+        #[arg(long)]
+        workspace_id: String,
+        #[arg(long)]
+        herdr_bin: PathBuf,
+    },
+}
+
 #[derive(Clone, Debug, Args)]
 struct PruneArgs {
     /// Show eligible records without changing state.
@@ -253,14 +312,15 @@ fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
         TopLevel::Open(args) => open(paths, args),
         TopLevel::Snapshot(args) => snapshot(paths, args),
         TopLevel::Session { command } => session_command(paths, command),
+        TopLevel::Orchestration { command } => orchestration_command(paths, command),
         TopLevel::Doctor => doctor(paths),
         TopLevel::Plugin { command } => plugin_command(command),
     }
 }
 
 fn snapshot(paths: &AppPaths, args: SnapshotArgs) -> Result<()> {
-    let config = ConfigStore::new(paths.config_file.clone()).load()?;
-    let state = StateStore::new(paths.state_file.clone()).load()?;
+    let config = ConfigStore::new(paths.config_file.clone()).load_read_only()?;
+    let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let snapshot = collect_snapshot(
@@ -911,31 +971,60 @@ fn place_in_herdr(
         return Ok(());
     }
 
-    let inspection = client.inspect_replacement_source()?;
-    if inspection.requires_confirmation() {
-        if !stdio_is_terminal() {
-            bail!(
-                "Replace current pane would terminate {}; an interactive confirmation is required and the source pane was preserved",
-                inspection.safe_summary()
-            );
-        }
-        print!(
-            "Replace current pane will terminate {}. Continue? [y/N] ",
-            inspection.safe_summary()
-        );
-        io::stdout()
-            .flush()
-            .context("show replacement confirmation")?;
-        let mut response = String::new();
-        io::stdin()
-            .read_line(&mut response)
-            .context("read replacement confirmation")?;
-        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            bail!("Replace current pane was cancelled; the source pane was preserved");
-        }
-    }
+    confirm_replacement(&client)?;
     if let Some(warning) = client.replace_current(command, title)?.warning {
         eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn place_built_in_herdr<F>(
+    client: HerdrClient,
+    title: &PaneTitle,
+    placement: Placement,
+    build: F,
+) -> Result<()>
+where
+    F: FnOnce(&HerdrContext) -> Result<CommandSpec>,
+{
+    if placement != Placement::ReplaceCurrentPane {
+        client.place_with_destination(title, placement, build)?;
+        return Ok(());
+    }
+    confirm_replacement(&client)?;
+    if let Some(warning) = client
+        .replace_current_with_destination(title, build)?
+        .warning
+    {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn confirm_replacement(client: &HerdrClient) -> Result<()> {
+    let inspection = client.inspect_replacement_source()?;
+    if !inspection.requires_confirmation() {
+        return Ok(());
+    }
+    if !stdio_is_terminal() {
+        bail!(
+            "Replace current pane would terminate {}; an interactive confirmation is required and the source pane was preserved",
+            inspection.safe_summary()
+        );
+    }
+    print!(
+        "Replace current pane will terminate {}. Continue? [y/N] ",
+        inspection.safe_summary()
+    );
+    io::stdout()
+        .flush()
+        .context("show replacement confirmation")?;
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .context("read replacement confirmation")?;
+    if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("Replace current pane was cancelled; the source pane was preserved");
     }
     Ok(())
 }
@@ -1073,6 +1162,116 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             };
             prune(&store, args, days, source)
         }
+    }
+}
+
+fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Result<()> {
+    let service = OrchestrationService::new(StateStore::new(paths.state_file.clone()));
+    match command {
+        OrchestrationCommand::Create {
+            id,
+            title,
+            orchestrator,
+        } => {
+            service.create_group(id.clone(), title, orchestrator)?;
+            println!("created {id}");
+            Ok(())
+        }
+        OrchestrationCommand::Delete { id } => {
+            service.delete_group(&id)?;
+            println!("deleted {id}");
+            Ok(())
+        }
+        OrchestrationCommand::List(args) => {
+            let groups = service.list_groups()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+            } else {
+                for group in groups {
+                    println!(
+                        "{}\t{}\t{}\t{} workers",
+                        group.id,
+                        group.title.as_str(),
+                        group.orchestrator_session_id,
+                        group.workers.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        OrchestrationCommand::AddWorker {
+            group,
+            session,
+            title,
+            observe_output,
+            open_interactive,
+        } => {
+            service.add_worker(
+                &group,
+                session,
+                title,
+                OrchestrationCapabilities {
+                    observe_output,
+                    open_interactive,
+                },
+            )?;
+            println!("added {session} to {group}");
+            Ok(())
+        }
+        OrchestrationCommand::RemoveWorker { group, session } => {
+            service.remove_worker(&group, session)?;
+            println!("removed {session} from {group}");
+            Ok(())
+        }
+        OrchestrationCommand::Observe { group, placement } => {
+            let persisted = service.group(&group)?;
+            let context = HerdrContext::from_env()
+                .context("orchestration observe must be launched from a Herdr pane")?;
+            let executable = env::current_exe().context("locate the Tether executable")?;
+            let placement = placement.map(Placement::from).unwrap_or(
+                ConfigStore::new(paths.config_file.clone())
+                    .load()?
+                    .ui
+                    .placement,
+            );
+            let placement = companion_placement(placement);
+            let title = PaneTitle::observer(persisted.title.as_str());
+            place_built_in_herdr(
+                HerdrClient::new(context),
+                &title,
+                placement,
+                |destination| {
+                    Ok(CommandSpec::new(
+                        executable.clone(),
+                        vec![
+                            "orchestration".to_owned(),
+                            "observer-runtime".to_owned(),
+                            group.to_string(),
+                            "--pane-id".to_owned(),
+                            destination.pane_id.clone(),
+                            "--workspace-id".to_owned(),
+                            destination.workspace_id.clone(),
+                            "--herdr-bin".to_owned(),
+                            destination.binary.display().to_string(),
+                        ],
+                    ))
+                },
+            )
+        }
+        OrchestrationCommand::ObserverRuntime {
+            group,
+            pane_id,
+            workspace_id,
+            herdr_bin,
+        } => crate::orchestration::run_observer(
+            paths,
+            group,
+            HerdrContext {
+                binary: herdr_bin,
+                pane_id,
+                workspace_id,
+            },
+        ),
     }
 }
 

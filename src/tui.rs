@@ -3412,6 +3412,7 @@ mod close_render_tests {
                     closed_at: Some(now - chrono::Duration::days(40)),
                     exit_status: None,
                 }],
+                orchestration_groups: Vec::new(),
             })
             .unwrap();
         PruneService::new(store).preview(14).unwrap()

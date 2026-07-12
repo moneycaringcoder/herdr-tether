@@ -1,0 +1,330 @@
+#[path = "../src/observer.rs"]
+mod observer;
+
+use observer::{
+    MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
+    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_key,
+    render_to_text, sanitize_capture, worker_rects,
+};
+use ratatui::layout::Rect;
+
+fn worker(id: &str) -> ObserverWorker {
+    ObserverWorker {
+        id: id.to_owned(),
+        title: Some(format!("Worker {id}")),
+        capabilities: ObserverCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        },
+        lifecycle: ObserverLifecycle::Running,
+        owned: true,
+        capture: Some(format!("output-{id}")),
+    }
+}
+
+fn state(count: usize) -> ObserverState {
+    ObserverState::new((0..count).map(|index| worker(&index.to_string())).collect())
+}
+
+#[test]
+fn pages_and_layouts_are_deterministic_for_supported_counts() {
+    for (count, pages, visible) in [
+        (0, 1, 0),
+        (1, 1, 1),
+        (2, 1, 2),
+        (3, 1, 3),
+        (4, 1, 4),
+        (5, 2, 4),
+        (64, 16, 4),
+    ] {
+        let observer = state(count);
+        assert_eq!(observer.page_count(), pages, "worker count {count}");
+        assert_eq!(
+            observer.visible_workers().len(),
+            visible,
+            "worker count {count}"
+        );
+    }
+    let capped = state(65);
+    assert_eq!(capped.workers().len(), 64);
+    assert_eq!(capped.page_count(), 16);
+
+    let area = Rect::new(0, 0, 12, 8);
+    assert_eq!(worker_rects(area, 1), vec![area]);
+    assert_eq!(
+        worker_rects(area, 2),
+        vec![Rect::new(0, 0, 6, 8), Rect::new(6, 0, 6, 8)]
+    );
+    assert_eq!(
+        worker_rects(area, 3),
+        vec![
+            Rect::new(0, 0, 6, 4),
+            Rect::new(6, 0, 6, 4),
+            Rect::new(0, 4, 6, 4),
+        ]
+    );
+    assert_eq!(worker_rects(area, 4).last(), Some(&Rect::new(6, 4, 6, 4)));
+    let odd = Rect::new(2, 3, 5, 5);
+    assert_eq!(
+        worker_rects(odd, 4),
+        vec![
+            Rect::new(2, 3, 2, 2),
+            Rect::new(4, 3, 3, 2),
+            Rect::new(2, 5, 2, 3),
+            Rect::new(4, 5, 3, 3),
+        ]
+    );
+}
+
+#[test]
+fn selection_survives_insert_remove_and_reorder_by_identity() {
+    let mut observer = state(5);
+    assert_eq!(
+        observer.apply(ObserverAction::NextWorker),
+        ObserverOutcome::None
+    );
+    assert_eq!(
+        observer.apply(ObserverAction::NextWorker),
+        ObserverOutcome::None
+    );
+    assert_eq!(observer.selected_id(), Some("2"));
+
+    observer.update_workers(vec![worker("9"), worker("2"), worker("0"), worker("1")]);
+    assert_eq!(observer.selected_id(), Some("2"));
+    assert_eq!(observer.selected_index(), Some(1));
+
+    observer.update_workers(vec![worker("9"), worker("0"), worker("1")]);
+    assert_eq!(observer.selected_id(), Some("0"));
+    assert_eq!(observer.selected_index(), Some(1));
+
+    observer.update_workers(Vec::new());
+    assert_eq!(observer.selected_id(), None);
+    observer.update_workers(vec![worker("later")]);
+    assert_eq!(observer.selected_id(), Some("later"));
+}
+
+#[test]
+fn paging_is_bounded_and_selects_a_visible_identity() {
+    let mut observer = state(5);
+    assert_eq!(observer.page(), 0);
+    observer.apply(ObserverAction::PreviousPage);
+    assert_eq!(observer.page(), 0);
+    observer.apply(ObserverAction::NextPage);
+    assert_eq!(observer.page(), 1);
+    assert_eq!(observer.selected_id(), Some("4"));
+    assert_eq!(observer.visible_workers()[0].id, "4");
+    observer.apply(ObserverAction::NextPage);
+    assert_eq!(observer.page(), 1);
+    observer.apply(ObserverAction::PreviousPage);
+    assert_eq!(observer.page(), 0);
+    assert_eq!(observer.selected_id(), Some("0"));
+}
+
+#[test]
+fn hostile_capture_is_sanitized_and_bounded() {
+    let hostile =
+        "ok\u{1b}[31mRED\u{1b}[0m\u{1b}]0;secret\u{7}x\r\n\u{202e}bi\u{0301}di\u{200b}\0\tend";
+    let clean = sanitize_capture(hostile);
+    assert_eq!(clean, "okREDx\nbidi    end");
+    assert!(!clean.contains('\u{1b}'));
+
+    let enormous = format!(
+        "{}\n{}",
+        "界".repeat(MAX_CAPTURE_CELLS),
+        "x\n".repeat(MAX_CAPTURE_LINES + 20)
+    );
+    let bounded = sanitize_capture(&enormous);
+    assert!(bounded.len() <= MAX_CAPTURE_BYTES);
+    assert!(bounded.lines().count() <= MAX_CAPTURE_LINES);
+    assert!(
+        bounded
+            .chars()
+            .map(|c| if c == '界' { 2 } else { 1 })
+            .sum::<usize>()
+            <= MAX_CAPTURE_CELLS
+    );
+    assert!(!bounded.contains('界'));
+    assert!(bounded.ends_with("x\n"));
+}
+
+#[test]
+fn outcomes_are_read_only_and_open_requires_all_eligibility() {
+    assert_eq!(
+        action_for_key(ObserverKey::Enter),
+        Some(ObserverAction::OpenSelected)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Char('r')),
+        Some(ObserverAction::Refresh)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Char('q')),
+        Some(ObserverAction::Quit)
+    );
+    assert_eq!(action_for_key(ObserverKey::Char('x')), None);
+    assert_eq!(
+        action_for_key(ObserverKey::Up),
+        Some(ObserverAction::PreviousWorker)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Left),
+        Some(ObserverAction::PreviousWorker)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Down),
+        Some(ObserverAction::NextWorker)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Right),
+        Some(ObserverAction::NextWorker)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::PageUp),
+        Some(ObserverAction::PreviousPage)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::PageDown),
+        Some(ObserverAction::NextPage)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Tab),
+        Some(ObserverAction::NextPage)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::BackTab),
+        Some(ObserverAction::PreviousPage)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::ControlC),
+        Some(ObserverAction::Quit)
+    );
+    assert_eq!(
+        action_for_key(ObserverKey::Escape),
+        Some(ObserverAction::Quit)
+    );
+
+    let mut eligible = state(1);
+    assert_eq!(
+        eligible.apply(ObserverAction::OpenSelected),
+        ObserverOutcome::OpenSelected {
+            worker_id: "0".to_owned()
+        }
+    );
+    assert_eq!(
+        eligible.apply(ObserverAction::Refresh),
+        ObserverOutcome::Refresh
+    );
+    assert_eq!(eligible.apply(ObserverAction::Quit), ObserverOutcome::Quit);
+
+    for ineligible in [
+        ObserverWorker {
+            owned: false,
+            ..worker("not-owned")
+        },
+        ObserverWorker {
+            lifecycle: ObserverLifecycle::Ended,
+            ..worker("ended")
+        },
+        ObserverWorker {
+            capabilities: ObserverCapabilities {
+                observe_output: true,
+                open_interactive: false,
+            },
+            ..worker("observe-only")
+        },
+    ] {
+        let id = ineligible.id.clone();
+        let mut observer = ObserverState::new(vec![ineligible]);
+        assert_eq!(
+            observer.apply(ObserverAction::OpenSelected),
+            ObserverOutcome::OpenUnavailable { worker_id: id }
+        );
+    }
+}
+
+#[test]
+fn render_text_is_deterministic_in_normal_and_small_terminals() {
+    let one = render_to_text(30, 8, &state(1)).unwrap();
+    assert!(one.contains("Observer  1 worker"));
+    assert!(one.contains("Worker 0"));
+    assert!(one.contains("RUNNING"));
+    assert!(one.contains("output-0"));
+
+    let five = render_to_text(48, 14, &state(5)).unwrap();
+    assert!(five.contains("page 1/2"));
+    assert!(five.contains("+1 more"));
+    assert!(five.contains("Worker 0"));
+    assert!(five.contains("Worker 3"));
+    assert!(!five.contains("Worker 4"));
+    assert_eq!(five, render_to_text(48, 14, &state(5)).unwrap());
+    for line in five.lines() {
+        assert_eq!(line.chars().count(), 48);
+    }
+
+    let mut tailed_worker = worker("tail");
+    tailed_worker.capture = Some((0..30).map(|line| format!("line-{line:02}\n")).collect());
+    let tailed = ObserverState::new(vec![tailed_worker]);
+    let tailed = render_to_text(30, 8, &tailed).unwrap();
+    assert!(tailed.contains("line-29"), "{tailed}");
+    assert!(!tailed.contains("line-00"), "{tailed}");
+
+    let empty = render_to_text(24, 5, &state(0)).unwrap();
+    assert!(empty.contains("No workers registered"));
+    assert_eq!(render_to_text(0, 5, &state(1)).unwrap(), "");
+
+    let tiny = render_to_text(1, 1, &state(4)).unwrap();
+    assert_eq!(tiny.lines().count(), 1);
+    assert_eq!(tiny.chars().count(), 1);
+    let short = render_to_text(12, 2, &state(3)).unwrap();
+    assert_eq!(short.lines().count(), 2);
+}
+
+#[test]
+fn runtime_notices_are_sanitized_without_changing_worker_state() {
+    let mut observer = state(1);
+    observer.set_notice(Some("open failed\u{1b}[31m:\nunsafe".to_owned()));
+
+    let rendered = render_to_text(48, 8, &observer).unwrap();
+    assert!(rendered.contains("! open failed: unsafe"));
+    assert!(!rendered.contains('\u{1b}'));
+    assert_eq!(observer.selected_id(), Some("0"));
+    assert_eq!(observer.workers().len(), 1);
+
+    let mut unauthorized = worker("restricted");
+    unauthorized.capabilities.observe_output = false;
+    unauthorized.capture = Some("must-not-render".to_owned());
+    let rendered = render_to_text(48, 8, &ObserverState::new(vec![unauthorized])).unwrap();
+    assert!(rendered.contains("Output not authorized"));
+    assert!(!rendered.contains("must-not-render"));
+}
+
+#[test]
+fn lifecycle_and_capability_labels_are_visible() {
+    let variants = [
+        ObserverLifecycle::Starting,
+        ObserverLifecycle::Running,
+        ObserverLifecycle::Stopping,
+        ObserverLifecycle::Ended,
+        ObserverLifecycle::Missing,
+        ObserverLifecycle::Removed,
+        ObserverLifecycle::Unknown,
+    ];
+    let workers = variants
+        .into_iter()
+        .enumerate()
+        .map(|(index, lifecycle)| ObserverWorker {
+            lifecycle,
+            ..worker(&index.to_string())
+        })
+        .collect();
+    let mut observer = ObserverState::new(workers);
+    let first = render_to_text(64, 16, &observer).unwrap();
+    for label in ["STARTING", "RUNNING", "STOPPING", "ENDED"] {
+        assert!(first.contains(label), "missing {label}:\n{first}");
+    }
+    observer.apply(ObserverAction::NextPage);
+    let second = render_to_text(64, 10, &observer).unwrap();
+    for label in ["MISSING", "REMOVED", "UNKNOWN"] {
+        assert!(second.contains(label), "missing {label}:\n{second}");
+    }
+}

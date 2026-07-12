@@ -121,6 +121,7 @@ fn lifecycle_fixture(
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let tmux = temp.path().join("tmux");
@@ -142,6 +143,7 @@ fn owned_record_reread_is_authoritative_and_transport_free() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![record.clone()],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -186,6 +188,7 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -236,6 +239,7 @@ fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
                 version: State::CURRENT_VERSION,
 
                 sessions: vec![owned_record(SessionStatus::Running)],
+                orchestration_groups: Vec::new(),
             })
             .unwrap();
         let before = fs::read(temp.path().join("state.json")).unwrap();
@@ -308,6 +312,7 @@ fn owned_close_releases_state_lock_while_closing_exact_running_workload() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -391,6 +396,7 @@ fn owned_close_revalidates_exact_record_and_target_before_finalizing() {
             .save(&State {
                 version: State::CURRENT_VERSION,
                 sessions: vec![owned_record(SessionStatus::Running)],
+                orchestration_groups: Vec::new(),
             })
             .unwrap();
         let ready = temp.path().join("ready");
@@ -445,6 +451,7 @@ fn owned_close_accepts_matching_record_already_finalized_by_peer() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let ready = temp.path().join("ready");
@@ -517,6 +524,7 @@ fn owned_close_times_out_hanging_inspect_without_mutating_active_record() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let before = fs::read(&state_path).unwrap();
@@ -564,6 +572,7 @@ fn owned_close_times_out_hanging_exact_close_and_leaves_closing() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let tmux = temp.path().join("tmux");
@@ -737,6 +746,213 @@ fn owned_create_accepts_symlinked_directory_with_same_inode() {
             .unwrap()
             .contains("set-option -t $7 mouse on")
     );
+}
+
+#[test]
+fn owned_capture_uses_exact_guard_and_single_workload_pane_without_mutation() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    write_fake(&tmux, &log, "first\r\nsecond\u{1b}[31m\n", 0);
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let capture = backend
+        .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap();
+
+    assert_eq!(capture.text(), "first\r\nsecond\u{1b}[31m\n");
+    let argv = read_argv(&log);
+    assert_eq!(&argv[..5], ["if-shell", "-t", "$7", "-F", argv[4].as_str()]);
+    assert!(argv[4].contains("#{session_id},$7"));
+    assert!(argv[4].contains(&id().to_string()));
+    assert!(argv[4].contains(&proof().to_string()));
+    assert_eq!(argv[5], "capture-pane -p -J -S -200 -t $7");
+    assert!(argv[6].contains("TETHER_OWNERSHIP_GUARD_REJECTED"));
+    for forbidden in [
+        "send-keys",
+        "set-option",
+        "kill-",
+        "attach-session",
+        "new-session",
+    ] {
+        assert!(!argv.iter().any(|arg| arg.contains(forbidden)), "{argv:?}");
+    }
+}
+
+#[test]
+fn owned_capture_does_not_confuse_worker_content_with_guard_rejection() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    write_fake(&tmux, &log, "TETHER_OWNERSHIP_GUARD_REJECTED\n", 0);
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    assert_eq!(
+        backend
+            .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+            .unwrap()
+            .text(),
+        "TETHER_OWNERSHIP_GUARD_REJECTED\n"
+    );
+}
+
+#[test]
+fn remote_owned_capture_passes_one_fully_quoted_read_only_command() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let log = temp.path().join("ssh.args");
+    write_fake(&ssh, &log, "remote output\n", 0);
+    let backend = TmuxBackend::remote(
+        "ssh://builder@example.test:2222",
+        ProcessBinaries::new(ssh, temp.path().join("unused-tmux")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        backend
+            .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+            .unwrap()
+            .into_text(),
+        "remote output\n"
+    );
+
+    let argv = read_argv(&log);
+    assert_eq!(
+        &argv[..10],
+        [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-p",
+            "2222",
+            "--",
+            "builder@example.test",
+        ]
+    );
+    assert_eq!(argv.len(), 11);
+    let remote = &argv[10];
+    assert!(remote.starts_with("'tmux' 'if-shell' '-t' '$7' '-F' "));
+    assert!(remote.contains("'capture-pane -p -J -S -200 -t $7'"));
+    assert!(remote.contains(&proof().to_string()));
+    assert!(!remote.contains("send-keys"));
+    assert!(!remote.contains("set-option"));
+}
+
+#[test]
+fn owned_capture_rejects_stale_identity_name_or_proof_and_redacts_proof() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let script = format!(
+        "#!/bin/sh\ncase \"$5\" in *'#{{session_id}},$7'*'{id}'*'{proof}'*) printf owned;; *) printf 'TETHER_OWNERSHIP_GUARD_REJECTED\\n'; exit 75;; esac\n",
+        id = id(),
+        proof = proof(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    assert_eq!(
+        backend
+            .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+            .unwrap()
+            .text(),
+        "owned"
+    );
+    let stale_name = "tether-0197f198000070008000000000000009".parse().unwrap();
+    let stale_proof = "0197f198000070008000000000000009".parse().unwrap();
+    for error in [
+        backend
+            .capture_owned(&stale_name, &proof(), "$7".parse().unwrap())
+            .unwrap_err(),
+        backend
+            .capture_owned(&id(), &stale_proof, "$7".parse().unwrap())
+            .unwrap_err(),
+        backend
+            .capture_owned(&id(), &proof(), "$8".parse().unwrap())
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "exact owned tmux identity changed before capture"
+        );
+        assert!(!error.to_string().contains(&proof().to_string()));
+        assert!(!error.to_string().contains(&stale_proof.to_string()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_capture_rejects_oversized_output() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nhead -c 70000 /dev/zero\n").unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let error = backend
+        .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "tmux capture exceeded the safe output limit"
+    );
+}
+
+#[test]
+fn owned_capture_transport_error_redacts_proof_and_terminal_controls() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let script = format!(
+        "#!/bin/sh\nprintf '\\033]2;spoofed title\\007\\033[31mTETHER_OWNERSHIP_PROOF={proof}\\033[0m\\n' >&2\nexit 23\n",
+        proof = proof(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let error = backend
+        .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("23"), "{error}");
+    assert!(!error.contains(&proof().to_string()), "{error}");
+    assert!(!error.contains("TETHER_OWNERSHIP_PROOF"), "{error}");
+    assert!(!error.contains('\u{1b}'), "{error:?}");
+    assert!(!error.contains("spoofed title"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_capture_times_out_and_cleans_its_process_group() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    let orphan = temp.path().join("orphan");
+    let script = format!(
+        "#!/bin/sh\n(sleep 31; printf orphan > '{}') &\nwait\n",
+        orphan.display()
+    );
+    fs::write(&tmux, script).unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
+
+    let error = backend
+        .capture_owned(&id(), &proof(), "$7".parse().unwrap())
+        .unwrap_err();
+    assert_eq!(error.to_string(), "tmux capture timed out");
+    thread::sleep(StdDuration::from_secs(2));
+    assert!(!orphan.exists(), "timed-out capture left a child process");
 }
 
 #[test]
@@ -1210,6 +1426,7 @@ fn prune_preview_selects_exact_cutoff_and_excludes_ineligible_records() {
                     None,
                 ),
             ],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
 
@@ -1235,6 +1452,7 @@ fn prune_preview_accepts_explicit_zero_and_rejects_duration_overflow() {
                 SessionStatus::Ended,
                 Some(now),
             )],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = PruneService::new(store);
@@ -1260,6 +1478,7 @@ fn confirmed_prune_uses_stable_preview_and_never_removes_newly_eligible_records(
                 prune_record(first, SessionStatus::Ended, Some(now - Duration::days(8))),
                 prune_record(later, SessionStatus::Ended, Some(now - Duration::days(6))),
             ],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = PruneService::new(store.clone());
@@ -1301,6 +1520,7 @@ fn confirmed_prune_skips_missing_and_changed_candidates_without_partial_lies() {
                 prune_record(changed, SessionStatus::Ended, Some(now - Duration::days(8))),
                 prune_record(missing, SessionStatus::Ended, Some(now - Duration::days(8))),
             ],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = PruneService::new(store.clone());
@@ -1390,6 +1610,7 @@ fn stop_refuses_replacement_incarnation_without_sending_kill() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -1430,6 +1651,7 @@ fn stop_guard_rejects_identity_reuse_after_final_inspection() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![record],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -1506,6 +1728,7 @@ fn open_revalidates_proof_and_identity_at_mutation_boundary() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![record],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
     let service = LifecycleService::new(
@@ -1599,6 +1822,7 @@ fn automatic_retention_removes_only_finalized_metadata_without_transport() {
         .save(&State {
             version: State::CURRENT_VERSION,
             sessions: vec![removed, ended],
+            orchestration_groups: Vec::new(),
         })
         .unwrap();
 
