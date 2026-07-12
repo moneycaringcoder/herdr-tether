@@ -51,6 +51,16 @@ pub const MANAGER_STALE_GROUP_ERROR: &str =
     "Observer group changed while the manager was open; refresh and retry";
 const OBSERVER_REFRESH_FAILURE_NOTICE: &str =
     "Refresh failed; stale output retained · r retry · q back";
+const OBSERVER_GROUP_DELETED_ERROR: &str =
+    "Observer group was deleted; access revoked";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObserverAuthorityOutcome {
+    Authorized,
+    RecoverableFailure,
+    GroupDeleted,
+}
+
 
 /// State-only management for opt-in orchestration groups.
 #[derive(Clone, Debug)]
@@ -477,13 +487,14 @@ pub fn run_observer(
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
     let (capture_worker, observer_results) = CaptureWorker::spawn();
-    refresh_observer_metadata(
+    let initial_refresh = refresh_observer_metadata(
         &store,
         &group_id,
         &mut observer,
         &mut capture_fingerprints,
         capture_worker.sender(),
     )?;
+    require_observer_authority(initial_refresh)?;
     enable_raw_mode().context("enable Observer terminal raw mode")?;
     let _guard = ObserverTerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen).context("enter Observer alternate screen")?;
@@ -505,7 +516,8 @@ pub fn run_observer(
             match observer_results.try_recv() {
                 Ok(result) if visible_worker_ids(&observer) == result.visible => {
                     let merge = merge_captured_workers(&store, &group_id, &mut observer, result);
-                    apply_observer_capture_merge_result(&mut observer, merge);
+                    let outcome = apply_observer_capture_merge_result(&mut observer, merge);
+                    require_observer_authority(outcome)?;
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -522,7 +534,8 @@ pub fn run_observer(
                 &mut capture_fingerprints,
                 capture_worker.sender(),
             );
-            apply_observer_refresh_result(&mut observer, refresh);
+            let outcome = apply_observer_refresh_result(&mut observer, refresh);
+            require_observer_authority(outcome)?;
             last_refresh = Instant::now();
         }
         if !event::poll(OBSERVER_INPUT_POLL).context("poll Observer input")? {
@@ -551,7 +564,8 @@ pub fn run_observer(
                     &mut capture_fingerprints,
                     capture_worker.sender(),
                 );
-                apply_observer_refresh_result(&mut observer, refresh);
+                let outcome = apply_observer_refresh_result(&mut observer, refresh);
+                require_observer_authority(outcome)?;
                 last_refresh = Instant::now();
             }
             ObserverOutcome::None => {}
@@ -563,7 +577,8 @@ pub fn run_observer(
                     &mut capture_fingerprints,
                     capture_worker.sender(),
                 );
-                apply_observer_refresh_result(&mut observer, refresh);
+                let outcome = apply_observer_refresh_result(&mut observer, refresh);
+                require_observer_authority(outcome)?;
                 last_refresh = Instant::now();
             }
             ObserverOutcome::OpenSelected { worker_id } => {
@@ -599,26 +614,41 @@ fn clear_transient_observer_notice(observer: &mut ObserverState, outcome: &Obser
     }
 }
 
-fn apply_observer_refresh_result(observer: &mut ObserverState, result: Result<()>) -> bool {
+fn apply_observer_refresh_result(
+    observer: &mut ObserverState,
+    result: Result<ObserverAuthorityOutcome>,
+) -> ObserverAuthorityOutcome {
     match result {
-        Ok(()) => {
+        Ok(ObserverAuthorityOutcome::Authorized) => {
             observer.set_notice(None);
-            true
+            ObserverAuthorityOutcome::Authorized
         }
-        Err(_) => {
+        Ok(ObserverAuthorityOutcome::GroupDeleted) => ObserverAuthorityOutcome::GroupDeleted,
+        Ok(ObserverAuthorityOutcome::RecoverableFailure) | Err(_) => {
             observer.set_notice(Some(OBSERVER_REFRESH_FAILURE_NOTICE.to_owned()));
-            false
+            ObserverAuthorityOutcome::RecoverableFailure
         }
     }
 }
 
-fn apply_observer_capture_merge_result(observer: &mut ObserverState, result: Result<()>) -> bool {
+fn apply_observer_capture_merge_result(
+    observer: &mut ObserverState,
+    result: Result<ObserverAuthorityOutcome>,
+) -> ObserverAuthorityOutcome {
     match result {
-        Ok(()) => true,
+        Ok(outcome) => outcome,
         Err(_) => {
             observer.set_notice(Some(OBSERVER_REFRESH_FAILURE_NOTICE.to_owned()));
-            false
+            ObserverAuthorityOutcome::RecoverableFailure
         }
+    }
+}
+ 
+fn require_observer_authority(outcome: ObserverAuthorityOutcome) -> Result<()> {
+    match outcome {
+        ObserverAuthorityOutcome::Authorized
+        | ObserverAuthorityOutcome::RecoverableFailure => Ok(()),
+        ObserverAuthorityOutcome::GroupDeleted => bail!(OBSERVER_GROUP_DELETED_ERROR),
     }
 }
 
@@ -628,13 +658,15 @@ fn refresh_observer_metadata(
     observer: &mut ObserverState,
     capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
     capture_requests: &SyncSender<CaptureRequest>,
-) -> Result<()> {
+) -> Result<ObserverAuthorityOutcome> {
     let state = store.load()?;
-    let group = state
+    let Some(group) = state
         .orchestration_groups
         .iter()
         .find(|group| &group.id == group_id)
-        .with_context(|| format!("orchestration group `{group_id}` was deleted"))?;
+    else {
+        return Ok(ObserverAuthorityOutcome::GroupDeleted);
+    };
     let next_fingerprints = capture_fingerprints_for(group, &state.sessions);
     update_observer_metadata(
         observer,
@@ -649,7 +681,7 @@ fn refresh_observer_metadata(
         visible: visible_worker_ids(observer),
     };
     match capture_requests.try_send(request) {
-        Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+        Ok(()) | Err(TrySendError::Full(_)) => Ok(ObserverAuthorityOutcome::Authorized),
         Err(TrySendError::Disconnected(_)) => {
             bail!("Observer capture worker stopped unexpectedly")
         }
@@ -766,14 +798,14 @@ fn merge_captured_workers(
     group_id: &OrchestrationGroupId,
     observer: &mut ObserverState,
     result: CaptureResult,
-) -> Result<()> {
+) -> Result<ObserverAuthorityOutcome> {
     let state = store.load()?;
     let Some(group) = state
         .orchestration_groups
         .iter()
         .find(|group| &group.id == group_id)
     else {
-        return Ok(());
+        return Ok(ObserverAuthorityOutcome::GroupDeleted);
     };
     let current_fingerprints = capture_fingerprints_for(group, &state.sessions);
     for captured in result.workers {
@@ -785,7 +817,7 @@ fn merge_captured_workers(
         }
         observer.merge_capture(&id, captured.capture);
     }
-    Ok(())
+    Ok(ObserverAuthorityOutcome::Authorized)
 }
 
 fn capture_fingerprints_for(
@@ -1280,9 +1312,16 @@ mod tests {
             let result = refreshes.pop_front().unwrap().map(|workers| {
                 observer.update_workers(workers);
             });
+            let expected_outcome = if expected_success {
+                ObserverAuthorityOutcome::Authorized
+            } else {
+                ObserverAuthorityOutcome::RecoverableFailure
+            };
             assert_eq!(
-                apply_observer_refresh_result(&mut observer, result),
-                expected_success
+                apply_observer_refresh_result(&mut observer, result.map(|()| {
+                    ObserverAuthorityOutcome::Authorized
+                })),
+                expected_outcome
             );
             assert_eq!(observer.selected_id(), Some(selected.as_str()));
             assert_eq!(observer.page(), page);
@@ -1341,7 +1380,10 @@ mod tests {
             &mut observer,
             capture_result(fingerprint, "new"),
         );
-        assert!(!apply_observer_capture_merge_result(&mut observer, result));
+        assert_eq!(
+            apply_observer_capture_merge_result(&mut observer, result),
+            ObserverAuthorityOutcome::RecoverableFailure
+        );
 
         assert_eq!(observer.workers(), stale);
         assert_eq!(observer.selected_id(), Some(selected.as_str()));
@@ -1353,6 +1395,70 @@ mod tests {
         assert!(!rendered.contains("raw-store-error"), "{rendered}");
 
         assert!(!rendered.contains("/private/state.json"), "{rendered}");
+    }
+
+    #[test]
+    fn authoritative_refresh_reports_group_deleted_without_replacing_stale_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let (mut state, group_id, _) = capture_state("0197f198000070008000000000000011");
+        state.orchestration_groups.clear();
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            "selected",
+            ObserverLifecycle::Running,
+            Some("stale"),
+        )]);
+        let stale = observer.workers().to_vec();
+        let mut fingerprints = HashMap::new();
+        let (capture_requests, _) = mpsc::sync_channel(1);
+
+        let outcome = refresh_observer_metadata(
+            &store,
+            &group_id,
+            &mut observer,
+            &mut fingerprints,
+            &capture_requests,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ObserverAuthorityOutcome::GroupDeleted);
+        assert_eq!(observer.workers(), stale);
+        assert!(fingerprints.is_empty());
+    }
+
+    #[test]
+    fn authoritative_capture_merge_reports_group_deleted_without_merging_stale_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let (mut state, group_id, worker_id) =
+            capture_state("0197f198000070008000000000000011");
+        let captured = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        state.orchestration_groups.clear();
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            Some("authorized-before-capture"),
+        )]);
+
+        let outcome = merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(captured, "captured-after-deletion"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ObserverAuthorityOutcome::GroupDeleted);
+        assert_eq!(
+            observer.workers()[0].capture.as_deref(),
+            Some("authorized-before-capture")
+        );
     }
 
     #[test]
@@ -1370,7 +1476,13 @@ mod tests {
         clear_transient_observer_notice(&mut observer, &outcome);
         assert_eq!(observer.notice(), Some(OBSERVER_REFRESH_FAILURE_NOTICE));
 
-        assert!(apply_observer_refresh_result(&mut observer, Ok(())));
+        assert_eq!(
+            apply_observer_refresh_result(
+                &mut observer,
+                Ok(ObserverAuthorityOutcome::Authorized),
+            ),
+            ObserverAuthorityOutcome::Authorized
+        );
         assert!(observer.notice().is_none());
     }
 
