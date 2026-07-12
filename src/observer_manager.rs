@@ -32,6 +32,9 @@ use crate::{
 
 const MAX_PANEL_WIDTH: u16 = 72;
 const MAX_VISIBLE_ROWS: usize = 12;
+const MIN_MANAGER_WIDTH: u16 = 40;
+const MIN_MANAGER_HEIGHT: u16 = 8;
+const MANAGER_RESIZE_MESSAGE: &str = "Resize terminal to at least 40x8";
 const DEFAULT_CAPABILITIES: OrchestrationCapabilities = OrchestrationCapabilities {
     observe_output: true,
     open_interactive: true,
@@ -1053,6 +1056,17 @@ fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
     if area.is_empty() {
         return;
     }
+    if area.width < MIN_MANAGER_WIDTH || area.height < MIN_MANAGER_HEIGHT {
+        frame.render_widget(Block::default().style(manager_style(false)), area);
+        frame.render_widget(
+            Paragraph::new(MANAGER_RESIZE_MESSAGE)
+                .style(manager_style(false))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
     frame.render_widget(Block::default().style(manager_style(false)), area);
     let labels = state.item_labels();
     let visible_rows = labels.len().clamp(1, MAX_VISIBLE_ROWS) as u16;
@@ -1106,30 +1120,83 @@ fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
             chunks[0],
         );
     }
-    let max_rows = usize::from(chunks[1].height);
-    let start = state
-        .selected_index()
-        .saturating_sub(max_rows.saturating_sub(1));
+    let list_height = chunks[1].height.saturating_sub(1);
+    let max_rows = usize::from(list_height);
+    let (start, metadata) = viewport_metadata(state.selected_index(), labels.len(), max_rows);
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(chunks[1]);
+    frame.render_widget(
+        Paragraph::new(metadata).style(manager_style(false)),
+        list_chunks[0],
+    );
     let lines = labels
         .iter()
         .enumerate()
         .skip(start)
         .take(max_rows)
         .map(|(index, label)| {
+            let label = bounded_label(label, usize::from(list_chunks[1].width.saturating_sub(2)));
             let selected = index == state.selected_index() && !labels.is_empty();
             Line::from(vec![
                 Span::styled(if selected { "> " } else { "  " }, manager_style(selected)),
-                Span::styled(label.clone(), manager_style(selected)),
+                Span::styled(label, manager_style(selected)),
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines).style(manager_style(false)), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(lines).style(manager_style(false)),
+        list_chunks[1],
+    );
     frame.render_widget(
         Paragraph::new(footer)
             .style(manager_style(false))
             .wrap(Wrap { trim: true }),
         chunks[2],
     );
+}
+
+fn viewport_metadata(selected: usize, len: usize, rows: usize) -> (usize, String) {
+    if len == 0 {
+        return (0, "0/0".to_owned());
+    }
+    let selected = selected.min(len - 1);
+    let rows = rows.max(1).min(len);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(len.saturating_sub(rows));
+    let end = start.saturating_add(rows).min(len);
+    let mut metadata = format!("{}/{}", selected + 1, len);
+    if start > 0 {
+        metadata.push_str(" · more above");
+    }
+    if end < len {
+        metadata.push_str(" · more below");
+    }
+    (start, metadata)
+}
+
+fn bounded_label(text: &str, max_width: usize) -> String {
+    if Line::from(text).width() <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let content_width = max_width.saturating_sub(1);
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        if Line::from(&text[..next]).width() > content_width {
+            break;
+        }
+        end = next;
+    }
+    let mut bounded = String::with_capacity(end.saturating_add('…'.len_utf8()));
+    bounded.push_str(&text[..end]);
+    bounded.push('…');
+    bounded
 }
 
 #[derive(Debug)]
@@ -1195,7 +1262,7 @@ pub fn render_to_styles(
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
     let width = usize::from(width.max(1));
     text.lines()
-        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .map(|line| Line::from(line).width().max(1).div_ceil(width))
         .sum::<usize>()
         .clamp(1, usize::from(u16::MAX)) as u16
 }

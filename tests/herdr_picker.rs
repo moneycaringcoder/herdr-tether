@@ -16,6 +16,7 @@ use herdr_tether::{
         PickerCloseAction, PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin,
         PickerInput, PickerOptions, PickerOutcome, PickerPruneModal, PickerPrunePhase,
         PickerPruneResult, PickerSelection, PickerStage, PickerState, format_close_error,
+        render_picker_to_text,
     },
 };
 use tempfile::tempdir;
@@ -874,6 +875,65 @@ fn picker_fixture() -> (Config, State) {
         orchestration_groups: Vec::new(),
     };
     (config, state)
+}
+
+fn long_host_picker(count: usize) -> PickerState {
+    let (config, state) = picker_fixture();
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let template = options.hosts[0].clone();
+    options.hosts = (0..count)
+        .map(|index| {
+            let mut host = template.clone();
+            host.name = format!("host-{index:02}");
+            host.label =
+                format!("host-{index:02}-with-a-label-that-is-deliberately-wider-than-the-panel");
+            host.target = Some(format!("builder-{index:02}@example.test"));
+            host
+        })
+        .collect();
+    PickerState::new(options).unwrap()
+}
+
+#[test]
+fn picker_uses_one_resize_fallback_until_the_minimum_geometry() {
+    let picker = long_host_picker(20);
+    for (width, height) in [(39, 8), (40, 7)] {
+        let rendered = render_picker_to_text(width, height, &picker).unwrap();
+        assert!(
+            rendered.contains("Resize terminal to at least 40x8"),
+            "{width}x{height}: {rendered:?}"
+        );
+        assert!(!rendered.contains("host-00"), "{width}x{height}");
+        assert!(!rendered.contains("Enter choose"), "{width}x{height}");
+    }
+
+    let rendered = render_picker_to_text(40, 8, &picker).unwrap();
+    assert!(!rendered.contains("Resize terminal"));
+    assert!(rendered.contains("host-00"));
+    assert!(rendered.contains('…'), "{rendered:?}");
+    assert!(rendered.contains("Enter select"), "{rendered:?}");
+    assert!(rendered.contains("Esc close"));
+}
+
+#[test]
+fn picker_viewport_reports_position_and_both_directions_without_changing_selection() {
+    let mut picker = long_host_picker(20);
+    let cases = [
+        (0, "1/20 · more below"),
+        (9, "10/20 · more above · more below"),
+        (19, "20/20 · more above"),
+    ];
+    let mut current = 0;
+    for (target, metadata) in cases {
+        for _ in current..target {
+            picker.handle(PickerEvent::Next);
+        }
+        current = target;
+        let rendered = render_picker_to_text(40, 8, &picker).unwrap();
+        assert!(rendered.contains(metadata), "{metadata}: {rendered:?}");
+        assert_eq!(rendered.lines().count(), 8);
+        assert!(rendered.lines().all(|line| line.chars().count() <= 40));
+    }
 }
 
 #[test]
