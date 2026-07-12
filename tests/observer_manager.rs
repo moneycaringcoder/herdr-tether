@@ -504,6 +504,34 @@ fn create_edit_and_reassign_require_review_before_one_exact_action() {
 }
 
 #[test]
+fn reassignment_review_renders_only_the_proposed_orchestrator_topology() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Confirm);
+    let worker_index = manager
+        .item_labels()
+        .iter()
+        .position(|row| row.contains("build / atlas / dev"))
+        .unwrap();
+    while manager.selected_index() != worker_index {
+        manager.handle(ObserverManagerEvent::Next);
+    }
+    let proposed_orchestrator = manager.item_labels()[worker_index].clone();
+    manager.handle(ObserverManagerEvent::Confirm);
+
+    assert_eq!(manager.screen(), ObserverManagerScreen::ReviewTopology);
+    let rendered = render_to_text(100, 16, &manager).unwrap();
+    assert_eq!(rendered.matches("ORCHESTRATOR").count(), 1);
+    assert!(rendered.contains(&proposed_orchestrator));
+    assert!(!rendered.contains("Observer build atlas · ORCHESTRATOR"));
+}
+
+#[test]
 fn group_rows_report_topology_health_without_raw_session_ids() {
     let mut state = state_with_sessions();
     let mut existing = group(&state);

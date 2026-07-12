@@ -248,6 +248,11 @@ impl ObserverManagerState {
 
     pub fn context_text(&self) -> Option<String> {
         match self.screen {
+            ObserverManagerScreen::ReviewTopology
+                if self.review_kind == Some(ReviewKind::ReassignOrchestrator) =>
+            {
+                None
+            }
             ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::ReviewTopology
                 if self.selected_group.is_none() =>
             {

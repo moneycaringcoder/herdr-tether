@@ -220,6 +220,9 @@ impl OrchestrationService {
                 .iter_mut()
                 .find(|group| &group.id == group_id)
                 .with_context(|| format!("unknown orchestration group `{group_id}`"))?;
+            if group.orchestrator_session_id == session_id {
+                bail!("orchestrator must not also be a worker");
+            }
             if group
                 .workers
                 .iter()
@@ -1934,6 +1937,59 @@ mod tests {
             );
             assert_eq!(store.load().unwrap(), before, "{case}");
         }
+    }
+
+    #[test]
+    fn adapter_add_worker_rejects_current_orchestrator_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        let service = OrchestrationService::new(store.clone());
+        let previous_orchestrator: SessionId =
+            "tether-0197f198000070008000000000000050".parse().unwrap();
+        let current_orchestrator: SessionId =
+            "tether-0197f198000070008000000000000051".parse().unwrap();
+        let retained: SessionId = "tether-0197f198000070008000000000000052".parse().unwrap();
+        let group_id: OrchestrationGroupId = "adapter-current-orchestrator".parse().unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: false,
+        };
+        let retained_member = OrchestrationMember {
+            session_id: retained,
+            membership_id: "0197f198000070008000000000000052".parse().unwrap(),
+            title: Some("retained".parse().unwrap()),
+            capabilities,
+        };
+        let before = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                exact_running_session(previous_orchestrator, "$50"),
+                exact_running_session(current_orchestrator, "$51"),
+            ],
+            orchestration_groups: vec![OrchestrationGroup {
+                id: group_id.clone(),
+                title: "Current topology".parse().unwrap(),
+                orchestrator_session_id: current_orchestrator,
+                workers: vec![retained_member],
+            }],
+        };
+        store.save(&before).unwrap();
+        let persisted_before = std::fs::read(&path).unwrap();
+
+        let error = service
+            .add_worker(
+                &group_id,
+                current_orchestrator,
+                Some("invalid worker".parse().unwrap()),
+                capabilities,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "orchestrator must not also be a worker");
+        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(std::fs::read(path).unwrap(), persisted_before);
     }
 
     #[test]
