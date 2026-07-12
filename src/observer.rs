@@ -199,6 +199,20 @@ impl ObserverState {
         self.notice = notice;
     }
 
+    /// Projects a key through the actions that are possible in the current view.
+    ///
+    /// With no workers there is nothing to select, page through, or open. Refresh
+    /// and Back remain available so an empty observer is never a dead end.
+    pub fn action_for_key(&self, key: ObserverKey) -> Option<ObserverAction> {
+        let action = action_for_key(key)?;
+        if self.workers.is_empty()
+            && !matches!(action, ObserverAction::Refresh | ObserverAction::Quit)
+        {
+            return None;
+        }
+        Some(action)
+    }
+
     /// Replaces membership while preserving selection and capture state by worker identity.
     ///
     /// A supplied capture, including an empty capture, completes loading. An absent
@@ -446,10 +460,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     }
     frame.render_widget(Block::default().style(observer_theme_style(false)), area);
 
+    let worker_count = observer.workers.len();
+    let controls_height = if worker_count == 0 || area.width >= 64 {
+        1
+    } else if area.width >= 30 {
+        2
+    } else {
+        3
+    };
+    let notice_height = u16::from(observer.notice().is_some());
+    let bottom_height = controls_height + notice_height;
     let visible_count = observer.visible_workers().len();
-    let canvas_height = area.height.saturating_sub(2);
+    let canvas_height = area.height.saturating_sub(1 + bottom_height);
     let canvas = Rect::new(area.x, area.y.saturating_add(1), area.width, canvas_height);
-    if area.height < 3 || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count)) {
+    if area.height < 2 + bottom_height
+        || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count))
+    {
         frame.render_widget(
             Paragraph::new("Observer\nResize pane").style(observer_theme_style(false)),
             area,
@@ -458,28 +484,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     }
 
     let header = Rect::new(area.x, area.y, area.width, 1);
-    let canvas = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
-    let footer = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-    let worker_count = observer.workers.len();
     let noun = if worker_count == 1 {
         "worker"
     } else {
         "workers"
     };
-    frame.render_widget(
-        Paragraph::new(format!(
+    let header_text = if worker_count == 0 {
+        "Observer  0 workers".to_owned()
+    } else {
+        format!(
             "Observer  {worker_count} {noun}  page {}/{}",
             observer.page() + 1,
             observer.page_count()
-        ))
-        .style(observer_theme_style(false)),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(header_text).style(observer_theme_style(false)),
         header,
     );
 
     let visible = observer.visible_workers();
     if visible.is_empty() {
         frame.render_widget(
-            Paragraph::new("No workers registered").style(observer_theme_style(false)),
+            Paragraph::new("No workers registered\nPress r to refresh")
+                .style(observer_theme_style(false)),
             canvas,
         );
     } else {
@@ -499,22 +527,46 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         }
     }
 
+    let mut footer_y = canvas.y.saturating_add(canvas.height);
+    if let Some(notice) = observer.notice() {
+        let notice_area = Rect::new(area.x, footer_y, area.width, 1);
+        let notice = format!("! {}", sanitize_capture(notice).replace('\n', " "));
+        frame.render_widget(
+            Paragraph::new(notice).style(observer_theme_style(false)),
+            notice_area,
+        );
+        footer_y = footer_y.saturating_add(1);
+    }
+
     let hidden = worker_count.saturating_sub((observer.page() + 1) * WORKERS_PER_PAGE);
-    let overflow = if hidden == 0 {
-        String::new()
+    let controls = if worker_count == 0 {
+        "r refresh  q back".to_owned()
+    } else if controls_height == 1 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("+{hidden} more  ")
+        };
+        format!("{overflow}↑↓ select  Tab/[ ] page  r refresh  Enter open  q back")
+    } else if controls_height == 2 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  [] page  r refresh\nEnter open  q back{overflow}")
     } else {
-        format!("+{hidden} more  ")
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  [] page\nr refresh  Enter open\nq back{overflow}")
     };
-    let controls = format!("{overflow}↑↓ select  Tab/[ ] page  r refresh  Enter open  q quit");
-    let footer_text = observer.notice().map_or(controls, |notice| {
-        format!(
-            "! {}  · q quit",
-            sanitize_capture(notice).replace('\n', " ")
-        )
-    });
+    let controls_area = Rect::new(area.x, footer_y, area.width, controls_height);
     frame.render_widget(
-        Paragraph::new(footer_text).style(observer_theme_style(false)),
-        footer,
+        Paragraph::new(controls).style(observer_theme_style(false)),
+        controls_area,
     );
 }
 

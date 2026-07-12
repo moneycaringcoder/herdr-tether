@@ -449,6 +449,110 @@ fn runtime_notices_are_sanitized_without_changing_worker_state() {
 }
 
 #[test]
+fn state_action_projection_accepts_only_possible_zero_worker_actions() {
+    let mut empty = state(0);
+    let impossible = [
+        ObserverKey::Up,
+        ObserverKey::Down,
+        ObserverKey::Left,
+        ObserverKey::Right,
+        ObserverKey::PageUp,
+        ObserverKey::PageDown,
+        ObserverKey::Tab,
+        ObserverKey::BackTab,
+        ObserverKey::Enter,
+        ObserverKey::Char('j'),
+        ObserverKey::Char('['),
+    ];
+    let mut impossible_invocations = 0;
+    for key in impossible {
+        let projected = empty.action_for_key(key);
+        if let Some(action) = projected {
+            impossible_invocations += 1;
+            let _ = empty.apply(action);
+        }
+        assert_eq!(projected, None, "{key:?} must be inert without workers");
+    }
+    assert_eq!(impossible_invocations, 0);
+
+    let mut refresh_invocations = 0;
+    let mut back_invocations = 0;
+    for key in [ObserverKey::Char('r'), ObserverKey::Escape] {
+        let action = empty
+            .action_for_key(key)
+            .unwrap_or_else(|| panic!("{key:?} must remain actionable"));
+        match empty.apply(action) {
+            ObserverOutcome::Refresh => refresh_invocations += 1,
+            ObserverOutcome::Quit => back_invocations += 1,
+            outcome => panic!("unexpected empty-state outcome: {outcome:?}"),
+        }
+    }
+    assert_eq!(refresh_invocations, 1);
+    assert_eq!(back_invocations, 1);
+
+    let nonempty = state(1);
+    for key in [
+        ObserverKey::Up,
+        ObserverKey::Down,
+        ObserverKey::PageUp,
+        ObserverKey::PageDown,
+        ObserverKey::Enter,
+        ObserverKey::Char('r'),
+        ObserverKey::Char('q'),
+    ] {
+        assert_eq!(nonempty.action_for_key(key), action_for_key(key), "{key:?}");
+    }
+}
+
+#[test]
+fn notices_coexist_with_every_valid_control_in_normal_and_narrow_views() {
+    let mut observer = state(1);
+    observer.set_notice(Some(
+        "Refresh failed after a long recoverable transport interruption; showing previous output"
+            .to_owned(),
+    ));
+
+    for (width, height) in [(72, 9), (30, 10)] {
+        let rendered = render_to_text(width, height, &observer).unwrap();
+        for expected in [
+            "! Refresh failed",
+            "select",
+            "page",
+            "r refresh",
+            "Enter open",
+            "q back",
+            "Worker 0",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} at {width}x{height}:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_worker_view_is_actionable_without_impossible_controls() {
+    let observer = state(0);
+    for (width, height) in [(48, 6), (24, 6)] {
+        let rendered = render_to_text(width, height, &observer).unwrap();
+        for expected in ["No workers", "r refresh", "q back"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} at {width}x{height}:\n{rendered}"
+            );
+        }
+        for impossible in ["select", "page", "open"] {
+            assert!(
+                !rendered.contains(impossible),
+                "impossible control {impossible:?} shown at {width}x{height}:\n{rendered}"
+            );
+        }
+        assert!(!rendered.trim().is_empty());
+    }
+}
+
+#[test]
 fn observer_chrome_uses_terminal_default_colors_without_weakening_capture_safety() {
     let normal = observer_theme_style(false);
     assert_eq!(normal.fg, Some(Color::Reset));
