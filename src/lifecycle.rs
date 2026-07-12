@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::{
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     model::{OwnershipProof, SessionId, TmuxSessionId},
-    state::{SessionRecord, SessionStatus, StateStore},
+    state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, run_bounded},
     tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend},
 };
@@ -16,6 +16,11 @@ use crate::{
 /// Exact lifecycle inspection and close transports get three seconds each.
 /// The shared bounded runner also caps each captured output stream at 64 KiB.
 const LIFECYCLE_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_FINAL_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// The disposition of the owned workload when a close completed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +75,14 @@ pub enum CloseOwnedError {
     },
     #[error("close session `{id}`")]
     Close {
+        id: SessionId,
+        #[source]
+        source: AnyError,
+    },
+    #[error(
+        "workload for session `{id}` was closed but final state could not be saved; retry close to reconcile"
+    )]
+    Finalize {
         id: SessionId,
         #[source]
         source: AnyError,
@@ -313,10 +326,14 @@ impl LifecycleService {
                 record.last_used_at = now;
                 record.closed_at = Some(now);
                 record.exit_status = exit_status;
+                #[cfg(test)]
+                if FAIL_FINAL_SAVE.with(|fail| fail.replace(false)) {
+                    return Err(anyhow!("injected final save failure"));
+                }
                 store.save(&state)?;
                 Ok(true)
             })
-            .map_err(CloseOwnedError::State)
+            .map_err(|source| CloseOwnedError::Finalize { id: *id, source })
             .and_then(|finalized| {
                 finalized
                     .then_some(())
@@ -560,6 +577,7 @@ impl LifecycleService {
                     current.status = SessionStatus::Removed;
                     current.last_used_at = now;
                     current.closed_at.get_or_insert(now);
+                    reconcile_orchestration_groups(state, |session_id| session_id == id);
                     Ok(())
                 })
                 .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
@@ -612,6 +630,7 @@ impl LifecycleService {
                 current.status = SessionStatus::Removed;
                 current.last_used_at = Utc::now();
                 current.closed_at.get_or_insert(current.last_used_at);
+                reconcile_orchestration_groups(state, |session_id| session_id == id);
                 Ok(())
             })
             .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
@@ -892,6 +911,7 @@ impl PruneService {
                 state
                     .sessions
                     .retain(|record| !removed.contains(&record.id));
+                reconcile_orchestration_groups(state, |session_id| removed.contains(&session_id));
                 Ok(PruneResult {
                     removed_ids,
                     skipped_ids,
@@ -925,9 +945,21 @@ impl PruneService {
                 state
                     .sessions
                     .retain(|record| !removed_set.contains(&record.id));
+                reconcile_orchestration_groups(state, |session_id| {
+                    removed_set.contains(&session_id)
+                });
                 Ok(removed)
             })
             .map_err(PruneError::State)
+    }
+}
+
+fn reconcile_orchestration_groups(state: &mut State, removed: impl Fn(SessionId) -> bool) {
+    state
+        .orchestration_groups
+        .retain(|group| !removed(group.orchestrator_session_id));
+    for group in &mut state.orchestration_groups {
+        group.workers.retain(|worker| !removed(worker.session_id));
     }
 }
 
@@ -974,5 +1006,96 @@ pub fn cleanup_eligibility(
         CleanupEligibility::KeepRecent
     } else {
         CleanupEligibility::RemoveMetadata
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use chrono::{TimeZone, Utc};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{
+        model::OwnershipProof,
+        state::{SessionRecord, State},
+    };
+
+    fn test_id() -> SessionId {
+        "tether-0197f198000070008000000000000001".parse().unwrap()
+    }
+
+    fn test_proof() -> OwnershipProof {
+        "0197f198000070008000000000000002".parse().unwrap()
+    }
+
+    #[test]
+    fn final_save_failure_after_kill_recovers_idempotently_without_second_kill() {
+        let temp = tempdir().unwrap();
+        let killed = temp.path().join("killed");
+        let kills = temp.path().join("kills");
+        let tmux = temp.path().join("tmux");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\nlist-sessions)\n  if [ ! -e '{killed}' ]; then\n    printf 'tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002'\n  fi;;\nif-shell)\n  printf 'kill\\n' >> '{kills}'\n  : > '{killed}';;\nesac\nexit 0\n",
+            killed = killed.display(),
+            kills = kills.display(),
+        );
+        fs::write(&tmux, script).unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![SessionRecord {
+                    id: test_id(),
+                    host: "local".into(),
+                    target: "local".into(),
+                    directory: "/srv/code".into(),
+                    preset: Some("shell".into()),
+                    command: Some("exec shell".into()),
+                    tmux_session_id: None,
+                    ownership_proof: Some(test_proof()),
+                    status: SessionStatus::Running,
+                    created_at: timestamp,
+                    last_used_at: timestamp,
+                    closed_at: None,
+                    exit_status: None,
+                }],
+                orchestration_groups: Vec::new(),
+            })
+            .unwrap();
+        let binaries = ProcessBinaries::new(temp.path().join("unused-ssh"), tmux);
+
+        FAIL_FINAL_SAVE.with(|fail| fail.set(true));
+        let error = LifecycleService::new(store.clone(), binaries.clone())
+            .close_owned(test_id())
+            .unwrap_err();
+        assert!(matches!(error, CloseOwnedError::Finalize { .. }));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was closed but final state could not be saved"));
+        assert!(rendered.contains("retry close to reconcile"));
+        let stopping = store.load().unwrap().sessions.remove(0);
+        assert_eq!(stopping.status, SessionStatus::Stopping);
+        assert_eq!(stopping.closed_at, None);
+        assert_eq!(stopping.tmux_session_id, Some("$7".parse().unwrap()));
+        assert_eq!(fs::read_to_string(&kills).unwrap().lines().count(), 1);
+
+        let restarted = LifecycleService::new(store.clone(), binaries);
+        assert_eq!(
+            restarted.close_owned(test_id()).unwrap().workload,
+            ClosedWorkload::Missing
+        );
+        let terminal = store.load().unwrap().sessions.remove(0);
+        assert_eq!(terminal.status, SessionStatus::Ended);
+        assert_eq!(terminal.closed_at, Some(terminal.last_used_at));
+        assert_eq!(terminal.tmux_session_id, Some("$7".parse().unwrap()));
+        assert_eq!(fs::read_to_string(&kills).unwrap().lines().count(), 1);
+        assert!(matches!(
+            restarted.close_owned(test_id()),
+            Err(CloseOwnedError::AlreadyClosed(_))
+        ));
+        assert_eq!(store.load().unwrap().sessions[0], terminal);
     }
 }

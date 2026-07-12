@@ -14,9 +14,15 @@ use herdr_tether::{
         CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, PruneError,
         PruneService, cleanup_eligibility,
     },
-    model::{ExternalSessionName, OwnershipProof, SessionId},
+    model::{
+        ExternalSessionName, OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle,
+        OwnershipProof, SessionId,
+    },
     quote::posix_quote,
-    state::{SessionRecord, SessionStatus, State, StateStore},
+    state::{
+        OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
+        SessionStatus, State, StateStore,
+    },
     tmux::TmuxBackend,
 };
 use parking_lot::Mutex;
@@ -1393,6 +1399,171 @@ fn prune_record(
         closed_at,
         exit_status: None,
     }
+}
+
+fn orchestration_group(
+    id: &str,
+    orchestrator_session_id: SessionId,
+    workers: &[SessionId],
+) -> OrchestrationGroup {
+    OrchestrationGroup {
+        id: id.parse::<OrchestrationGroupId>().unwrap(),
+        title: format!("Group {id}").parse::<OrchestrationTitle>().unwrap(),
+        orchestrator_session_id,
+        workers: workers
+            .iter()
+            .copied()
+            .map(|session_id| OrchestrationMember {
+                session_id,
+                membership_id: OrchestrationMembershipId::new(),
+                title: Some("Stable worker title".parse().unwrap()),
+                capabilities: OrchestrationCapabilities {
+                    observe_output: true,
+                    open_interactive: true,
+                },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn confirmed_prune_reconciles_worker_and_orchestrator_metadata_only() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let pruned_worker = "tether-0197f198000070008000000000000011";
+    let pruned_orchestrator = "tether-0197f198000070008000000000000012";
+    let stable_orchestrator = "tether-0197f198000070008000000000000013";
+    let stable_worker = "tether-0197f198000070008000000000000014";
+    let doomed_group = orchestration_group(
+        "doomed",
+        pruned_orchestrator.parse().unwrap(),
+        &[stable_worker.parse().unwrap()],
+    );
+    let reconciled_group = orchestration_group(
+        "reconciled",
+        stable_orchestrator.parse().unwrap(),
+        &[
+            pruned_worker.parse().unwrap(),
+            stable_worker.parse().unwrap(),
+        ],
+    );
+    let unrelated_group = orchestration_group(
+        "unrelated",
+        stable_worker.parse().unwrap(),
+        &[stable_orchestrator.parse().unwrap()],
+    );
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                prune_record(
+                    pruned_worker,
+                    SessionStatus::Removed,
+                    Some(now - Duration::days(8)),
+                ),
+                prune_record(
+                    pruned_orchestrator,
+                    SessionStatus::Removed,
+                    Some(now - Duration::days(8)),
+                ),
+                prune_record(stable_orchestrator, SessionStatus::Running, None),
+                prune_record(stable_worker, SessionStatus::Running, None),
+            ],
+            orchestration_groups: vec![
+                doomed_group,
+                reconciled_group.clone(),
+                unrelated_group.clone(),
+            ],
+        })
+        .unwrap();
+    let service = PruneService::new(store.clone());
+    let preview = service.preview_at(7, now).unwrap();
+
+    assert_eq!(service.apply(&preview).unwrap().removed_ids.len(), 2);
+    let state = store.load().unwrap();
+    let mut expected_reconciled = reconciled_group;
+    expected_reconciled
+        .workers
+        .retain(|worker| worker.session_id != pruned_worker.parse().unwrap());
+    assert_eq!(
+        state.orchestration_groups,
+        vec![expected_reconciled, unrelated_group],
+        "orchestrator deletion removes its group while worker deletion changes only membership"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        vec![
+            stable_orchestrator.parse().unwrap(),
+            stable_worker.parse().unwrap()
+        ]
+    );
+}
+
+#[test]
+fn metadata_only_remove_reconciles_group_without_backend_or_session_side_effects() {
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let removed = id();
+    let stable_orchestrator = "tether-0197f198000070008000000000000013".parse().unwrap();
+    let stable_worker = "tether-0197f198000070008000000000000014".parse().unwrap();
+    let mut legacy = owned_record(SessionStatus::Ended);
+    legacy.ownership_proof = None;
+    let worker_group = orchestration_group(
+        "worker-removal",
+        stable_orchestrator,
+        &[removed, stable_worker],
+    );
+    let orchestrator_group = orchestration_group("orchestrator-removal", removed, &[stable_worker]);
+    let unrelated_group =
+        orchestration_group("unrelated-removal", stable_worker, &[stable_orchestrator]);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                legacy,
+                prune_record(
+                    &stable_orchestrator.to_string(),
+                    SessionStatus::Running,
+                    None,
+                ),
+                prune_record(&stable_worker.to_string(), SessionStatus::Running, None),
+            ],
+            orchestration_groups: vec![
+                worker_group.clone(),
+                orchestrator_group,
+                unrelated_group.clone(),
+            ],
+        })
+        .unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(
+            temp.path().join("must-not-run-ssh"),
+            temp.path().join("must-not-run-tmux"),
+        ),
+    );
+
+    assert_eq!(
+        service.remove_owned(removed).unwrap().workload,
+        ClosedWorkload::Missing
+    );
+    let state = store.load().unwrap();
+    let mut expected_worker_group = worker_group;
+    expected_worker_group
+        .workers
+        .retain(|worker| worker.session_id != removed);
+    assert_eq!(
+        state.orchestration_groups,
+        vec![expected_worker_group, unrelated_group]
+    );
+    assert_eq!(state.sessions[0].status, SessionStatus::Removed);
+    assert_eq!(state.sessions[1].id, stable_orchestrator);
+    assert_eq!(state.sessions[2].id, stable_worker);
 }
 
 #[test]
