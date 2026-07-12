@@ -41,6 +41,7 @@ use crate::{
 
 const MIN_PICKER_WIDTH: u16 = 40;
 const MIN_PICKER_HEIGHT: u16 = 8;
+const NARROW_GUIDANCE_WIDTH: u16 = 32;
 const PICKER_RESIZE_MESSAGE: &str = "Resize terminal to at least 40x8";
 
 const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
@@ -2701,7 +2702,18 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
 }
 
 fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, colors_enabled: bool) {
-    if frame.area().width < MIN_PICKER_WIDTH || frame.area().height < MIN_PICKER_HEIGHT {
+    let compact_guidance = state.close_modal.is_some()
+        || state.pending_close.is_some()
+        || state.prune_modal.is_some()
+        || state.pending_prune.is_some()
+        || state.operation_error.is_some();
+    let narrow_guidance = compact_guidance && frame.area().width == NARROW_GUIDANCE_WIDTH;
+    let minimum_width = if narrow_guidance {
+        NARROW_GUIDANCE_WIDTH
+    } else {
+        MIN_PICKER_WIDTH
+    };
+    if frame.area().width < minimum_width || frame.area().height < MIN_PICKER_HEIGHT {
         frame.render_widget(Clear, frame.area());
         frame.render_widget(
             Paragraph::new(PICKER_RESIZE_MESSAGE)
@@ -2716,21 +2728,18 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
     let footer = state.footer_text();
     let panel_width = 72.min(frame.area().width);
     let footer_width = panel_width.saturating_sub(6).max(1);
-    let footer_height = wrapped_line_count(&footer, footer_width);
+    let desired_footer_height = wrapped_line_count(&footer, footer_width);
     let area = centered_rect(
         frame.area(),
         72,
         visible_rows
-            .saturating_add(footer_height)
+            .saturating_add(desired_footer_height)
             .saturating_add(4)
             .max(9),
     );
+    let footer_height = desired_footer_height.min(area.height.saturating_sub(4));
     frame.render_widget(Clear, area);
-    let destructive = state.close_modal.is_some()
-        || state.pending_close.is_some()
-        || state.prune_modal.is_some()
-        || state.pending_prune.is_some()
-        || state.operation_error.is_some();
+    let destructive = compact_guidance;
     let accent = if !colors_enabled {
         Color::Reset
     } else if destructive {
