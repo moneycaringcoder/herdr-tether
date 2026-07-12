@@ -32,7 +32,7 @@ use crate::{
     },
     lifecycle::{CloseOwnedError, LifecycleService, PrunePreview, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
-    state::{SessionRecord, SessionStatus, State},
+    state::{SessionRecord, SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
         StatusRequest, StatusRun, StatusService, WorkloadStatus,
@@ -182,7 +182,11 @@ impl PickerOptions {
         }
 
         let mut retained = BTreeMap::<(String, String), ()>::new();
-        for record in &state.sessions {
+        for record in state
+            .sessions
+            .iter()
+            .filter(|record| is_normal_session(record))
+        {
             let key = (record.host.clone(), record.target.clone());
             if !effective_keys.contains(&key) {
                 retained.insert(key, ());
@@ -228,15 +232,20 @@ fn recent_directories(state: &State, host: &str, target: &str) -> Vec<String> {
     let mut sessions: Vec<&SessionRecord> = state
         .sessions
         .iter()
-        .filter(|session| session.host == host && session.target == target)
+        .filter(|session| {
+            session.host == host && session.target == target && is_normal_session(session)
+        })
         .collect();
     sessions.sort_by(|left, right| {
-        right
-            .last_used_at
-            .cmp(&left.last_used_at)
-            .then_with(|| left.directory.cmp(&right.directory))
+        compare_normal_sessions(
+            left.status,
+            left.last_used_at,
+            (left.directory.as_str(), left.id),
+            right.status,
+            right.last_used_at,
+            (right.directory.as_str(), right.id),
+        )
     });
-
     let mut directories = Vec::with_capacity(sessions.len());
     for session in sessions {
         push_unique(&mut directories, &session.directory);
@@ -247,13 +256,19 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
     let mut sessions: Vec<&SessionRecord> = state
         .sessions
         .iter()
-        .filter(|session| session.host == host && session.target == target)
+        .filter(|session| {
+            session.host == host && session.target == target && is_normal_session(session)
+        })
         .collect();
     sessions.sort_by(|left, right| {
-        right
-            .last_used_at
-            .cmp(&left.last_used_at)
-            .then_with(|| left.id.cmp(&right.id))
+        compare_normal_sessions(
+            left.status,
+            left.last_used_at,
+            left.id,
+            right.status,
+            right.last_used_at,
+            right.id,
+        )
     });
 
     sessions
@@ -989,60 +1004,67 @@ impl PickerState {
             host.origin == PickerHostOrigin::Effective || !host.workloads.is_empty()
         });
 
-        if !self.options.hosts.iter().any(|host| {
-            host.name == record.host && host.target.as_deref().unwrap_or("local") == record.target
-        }) {
-            self.options.hosts.push(PickerHost {
-                name: record.host.clone(),
-                label: format!("{} · retained · {}", record.host, record.target),
-                target: (record.target != "local").then(|| record.target.clone()),
-                origin: PickerHostOrigin::Retained,
-                directories: vec![record.directory.clone()],
-                scan_roots: Vec::new(),
-                commands: vec![PickerCommand::Shell],
-                workloads: Vec::new(),
-                allow_existing: false,
-                allow_create: false,
-            });
-            let first_retained = self
+        if is_normal_session(record) {
+            if !self.options.hosts.iter().any(|host| {
+                host.name == record.host
+                    && host.target.as_deref().unwrap_or("local") == record.target
+            }) {
+                self.options.hosts.push(PickerHost {
+                    name: record.host.clone(),
+                    label: format!("{} · retained · {}", record.host, record.target),
+                    target: (record.target != "local").then(|| record.target.clone()),
+                    origin: PickerHostOrigin::Retained,
+                    directories: vec![record.directory.clone()],
+                    scan_roots: Vec::new(),
+                    commands: vec![PickerCommand::Shell],
+                    workloads: Vec::new(),
+                    allow_existing: false,
+                    allow_create: false,
+                });
+                let first_retained = self
+                    .options
+                    .hosts
+                    .iter()
+                    .position(|host| host.origin == PickerHostOrigin::Retained)
+                    .unwrap_or(self.options.hosts.len());
+                self.options.hosts[first_retained..].sort_by(|left, right| {
+                    (&left.name, left.target.as_deref().unwrap_or("local"))
+                        .cmp(&(&right.name, right.target.as_deref().unwrap_or("local")))
+                });
+            }
+            let host_index = self
                 .options
                 .hosts
                 .iter()
-                .position(|host| host.origin == PickerHostOrigin::Retained)
-                .unwrap_or(self.options.hosts.len());
-            self.options.hosts[first_retained..].sort_by(|left, right| {
-                (&left.name, left.target.as_deref().unwrap_or("local"))
-                    .cmp(&(&right.name, right.target.as_deref().unwrap_or("local")))
-            });
+                .position(|host| {
+                    host.name == record.host
+                        && host.target.as_deref().unwrap_or("local") == record.target
+                })
+                .expect("reconciled host group exists");
+            let label = workload_label(record);
+            self.options.hosts[host_index]
+                .workloads
+                .push(PickerWorkload {
+                    id: record.id,
+                    status: record.status,
+                    legacy: record.ownership_proof.is_none(),
+                    last_used_at: record.last_used_at,
+                    base_label: label.clone(),
+                    label,
+                });
+            self.options.hosts[host_index]
+                .workloads
+                .sort_by(|left, right| {
+                    compare_normal_sessions(
+                        left.status,
+                        left.last_used_at,
+                        left.id,
+                        right.status,
+                        right.last_used_at,
+                        right.id,
+                    )
+                });
         }
-        let host_index = self
-            .options
-            .hosts
-            .iter()
-            .position(|host| {
-                host.name == record.host
-                    && host.target.as_deref().unwrap_or("local") == record.target
-            })
-            .expect("reconciled host group exists");
-        let label = workload_label(record);
-        self.options.hosts[host_index]
-            .workloads
-            .push(PickerWorkload {
-                id: record.id,
-                status: record.status,
-                legacy: record.ownership_proof.is_none(),
-                last_used_at: record.last_used_at,
-                base_label: label.clone(),
-                label,
-            });
-        self.options.hosts[host_index]
-            .workloads
-            .sort_by(|left, right| {
-                right
-                    .last_used_at
-                    .cmp(&left.last_used_at)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
         self.restore_selection(selected_host, selected_resource);
     }
 

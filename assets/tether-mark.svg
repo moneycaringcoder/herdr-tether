@@ -15,5 +15,5 @@
   <rect class="frame" x="8" y="8" width="144" height="144" rx="30" stroke-width="8"/>
   <path class="accent" d="M43 51l18 16-18 16" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
   <path class="line" d="M75 85h20c18 0 27 10 27 24s-10 24-27 24H66c-18 0-29-11-29-26 0-12 7-22 19-25" stroke-width="9" stroke-linecap="round"/>
-  <path class="accent" d="M100 107h20" stroke-width="10" stroke-linecap="round"/>
+  <path class="accent" d="M92 107h18" stroke-width="10" stroke-linecap="round"/>
 </svg>

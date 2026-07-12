@@ -27,6 +27,32 @@ pub enum SessionStatus {
     Removed,
 }
 
+pub(crate) fn is_normal_session(record: &SessionRecord) -> bool {
+    record.status != SessionStatus::Removed
+}
+
+pub(crate) fn compare_normal_sessions<T: Ord>(
+    left_status: SessionStatus,
+    left_last_used_at: chrono::DateTime<chrono::Utc>,
+    left_tie_breaker: T,
+    right_status: SessionStatus,
+    right_last_used_at: chrono::DateTime<chrono::Utc>,
+    right_tie_breaker: T,
+) -> std::cmp::Ordering {
+    normal_status_group(left_status)
+        .cmp(&normal_status_group(right_status))
+        .then_with(|| right_last_used_at.cmp(&left_last_used_at))
+        .then_with(|| left_tie_breaker.cmp(&right_tie_breaker))
+}
+
+fn normal_status_group(status: SessionStatus) -> u8 {
+    match status {
+        SessionStatus::Creating | SessionStatus::Running | SessionStatus::Stopping => 0,
+        SessionStatus::Ended => 1,
+        SessionStatus::Removed => 2,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {

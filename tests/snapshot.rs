@@ -198,7 +198,9 @@ workers = 2
 closed_days = 30
 "#;
     let state = r#"{"version":2,"sessions":[
-{"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/closed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-03T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000005","host":"retired","target":"retired@example.test","directory":"/retired","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-06T00:00:00Z","closed_at":"2026-01-06T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/closed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/closing","preset":"named","status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
 {"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/active","preset":null,"status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null}
 ]}"#;
@@ -220,6 +222,7 @@ closed_days = 30
             .stdout,
     )
     .unwrap();
+    assert_eq!(value["hosts"].as_array().unwrap().len(), 1);
     assert_eq!(value["completion"], "complete");
     let local = &value["hosts"][0];
     assert_eq!(
@@ -238,6 +241,17 @@ closed_days = 30
         "z-external"
     );
     let owned = local["owned_sessions"].as_array().unwrap();
+    assert_eq!(
+        owned
+            .iter()
+            .map(|session| session["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "tether-0197f198000070008000000000000001",
+            "tether-0197f198000070008000000000000002",
+            "tether-0197f198000070008000000000000003",
+        ]
+    );
     assert_eq!(owned[0]["workload_status"], "running");
     assert_eq!(owned[0]["attached"], 2);
     assert_eq!(owned[1]["workload_status"], "not_checked");

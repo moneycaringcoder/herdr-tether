@@ -94,6 +94,63 @@ fn require_nonempty_env(name: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
+/// Safe, bounded presentation metadata for a placed Tether pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneTitle(String);
+
+impl PaneTitle {
+    /// Builds a title for an owned workload from persisted presentation fields.
+    pub fn owned(host: &str, directory: &str, preset: Option<&str>, command: Option<&str>) -> Self {
+        let workload = preset.and_then(sanitize_title_component).or_else(|| {
+            command
+                .and_then(command_basename)
+                .and_then(sanitize_title_component)
+        });
+        Self::from_components([
+            (host != "local").then_some(host),
+            directory_leaf(directory),
+            workload.as_deref(),
+        ])
+    }
+
+    /// Builds a title for an externally owned tmux session.
+    pub fn external(host: &str, session: &str) -> Self {
+        Self::from_components([(host != "local").then_some(host), Some(session), None])
+    }
+
+    /// Supplies the deterministic title used when no safe context is available.
+    pub fn fallback() -> Self {
+        Self("Tether session".to_owned())
+    }
+
+    fn from_components<'a>(components: impl IntoIterator<Item = Option<&'a str>>) -> Self {
+        let mut title = String::new();
+        for raw in components.into_iter().flatten() {
+            let Some(component) = sanitize_title_component(raw) else {
+                continue;
+            };
+            if title
+                .split(" · ")
+                .any(|existing| existing == component.as_str())
+            {
+                continue;
+            }
+            if !title.is_empty() {
+                title.push_str(" · ");
+            }
+            title.push_str(&component);
+        }
+        if title.is_empty() {
+            return Self::fallback();
+        }
+        Self(truncate_title(title))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacedPane {
     pub pane_id: String,
@@ -156,7 +213,12 @@ impl HerdrClient {
     }
 
     /// Creates the requested transient pane and runs `command` in that exact pane.
-    pub fn place(&self, command: &CommandSpec, placement: Placement) -> Result<PlacedPane> {
+    pub fn place(
+        &self,
+        command: &CommandSpec,
+        title: &PaneTitle,
+        placement: Placement,
+    ) -> Result<PlacedPane> {
         let pane_id = match placement {
             Placement::SplitRight => self.split("right")?,
             Placement::SplitDown => self.split("down")?,
@@ -166,7 +228,7 @@ impl HerdrClient {
             }
         };
         // Presentation metadata must never block a working attach.
-        let _ = self.label_pane(&pane_id);
+        let _ = self.label_pane(&pane_id, title);
         match self.run_in_pane(command, pane_id.clone()) {
             Ok(placed) => Ok(placed),
             Err(error) => {
@@ -190,7 +252,7 @@ impl HerdrClient {
     }
 
     /// Creates and verifies a destination before closing the exact invoking pane.
-    pub fn replace_current(&self, command: &CommandSpec) -> Result<PlacedPane> {
+    pub fn replace_current(&self, command: &CommandSpec, title: &PaneTitle) -> Result<PlacedPane> {
         const VERIFY_ATTEMPTS: usize = 20;
         const VERIFY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -200,7 +262,7 @@ impl HerdrClient {
             .context("capture the exact source pane occupant before replacement")?;
         let destination_pane_id = self.split("right")?;
         // Presentation metadata must never block a working replacement.
-        let _ = self.label_pane(&destination_pane_id);
+        let _ = self.label_pane(&destination_pane_id, title);
         let placed = match self.run_in_pane(command, destination_pane_id.clone()) {
             Ok(placed) => placed,
             Err(error) => {
@@ -439,14 +501,14 @@ impl HerdrClient {
             .is_some_and(|argument| argument == &format!("'tmux' 'attach-session' '-t' {target}"))
     }
 
-    fn label_pane(&self, pane_id: &str) -> Result<()> {
+    fn label_pane(&self, pane_id: &str, title: &PaneTitle) -> Result<()> {
         let response = self.invoke(
             "label Tether pane",
             &[
                 "pane".to_owned(),
                 "rename".to_owned(),
                 pane_id.to_owned(),
-                "Tether session".to_owned(),
+                title.as_str().to_owned(),
             ],
         )?;
         require_result_type(&response, "pane_info")
@@ -591,6 +653,79 @@ fn require_empty_success(output: &std::process::Output, operation: &str) -> Resu
     )
 }
 
+const MAX_PANE_TITLE_CHARS: usize = 48;
+
+fn directory_leaf(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value == "/" {
+        return Some("/");
+    }
+    if value == "~" || value == "~/" {
+        return Some("~");
+    }
+    value
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|component| !component.is_empty())
+}
+
+fn command_basename(command: &str) -> Option<&str> {
+    command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .skip_while(|token| {
+            matches!(*token, "exec" | "command" | "env" | "sudo") || token.contains('=')
+        })
+        .take_while(|token| !token.contains('$'))
+        .find_map(|token| {
+            token
+                .rsplit('/')
+                .next()
+                .filter(|basename| !basename.is_empty() && *basename != "." && *basename != "..")
+        })
+}
+
+fn sanitize_title_component(value: &str) -> Option<String> {
+    let mut sanitized = String::with_capacity(value.len().min(MAX_PANE_TITLE_CHARS));
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_control()
+            || character.is_whitespace()
+            || matches!(
+                character,
+                '|' | '·'
+                    | '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+        {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn truncate_title(title: String) -> String {
+    if title.chars().count() <= MAX_PANE_TITLE_CHARS {
+        return title;
+    }
+    let mut bounded = title
+        .chars()
+        .take(MAX_PANE_TITLE_CHARS - 1)
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
 fn placed_command(command: &CommandSpec) -> Result<CommandSpec> {
     let mut plugin_paths = Vec::new();
     for name in ["HERDR_PLUGIN_CONFIG_DIR", "HERDR_PLUGIN_STATE_DIR"] {
@@ -700,6 +835,26 @@ mod tests {
         assert_eq!(
             placement_pane_id("w1:p2".to_owned(), None).unwrap(),
             "w1:p2"
+        );
+    }
+
+    #[test]
+    fn pane_title_preserves_an_exactly_full_budget() {
+        let exact = "x".repeat(MAX_PANE_TITLE_CHARS);
+        assert_eq!(truncate_title(exact.clone()), exact);
+
+        let over = truncate_title("x".repeat(MAX_PANE_TITLE_CHARS + 1));
+        assert_eq!(over.chars().count(), MAX_PANE_TITLE_CHARS);
+        assert!(over.ends_with('…'));
+        assert_eq!(
+            PaneTitle::owned(
+                "local",
+                "/srv/project",
+                None,
+                Some("exec ${SHELL:-/bin/sh}"),
+            )
+            .as_str(),
+            "project",
         );
     }
 

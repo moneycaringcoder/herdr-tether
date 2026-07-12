@@ -2,11 +2,11 @@ id = "moneycaringcoder.tether"
 name = "Tether for Herdr"
 version = "0.3.0"
 min_herdr_version = "0.7.3"
+description = "Keep local and remote terminal workloads running after their Herdr view closes."
 platforms = ["linux", "macos"]
 
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
-artifacts = ["target/release/herdr-tether"]
 
 [[actions]]
 id = "open"

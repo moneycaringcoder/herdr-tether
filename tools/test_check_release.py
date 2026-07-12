@@ -2,6 +2,7 @@
 import unittest
 
 from check_release import (
+    PUBLIC_RELEASE_FILES,
     ReleaseIdentityError,
     validate_readme_install,
     validate_release_context,
@@ -23,6 +24,27 @@ Use a full commit SHA for a reproducible candidate checkout.
                 with self.assertRaises(ReleaseIdentityError):
                     validate_readme_install(truthful + command, "v0.3.0", release=False)
 
+    def test_candidate_accepts_explicitly_future_stable_commands(self) -> None:
+        truthful = """\
+Stable v0.3.0 (use only after `v0.3.0` is published):
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \\
+  --tag v0.3.0 --locked herdr-tether
+
+Development:
+herdr plugin install moneycaringcoder/herdr-tether --ref main
+"""
+        validate_readme_install(truthful, "v0.3.0", release=False)
+
+    def test_quickstart_is_a_checked_public_release_surface(self) -> None:
+        self.assertIn("docs/quickstart.md", {str(path) for path in PUBLIC_RELEASE_FILES})
+
+    def test_hermes_skill_is_a_checked_public_release_surface(self) -> None:
+        self.assertIn(
+            "integrations/hermes/SKILL.md",
+            {str(path) for path in PUBLIC_RELEASE_FILES},
+        )
+
     def test_release_requires_both_tagged_install_paths(self) -> None:
         complete = """\
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0 --yes
@@ -36,6 +58,15 @@ cargo install --git https://github.com/moneycaringcoder/herdr-tether \\
                 "v0.3.0",
                 release=True,
             )
+        future_copy = complete.replace(
+            "herdr plugin install",
+            "Stable v0.3.0 (once published). v0.3.0 is not published yet.\n"
+            "herdr plugin install",
+            1,
+        )
+        with self.assertRaises(ReleaseIdentityError):
+            validate_readme_install(future_copy, "v0.3.0", release=True)
+
 
     def test_release_requires_exact_local_and_github_tag_context(self) -> None:
         tag = "v0.3.0"

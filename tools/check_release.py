@@ -22,6 +22,8 @@ PUBLIC_RELEASE_FILES = (
     Path("CHANGELOG.md"),
     Path("SECURITY.md"),
     Path("docs/architecture.md"),
+    Path("docs/quickstart.md"),
+    Path("integrations/hermes/SKILL.md"),
     Path("herdr-plugin.toml"),
 )
 
@@ -93,26 +95,56 @@ def resolve_git_commit(ref: str) -> str | None:
     return commit
 
 
-def validate_readme_install(readme: str, tag: str, release: bool) -> None:
+def validate_readme_install(
+    readme: str,
+    tag: str,
+    release: bool,
+    *,
+    surface: str = "README.md",
+) -> None:
     herdr_tag = f"--ref {tag}"
     cargo_tag = re.search(
         rf"cargo install[\s\S]{{0,200}}?--tag {re.escape(tag)}(?:\s|$)",
         readme,
     )
+    future_copy = re.compile(
+        rf"(?:is\s+not\s+published\s+yet|once\s+published|"
+        rf"after\s+`?{re.escape(tag)}`?\s+is\s+published)",
+        re.IGNORECASE,
+    )
     if release:
+        if future_copy.search(readme):
+            raise ReleaseIdentityError(
+                f"{surface} still describes {tag} as unpublished"
+            )
         if herdr_tag not in readme:
             raise ReleaseIdentityError(
-                f"README.md does not pin the primary install to {herdr_tag}"
+                f"{surface} does not pin the primary install to {herdr_tag}"
             )
         if not cargo_tag:
             raise ReleaseIdentityError(
-                f"README.md does not pin the primary Cargo install to --tag {tag}"
+                f"{surface} does not pin the primary Cargo install to --tag {tag}"
             )
     elif herdr_tag in readme or cargo_tag:
-        raise ReleaseIdentityError(
-            f"README.md advertises nonexistent candidate tag {tag}; "
-            "use main or full-commit-SHA candidate guidance"
+        tag_references = [
+            match.start()
+            for match in re.finditer(
+                rf"(?:--ref|--tag)\s+{re.escape(tag)}(?:\s|$)",
+                readme,
+            )
+        ]
+        future_label = re.compile(
+            rf"after\s+`?{re.escape(tag)}`?\s+is\s+published",
+            re.IGNORECASE,
         )
+        if any(
+            not future_label.search(readme[max(0, position - 400) : position])
+            for position in tag_references
+        ):
+            raise ReleaseIdentityError(
+                f"{surface} advertises nonexistent candidate tag {tag}; "
+                f"label tagged commands for use after {tag} is published"
+            )
 
 
 def fail(message: str) -> None:
@@ -185,6 +217,16 @@ def main() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     try:
         validate_readme_install(readme, args.tag, args.release)
+    except ReleaseIdentityError as error:
+        fail(str(error))
+    quickstart_path = Path("docs/quickstart.md")
+    try:
+        validate_readme_install(
+            (ROOT / quickstart_path).read_text(encoding="utf-8"),
+            args.tag,
+            args.release,
+            surface=str(quickstart_path),
+        )
     except ReleaseIdentityError as error:
         fail(str(error))
 

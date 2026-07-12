@@ -870,6 +870,64 @@ fn session_list_json_never_exposes_private_ownership_proof() {
 }
 
 #[test]
+fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let state = r#"{"version":2,"sessions":[
+{"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/ended","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
+{"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/older-active","preset":null,"status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
+{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/newer-active","preset":null,"status":"creating","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":null}
+]}"#;
+    fs::write(sandbox.state_file(), state).unwrap();
+
+    let json_output = sandbox
+        .command()
+        .args(["session", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: serde_json::Value = serde_json::from_slice(&json_output).unwrap();
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "tether-0197f198000070008000000000000001",
+            "tether-0197f198000070008000000000000002",
+            "tether-0197f198000070008000000000000003",
+        ]
+    );
+
+    let human = sandbox
+        .command()
+        .args(["session", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert_eq!(
+        human
+            .lines()
+            .map(|line| line.split('\t').next().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "tether-0197f198000070008000000000000001",
+            "tether-0197f198000070008000000000000002",
+            "tether-0197f198000070008000000000000003",
+        ]
+    );
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), state);
+}
+
+#[test]
 fn external_attach_is_exact_and_does_not_mutate_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
