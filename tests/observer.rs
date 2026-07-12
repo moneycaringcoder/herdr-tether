@@ -7,8 +7,9 @@ mod model;
 
 use observer::{
     MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
-    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_key,
-    observer_theme_style, render_to_styles, render_to_text, sanitize_capture, worker_rects,
+    ObserverCapture, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
+    ObserverWorker, action_for_key, observer_theme_style, render_to_styles, render_to_text,
+    sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -313,6 +314,49 @@ fn session_reference_tokens_are_deterministic_ascii_and_bounded() {
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!((8..=32).contains(&token.len()));
     }
+}
+
+#[test]
+fn capture_lifecycle_renders_loading_ready_empty_and_unavailable_distinctly() {
+    let mut loading_worker = worker("capture");
+    loading_worker.capture = None;
+    let mut observer = ObserverState::new(vec![loading_worker]);
+    let loading = render_to_text(40, 8, &observer).unwrap();
+    assert!(loading.contains("Loading output"), "{loading}");
+    assert!(!loading.contains("No captured output"), "{loading}");
+    assert!(!loading.contains("Output unavailable"), "{loading}");
+    observer.merge_capture("capture", ObserverCapture::Ready(String::new()));
+    let ready_empty = render_to_text(40, 8, &observer).unwrap();
+    assert!(ready_empty.contains("No captured output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Loading output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Output unavailable"), "{ready_empty}");
+    observer.merge_capture("capture", ObserverCapture::Unavailable);
+    let unavailable = render_to_text(40, 8, &observer).unwrap();
+    assert!(unavailable.contains("Output unavailable"), "{unavailable}");
+    assert!(!unavailable.contains("Loading output"), "{unavailable}");
+    assert!(!unavailable.contains("No captured output"), "{unavailable}");
+}
+
+#[test]
+fn capture_merge_supports_loading_and_ready_to_unavailable_transitions() {
+    let mut loading_worker = worker("loading");
+    loading_worker.capture = None;
+    let mut ready_worker = worker("ready");
+    ready_worker.capture = Some("existing output".to_owned());
+    let mut observer = ObserverState::new(vec![loading_worker, ready_worker]);
+    observer.merge_capture("loading", ObserverCapture::Unavailable);
+    observer.merge_capture("ready", ObserverCapture::Unavailable);
+    let unavailable = render_to_text(64, 10, &observer).unwrap();
+    assert_eq!(unavailable.matches("Output unavailable").count(), 2);
+    assert!(!unavailable.contains("existing output"), "{unavailable}");
+    observer.merge_capture("loading", ObserverCapture::Loading);
+    observer.update_workers(vec![ObserverWorker {
+        capture: Some(String::new()),
+        ..worker("loading")
+    }]);
+    let ready_empty = render_to_text(40, 8, &observer).unwrap();
+    assert!(ready_empty.contains("No captured output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Loading output"), "{ready_empty}");
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! and translate [`ObserverOutcome`] values back into application actions.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
 };
 
@@ -58,6 +58,20 @@ impl ObserverLifecycle {
             Self::Unknown => "UNKNOWN",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverCapture {
+    Loading,
+    Ready(String),
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureStatus {
+    Loading,
+    Ready,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +175,7 @@ pub fn action_for_key(key: ObserverKey) -> Option<ObserverAction> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObserverState {
     workers: Vec<ObserverWorker>,
+    capture_statuses: HashMap<String, CaptureStatus>,
     selected_id: Option<String>,
     notice: Option<String>,
 }
@@ -184,18 +199,43 @@ impl ObserverState {
         self.notice = notice;
     }
 
-    /// Replaces membership while preserving selection by worker identity.
+    /// Replaces membership while preserving selection and capture state by worker identity.
     ///
-    /// Duplicate IDs after their first occurrence and workers beyond [`MAX_WORKERS`]
-    /// are ignored. If the selected identity disappeared, the prior numeric position
-    /// is retained where possible.
+    /// A supplied capture, including an empty capture, completes loading. An absent
+    /// capture preserves the prior lifecycle for an existing worker and starts a new
+    /// worker in loading. Duplicate IDs after their first occurrence and workers beyond
+    /// [`MAX_WORKERS`] are ignored. If the selected identity disappeared, the prior
+    /// numeric position is retained where possible.
     pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) {
         let previous_index = self.selected_index().unwrap_or(0);
+        let previous_workers: HashMap<String, Option<String>> = self
+            .workers
+            .drain(..)
+            .map(|worker| (worker.id, worker.capture))
+            .collect();
+        let previous_statuses = std::mem::take(&mut self.capture_statuses);
         let mut seen = HashSet::with_capacity(workers.len().min(MAX_WORKERS));
         self.workers = workers
             .into_iter()
             .filter(|worker| seen.insert(worker.id.clone()))
             .take(MAX_WORKERS)
+            .map(|mut worker| {
+                let status = if let Some(capture) = worker.capture.take() {
+                    worker.capture = Some(sanitize_capture(&capture));
+                    CaptureStatus::Ready
+                } else {
+                    let status = previous_statuses
+                        .get(&worker.id)
+                        .copied()
+                        .unwrap_or(CaptureStatus::Loading);
+                    if status == CaptureStatus::Ready {
+                        worker.capture = previous_workers.get(&worker.id).cloned().flatten();
+                    }
+                    status
+                };
+                self.capture_statuses.insert(worker.id.clone(), status);
+                worker
+            })
             .collect();
 
         if self.workers.is_empty() {
@@ -209,6 +249,33 @@ impl ObserverState {
         }
         let index = previous_index.min(self.workers.len() - 1);
         self.selected_id = Some(self.workers[index].id.clone());
+    }
+
+    /// Merges one capture result without changing worker identity or membership.
+    pub fn merge_capture(&mut self, worker_id: &str, capture: ObserverCapture) -> bool {
+        let Some(worker) = self
+            .workers
+            .iter_mut()
+            .find(|worker| worker.id == worker_id)
+        else {
+            return false;
+        };
+        let status = match capture {
+            ObserverCapture::Loading => {
+                worker.capture = None;
+                CaptureStatus::Loading
+            }
+            ObserverCapture::Ready(capture) => {
+                worker.capture = Some(sanitize_capture(&capture));
+                CaptureStatus::Ready
+            }
+            ObserverCapture::Unavailable => {
+                worker.capture = None;
+                CaptureStatus::Unavailable
+            }
+        };
+        self.capture_statuses.insert(worker_id.to_owned(), status);
+        true
     }
 
     pub fn selected_id(&self) -> Option<&str> {
@@ -421,6 +488,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
                 frame,
                 rect,
                 worker,
+                observer
+                    .capture_statuses
+                    .get(&worker.id)
+                    .copied()
+                    .unwrap_or(CaptureStatus::Loading),
                 &observer.worker_display_title(worker),
                 observer.selected_id() == Some(worker.id.as_str()),
             );
@@ -450,6 +522,7 @@ fn render_worker(
     frame: &mut Frame<'_>,
     area: Rect,
     worker: &ObserverWorker,
+    capture_status: CaptureStatus,
     display_title: &str,
     selected: bool,
 ) {
@@ -471,19 +544,23 @@ fn render_worker(
     let body = if !worker.capabilities.observe_output {
         "Output not authorized".to_owned()
     } else {
-        worker
-            .capture
-            .as_deref()
-            .map(sanitize_capture)
-            .filter(|capture| !capture.is_empty())
-            .map(|capture| {
-                capture_viewport(
-                    &capture,
-                    area.width.saturating_sub(2),
-                    area.height.saturating_sub(2),
-                )
-            })
-            .unwrap_or_else(|| "No captured output".to_owned())
+        match capture_status {
+            CaptureStatus::Loading => "Loading output".to_owned(),
+            CaptureStatus::Unavailable => "Output unavailable".to_owned(),
+            CaptureStatus::Ready => worker
+                .capture
+                .as_deref()
+                .map(sanitize_capture)
+                .filter(|capture| !capture.is_empty())
+                .map(|capture| {
+                    capture_viewport(
+                        &capture,
+                        area.width.saturating_sub(2),
+                        area.height.saturating_sub(2),
+                    )
+                })
+                .unwrap_or_else(|| "No captured output".to_owned()),
+        }
     };
     frame.render_widget(
         Paragraph::new(body)
