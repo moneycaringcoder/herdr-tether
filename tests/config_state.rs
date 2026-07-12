@@ -12,7 +12,7 @@ use herdr_tether::{
         CommandPreset, Config, ConfigStore, DiscoveryDefaults, HerdrKeybindingInstall,
         HerdrKeybindingRollback, HerdrKeybindingStore, HostConfig, RetentionDefaults, UiDefaults,
     },
-    model::{OrchestrationGroupId, OrchestrationTitle, Placement},
+    model::{OrchestrationGroupId, OrchestrationTitle, Placement, SessionId},
     state::{
         OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
         SessionStatus, State, StateStore,
@@ -44,6 +44,77 @@ fn sample_config() -> Config {
         discovery: DiscoveryDefaults::default(),
         retention: RetentionDefaults::default(),
     }
+}
+
+fn config_at_serialized_limit() -> Config {
+    let mut config = Config {
+        hosts: vec![HostConfig {
+            name: "boundary".into(),
+            target: "example.test".into(),
+            roots: Vec::new(),
+            presets: (0..33)
+                .map(|index| CommandPreset {
+                    name: format!("preset-{index}"),
+                    command: "x".into(),
+                })
+                .collect(),
+        }],
+        ..Config::default()
+    };
+    let current = toml::to_string_pretty(&config).unwrap().len();
+    let mut remaining = ConfigStore::MAX_INPUT_BYTES - current;
+    for preset in &mut config.hosts[0].presets {
+        let added = remaining.min(CommandPreset::MAX_COMMAND_BYTES - preset.command.len());
+        preset.command.push_str(&"x".repeat(added));
+        remaining -= added;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        toml::to_string_pretty(&config).unwrap().len(),
+        ConfigStore::MAX_INPUT_BYTES
+    );
+    config
+}
+
+fn state_at_serialized_limit() -> State {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let mut state = State {
+        version: State::CURRENT_VERSION,
+        sessions: (0..33)
+            .map(|index| SessionRecord {
+                id: format!("tether-0197f19800007000800000000000{index:04x}")
+                    .parse()
+                    .unwrap(),
+                host: "host".into(),
+                target: "example.test".into(),
+                directory: "/work".into(),
+                preset: None,
+                command: Some("x".into()),
+                tmux_session_id: None,
+                ownership_proof: None,
+                status: SessionStatus::Running,
+                created_at: now,
+                last_used_at: now,
+                closed_at: None,
+                exit_status: None,
+            })
+            .collect(),
+        orchestration_groups: Vec::new(),
+    };
+    let current = serde_json::to_string_pretty(&state).unwrap().len() + 1;
+    let mut remaining = StateStore::MAX_INPUT_BYTES - current;
+    for session in &mut state.sessions {
+        let command = session.command.as_mut().unwrap();
+        let added = remaining.min(State::MAX_COMMAND_BYTES - command.len());
+        command.push_str(&"x".repeat(added));
+        remaining -= added;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        serde_json::to_string_pretty(&state).unwrap().len() + 1,
+        StateStore::MAX_INPUT_BYTES
+    );
+    state
 }
 
 #[test]
@@ -378,6 +449,178 @@ fn invalid_config_is_rejected_before_persistence() {
 }
 
 #[test]
+fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
+    let boundary = "x".repeat(Config::MAX_STRING_BYTES);
+    let mut cases: Vec<(&str, Config, Config)> = Vec::new();
+
+    let host_count = Config {
+        hosts: (0..Config::MAX_HOSTS)
+            .map(|index| HostConfig {
+                name: format!("host-{index}"),
+                target: "example.test".into(),
+                roots: Vec::new(),
+                presets: Vec::new(),
+            })
+            .collect(),
+        ..Config::default()
+    };
+    let mut host_count_over = host_count.clone();
+    host_count_over.hosts.push(HostConfig {
+        name: "host-over-limit".into(),
+        target: "example.test".into(),
+        roots: Vec::new(),
+        presets: Vec::new(),
+    });
+    cases.push(("config hosts", host_count, host_count_over));
+
+    let mut roots = sample_config();
+    roots.hosts[0].roots = vec!["/root".into(); HostConfig::MAX_ROOTS];
+    let mut roots_over = roots.clone();
+    roots_over.hosts[0].roots.push("/over".into());
+    cases.push(("host roots", roots, roots_over));
+
+    let mut presets = sample_config();
+    presets.hosts[0].presets = (0..HostConfig::MAX_PRESETS)
+        .map(|index| CommandPreset {
+            name: format!("preset-{index}"),
+            command: "true".into(),
+        })
+        .collect();
+    let mut presets_over = presets.clone();
+    presets_over.hosts[0].presets.push(CommandPreset {
+        name: "over".into(),
+        command: "true".into(),
+    });
+    cases.push(("host presets", presets, presets_over));
+
+    let mut local_roots = sample_config();
+    local_roots.discovery.local_roots = vec!["/root".into(); DiscoveryDefaults::MAX_LOCAL_ROOTS];
+    let mut local_roots_over = local_roots.clone();
+    local_roots_over.discovery.local_roots.push("/over".into());
+    cases.push(("discovery local roots", local_roots, local_roots_over));
+
+    for field in ["name", "target", "root", "preset name"] {
+        let mut valid = sample_config();
+        match field {
+            "name" => valid.hosts[0].name = boundary.clone(),
+            "target" => valid.hosts[0].target = boundary.clone(),
+            "root" => valid.hosts[0].roots[0] = boundary.clone(),
+            "preset name" => valid.hosts[0].presets[0].name = boundary.clone(),
+            _ => unreachable!(),
+        }
+        let mut invalid = valid.clone();
+        match field {
+            "name" => invalid.hosts[0].name.push('x'),
+            "target" => invalid.hosts[0].target.push('x'),
+            "root" => invalid.hosts[0].roots[0].push('x'),
+            "preset name" => invalid.hosts[0].presets[0].name.push('x'),
+            _ => unreachable!(),
+        }
+        cases.push((field, valid, invalid));
+    }
+
+    let mut local_root = sample_config();
+    local_root.discovery.local_roots = vec![boundary.clone()];
+    let mut local_root_over = local_root.clone();
+    local_root_over.discovery.local_roots[0].push('x');
+    cases.push(("discovery local root", local_root, local_root_over));
+
+    let command_boundary = "x".repeat(CommandPreset::MAX_COMMAND_BYTES);
+    let mut command = sample_config();
+    command.hosts[0].presets[0].command = command_boundary;
+    let mut command_over = command.clone();
+    command_over.hosts[0].presets[0].command.push('x');
+    cases.push(("preset command", command, command_over));
+
+    for (category, valid, invalid) in cases {
+        valid
+            .validate()
+            .unwrap_or_else(|error| panic!("{category} boundary rejected: {error}"));
+        let error = invalid.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(category),
+            "unexpected {category} error: {error}"
+        );
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = ConfigStore::new(path.clone());
+        store.save(&sample_config()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let save_error = store.save(&invalid).unwrap_err().to_string();
+        assert!(
+            save_error.contains(category),
+            "unexpected persisted {category} error: {save_error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn config_serialized_ceiling_round_trips_current_and_migrated_bytes() {
+    let config = config_at_serialized_limit();
+    for migrated in [false, true] {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = ConfigStore::new(path.clone());
+        if migrated {
+            let mut legacy = toml::Value::try_from(&config).unwrap();
+            let table = legacy.as_table_mut().unwrap();
+            table.insert("version".into(), 1.into());
+            table.remove("discovery");
+            table.remove("retention");
+            let source = toml::to_string(&legacy).unwrap();
+            assert!(source.len() <= ConfigStore::MAX_INPUT_BYTES);
+            fs::write(&path, source).unwrap();
+            assert_eq!(store.load().unwrap(), config);
+        } else {
+            store.save(&config).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), ConfigStore::MAX_INPUT_BYTES);
+        assert_eq!(store.load().unwrap(), config);
+        store.save(&config).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn config_serialized_n_plus_one_is_rejected_without_changing_file() {
+    let mut config = config_at_serialized_limit();
+    config.hosts[0]
+        .presets
+        .last_mut()
+        .unwrap()
+        .command
+        .push('x');
+    config.validate().unwrap();
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let before = b"existing config bytes";
+    fs::write(&path, before).unwrap();
+
+    let error = ConfigStore::new(path.clone())
+        .save(&config)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("serialized config"), "{error}");
+    assert!(error.contains("at most"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn oversized_config_input_is_rejected_before_toml_parsing() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, vec![b'x'; ConfigStore::MAX_INPUT_BYTES + 1]).unwrap();
+
+    let error = ConfigStore::new(path).load().unwrap_err().to_string();
+    assert!(error.contains("config input"));
+    assert!(error.contains("at most"));
+}
+
+#[test]
 fn state_round_trips_and_migrates_v0() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
@@ -686,6 +929,221 @@ fn state_v4_orchestration_validation_fails_closed() {
             .to_string()
             .contains("capability")
     );
+}
+
+#[test]
+fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let session = || SessionRecord {
+        id: SessionId::new(),
+        host: "host".into(),
+        target: "example.test".into(),
+        directory: "/work".into(),
+        preset: Some("shell".into()),
+        command: Some("true".into()),
+        tmux_session_id: None,
+        ownership_proof: None,
+        status: SessionStatus::Running,
+        created_at: now,
+        last_used_at: now,
+        closed_at: None,
+        exit_status: None,
+    };
+    let boundary = "x".repeat(State::MAX_STRING_BYTES);
+    let mut cases: Vec<(&str, State, State)> = Vec::new();
+
+    let session_count = State {
+        version: State::CURRENT_VERSION,
+        sessions: (0..State::MAX_SESSIONS).map(|_| session()).collect(),
+        orchestration_groups: Vec::new(),
+    };
+    let mut session_count_over = session_count.clone();
+    session_count_over.sessions.push(session());
+    cases.push(("state sessions", session_count, session_count_over));
+
+    for field in [
+        "session host",
+        "session target",
+        "session directory",
+        "session preset",
+    ] {
+        let mut valid = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![session()],
+            orchestration_groups: Vec::new(),
+        };
+        match field {
+            "session host" => valid.sessions[0].host = boundary.clone(),
+            "session target" => valid.sessions[0].target = boundary.clone(),
+            "session directory" => valid.sessions[0].directory = boundary.clone(),
+            "session preset" => valid.sessions[0].preset = Some(boundary.clone()),
+            _ => unreachable!(),
+        }
+        let mut invalid = valid.clone();
+        match field {
+            "session host" => invalid.sessions[0].host.push('x'),
+            "session target" => invalid.sessions[0].target.push('x'),
+            "session directory" => invalid.sessions[0].directory.push('x'),
+            "session preset" => invalid.sessions[0].preset.as_mut().unwrap().push('x'),
+            _ => unreachable!(),
+        }
+        cases.push((field, valid, invalid));
+    }
+
+    let mut command = State {
+        version: State::CURRENT_VERSION,
+        sessions: vec![session()],
+        orchestration_groups: Vec::new(),
+    };
+    command.sessions[0].command = Some("x".repeat(State::MAX_COMMAND_BYTES));
+    let mut command_over = command.clone();
+    command_over.sessions[0].command.as_mut().unwrap().push('x');
+    cases.push(("session command", command, command_over));
+
+    for (category, valid, invalid) in cases {
+        valid
+            .validate()
+            .unwrap_or_else(|error| panic!("{category} boundary rejected: {error}"));
+        let error = invalid.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(category),
+            "unexpected {category} error: {error}"
+        );
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        store.save(&State::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let save_error = store.save(&invalid).unwrap_err().to_string();
+        assert!(
+            save_error.contains(category),
+            "unexpected persisted {category} error: {save_error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn orchestration_collection_boundaries_succeed_and_n_plus_one_preserves_file() {
+    let member = || OrchestrationMember {
+        session_id: SessionId::new(),
+        membership_id: Default::default(),
+        title: None,
+        capabilities: OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: false,
+        },
+    };
+    let group = |index: usize| OrchestrationGroup {
+        id: format!("group-{index}").parse().unwrap(),
+        title: "Group".parse().unwrap(),
+        orchestrator_session_id: SessionId::new(),
+        workers: Vec::new(),
+    };
+
+    let exact_groups = State {
+        version: State::CURRENT_VERSION,
+        sessions: Vec::new(),
+        orchestration_groups: (0..State::MAX_ORCHESTRATION_GROUPS).map(group).collect(),
+    };
+    exact_groups.validate().unwrap();
+    let mut over_groups = exact_groups.clone();
+    over_groups
+        .orchestration_groups
+        .push(group(State::MAX_ORCHESTRATION_GROUPS));
+
+    let mut exact_members = State {
+        version: State::CURRENT_VERSION,
+        sessions: Vec::new(),
+        orchestration_groups: vec![group(0)],
+    };
+    exact_members.orchestration_groups[0].workers = (0..OrchestrationGroup::MAX_WORKERS)
+        .map(|_| member())
+        .collect();
+    exact_members.validate().unwrap();
+    let mut over_members = exact_members.clone();
+    over_members.orchestration_groups[0].workers.push(member());
+
+    for (category, invalid) in [
+        ("state orchestration groups", over_groups),
+        ("orchestration group workers", over_members),
+    ] {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        store.save(&State::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = store.save(&invalid).unwrap_err().to_string();
+        assert!(
+            error.contains(category),
+            "unexpected {category} error: {error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn state_serialized_ceiling_round_trips_current_and_migrated_bytes() {
+    let state = state_at_serialized_limit();
+    for migrated in [false, true] {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        if migrated {
+            let mut legacy = serde_json::to_value(&state).unwrap();
+            legacy["version"] = 3.into();
+            let source = serde_json::to_vec(&legacy).unwrap();
+            assert!(source.len() <= StateStore::MAX_INPUT_BYTES);
+            fs::write(&path, source).unwrap();
+            assert_eq!(store.load().unwrap(), state);
+        } else {
+            store.save(&state).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), StateStore::MAX_INPUT_BYTES);
+        assert_eq!(store.load().unwrap(), state);
+        store.save(&state).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn state_serialized_n_plus_one_is_rejected_without_changing_file() {
+    let mut state = state_at_serialized_limit();
+    state
+        .sessions
+        .last_mut()
+        .unwrap()
+        .command
+        .as_mut()
+        .unwrap()
+        .push('x');
+    state.validate().unwrap();
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let before = b"existing state bytes";
+    fs::write(&path, before).unwrap();
+
+    let error = StateStore::new(path.clone())
+        .save(&state)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("serialized state"), "{error}");
+    assert!(error.contains("at most"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn oversized_state_input_is_rejected_before_json_parsing() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    fs::write(&path, vec![b'x'; StateStore::MAX_INPUT_BYTES + 1]).unwrap();
+
+    let error = StateStore::new(path).load().unwrap_err().to_string();
+    assert!(error.contains("state input"));
+    assert!(error.contains("at most"));
 }
 
 #[test]

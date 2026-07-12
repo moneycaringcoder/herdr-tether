@@ -248,6 +248,10 @@ The snapshot reports bounded host, repository, owned-workload, and safe external
 - **Only Tether-owned workloads can be stopped or removed.** Discovered external `tmux` sessions are attach-only.
 - **Unknown is not dead.** When a host or backend cannot be inspected, Tether does not infer that destructive action is safe.
 - **Closing a view is non-destructive.** Stop is separate, explicit, and confirmed.
+- **Persisted and status inputs are bounded.** Over-budget state, configuration, and status requests fail with actionable category-level errors instead of being truncated or expanding follow-on work.
+- **Discovery has one request-wide budget.** It stops at its global result, deadline, or cancellation boundary and reports the completion reason deterministically.
+- **Lifecycle recovery is idempotent.** Metadata removal also reconciles Observer groups atomically; if exact Stop succeeds but final persistence fails, retry finalizes the existing stopping transition without another kill.
+- **Atomic writes retain existing modes.** Replacing an existing regular configuration or state file preserves its permission bits; newly created private files use mode `0600`.
 - **Commands and presets are trusted code.** They run through the selected machine's shell; Tether is not a sandbox.
 - **SSH policy remains yours.** Tether uses `BatchMode=yes` and never weakens host-key verification.
 - **Remote support is SSH + tmux.** Tether does not provide remote Herdr federation or pane streaming.

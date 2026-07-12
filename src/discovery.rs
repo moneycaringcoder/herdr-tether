@@ -4,8 +4,8 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -19,6 +19,10 @@ use crate::{
 const MAX_DISCOVERY_WORKERS: usize = 16;
 const MAX_DISCOVERY_ENTRIES: usize = 100_000;
 const MAX_DISCOVERY_RESULTS: usize = 4_096;
+const MAX_DISCOVERY_LOCATIONS: usize = 256;
+const MAX_DISCOVERY_ROOTS: usize = 256;
+const MAX_DISCOVERY_MESSAGES: usize =
+    MAX_DISCOVERY_RESULTS + MAX_DISCOVERY_ROOTS + MAX_DISCOVERY_LOCATIONS + 1;
 
 const REMOTE_SCAN_SCRIPT: &str = r#"max_depth=$1
 result_limit=$2
@@ -106,6 +110,20 @@ pub enum DiscoveryCompletion {
     Error,
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryRunCompletion {
+    Complete = 1,
+    ResultsLimit = 2,
+    EntriesLimit = 3,
+    TimedOut = 4,
+    Unavailable = 5,
+    OutputLimit = 6,
+    Malformed = 7,
+    Error = 8,
+    Cancelled = 9,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveryMessage {
     Repository {
@@ -161,51 +179,129 @@ pub struct DiscoveryLimits {
     pub workers: usize,
 }
 
-#[derive(Clone, Debug)]
+type DiscoveryClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+#[derive(Clone)]
 pub struct DiscoveryService {
     binaries: ProcessBinaries,
     limits: DiscoveryLimits,
+    clock: DiscoveryClock,
+}
+
+impl std::fmt::Debug for DiscoveryService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryService")
+            .field("binaries", &self.binaries)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiscoveryService {
-    pub fn new(binaries: ProcessBinaries, mut limits: DiscoveryLimits) -> Self {
+    pub fn new(binaries: ProcessBinaries, limits: DiscoveryLimits) -> Self {
+        Self::new_with_clock(binaries, limits, Instant::now)
+    }
+
+    pub fn new_with_clock<F>(
+        binaries: ProcessBinaries,
+        mut limits: DiscoveryLimits,
+        clock: F,
+    ) -> Self
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
         limits.workers = limits.workers.clamp(1, MAX_DISCOVERY_WORKERS);
         limits.max_entries = limits.max_entries.clamp(1, MAX_DISCOVERY_ENTRIES);
         limits.max_results = limits.max_results.clamp(1, MAX_DISCOVERY_RESULTS);
-        Self { binaries, limits }
+        Self {
+            binaries,
+            limits,
+            clock: Arc::new(clock),
+        }
     }
 
     pub fn start(&self, request: DiscoveryRequest) -> DiscoveryRun {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_DISCOVERY_MESSAGES);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let jobs = Arc::new(Mutex::new(VecDeque::from(request.locations)));
-        let worker_count = self
-            .limits
-            .workers
-            .min(jobs.lock().expect("discovery jobs lock").len().max(1));
+        let completion = Arc::new(AtomicUsize::new(0));
+        let generation = request.generation;
+        let root_count = request
+            .locations
+            .iter()
+            .try_fold(0usize, |count, location| {
+                count.checked_add(location.roots.len())
+            });
+        if request.locations.len() > MAX_DISCOVERY_LOCATIONS
+            || root_count.is_none_or(|count| count > MAX_DISCOVERY_ROOTS)
+        {
+            completion.store(DiscoveryRunCompletion::Error as usize, Ordering::Release);
+            let _ = sender.send(DiscoveryMessage::Finished { generation });
+            return DiscoveryRun {
+                receiver,
+                cancelled,
+                completion,
+            };
+        }
+
+        let location_count = request.locations.len();
+        let worker_count = self.limits.workers.min(location_count.max(1));
+        let mut outcome_receivers = Vec::with_capacity(location_count);
+        let mut queued_jobs = VecDeque::with_capacity(location_count);
+        for location in request.locations {
+            // A single pending message per location gives ordered publication
+            // backpressure without allowing a slow early location to make later
+            // locations accumulate whole scan outcomes.
+            let (outcomes, receiver) = mpsc::sync_channel(1);
+            queued_jobs.push_back(DiscoveryJob { location, outcomes });
+            outcome_receivers.push(receiver);
+        }
+        let jobs = Arc::new(Mutex::new(JobQueue {
+            jobs: queued_jobs,
+            reservations: EntryReservations::new(self.limits.max_entries),
+        }));
+        let started = (self.clock)();
+        let deadline = started.checked_add(self.limits.timeout).unwrap_or(started);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let jobs = Arc::clone(&jobs);
-            let sender = sender.clone();
-            let cancelled = Arc::clone(&cancelled);
-            let binaries = self.binaries.clone();
-            let limits = self.limits;
-            let generation = request.generation;
-            handles.push(thread::spawn(move || {
-                worker_loop(generation, jobs, &sender, &cancelled, &binaries, limits);
-            }));
+            let context = WorkerContext {
+                generation,
+                cancelled: Arc::clone(&cancelled),
+                binaries: self.binaries.clone(),
+                limits: self.limits,
+                deadline,
+                clock: Arc::clone(&self.clock),
+            };
+            handles.push(thread::spawn(move || worker_loop(jobs, &context)));
         }
+        let supervisor_cancelled = Arc::clone(&cancelled);
+        let supervisor_completion = Arc::clone(&completion);
+        let max_results = self.limits.max_results;
         thread::spawn(move || {
+            let outcome = publish_outcomes(
+                generation,
+                outcome_receivers,
+                &sender,
+                &supervisor_cancelled,
+                max_results,
+            );
+            let _ = supervisor_completion.compare_exchange(
+                0,
+                outcome as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            supervisor_cancelled.store(true, Ordering::Release);
             for handle in handles {
                 let _ = handle.join();
             }
-            let _ = sender.send(DiscoveryMessage::Finished {
-                generation: request.generation,
-            });
+            let _ = sender.send(DiscoveryMessage::Finished { generation });
         });
         DiscoveryRun {
             receiver,
             cancelled,
+            completion,
         }
     }
 }
@@ -213,11 +309,34 @@ impl DiscoveryService {
 pub struct DiscoveryRun {
     pub receiver: Receiver<DiscoveryMessage>,
     cancelled: Arc<AtomicBool>,
+    completion: Arc<AtomicUsize>,
 }
 
 impl DiscoveryRun {
     pub fn cancel(&self) {
+        let _ = self.completion.compare_exchange(
+            0,
+            DiscoveryRunCompletion::Cancelled as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn completion(&self) -> Option<DiscoveryRunCompletion> {
+        match self.completion.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(DiscoveryRunCompletion::Complete),
+            2 => Some(DiscoveryRunCompletion::ResultsLimit),
+            3 => Some(DiscoveryRunCompletion::EntriesLimit),
+            4 => Some(DiscoveryRunCompletion::TimedOut),
+            5 => Some(DiscoveryRunCompletion::Unavailable),
+            6 => Some(DiscoveryRunCompletion::OutputLimit),
+            7 => Some(DiscoveryRunCompletion::Malformed),
+            8 => Some(DiscoveryRunCompletion::Error),
+            9 => Some(DiscoveryRunCompletion::Cancelled),
+            _ => unreachable!("invalid discovery completion"),
+        }
     }
 }
 
@@ -227,58 +346,234 @@ impl Drop for DiscoveryRun {
     }
 }
 
-fn worker_loop(
+struct WorkerContext {
     generation: u64,
-    jobs: Arc<Mutex<VecDeque<DiscoveryLocation>>>,
-    sender: &Sender<DiscoveryMessage>,
-    cancelled: &AtomicBool,
-    binaries: &ProcessBinaries,
+    cancelled: Arc<AtomicBool>,
+    binaries: ProcessBinaries,
     limits: DiscoveryLimits,
-) {
-    loop {
-        if cancelled.load(Ordering::Acquire) {
-            return;
+    deadline: Instant,
+    clock: DiscoveryClock,
+}
+
+struct DiscoveryJob {
+    location: DiscoveryLocation,
+    outcomes: SyncSender<DiscoveryMessage>,
+}
+
+// Entry allowances are assigned while jobs are dequeued, so worker timing
+// cannot change which request index owns each allowance. Earlier locations
+// receive any indivisible remainder. An unused allowance is intentionally not
+// returned: bounded under-utilization is preferable to timing-dependent theft
+// by a later, faster scan.
+struct JobQueue {
+    jobs: VecDeque<DiscoveryJob>,
+    reservations: EntryReservations,
+}
+
+impl JobQueue {
+    fn pop(&mut self) -> Option<(DiscoveryJob, usize)> {
+        let remaining_jobs = self.jobs.len();
+        let job = self.jobs.pop_front()?;
+        Some((job, self.reservations.reserve(remaining_jobs)))
+    }
+}
+
+struct EntryReservations {
+    remaining: usize,
+}
+
+impl EntryReservations {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            remaining: max_entries,
         }
-        let Some(location) = jobs.lock().expect("discovery jobs lock").pop_front() else {
-            return;
-        };
-        match &location.target {
-            Some(target) => scan_remote(
-                generation, &location, target, sender, cancelled, binaries, limits,
-            ),
-            None => scan_local(generation, &location, sender, cancelled, limits),
+    }
+
+    fn reserve(&mut self, remaining_jobs: usize) -> usize {
+        let allowance = self.remaining.div_ceil(remaining_jobs);
+        self.remaining -= allowance;
+        allowance
+    }
+}
+
+struct ScanContext<'a> {
+    generation: u64,
+    sender: &'a SyncSender<DiscoveryMessage>,
+    cancelled: &'a AtomicBool,
+    entries: &'a AtomicUsize,
+    entry_limit: usize,
+    limits: DiscoveryLimits,
+    deadline: Instant,
+    clock: &'a DiscoveryClock,
+}
+fn send_scan(context: &ScanContext<'_>, mut message: DiscoveryMessage) -> bool {
+    loop {
+        if context.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        match context.sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                message = returned;
+                thread::yield_now();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
         }
     }
 }
 
-struct LocalScan<'a> {
+fn worker_loop(jobs: Arc<Mutex<JobQueue>>, context: &WorkerContext) {
+    loop {
+        if context.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some((DiscoveryJob { location, outcomes }, entry_limit)) =
+            jobs.lock().expect("discovery jobs lock").pop()
+        else {
+            return;
+        };
+        let entries = AtomicUsize::new(0);
+        let scan_context = ScanContext {
+            generation: context.generation,
+            sender: &outcomes,
+            cancelled: &context.cancelled,
+            entries: &entries,
+            entry_limit,
+            limits: context.limits,
+            deadline: context.deadline,
+            clock: &context.clock,
+        };
+        if entry_limit == 0 {
+            let _ = send_scan(
+                &scan_context,
+                DiscoveryMessage::HostFinished {
+                    generation: context.generation,
+                    host: location.host,
+                    completion: DiscoveryCompletion::EntriesLimit,
+                },
+            );
+        } else {
+            match &location.target {
+                Some(target) => {
+                    scan_remote(&location, target, &context.binaries, &scan_context);
+                }
+                None => scan_local(&location, &scan_context),
+            }
+        }
+    }
+}
+
+fn publish_outcomes(
     generation: u64,
+    outcomes: Vec<Receiver<DiscoveryMessage>>,
+    sender: &SyncSender<DiscoveryMessage>,
+    cancelled: &AtomicBool,
+    max_results: usize,
+) -> DiscoveryRunCompletion {
+    let mut overall = DiscoveryRunCompletion::Complete;
+    let published_results = AtomicUsize::new(0);
+    for outcome in outcomes {
+        let mut exceeded_results = false;
+        for message in outcome {
+            if cancelled.load(Ordering::Acquire) {
+                return DiscoveryRunCompletion::Cancelled;
+            }
+            match message {
+                DiscoveryMessage::Repository { .. }
+                    if published_results
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |results| {
+                            (results < max_results).then_some(results + 1)
+                        })
+                        .is_err() =>
+                {
+                    exceeded_results = true;
+                }
+                DiscoveryMessage::Repository { .. } => {
+                    if sender.send(message).is_err() {
+                        return overall;
+                    }
+                }
+                DiscoveryMessage::HostFinished {
+                    host, completion, ..
+                } => {
+                    let completion = if exceeded_results {
+                        DiscoveryCompletion::ResultsLimit
+                    } else {
+                        completion
+                    };
+                    overall = more_significant_completion(overall, completion);
+                    if sender
+                        .send(DiscoveryMessage::HostFinished {
+                            generation,
+                            host,
+                            completion,
+                        })
+                        .is_err()
+                    {
+                        return overall;
+                    }
+                }
+                _ => {
+                    if sender.send(message).is_err() {
+                        return overall;
+                    }
+                }
+            }
+        }
+        if exceeded_results {
+            return DiscoveryRunCompletion::ResultsLimit;
+        }
+    }
+    overall
+}
+
+fn more_significant_completion(
+    current: DiscoveryRunCompletion,
+    completion: DiscoveryCompletion,
+) -> DiscoveryRunCompletion {
+    let candidate = match completion {
+        DiscoveryCompletion::Complete => DiscoveryRunCompletion::Complete,
+        DiscoveryCompletion::ResultsLimit => DiscoveryRunCompletion::ResultsLimit,
+        DiscoveryCompletion::EntriesLimit => DiscoveryRunCompletion::EntriesLimit,
+        DiscoveryCompletion::TimedOut => DiscoveryRunCompletion::TimedOut,
+        DiscoveryCompletion::Unavailable => DiscoveryRunCompletion::Unavailable,
+        DiscoveryCompletion::OutputLimit => DiscoveryRunCompletion::OutputLimit,
+        DiscoveryCompletion::Malformed => DiscoveryRunCompletion::Malformed,
+        DiscoveryCompletion::Error => DiscoveryRunCompletion::Error,
+    };
+    if completion_priority(candidate) > completion_priority(current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+fn completion_priority(completion: DiscoveryRunCompletion) -> usize {
+    match completion {
+        DiscoveryRunCompletion::Complete => 0,
+        DiscoveryRunCompletion::Unavailable => 1,
+        DiscoveryRunCompletion::Malformed => 2,
+        DiscoveryRunCompletion::Error => 3,
+        DiscoveryRunCompletion::OutputLimit => 4,
+        DiscoveryRunCompletion::EntriesLimit => 5,
+        DiscoveryRunCompletion::ResultsLimit => 6,
+        DiscoveryRunCompletion::TimedOut => 7,
+        DiscoveryRunCompletion::Cancelled => 8,
+    }
+}
+
+struct LocalScan<'a> {
+    context: &'a ScanContext<'a>,
     host: &'a str,
-    sender: &'a Sender<DiscoveryMessage>,
-    cancelled: &'a AtomicBool,
-    limits: DiscoveryLimits,
-    started: Instant,
-    entries: usize,
     results: usize,
     seen: HashSet<PathBuf>,
     completion: DiscoveryCompletion,
 }
 
-fn scan_local(
-    generation: u64,
-    location: &DiscoveryLocation,
-    sender: &Sender<DiscoveryMessage>,
-    cancelled: &AtomicBool,
-    limits: DiscoveryLimits,
-) {
+fn scan_local(location: &DiscoveryLocation, context: &ScanContext<'_>) {
     let mut scan = LocalScan {
-        generation,
+        context,
         host: &location.host,
-        sender,
-        cancelled,
-        limits,
-        started: Instant::now(),
-        entries: 0,
         results: 0,
         seen: HashSet::new(),
         completion: DiscoveryCompletion::Complete,
@@ -295,37 +590,43 @@ fn scan_local(
         } else {
             scan.visit(&path, &path, Path::new(root), 0)
         };
-        if result.is_err() && !scan.cancelled.load(Ordering::Acquire) {
+        if result.is_err() && !scan.context.cancelled.load(Ordering::Acquire) {
             scan.completion = DiscoveryCompletion::Error;
-            let _ = scan.sender.send(DiscoveryMessage::RootError {
-                generation,
-                host: location.host.clone(),
-                root: root.clone(),
-            });
+            let _ = send_scan(
+                scan.context,
+                DiscoveryMessage::RootError {
+                    generation: scan.context.generation,
+                    host: location.host.clone(),
+                    root: root.clone(),
+                },
+            );
         }
     }
-    if !cancelled.load(Ordering::Acquire) {
-        let _ = sender.send(DiscoveryMessage::HostFinished {
-            generation,
-            host: location.host.clone(),
-            completion: scan.completion,
-        });
+    if !context.cancelled.load(Ordering::Acquire) {
+        let _ = send_scan(
+            context,
+            DiscoveryMessage::HostFinished {
+                generation: context.generation,
+                host: location.host.clone(),
+                completion: scan.completion,
+            },
+        );
     }
 }
 
 impl LocalScan<'_> {
     fn stopped(&mut self) -> bool {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.context.cancelled.load(Ordering::Acquire) {
             return true;
         }
         if self.completion == DiscoveryCompletion::ResultsLimit {
             return true;
         }
-        if self.started.elapsed() >= self.limits.timeout {
+        if (self.context.clock)() >= self.context.deadline {
             self.completion = DiscoveryCompletion::TimedOut;
             return true;
         }
-        if self.entries >= self.limits.max_entries {
+        if self.context.entries.load(Ordering::Acquire) >= self.context.entry_limit {
             self.completion = DiscoveryCompletion::EntriesLimit;
             return true;
         }
@@ -342,14 +643,24 @@ impl LocalScan<'_> {
         if self.stopped() {
             return Ok(());
         }
-        self.entries += 1;
+        if self
+            .context
+            .entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
+                (entries < self.context.entry_limit).then_some(entries + 1)
+            })
+            .is_err()
+        {
+            self.completion = DiscoveryCompletion::EntriesLimit;
+            return Ok(());
+        }
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Ok(());
         }
         if is_repository(path)? {
             if self.seen.insert(path.to_path_buf()) {
-                if self.results >= self.limits.max_results {
+                if self.results >= self.context.limits.max_results {
                     self.completion = DiscoveryCompletion::ResultsLimit;
                     return Ok(());
                 }
@@ -371,18 +682,24 @@ impl LocalScan<'_> {
                     )
                 })?;
                 self.results += 1;
-                let _ = self.sender.send(DiscoveryMessage::Repository {
-                    generation: self.generation,
-                    host: self.host.to_owned(),
-                    path: path.to_owned(),
-                });
+                let _ = send_scan(
+                    self.context,
+                    DiscoveryMessage::Repository {
+                        generation: self.context.generation,
+                        host: self.host.to_owned(),
+                        path: path.to_owned(),
+                    },
+                );
             }
             return Ok(());
         }
-        if depth >= self.limits.max_depth {
+        if depth >= self.context.limits.max_depth {
             return Ok(());
         }
-        let remaining_entries = self.limits.max_entries.saturating_sub(self.entries);
+        let remaining_entries = self
+            .context
+            .entry_limit
+            .saturating_sub(self.context.entries.load(Ordering::Acquire));
         let mut children = BinaryHeap::new();
         for entry in fs::read_dir(path)? {
             if self.stopped() {
@@ -452,19 +769,35 @@ fn is_repository(path: &Path) -> std::io::Result<bool> {
 }
 
 fn scan_remote(
-    generation: u64,
     location: &DiscoveryLocation,
     target: &str,
-    sender: &Sender<DiscoveryMessage>,
-    cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
-    limits: DiscoveryLimits,
+    context: &ScanContext<'_>,
 ) {
-    let result = remote_spec(target, &location.roots, binaries, limits)
-        .map_or(BoundedOutput::Error, |spec| {
-            run_bounded(&spec, limits.timeout, cancelled)
-        });
-    if cancelled.load(Ordering::Acquire) || matches!(result, BoundedOutput::Cancelled) {
+    let now = (context.clock)();
+    if now >= context.deadline {
+        let _ = send_scan(
+            context,
+            DiscoveryMessage::HostFinished {
+                generation: context.generation,
+                host: location.host.clone(),
+                completion: DiscoveryCompletion::TimedOut,
+            },
+        );
+        return;
+    }
+    let remaining = context.deadline.saturating_duration_since(now);
+    let result = remote_spec(
+        target,
+        &location.roots,
+        binaries,
+        context.limits,
+        context.entry_limit,
+    )
+    .map_or(BoundedOutput::Error, |spec| {
+        run_bounded(&spec, remaining, context.cancelled)
+    });
+    if context.cancelled.load(Ordering::Acquire) || matches!(result, BoundedOutput::Cancelled) {
         return;
     }
     let (repositories, completion) = match result {
@@ -473,7 +806,7 @@ fn scan_remote(
             stdout,
             stdout_truncated: false,
             ..
-        } if status.success() => parse_remote(&stdout, &location.roots, limits.max_results),
+        } if status.success() => parse_remote(&stdout, &location.roots, context.limits.max_results),
         BoundedOutput::Completed {
             stdout_truncated: true,
             ..
@@ -488,25 +821,28 @@ fn scan_remote(
         BoundedOutput::Cancelled => return,
     };
     for path in repositories {
-        if cancelled.load(Ordering::Acquire) {
+        if context.cancelled.load(Ordering::Acquire) {
             return;
         }
-        if sender
-            .send(DiscoveryMessage::Repository {
-                generation,
+        if !send_scan(
+            context,
+            DiscoveryMessage::Repository {
+                generation: context.generation,
                 host: location.host.clone(),
                 path,
-            })
-            .is_err()
-        {
+            },
+        ) {
             return;
         }
     }
-    let _ = sender.send(DiscoveryMessage::HostFinished {
-        generation,
-        host: location.host.clone(),
-        completion,
-    });
+    let _ = send_scan(
+        context,
+        DiscoveryMessage::HostFinished {
+            generation: context.generation,
+            host: location.host.clone(),
+            completion,
+        },
+    );
 }
 
 fn remote_spec(
@@ -514,6 +850,7 @@ fn remote_spec(
     roots: &[String],
     binaries: &ProcessBinaries,
     limits: DiscoveryLimits,
+    entry_limit: usize,
 ) -> anyhow::Result<CommandSpec> {
     let target = openssh_target(target)?;
     let mut remote_args = vec![
@@ -522,7 +859,7 @@ fn remote_spec(
         "tether-discovery".to_owned(),
         limits.max_depth.to_string(),
         limits.max_results.to_string(),
-        limits.max_entries.to_string(),
+        entry_limit.to_string(),
     ];
     remote_args.extend(roots.iter().cloned());
     let remote_command = CommandSpec::new("/bin/sh", remote_args).posix_command_line()?;
@@ -678,13 +1015,17 @@ mod tests {
 
     #[test]
     fn expired_local_scan_stops_before_touching_the_filesystem() {
-        let (sender, _receiver) = mpsc::channel();
+        let (sender, _receiver) = mpsc::sync_channel(1);
         let cancelled = AtomicBool::new(false);
-        let mut scan = LocalScan {
+        let entries = AtomicUsize::new(0);
+        let now = Instant::now();
+        let clock: DiscoveryClock = Arc::new(move || now);
+        let context = ScanContext {
             generation: 1,
-            host: "local",
             sender: &sender,
             cancelled: &cancelled,
+            entries: &entries,
+            entry_limit: 100,
             limits: DiscoveryLimits {
                 max_depth: 4,
                 max_entries: 100,
@@ -692,8 +1033,12 @@ mod tests {
                 timeout: Duration::ZERO,
                 workers: 1,
             },
-            started: Instant::now(),
-            entries: 0,
+            deadline: now,
+            clock: &clock,
+        };
+        let mut scan = LocalScan {
+            context: &context,
+            host: "local",
             results: 0,
             seen: HashSet::new(),
             completion: DiscoveryCompletion::Complete,
@@ -706,7 +1051,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(scan.entries, 0);
+        assert_eq!(entries.load(Ordering::Acquire), 0);
         assert_eq!(scan.completion, DiscoveryCompletion::TimedOut);
     }
 

@@ -195,7 +195,7 @@ Open loads the exact persisted host and identity, observes it, and attaches only
 
 Stop is explicit and confirmed. Tether observes the exact owned identity without holding the state-file lock, revalidates the unchanged record under a short lock, and persists a recoverable stopping transition before invoking exact backend termination. It finalizes the record only after the workload is proven missing or the exact Stop succeeds.
 
-Timeout, transport failure, save failure, or concurrent change never masquerades as success. A persisted stopping transition can be reconciled after interruption.
+Timeout, transport failure, save failure, or concurrent change never masquerades as success. If exact termination succeeds but final persistence fails, the retained stopping transition exposes an actionable finalization retry. Reconciliation proves the backend is already absent and never sends a second kill.
 
 ### Restart
 
@@ -203,28 +203,46 @@ Restart is available only for an ended or proven-missing owned record. It retain
 
 ### Remove and retention
 
-Remove finalizes metadata only for ended or proven-missing work. Automatic retention cleanup removes only safely finalized metadata after the configured period. Cleanup does not construct a backend and cannot contact a host or stop a process.
+Remove finalizes metadata only for ended or proven-missing work. In the same locked transaction it removes matching worker memberships and removes a group whose orchestrator metadata was deleted; unrelated group order and metadata remain unchanged. Automatic retention cleanup applies the same reconciliation and removes only safely finalized metadata after the configured period. Cleanup does not construct a backend and cannot contact a host or stop a process.
 
 When a cleanup operation works from a preview, it revalidates the exact unchanged candidate set under one lock. It never expands to records that became eligible after the preview began.
 
 ## Persistence
 
-`ConfigStore` owns validated TOML. `StateStore` owns lifecycle records. Their parent directories, persistent lock files, data, and temporary files use private Unix permissions. Mutations hold a per-file advisory lock across load, validation, migration, mutation, and save.
+`ConfigStore` owns validated TOML. `StateStore` owns lifecycle records. Both
+apply finite input, cardinality, collection, and field-size budgets before
+serialization or follow-on work; boundary values are accepted and the next
+value is rejected without truncation. Their parent directories, persistent lock
+files, data, and temporary files use private Unix permissions. Mutations hold a
+per-file advisory lock across load, validation, migration, mutation, and save.
 
 The atomic writer:
 
-1. writes a unique sibling temporary file;
-2. synchronizes its contents;
-3. atomically renames it over the destination; and
-4. synchronizes the parent directory.
+1. rejects symlink and non-regular destinations;
+2. writes and synchronizes a unique sibling temporary file;
+3. preserves an existing regular destination's permission bits, or uses mode
+   `0600` for a new private file;
+4. atomically renames it over the destination; and
+5. synchronizes the parent directory.
 
-Supported older schemas migrate inside the lock. Corrupt data, unknown fields where strict schemas apply, and future versions fail closed. State is metadata, not a process registry; destructive safety comes from fresh exact backend evidence, not the presence or absence of a JSON record.
+Supported older schemas migrate inside the lock. Corrupt data, over-budget data,
+unknown fields where strict schemas apply, and future versions fail closed.
+State is metadata, not a process registry; destructive safety comes from fresh
+exact backend evidence, not the presence or absence of a JSON record.
 
 Stored data may include host targets, directories, trusted preset commands, owned identifiers, launch information, lifecycle status, exit context, and timestamps. Tether does not store SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
 
 ## Discovery and snapshots
 
-Repository discovery is bounded by configured roots, depth, entries, results, workers, and time. Local traversal does not follow symlinks. Remote traversal uses a fixed portable scanner through validated BatchMode SSH. Results are presentation data and never rewrite configured roots or lifecycle state.
+Repository discovery uses one whole-request deadline plus global entry, result,
+message, worker, and cancellation budgets across every configured location.
+Completion reports whether the request completed, reached a budget/deadline, or
+was cancelled; stable request and lexical ordering survive truncation. Local
+traversal does not follow symlinks. Remote traversal uses a fixed portable
+scanner through validated BatchMode SSH. Status requests reject over-budget
+input and deduplicate exact targets before bounded classification. Discovery and
+status results are presentation data and never rewrite configured roots or
+lifecycle state.
 
 The scriptable snapshot joins effective hosts, bounded repository discovery, complete owned metadata, live owned status, and safe external catalogs. Expected degradation is represented as typed partial data instead of a fabricated empty result. Snapshot has no lifecycle or persistence-mutation capability and excludes preset command bodies, child output, raw backend errors, and private storage paths.
 

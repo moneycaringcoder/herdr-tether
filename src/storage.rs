@@ -149,6 +149,14 @@ fn atomic_write_mode_with(
         Ok(())
     };
     precommit().map_err(AtomicWriteError::PreCommit)?;
+    #[cfg(unix)]
+    let existing_mode = destination_mode(path)
+        .with_context(|| format!("inspect atomic write destination `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
+    #[cfg(not(unix))]
+    validate_destination(path)
+        .with_context(|| format!("inspect atomic write destination `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
     let parent = usable_parent(path);
     let file_name = path
         .file_name()
@@ -193,6 +201,13 @@ fn atomic_write_mode_with(
         .write_all(contents)
         .with_context(|| format!("write temporary file for `{}`", path.display()))
         .map_err(AtomicWriteError::PreCommit)?;
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        temp_file
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("preserve permissions for `{}`", path.display()))
+            .map_err(AtomicWriteError::PreCommit)?;
+    }
     temp_file
         .sync_all()
         .with_context(|| format!("sync temporary file for `{}`", path.display()))
@@ -208,6 +223,32 @@ fn atomic_write_mode_with(
     cleanup.disarm();
 
     sync_parent(parent).map_err(AtomicWriteError::PostCommitDurability)
+}
+
+#[cfg(unix)]
+fn destination_mode(path: &Path) -> io::Result<Option<u32>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o7777)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_destination(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn usable_parent(path: &Path) -> &Path {
@@ -272,6 +313,101 @@ impl Drop for TempFileCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_regular_file_modes() {
+        for expected_mode in [0o640, 0o600] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.json");
+            fs::write(&path, b"old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(expected_mode)).unwrap();
+
+            atomic_write_preserving_parent(&path, b"new").unwrap();
+
+            assert_eq!(fs::read(&path).unwrap(), b"new");
+            assert_eq!(mode(&path), expected_mode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_file_without_changing_parent_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let path = temp.path().join("state.json");
+
+        atomic_write_preserving_parent(&path, b"new").unwrap();
+
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(temp.path()), 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_symlink_and_non_regular_destinations() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        let link = temp.path().join("state.json");
+        fs::write(&target, b"target").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = atomic_write_preserving_parent(&link, b"new").unwrap_err();
+        assert!(!error.committed());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+        assert_eq!(mode(&target), 0o640);
+
+        let directory = temp.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let error = atomic_write_preserving_parent(&directory, b"new").unwrap_err();
+        assert!(!error.committed());
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn precommit_failure_preserves_original_mode_and_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = atomic_write_mode_with(
+            &path,
+            b"new",
+            false,
+            || Err(io::Error::other("injected before rename")),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(!error.committed());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path() != path)
+                .count(),
+            0,
+            "precommit failure must clean its temporary file"
+        );
+    }
 
     #[test]
     fn injected_precommit_and_postcommit_failures_have_distinct_safe_results() {

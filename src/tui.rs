@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -37,7 +37,7 @@ use crate::{
     state::{SessionRecord, SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
-        StatusRequest, StatusRun, StatusService, WorkloadStatus,
+        StatusRequest, StatusRequestError, StatusRun, StatusService, WorkloadStatus,
     },
 };
 
@@ -1248,6 +1248,46 @@ impl PickerState {
         self.rebuild_status_labels();
     }
 
+    pub fn start_status_refresh(
+        &mut self,
+        service: &StatusService,
+        generation: u64,
+    ) -> std::result::Result<StatusRun, StatusRequestError> {
+        self.begin_refresh(generation);
+        match service.try_start(self.status_request()) {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                self.apply_status_request_error(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_status_request_error(&mut self, error: &StatusRequestError) {
+        let checked_at = SystemTime::now();
+        let detail = error.to_string();
+        for host in &self.options.hosts {
+            if let Some(cell) = self.host_status.get_mut(&host.name) {
+                cell.apply(HostReachability::Error, checked_at);
+                self.host_error_details
+                    .insert(host.name.clone(), detail.clone());
+            }
+            for workload in host
+                .workloads
+                .iter()
+                .filter(|workload| workload.status == SessionStatus::Running && !workload.legacy)
+            {
+                if let Some(cell) = self.workload_status.get_mut(&workload.id) {
+                    cell.apply(WorkloadStatus::Error, checked_at);
+                }
+            }
+            if let Some(catalog) = self.catalogs.get_mut(&host.name) {
+                catalog.apply(ExternalCatalogStatus::Error, Vec::new(), 0, 0);
+            }
+        }
+        self.rebuild_status_labels();
+    }
+
     pub fn apply_status(&mut self, message: StatusMessage) -> bool {
         if message.generation() != self.generation {
             return false;
@@ -2402,9 +2442,10 @@ fn start_status_run(
     state: &mut PickerState,
     service: &StatusService,
     generation: u64,
-) -> StatusRun {
-    state.begin_refresh(generation);
-    service.start(state.status_request())
+) -> Result<StatusRun> {
+    state
+        .start_status_refresh(service, generation)
+        .map_err(Into::into)
 }
 
 fn start_discovery_run(
@@ -2427,7 +2468,7 @@ fn run_terminal_picker(
     let mut terminal = Terminal::new(backend).context("initialize terminal picker")?;
     terminal.clear().context("clear terminal picker")?;
     let mut generation = 1_u64;
-    let mut status_run = start_status_run(state, status_service, generation);
+    let mut status_run = start_status_run(state, status_service, generation)?;
     let mut discovery_run = start_discovery_run(state, discovery_service, generation);
     let mut dirty = true;
     let (close_sender, close_receiver) = mpsc::channel::<PickerCloseResult>();
@@ -2463,7 +2504,7 @@ fn run_terminal_picker(
                 generation = generation
                     .checked_add(1)
                     .context("close refresh generation overflow")?;
-                status_run = start_status_run(state, status_service, generation);
+                status_run = start_status_run(state, status_service, generation)?;
                 discovery_run = start_discovery_run(state, discovery_service, generation);
                 dirty = true;
             }
@@ -2505,7 +2546,7 @@ fn run_terminal_picker(
                 generation = generation
                     .checked_add(1)
                     .context("status refresh generation overflow")?;
-                status_run = start_status_run(state, status_service, generation);
+                status_run = start_status_run(state, status_service, generation)?;
                 discovery_run = start_discovery_run(state, discovery_service, generation);
             }
             PickerOutcome::CloseOwnedRequested {

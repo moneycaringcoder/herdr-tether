@@ -8,8 +8,8 @@ use herdr_tether::{
     backend::ProcessBinaries,
     model::{ExternalSessionName, SessionId},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
-        StatusRequest, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS, StatusHost,
+        StatusMessage, StatusRequest, StatusRequestError, StatusService, WorkloadStatus,
     },
 };
 use tempfile::tempdir;
@@ -50,21 +50,23 @@ fn fast_host_publishes_before_slow_host_times_out() {
         2,
     );
     let started = Instant::now();
-    let run = service.start(StatusRequest {
-        generation: 7,
-        hosts: vec![
-            StatusHost {
-                name: "slow".into(),
-                target: Some("slow".into()),
-                workloads: vec![slow_id],
-            },
-            StatusHost {
-                name: "fast".into(),
-                target: Some("fast".into()),
-                workloads: vec![fast_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 7,
+            hosts: vec![
+                StatusHost {
+                    name: "slow".into(),
+                    target: Some("slow".into()),
+                    workloads: vec![slow_id],
+                },
+                StatusHost {
+                    name: "fast".into(),
+                    target: Some("fast".into()),
+                    workloads: vec![fast_id],
+                },
+            ],
+        })
+        .unwrap();
 
     let mut messages = Vec::new();
     loop {
@@ -129,14 +131,16 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
         Duration::from_secs(10),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 8,
-        hosts: vec![StatusHost {
-            name: "dev".into(),
-            target: Some("dev".into()),
-            workloads: vec![owned],
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 8,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![owned],
+            }],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -205,21 +209,23 @@ esac
         Duration::from_secs(10),
         2,
     );
-    let run = service.start(StatusRequest {
-        generation: 10,
-        hosts: vec![
-            StatusHost {
-                name: "duplicate".into(),
-                target: Some("duplicate".into()),
-                workloads: vec![duplicate_id],
-            },
-            StatusHost {
-                name: "unsafe".into(),
-                target: Some("unsafe".into()),
-                workloads: vec![unsafe_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 10,
+            hosts: vec![
+                StatusHost {
+                    name: "duplicate".into(),
+                    target: Some("duplicate".into()),
+                    workloads: vec![duplicate_id],
+                },
+                StatusHost {
+                    name: "unsafe".into(),
+                    target: Some("unsafe".into()),
+                    workloads: vec![unsafe_id],
+                },
+            ],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -282,14 +288,16 @@ fn cancelled_generation_does_not_publish_late_results() {
         Duration::from_secs(3),
         2,
     );
-    let run = service.start(StatusRequest {
-        generation: 1,
-        hosts: vec![StatusHost {
-            name: "slow".into(),
-            target: Some("slow".into()),
-            workloads: vec![workload],
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 1,
+            hosts: vec![StatusHost {
+                name: "slow".into(),
+                target: Some("slow".into()),
+                workloads: vec![workload],
+            }],
+        })
+        .unwrap();
 
     run.cancel();
     let started = Instant::now();
@@ -331,26 +339,28 @@ esac
         Duration::from_secs(10),
         3,
     );
-    let run = service.start(StatusRequest {
-        generation: 9,
-        hosts: vec![
-            StatusHost {
-                name: "offline".into(),
-                target: Some("offline".into()),
-                workloads: vec![offline_id],
-            },
-            StatusHost {
-                name: "empty".into(),
-                target: Some("empty".into()),
-                workloads: vec![empty_id],
-            },
-            StatusHost {
-                name: "malformed".into(),
-                target: Some("malformed".into()),
-                workloads: vec![malformed_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 9,
+            hosts: vec![
+                StatusHost {
+                    name: "offline".into(),
+                    target: Some("offline".into()),
+                    workloads: vec![offline_id],
+                },
+                StatusHost {
+                    name: "empty".into(),
+                    target: Some("empty".into()),
+                    workloads: vec![empty_id],
+                },
+                StatusHost {
+                    name: "malformed".into(),
+                    target: Some("malformed".into()),
+                    workloads: vec![malformed_id],
+                },
+            ],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -423,14 +433,16 @@ fn local_spawn_error_includes_actionable_tool_locations() {
         Duration::from_millis(100),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 9,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 9,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let message = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
     let StatusMessage::Host {
@@ -458,14 +470,16 @@ fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
         Duration::MAX,
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 10,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 10,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let first = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(matches!(
@@ -506,14 +520,16 @@ fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
         Duration::from_secs(1),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 11,
-        hosts: vec![StatusHost {
-            name: "private-alias".into(),
-            target: Some("private.example".into()),
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 11,
+            hosts: vec![StatusHost {
+                name: "private-alias".into(),
+                target: Some("private.example".into()),
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let StatusMessage::Host {
         status: HostReachability::Unreachable,
@@ -551,14 +567,16 @@ fn successful_probe_does_not_leave_background_descendants_running() {
         Duration::from_secs(1),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 12,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 12,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     while !matches!(
         run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -583,4 +601,129 @@ fn successful_probe_does_not_leave_background_descendants_running() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
+    let temp = tempdir().unwrap();
+    let marker = temp.path().join("probed");
+    let tmux = temp.path().join("tmux");
+    fs::write(
+        &tmux,
+        format!("#!/bin/sh\nprintf x >> '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        1,
+    );
+    let workload = id("tether-0197f198000070008000000000000001");
+    let error = service
+        .try_start(StatusRequest {
+            generation: 20,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: vec![workload; MAX_STATUS_WORKLOADS + 1],
+            }],
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        StatusRequestError::TooManyWorkloads {
+            actual: MAX_STATUS_WORKLOADS + 1,
+            maximum: MAX_STATUS_WORKLOADS,
+        }
+    );
+    assert!(!marker.exists(), "an invalid request reached the probe");
+
+    let run = service
+        .try_start(StatusRequest {
+            generation: 21,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: vec![workload; MAX_STATUS_WORKLOADS],
+            }],
+        })
+        .expect("the exact workload boundary must remain valid");
+    loop {
+        if matches!(
+            run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            StatusMessage::Finished { generation: 21 }
+        ) {
+            break;
+        }
+    }
+    assert!(
+        marker.exists(),
+        "a boundary-valid request did not reach the probe"
+    );
+}
+
+#[test]
+fn duplicate_heavy_status_request_probes_and_reports_each_exact_target_once() {
+    let temp = tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let tmux = temp.path().join("tmux");
+    let first = id("tether-0197f198000070008000000000000001");
+    let second = id("tether-0197f198000070008000000000000002");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf '{}: 1 windows (created now) (attached)\\n{}: 1 windows (created now)\\n'\n",
+            calls.display(),
+            first,
+            second,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        2,
+    );
+    let duplicate = StatusHost {
+        name: "local".into(),
+        target: None,
+        workloads: vec![second, first, second, first],
+    };
+    let run = service
+        .try_start(StatusRequest {
+            generation: 21,
+            hosts: vec![duplicate.clone(), duplicate],
+        })
+        .unwrap();
+    let mut messages = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { generation: 21 });
+        messages.push(message);
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(fs::read_to_string(calls).unwrap(), "x");
+    assert_eq!(
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                StatusMessage::Workload { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![second, first],
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(message, StatusMessage::Host { .. }))
+            .count(),
+        1,
+    );
 }

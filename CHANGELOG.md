@@ -12,6 +12,7 @@
 - Added stable bounded reference tokens only when otherwise-safe workload or Observer tile labels are ambiguous, while retaining exact internal identity for every action.
 - Added distinct Observer capture states for loading, ready-but-empty output, and unavailable output; empty groups now expose only refresh and back actions.
 - Added bounded picker and Observer-manager viewport position and overflow guidance, plus explicit resize fallbacks for panes too small to show actionable content.
+- Added finite persisted-state, configuration, discovery-request, and status-request budgets with deterministic boundary rejection, global discovery completion reasons, and exact-target status deduplication.
 
 ### Fixed
 
@@ -23,6 +24,8 @@
 - Required native Observer-manager placement to use `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` and fail closed instead of falling back to a managed overlay pane ID.
 - Kept the last authorized Observer tiles, page, selection, and warning visible across recoverable refresh failures until a successful retry, while mapping capture failures to unavailable instead of rendering error text as output.
 - Made held navigation repeat-safe while keeping refresh, open, and quit single-shot, and made capture sanitization and truncation preserve extended grapheme clusters such as flags, keycaps, combining sequences, and emoji.
+- Reconciled orchestration membership atomically when workload metadata is removed, and made post-kill finalization retryable without sending a second backend kill.
+- Preserved existing regular-file permission bits across atomic configuration and state replacement while keeping newly created private files at mode `0600`.
 
 ### Limitations
 
