@@ -146,6 +146,12 @@ pub enum ObserverKey {
     Char(char),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserverInputKind {
+    Press,
+    Repeat,
+}
+
 /// Maps a navigation key to a read-only observer action.
 ///
 /// There is intentionally no action carrying arbitrary text or terminal bytes.
@@ -169,6 +175,39 @@ pub fn action_for_key(key: ObserverKey) -> Option<ObserverAction> {
             Some(ObserverAction::Quit)
         }
         ObserverKey::Char(_) => None,
+    }
+}
+
+/// Applies event-kind and in-flight-operation gating to Observer keys.
+///
+/// Navigation is repeat-safe and remains available while an operation is busy.
+/// Open and refresh are single-shot and idle-only. Quit remains available while
+/// busy, but release and repeat events never duplicate it.
+pub fn action_for_input(
+    key: ObserverKey,
+    kind: ObserverInputKind,
+    busy: bool,
+) -> Option<ObserverAction> {
+    gate_action_for_input(action_for_key(key)?, kind, busy)
+}
+
+fn gate_action_for_input(
+    action: ObserverAction,
+    kind: ObserverInputKind,
+    busy: bool,
+) -> Option<ObserverAction> {
+    match action {
+        ObserverAction::PreviousWorker
+        | ObserverAction::NextWorker
+        | ObserverAction::PreviousPage
+        | ObserverAction::NextPage => Some(action),
+        ObserverAction::Refresh | ObserverAction::OpenSelected
+            if kind == ObserverInputKind::Press && !busy =>
+        {
+            Some(action)
+        }
+        ObserverAction::Quit if kind == ObserverInputKind::Press => Some(action),
+        ObserverAction::Refresh | ObserverAction::OpenSelected | ObserverAction::Quit => None,
     }
 }
 
@@ -211,6 +250,16 @@ impl ObserverState {
             return None;
         }
         Some(action)
+    }
+
+    /// Projects a key through both view availability and input event gating.
+    pub fn action_for_input(
+        &self,
+        key: ObserverKey,
+        kind: ObserverInputKind,
+        busy: bool,
+    ) -> Option<ObserverAction> {
+        gate_action_for_input(self.action_for_key(key)?, kind, busy)
     }
 
     /// Replaces membership while preserving selection and capture state by worker identity.
@@ -716,21 +765,29 @@ fn bounded_capture_tail(input: &str) -> String {
     let mut lines = 1usize;
     let mut bytes = 0usize;
     let mut cells = 0usize;
-    for (index, character) in input.char_indices().rev() {
-        let character_bytes = character.len_utf8();
-        if character == '\n' {
-            if lines >= MAX_CAPTURE_LINES || bytes + character_bytes > MAX_CAPTURE_BYTES {
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while index < input.len() {
+        starts.push(index);
+        index = next_display_cluster_end(input, index);
+    }
+    for &index in starts.iter().rev() {
+        let cluster_end = next_display_cluster_end(input, index);
+        let cluster = &input[index..cluster_end];
+        let cluster_bytes = cluster.len();
+        if cluster == "\n" {
+            if lines >= MAX_CAPTURE_LINES || bytes + cluster_bytes > MAX_CAPTURE_BYTES {
                 break;
             }
             lines += 1;
         } else {
-            let width = display_width(character);
-            if bytes + character_bytes > MAX_CAPTURE_BYTES || cells + width > MAX_CAPTURE_CELLS {
+            let width = display_width(cluster);
+            if bytes + cluster_bytes > MAX_CAPTURE_BYTES || cells + width > MAX_CAPTURE_CELLS {
                 break;
             }
             cells += width;
         }
-        bytes += character_bytes;
+        bytes += cluster_bytes;
         start = index;
     }
     input[start..].to_owned()
@@ -746,17 +803,20 @@ fn capture_viewport(input: &str, width: u16, height: u16) -> String {
     for line in input.split('\n') {
         let mut row = String::new();
         let mut cells = 0usize;
-        for character in line.chars() {
-            let character_width = display_width(character);
-            if cells > 0 && cells + character_width > width {
+        let mut index = 0;
+        while index < line.len() {
+            let cluster_end = next_display_cluster_end(line, index);
+            let cluster = &line[index..cluster_end];
+            let cluster_width = display_width(cluster);
+            if cells > 0 && cells + cluster_width > width {
                 push_viewport_row(&mut rows, std::mem::take(&mut row), height);
                 cells = 0;
             }
-            if character_width > width {
-                continue;
+            if cluster_width <= width {
+                row.push_str(cluster);
+                cells += cluster_width;
             }
-            row.push(character);
-            cells += character_width;
+            index = cluster_end;
         }
         push_viewport_row(&mut rows, row, height);
     }
@@ -802,14 +862,25 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
     let capture = sanitize_capture(input);
     let mut output = String::new();
     let mut cells = 0;
-    for character in capture.chars() {
-        let character = if character == '\n' { ' ' } else { character };
-        let width = display_width(character);
+    let mut index = 0;
+    while index < capture.len() {
+        let cluster_end = next_display_cluster_end(&capture, index);
+        let cluster = &capture[index..cluster_end];
+        let width = if cluster == "\n" {
+            1
+        } else {
+            display_width(cluster)
+        };
         if cells + width > max_cells {
             break;
         }
-        output.push(character);
+        if cluster == "\n" {
+            output.push(' ');
+        } else {
+            output.push_str(cluster);
+        }
         cells += width;
+        index = cluster_end;
     }
     output
 }
@@ -817,40 +888,38 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
 fn is_unsafe_format(character: char) -> bool {
     matches!(
         character,
-        '\u{0300}'..='\u{036f}'
-            | '\u{0483}'..='\u{0489}'
-            | '\u{0610}'..='\u{061a}'
-            | '\u{061c}'
-            | '\u{064b}'..='\u{065f}'
-            | '\u{200b}'..='\u{200f}'
+        '\u{061c}'
+            | '\u{200b}'..='\u{200c}'
+            | '\u{200e}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
             | '\u{feff}'
-    ) || ('\u{fe00}'..='\u{fe0f}').contains(&character)
-        || ('\u{e0100}'..='\u{e01ef}').contains(&character)
+    )
 }
 
-fn display_width(character: char) -> usize {
-    if character == '\0' || is_unsafe_format(character) || character.is_control() {
-        0
-    } else if matches!(
-        character,
-        '\u{1100}'..='\u{115f}'
-            | '\u{2329}'..='\u{232a}'
-            | '\u{2e80}'..='\u{a4cf}'
-            | '\u{ac00}'..='\u{d7a3}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{fe10}'..='\u{fe19}'
-            | '\u{fe30}'..='\u{fe6f}'
-            | '\u{ff00}'..='\u{ff60}'
-            | '\u{ffe0}'..='\u{ffe6}'
-            | '\u{1f300}'..='\u{1faff}'
-            | '\u{20000}'..='\u{3fffd}'
-    ) {
-        2
-    } else {
-        1
+fn next_display_cluster_end(input: &str, start: usize) -> usize {
+    let mut characters = input[start..].char_indices();
+    let (_, first) = characters
+        .next()
+        .expect("display cluster starts on a character");
+    let mut end = start + first.len_utf8();
+    let mut join_next = false;
+    for (offset, character) in characters {
+        let character_start = start + offset;
+        let extender = (character != '\n' && Line::from(character.to_string()).width() == 0)
+            || matches!(character, '\u{1f3fb}'..='\u{1f3ff}');
+        if join_next || extender {
+            end = character_start + character.len_utf8();
+            join_next = character == '\u{200d}';
+            continue;
+        }
+        break;
     }
+    end
+}
+
+fn display_width(cluster: &str) -> usize {
+    Line::from(cluster).width()
 }
 
 #[cfg(test)]

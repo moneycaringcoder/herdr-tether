@@ -29,8 +29,8 @@ use crate::{
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        ObserverCapabilities, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
-        ObserverWorker, action_for_key, render,
+        ObserverCapabilities, ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome,
+        ObserverState, ObserverWorker, render,
     },
     paths::AppPaths,
     state::{
@@ -403,28 +403,31 @@ impl ObserverOpenGate {
     }
 }
 
-fn observer_key_for_event(key: KeyEvent) -> Option<ObserverKey> {
-    if key.kind != KeyEventKind::Press {
-        return None;
-    }
+fn observer_key_for_event(key: KeyEvent) -> Option<(ObserverKey, ObserverInputKind)> {
+    let kind = match key.kind {
+        KeyEventKind::Press => ObserverInputKind::Press,
+        KeyEventKind::Repeat => ObserverInputKind::Repeat,
+        KeyEventKind::Release => return None,
+    };
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
-        return Some(ObserverKey::ControlC);
+        return Some((ObserverKey::ControlC, kind));
     }
-    match key.code {
-        KeyCode::Up => Some(ObserverKey::Up),
-        KeyCode::Down => Some(ObserverKey::Down),
-        KeyCode::Left => Some(ObserverKey::Left),
-        KeyCode::Right => Some(ObserverKey::Right),
-        KeyCode::PageUp => Some(ObserverKey::PageUp),
-        KeyCode::PageDown => Some(ObserverKey::PageDown),
-        KeyCode::Tab => Some(ObserverKey::Tab),
-        KeyCode::BackTab => Some(ObserverKey::BackTab),
-        KeyCode::Enter => Some(ObserverKey::Enter),
-        KeyCode::Esc => Some(ObserverKey::Escape),
-        KeyCode::Char(character) => Some(ObserverKey::Char(character)),
-        _ => None,
-    }
+    let key = match key.code {
+        KeyCode::Up => ObserverKey::Up,
+        KeyCode::Down => ObserverKey::Down,
+        KeyCode::Left => ObserverKey::Left,
+        KeyCode::Right => ObserverKey::Right,
+        KeyCode::PageUp => ObserverKey::PageUp,
+        KeyCode::PageDown => ObserverKey::PageDown,
+        KeyCode::Tab => ObserverKey::Tab,
+        KeyCode::BackTab => ObserverKey::BackTab,
+        KeyCode::Enter => ObserverKey::Enter,
+        KeyCode::Esc => ObserverKey::Escape,
+        KeyCode::Char(character) => ObserverKey::Char(character),
+        _ => return None,
+    };
+    Some((key, kind))
 }
 
 fn handle_observer_open(
@@ -509,13 +512,14 @@ pub fn run_observer(
             }
         }
         if last_refresh.elapsed() >= OBSERVER_REFRESH_INTERVAL {
-            refresh_observer_metadata(
+            let refresh = refresh_observer_metadata(
                 &store,
                 &group_id,
                 &mut observer,
                 &mut capture_fingerprints,
                 capture_worker.sender(),
-            )?;
+            );
+            apply_observer_refresh_result(&mut observer, refresh);
             last_refresh = Instant::now();
         }
         if !event::poll(OBSERVER_INPUT_POLL).context("poll Observer input")? {
@@ -524,10 +528,12 @@ pub fn run_observer(
         let Event::Key(key) = event::read().context("read Observer input")? else {
             continue;
         };
-        let Some(observer_key) = observer_key_for_event(key) else {
+        let Some((observer_key, input_kind)) = observer_key_for_event(key) else {
             continue;
         };
-        let Some(action) = action_for_key(observer_key) else {
+        // Actions finish synchronously before this loop polls again. ObserverOpenGate
+        // separately suppresses queued/repeated opens, so no action is in flight here.
+        let Some(action) = observer.action_for_input(observer_key, input_kind, false) else {
             continue;
         };
         let previous_page = observer.page();
@@ -537,24 +543,26 @@ pub fn run_observer(
         }
         match outcome {
             ObserverOutcome::None if observer.page() != previous_page => {
-                refresh_observer_metadata(
+                let refresh = refresh_observer_metadata(
                     &store,
                     &group_id,
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
-                )?;
+                );
+                apply_observer_refresh_result(&mut observer, refresh);
                 last_refresh = Instant::now();
             }
             ObserverOutcome::None => {}
             ObserverOutcome::Refresh => {
-                refresh_observer_metadata(
+                let refresh = refresh_observer_metadata(
                     &store,
                     &group_id,
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
-                )?;
+                );
+                apply_observer_refresh_result(&mut observer, refresh);
                 last_refresh = Instant::now();
             }
             ObserverOutcome::OpenSelected { worker_id } => {
@@ -578,6 +586,21 @@ pub fn run_observer(
                 )));
             }
             ObserverOutcome::Quit => return Ok(()),
+        }
+    }
+}
+
+fn apply_observer_refresh_result(observer: &mut ObserverState, result: Result<()>) -> bool {
+    match result {
+        Ok(()) => {
+            observer.set_notice(None);
+            true
+        }
+        Err(_) => {
+            observer.set_notice(Some(
+                "Refresh failed; stale output retained · r retry · q back".to_owned(),
+            ));
+            false
         }
     }
 }
@@ -970,6 +993,9 @@ impl Drop for ObserverTerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    use crate::observer::ObserverAction;
 
     fn worker(id: &str, lifecycle: ObserverLifecycle, capture: Option<&str>) -> ObserverWorker {
         ObserverWorker {
@@ -1084,8 +1110,10 @@ mod tests {
                     KeyModifiers::NONE,
                     KeyEventKind::Press,
                 );
-                let observer_key = observer_key_for_event(key).expect("Enter press is handled");
-                let action = action_for_key(observer_key).expect("Enter maps to an action");
+                let (observer_key, input_kind) =
+                    observer_key_for_event(key).expect("Enter press is handled");
+                let action =
+                    action_for_input(observer_key, input_kind, false).expect("Enter maps once");
                 let ObserverOutcome::OpenSelected { worker_id } = observer.apply(action) else {
                     panic!("eligible Enter must request an open");
                 };
@@ -1183,12 +1211,83 @@ mod tests {
     }
 
     #[test]
-    fn observer_input_ignores_repeat_and_release_enter_events() {
-        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
-            let key =
-                crossterm::event::KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind);
-            assert_eq!(observer_key_for_event(key), None);
+    fn observer_input_repeats_navigation_but_not_single_shot_actions() {
+        let repeat_navigation =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+        let (key, kind) = observer_key_for_event(repeat_navigation).unwrap();
+        assert_eq!(
+            action_for_input(key, kind, false),
+            Some(ObserverAction::NextWorker)
+        );
+
+        let repeat_open =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
+        let (key, kind) = observer_key_for_event(repeat_open).unwrap();
+        assert_eq!(action_for_input(key, kind, false), None);
+
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(observer_key_for_event(release), None);
+    }
+
+    #[test]
+    fn refresh_failure_retains_stale_tiles_and_context_until_retry_succeeds() {
+        let mut observer = ObserverState::new(
+            (0..5)
+                .map(|index| {
+                    worker(
+                        &index.to_string(),
+                        ObserverLifecycle::Running,
+                        Some(&format!("first-{index}")),
+                    )
+                })
+                .collect(),
+        );
+        for _ in 0..4 {
+            observer.apply(ObserverAction::NextWorker);
         }
+        let selected = observer.selected_id().unwrap().to_owned();
+        let page = observer.page();
+        let stale = observer.workers().to_vec();
+        let mut refreshes = VecDeque::from([
+            Ok(stale.clone()),
+            Err(anyhow::anyhow!("metadata backend unavailable")),
+            Ok(stale
+                .iter()
+                .cloned()
+                .map(|mut worker| {
+                    worker.capture = Some(format!("retry-{}", worker.id));
+                    worker
+                })
+                .collect()),
+        ]);
+
+        for expected_success in [true, false, true] {
+            let result = refreshes.pop_front().unwrap().map(|workers| {
+                observer.update_workers(workers);
+            });
+            assert_eq!(
+                apply_observer_refresh_result(&mut observer, result),
+                expected_success
+            );
+            assert_eq!(observer.selected_id(), Some(selected.as_str()));
+            assert_eq!(observer.page(), page);
+            if !expected_success {
+                assert_eq!(observer.workers(), stale);
+                let rendered = crate::observer::render_to_text(100, 14, &observer).unwrap();
+                assert!(rendered.contains("first-4"), "{rendered}");
+                assert!(rendered.contains("stale output retained"), "{rendered}");
+                assert!(rendered.contains("r retry"), "{rendered}");
+                assert!(rendered.contains("q back"), "{rendered}");
+            }
+        }
+        assert!(observer.notice().is_none());
+        assert_eq!(
+            observer
+                .selected_worker()
+                .and_then(|worker| worker.capture.as_deref()),
+            Some("retry-4")
+        );
     }
 
     fn fingerprint(membership: &str, identity: &str) -> CaptureFingerprint {

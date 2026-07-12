@@ -7,9 +7,9 @@ mod model;
 
 use observer::{
     MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
-    ObserverCapture, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
-    ObserverWorker, action_for_key, observer_theme_style, render_to_styles, render_to_text,
-    sanitize_capture, worker_rects,
+    ObserverCapture, ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome,
+    ObserverState, ObserverWorker, action_for_input, action_for_key, observer_theme_style, render,
+    render_to_styles, render_to_text, sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -139,7 +139,7 @@ fn hostile_capture_is_sanitized_and_bounded() {
     let hostile =
         "ok\u{1b}[31mRED\u{1b}[0m\u{1b}]0;secret\u{7}x\r\n\u{202e}bi\u{0301}di\u{200b}\0\tend";
     let clean = sanitize_capture(hostile);
-    assert_eq!(clean, "okREDx\nbidi    end");
+    assert_eq!(clean, "okREDx\nbi\u{301}di    end");
     assert!(!clean.contains('\u{1b}'));
 
     let enormous = format!(
@@ -466,12 +466,19 @@ fn state_action_projection_accepts_only_possible_zero_worker_actions() {
     ];
     let mut impossible_invocations = 0;
     for key in impossible {
-        let projected = empty.action_for_key(key);
-        if let Some(action) = projected {
-            impossible_invocations += 1;
-            let _ = empty.apply(action);
+        for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+            for busy in [false, true] {
+                let projected = empty.action_for_input(key, kind, busy);
+                if let Some(action) = projected {
+                    impossible_invocations += 1;
+                    let _ = empty.apply(action);
+                }
+                assert_eq!(
+                    projected, None,
+                    "{key:?} {kind:?} busy={busy} must be inert without workers"
+                );
+            }
         }
-        assert_eq!(projected, None, "{key:?} must be inert without workers");
     }
     assert_eq!(impossible_invocations, 0);
 
@@ -606,4 +613,112 @@ fn lifecycle_and_capability_labels_are_visible() {
     for label in ["MISSING", "REMOVED", "UNKNOWN"] {
         assert!(second.contains(label), "missing {label}:\n{second}");
     }
+}
+
+#[test]
+fn press_repeat_boundary_and_busy_matrix_is_consistent() {
+    for busy in [false, true] {
+        for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+            for (key, expected) in [
+                (ObserverKey::Up, Some(ObserverAction::PreviousWorker)),
+                (ObserverKey::Down, Some(ObserverAction::NextWorker)),
+                (ObserverKey::PageUp, Some(ObserverAction::PreviousPage)),
+                (ObserverKey::PageDown, Some(ObserverAction::NextPage)),
+            ] {
+                assert_eq!(
+                    action_for_input(key, kind, busy),
+                    expected,
+                    "{key:?} {kind:?} busy={busy}"
+                );
+            }
+            let single_action = kind == ObserverInputKind::Press && !busy;
+            assert_eq!(
+                action_for_input(ObserverKey::Enter, kind, busy),
+                single_action.then_some(ObserverAction::OpenSelected)
+            );
+            assert_eq!(
+                action_for_input(ObserverKey::Char('r'), kind, busy),
+                single_action.then_some(ObserverAction::Refresh)
+            );
+            assert_eq!(
+                action_for_input(ObserverKey::Escape, kind, busy),
+                (kind == ObserverInputKind::Press).then_some(ObserverAction::Quit)
+            );
+        }
+    }
+
+    for start in [0, 2, 4] {
+        let mut observer = state(5);
+        for _ in 0..start {
+            observer.apply(ObserverAction::NextWorker);
+        }
+        let before = observer.selected_index().unwrap();
+        for key in [ObserverKey::Up, ObserverKey::Down] {
+            for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+                let mut candidate = observer.clone();
+                candidate.apply(action_for_input(key, kind, false).unwrap());
+                let expected = match key {
+                    ObserverKey::Up => before.saturating_sub(1),
+                    ObserverKey::Down => before.saturating_add(1).min(4),
+                    _ => unreachable!(),
+                };
+                assert_eq!(candidate.selected_index(), Some(expected));
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let capture = "界e\u{301} 👩\u{200d}💻\u{fe0f}\t\u{1b}[31mRED\u{1b}[0m\u{7} tail";
+    let clean = sanitize_capture(capture);
+    assert!(clean.contains("e\u{301}"), "combining mark was discarded: {clean:?}");
+    assert!(
+        clean.contains("👩\u{200d}💻\u{fe0f}"),
+        "emoji grapheme was split: {clean:?}"
+    );
+    assert!(!clean.contains('\u{1b}'));
+    assert!(!clean.contains('\u{7}'));
+
+    let mut observed = worker("unicode");
+    observed.capture = Some(clean);
+    let observer = ObserverState::new(vec![observed]);
+    let width = 24;
+    let height = 8;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, frame.area(), &observer))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer.area.width, width);
+    assert_eq!(buffer.area.height, height);
+    assert_eq!(
+        buffer.content().len(),
+        usize::from(width) * usize::from(height)
+    );
+    for y in 0..height {
+        for x in 0..width {
+            let cell = &buffer[(x, y)];
+            assert!(
+                !cell.symbol().contains(['\n', '\r', '\u{1b}', '\u{7}']),
+                "unsafe cell at ({x}, {y}): {:?}",
+                cell.symbol()
+            );
+        }
+    }
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains("e\u{301}"))
+    );
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains("👩\u{200d}💻"))
+    );
 }
