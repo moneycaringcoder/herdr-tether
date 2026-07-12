@@ -13,7 +13,7 @@ use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph},
 };
@@ -23,6 +23,8 @@ pub const MAX_WORKERS: usize = 64;
 pub const MAX_CAPTURE_LINES: usize = 200;
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 pub const MAX_CAPTURE_CELLS: usize = 16 * 1024;
+const MIN_TILE_WIDTH: u16 = 12;
+const MIN_TILE_HEIGHT: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObserverCapabilities {
@@ -316,15 +318,39 @@ pub fn worker_rects(area: Rect, count: usize) -> Vec<Rect> {
         _ => unreachable!(),
     }
 }
+pub(crate) fn observer_theme_style(selected: bool) -> Style {
+    let style = Style::default().fg(Color::Reset).bg(Color::Reset);
+    if selected {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn can_render_worker_grid(canvas: Rect, count: usize) -> bool {
+    match count.min(WORKERS_PER_PAGE) {
+        0 => true,
+        1 => canvas.width >= MIN_TILE_WIDTH && canvas.height >= MIN_TILE_HEIGHT,
+        2 => canvas.width / 2 >= MIN_TILE_WIDTH && canvas.height >= MIN_TILE_HEIGHT,
+        3 | 4 => canvas.width / 2 >= MIN_TILE_WIDTH && canvas.height / 2 >= MIN_TILE_HEIGHT,
+        _ => unreachable!(),
+    }
+}
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     if area.is_empty() {
         return;
     }
+    frame.render_widget(Block::default().style(observer_theme_style(false)), area);
 
-    if area.height < 3 {
-        let compact = format!("Observer {}/{}", observer.page() + 1, observer.page_count());
-        frame.render_widget(Paragraph::new(compact), area);
+    let visible_count = observer.visible_workers().len();
+    let canvas_height = area.height.saturating_sub(2);
+    let canvas = Rect::new(area.x, area.y.saturating_add(1), area.width, canvas_height);
+    if area.height < 3 || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count)) {
+        frame.render_widget(
+            Paragraph::new("Observer\nResize pane").style(observer_theme_style(false)),
+            area,
+        );
         return;
     }
 
@@ -342,13 +368,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
             "Observer  {worker_count} {noun}  page {}/{}",
             observer.page() + 1,
             observer.page_count()
-        )),
+        ))
+        .style(observer_theme_style(false)),
         header,
     );
 
     let visible = observer.visible_workers();
     if visible.is_empty() {
-        frame.render_widget(Paragraph::new("No workers registered"), canvas);
+        frame.render_widget(
+            Paragraph::new("No workers registered").style(observer_theme_style(false)),
+            canvas,
+        );
     } else {
         for (worker, rect) in visible.iter().zip(worker_rects(canvas, visible.len())) {
             render_worker(
@@ -373,7 +403,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
             sanitize_capture(notice).replace('\n', " ")
         )
     });
-    frame.render_widget(Paragraph::new(footer_text), footer);
+    frame.render_widget(
+        Paragraph::new(footer_text).style(observer_theme_style(false)),
+        footer,
+    );
 }
 
 fn render_worker(frame: &mut Frame<'_>, area: Rect, worker: &ObserverWorker, selected: bool) {
@@ -387,11 +420,7 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, worker: &ObserverWorker, sel
         worker.display_title(),
         worker.lifecycle.label()
     );
-    let style = if selected {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    let style = observer_theme_style(selected);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(title))
@@ -413,7 +442,12 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, worker: &ObserverWorker, sel
             })
             .unwrap_or_else(|| "No captured output".to_owned())
     };
-    frame.render_widget(Paragraph::new(body).block(block), area);
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(observer_theme_style(false))
+            .block(block),
+        area,
+    );
 }
 
 #[derive(Debug)]
@@ -452,6 +486,29 @@ pub fn render_to_text(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+pub(crate) fn render_to_styles(
+    width: u16,
+    height: u16,
+    observer: &ObserverState,
+) -> Result<Vec<(Color, Color, Modifier)>, ObserverRenderError> {
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).map_err(|error| match error {})?;
+    terminal
+        .draw(|frame| render(frame, frame.area(), observer))
+        .map_err(|error| match error {})?;
+    Ok(terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| (cell.fg, cell.bg, cell.modifier))
+        .collect())
 }
 
 /// Removes terminal escapes and unsafe formatting characters, normalizes line
@@ -621,5 +678,20 @@ fn display_width(character: char) -> usize {
         2
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_renderer_exposes_only_terminal_default_colors() {
+        let observer = ObserverState::new(Vec::new());
+        assert!(render_to_styles(12, 3, &observer).unwrap().iter().all(
+            |(foreground, background, _)| {
+                *foreground == Color::Reset && *background == Color::Reset
+            }
+        ));
     }
 }
