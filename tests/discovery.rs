@@ -846,3 +846,106 @@ fn slow_first_remote_stream_reserves_the_global_result_cap_in_request_order() {
     );
     assert_eq!(run.completion(), Some(DiscoveryRunCompletion::ResultsLimit));
 }
+
+#[cfg(unix)]
+#[test]
+fn remote_entry_allowances_are_request_ordered_and_request_wide() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let log = temp.path().join("entry-limits");
+    let release = temp.path().join("release-first");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\n\
+             previous=\n\
+             for argument do\n\
+                 target=$previous\n\
+                 command=$argument\n\
+                 previous=$argument\n\
+             done\n\
+             eval \"set -- $command\"\n\
+             printf '%s %s\\n' \"$target\" \"$7\" >> '{}'\n\
+             case \"$target\" in\n\
+                 first.example)\n\
+                     while [ ! -e '{}' ]; do :; done\n\
+                     ;;\n\
+                 second.example)\n\
+                     : > '{}'\n\
+                     printf 'N\\000'\n\
+                     ;;\n\
+                 *) printf 'N\\000' ;;\n\
+             esac\n",
+            log.display(),
+            release.display(),
+            release.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut bounded = limits();
+    bounded.max_entries = 4;
+    bounded.workers = 4;
+    bounded.timeout = Duration::from_secs(10);
+    let service = DiscoveryService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        bounded,
+    );
+    let locations = (1..=6)
+        .map(|index| DiscoveryLocation {
+            host: format!("host-{index}"),
+            target: Some(match index {
+                1 => "first.example".into(),
+                2 => "second.example".into(),
+                _ => format!("remote-{index}.example"),
+            }),
+            roots: vec!["/work".into()],
+        })
+        .collect::<Vec<_>>();
+
+    for generation in 50..53 {
+        let _ = fs::remove_file(&log);
+        let _ = fs::remove_file(&release);
+        let run = service.start(DiscoveryRequest {
+            generation,
+            locations: locations.clone(),
+        });
+        let messages = collect_messages(&run, generation);
+        let mut allowances = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (target, allowance) = line.rsplit_once(' ').unwrap();
+                (target.to_owned(), allowance.parse::<usize>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        allowances.sort();
+
+        assert_eq!(
+            allowances,
+            vec![
+                ("first.example".into(), 1),
+                ("remote-3.example".into(), 1),
+                ("remote-4.example".into(), 1),
+                ("second.example".into(), 1),
+            ]
+        );
+        assert!(allowances.iter().map(|(_, limit)| limit).sum::<usize>() <= 4);
+        assert_eq!(
+            messages,
+            (1..=6)
+                .map(|index| DiscoveryMessage::HostFinished {
+                    generation,
+                    host: format!("host-{index}"),
+                    completion: if index == 1 {
+                        DiscoveryCompletion::Complete
+                    } else {
+                        DiscoveryCompletion::EntriesLimit
+                    },
+                })
+                .chain(std::iter::once(DiscoveryMessage::Finished { generation }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(run.completion(), Some(DiscoveryRunCompletion::EntriesLimit));
+    }
+}

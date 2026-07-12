@@ -256,8 +256,10 @@ impl DiscoveryService {
             queued_jobs.push_back(DiscoveryJob { location, outcomes });
             outcome_receivers.push(receiver);
         }
-        let jobs = Arc::new(Mutex::new(queued_jobs));
-        let entries = Arc::new(AtomicUsize::new(0));
+        let jobs = Arc::new(Mutex::new(JobQueue {
+            jobs: queued_jobs,
+            reservations: EntryReservations::new(self.limits.max_entries),
+        }));
         let started = (self.clock)();
         let deadline = started.checked_add(self.limits.timeout).unwrap_or(started);
         let mut handles = Vec::with_capacity(worker_count);
@@ -266,7 +268,6 @@ impl DiscoveryService {
             let context = WorkerContext {
                 generation,
                 cancelled: Arc::clone(&cancelled),
-                entries: Arc::clone(&entries),
                 binaries: self.binaries.clone(),
                 limits: self.limits,
                 deadline,
@@ -348,7 +349,6 @@ impl Drop for DiscoveryRun {
 struct WorkerContext {
     generation: u64,
     cancelled: Arc<AtomicBool>,
-    entries: Arc<AtomicUsize>,
     binaries: ProcessBinaries,
     limits: DiscoveryLimits,
     deadline: Instant,
@@ -360,11 +360,48 @@ struct DiscoveryJob {
     outcomes: SyncSender<DiscoveryMessage>,
 }
 
+// Entry allowances are assigned while jobs are dequeued, so worker timing
+// cannot change which request index owns each allowance. Earlier locations
+// receive any indivisible remainder. An unused allowance is intentionally not
+// returned: bounded under-utilization is preferable to timing-dependent theft
+// by a later, faster scan.
+struct JobQueue {
+    jobs: VecDeque<DiscoveryJob>,
+    reservations: EntryReservations,
+}
+
+impl JobQueue {
+    fn pop(&mut self) -> Option<(DiscoveryJob, usize)> {
+        let remaining_jobs = self.jobs.len();
+        let job = self.jobs.pop_front()?;
+        Some((job, self.reservations.reserve(remaining_jobs)))
+    }
+}
+
+struct EntryReservations {
+    remaining: usize,
+}
+
+impl EntryReservations {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            remaining: max_entries,
+        }
+    }
+
+    fn reserve(&mut self, remaining_jobs: usize) -> usize {
+        let allowance = self.remaining.div_ceil(remaining_jobs);
+        self.remaining -= allowance;
+        allowance
+    }
+}
+
 struct ScanContext<'a> {
     generation: u64,
     sender: &'a SyncSender<DiscoveryMessage>,
     cancelled: &'a AtomicBool,
     entries: &'a AtomicUsize,
+    entry_limit: usize,
     limits: DiscoveryLimits,
     deadline: Instant,
     clock: &'a DiscoveryClock,
@@ -385,30 +422,43 @@ fn send_scan(context: &ScanContext<'_>, mut message: DiscoveryMessage) -> bool {
     }
 }
 
-fn worker_loop(jobs: Arc<Mutex<VecDeque<DiscoveryJob>>>, context: &WorkerContext) {
+fn worker_loop(jobs: Arc<Mutex<JobQueue>>, context: &WorkerContext) {
     loop {
         if context.cancelled.load(Ordering::Acquire) {
             return;
         }
-        let Some(DiscoveryJob { location, outcomes }) =
-            jobs.lock().expect("discovery jobs lock").pop_front()
+        let Some((DiscoveryJob { location, outcomes }, entry_limit)) =
+            jobs.lock().expect("discovery jobs lock").pop()
         else {
             return;
         };
+        let entries = AtomicUsize::new(0);
         let scan_context = ScanContext {
             generation: context.generation,
             sender: &outcomes,
             cancelled: &context.cancelled,
-            entries: &context.entries,
+            entries: &entries,
+            entry_limit,
             limits: context.limits,
             deadline: context.deadline,
             clock: &context.clock,
         };
-        match &location.target {
-            Some(target) => {
-                scan_remote(&location, target, &context.binaries, &scan_context);
+        if entry_limit == 0 {
+            let _ = send_scan(
+                &scan_context,
+                DiscoveryMessage::HostFinished {
+                    generation: context.generation,
+                    host: location.host,
+                    completion: DiscoveryCompletion::EntriesLimit,
+                },
+            );
+        } else {
+            match &location.target {
+                Some(target) => {
+                    scan_remote(&location, target, &context.binaries, &scan_context);
+                }
+                None => scan_local(&location, &scan_context),
             }
-            None => scan_local(&location, &scan_context),
         }
     }
 }
@@ -576,7 +626,7 @@ impl LocalScan<'_> {
             self.completion = DiscoveryCompletion::TimedOut;
             return true;
         }
-        if self.context.entries.load(Ordering::Acquire) >= self.context.limits.max_entries {
+        if self.context.entries.load(Ordering::Acquire) >= self.context.entry_limit {
             self.completion = DiscoveryCompletion::EntriesLimit;
             return true;
         }
@@ -597,7 +647,7 @@ impl LocalScan<'_> {
             .context
             .entries
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
-                (entries < self.context.limits.max_entries).then_some(entries + 1)
+                (entries < self.context.entry_limit).then_some(entries + 1)
             })
             .is_err()
         {
@@ -648,8 +698,7 @@ impl LocalScan<'_> {
         }
         let remaining_entries = self
             .context
-            .limits
-            .max_entries
+            .entry_limit
             .saturating_sub(self.context.entries.load(Ordering::Acquire));
         let mut children = BinaryHeap::new();
         for entry in fs::read_dir(path)? {
@@ -738,10 +787,16 @@ fn scan_remote(
         return;
     }
     let remaining = context.deadline.saturating_duration_since(now);
-    let result = remote_spec(target, &location.roots, binaries, context.limits)
-        .map_or(BoundedOutput::Error, |spec| {
-            run_bounded(&spec, remaining, context.cancelled)
-        });
+    let result = remote_spec(
+        target,
+        &location.roots,
+        binaries,
+        context.limits,
+        context.entry_limit,
+    )
+    .map_or(BoundedOutput::Error, |spec| {
+        run_bounded(&spec, remaining, context.cancelled)
+    });
     if context.cancelled.load(Ordering::Acquire) || matches!(result, BoundedOutput::Cancelled) {
         return;
     }
@@ -795,6 +850,7 @@ fn remote_spec(
     roots: &[String],
     binaries: &ProcessBinaries,
     limits: DiscoveryLimits,
+    entry_limit: usize,
 ) -> anyhow::Result<CommandSpec> {
     let target = openssh_target(target)?;
     let mut remote_args = vec![
@@ -803,7 +859,7 @@ fn remote_spec(
         "tether-discovery".to_owned(),
         limits.max_depth.to_string(),
         limits.max_results.to_string(),
-        limits.max_entries.to_string(),
+        entry_limit.to_string(),
     ];
     remote_args.extend(roots.iter().cloned());
     let remote_command = CommandSpec::new("/bin/sh", remote_args).posix_command_line()?;
@@ -969,6 +1025,7 @@ mod tests {
             sender: &sender,
             cancelled: &cancelled,
             entries: &entries,
+            entry_limit: 100,
             limits: DiscoveryLimits {
                 max_depth: 4,
                 max_entries: 100,
