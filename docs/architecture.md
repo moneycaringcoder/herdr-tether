@@ -89,16 +89,20 @@ Additional workers remain in membership order on deterministic pages; the
 footer reports overflow. The persisted 64-worker limit also bounds projection
 work.
 When the available geometry cannot fit useful bordered tiles, Observer renders
-one bounded resize message instead of subdividing the pane. Observer chrome
-uses terminal-default foreground and background colors; untrusted captured
-output remains sanitized rather than interpreting its color escapes.
+one bounded resize message instead of subdividing the pane. Picker and manager
+viewports reserve actionable rows and report position plus more-above/below
+content. Observer chrome uses terminal-default foreground and background
+colors; untrusted captured output remains sanitized rather than interpreting
+its color escapes or splitting extended grapheme clusters during truncation.
 
 Observer reloads group and session metadata while it runs, so membership,
 selection, and lifecycle labels follow state changes without creating one Herdr
 pane per worker. Labels distinguish `STARTING`, `RUNNING`, `STOPPING`, `ENDED`,
 `MISSING`, `REMOVED`, and `UNKNOWN`; stopping is never reported as ended.
-Deleting the observed group ends refresh with an explicit
-error rather than retaining a stale authority view.
+Successful refresh that finds the observed group deleted ends with an explicit
+error rather than retaining a stale authority view. A recoverable post-initial
+refresh failure retains the last authorized tiles, page, and selection with a
+sanitized warning until a successful retry; navigation does not clear it.
 
 Capture requires all of the following at refresh time: the exact persisted
 membership epoch, `observe_output`, running status, and a Tether record with
@@ -109,8 +113,10 @@ capabilities, session identity, ownership proof, or internal `tmux` identity
 changed while capture was in flight. Each request reads at most the recent 200
 joined lines. Rendering strips terminal escape sequences and unsafe formatting
 and caps each capture at 200 logical lines, 16 KiB, and 16,384 display cells.
-Capture failure is shown as unavailable; it does not broaden the target or make
-the worker interactive. Observer has no worker-input path.
+Tiles distinguish loading, successful empty output, and unavailable output.
+Capture failure is unavailable rather than successful error-text output; it
+does not broaden the target or make the worker interactive. With no workers,
+only refresh and back remain actionable. Observer has no worker-input path.
 
 `Enter` is a separate, capability-checked transition. It succeeds only when the
 selected member still has `open_interactive` and still resolves to a running
@@ -120,6 +126,9 @@ Observer launch and an interactive worker open normalize configured or explicit
 `replace-current-pane` to `split-right`, preserving the companion/source pane.
 Observer debounces repeated opens of the same selected worker after one
 placement completes, so queued `Enter` presses cannot fan out duplicate panes.
+Navigation accepts held-key repeats with bounded, non-wrapping selection.
+Refresh and open accept press events only, so repeat events cannot duplicate
+their side effects.
 This gate is local to Observer and does not change ordinary intentional
 multi-attachment elsewhere. Companion placement creates and runs only the
 destination pane; it does not run a command in or close the source launcher

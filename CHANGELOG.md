@@ -10,6 +10,8 @@
 - Added a native `prefix+t` Observer manager that creates safe group metadata from running workloads, edits membership reversibly, confirms metadata-only deletion, and launches one companion pane from the current Herdr plugin context without exposing session IDs or requiring standalone CLI setup.
 - Added explicit topology review with visible `ORCHESTRATOR` and `WORKER` roles, group health summaries, and metadata-only orchestrator reassignment that preserves unaffected worker membership.
 - Added stable bounded reference tokens only when otherwise-safe workload or Observer tile labels are ambiguous, while retaining exact internal identity for every action.
+- Added distinct Observer capture states for loading, ready-but-empty output, and unavailable output; empty groups now expose only refresh and back actions.
+- Added bounded picker and Observer-manager viewport position and overflow guidance, plus explicit resize fallbacks for panes too small to show actionable content.
 
 ### Fixed
 
@@ -19,6 +21,8 @@
 - Revalidated every newly admitted orchestrator or worker as a running exact-owned workload inside the locked state transaction, including optional CLI adapter operations, while preserving already-retained unavailable members.
 - Rejected manager edit or delete requests when the displayed group snapshot changed before commit, preventing stale screens from overwriting or deleting concurrent metadata updates.
 - Required native Observer-manager placement to use `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` and fail closed instead of falling back to a managed overlay pane ID.
+- Kept the last authorized Observer tiles, page, selection, and warning visible across recoverable refresh failures until a successful retry, while mapping capture failures to unavailable instead of rendering error text as output.
+- Made held navigation repeat-safe while keeping refresh, open, and quit single-shot, and made capture sanitization and truncation preserve extended grapheme clusters such as flags, keycaps, combining sequences, and emoji.
 
 ### Limitations
 
