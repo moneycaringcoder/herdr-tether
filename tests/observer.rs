@@ -162,6 +162,71 @@ fn hostile_capture_is_sanitized_and_bounded() {
 }
 
 #[test]
+fn unicode_grapheme_boundaries_are_atomic_at_capture_limits() {
+    let clusters = [
+        ("regional-indicator flag", "🇺🇸"),
+        ("adjacent regional-indicator flags", "🇺🇸🇨🇦"),
+        ("keycap", "1\u{fe0f}\u{20e3}"),
+        (
+            "emoji zwj with modifier and variation selector",
+            "👩🏽\u{200d}⚕\u{fe0f}",
+        ),
+        ("standalone combining sequence", "\u{301}\u{327}"),
+        ("combining character sequence", "e\u{301}\u{327}"),
+        ("text variation selector", "♥\u{fe0e}"),
+        ("emoji variation selector", "♥\u{fe0f}"),
+    ];
+
+    for (name, cluster) in clusters {
+        let exactly_after = format!(
+            "{cluster}{}",
+            "x".repeat(MAX_CAPTURE_BYTES - cluster.len())
+        );
+        assert_eq!(
+            sanitize_capture(&exactly_after),
+            exactly_after,
+            "{name} was split at a limit exactly after the cluster"
+        );
+
+        let exactly_before = format!("{cluster}{}", "x".repeat(MAX_CAPTURE_BYTES));
+        assert_eq!(
+            sanitize_capture(&exactly_before),
+            "x".repeat(MAX_CAPTURE_BYTES),
+            "{name} was split at a limit exactly before the cluster"
+        );
+    }
+}
+
+#[test]
+fn adjacent_flags_are_not_truncated_to_orphan_regional_indicators() {
+    let adjacent_flags = "🇺🇸🇨🇦";
+    let suffix = "x".repeat(MAX_CAPTURE_BYTES - '🇦'.len_utf8());
+    let clean = sanitize_capture(&format!("{adjacent_flags}{suffix}"));
+
+    assert_eq!(clean, suffix);
+    assert!(!clean.starts_with(['🇺', '🇸', '🇨', '🇦']));
+}
+
+#[test]
+fn hostile_controls_and_ansi_cannot_escape_grapheme_sanitization() {
+    let hostile = concat!(
+        "\u{1b}[31m",
+        "🇺🇸",
+        "\u{1b}[0m",
+        "\u{1b}]8;;file:///secret\u{7}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1b}]8;;\u{7}",
+        "\u{0}\u{7}\u{202e}",
+        "👩🏽\u{200d}⚕\u{fe0f}"
+    );
+
+    assert_eq!(
+        sanitize_capture(hostile),
+        "🇺🇸1\u{fe0f}\u{20e3}👩🏽\u{200d}⚕\u{fe0f}"
+    );
+}
+
+#[test]
 fn outcomes_are_read_only_and_open_requires_all_eligibility() {
     assert_eq!(
         action_for_key(ObserverKey::Enter),
@@ -672,14 +737,18 @@ fn press_repeat_boundary_and_busy_matrix_is_consistent() {
 fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let capture = "界e\u{301} 👩\u{200d}💻\u{fe0f}\t\u{1b}[31mRED\u{1b}[0m\u{7} tail";
+    let capture = concat!(
+        "界e\u{301} 🇺🇸🇨🇦 1\u{fe0f}\u{20e3} ",
+        "👩🏽\u{200d}⚕\u{fe0f} ♥\u{fe0e} ♥\u{fe0f}",
+        "\t\u{1b}[31mRED\u{1b}[0m\u{7} tail"
+    );
     let clean = sanitize_capture(capture);
     assert!(
         clean.contains("e\u{301}"),
         "combining mark was discarded: {clean:?}"
     );
     assert!(
-        clean.contains("👩\u{200d}💻\u{fe0f}"),
+        clean.contains("👩🏽\u{200d}⚕\u{fe0f}"),
         "emoji grapheme was split: {clean:?}"
     );
     assert!(!clean.contains('\u{1b}'));
@@ -712,6 +781,22 @@ fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
             );
         }
     }
+    for grapheme in ["🇺🇸", "🇨🇦", "1\u{fe0f}\u{20e3}", "👩🏽\u{200d}⚕\u{fe0f}"] {
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == grapheme),
+            "rendered buffer split or discarded {grapheme:?}"
+        );
+    }
+    assert!(
+        buffer.content().iter().all(|cell| !matches!(
+            cell.symbol(),
+            "🇺" | "🇸" | "🇨" | "🇦"
+        )),
+        "rendered buffer contains an orphan regional indicator"
+    );
     assert!(
         buffer
             .content()
@@ -722,6 +807,6 @@ fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
         buffer
             .content()
             .iter()
-            .any(|cell| cell.symbol().contains("👩\u{200d}💻"))
+            .any(|cell| cell.symbol().contains("👩🏽\u{200d}⚕"))
     );
 }

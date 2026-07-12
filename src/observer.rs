@@ -19,6 +19,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const WORKERS_PER_PAGE: usize = 4;
 pub const MAX_WORKERS: usize = 64;
@@ -765,15 +766,7 @@ fn bounded_capture_tail(input: &str) -> String {
     let mut lines = 1usize;
     let mut bytes = 0usize;
     let mut cells = 0usize;
-    let mut starts = Vec::new();
-    let mut index = 0;
-    while index < input.len() {
-        starts.push(index);
-        index = next_display_cluster_end(input, index);
-    }
-    for &index in starts.iter().rev() {
-        let cluster_end = next_display_cluster_end(input, index);
-        let cluster = &input[index..cluster_end];
+    for (index, cluster) in input.grapheme_indices(true).rev() {
         let cluster_bytes = cluster.len();
         if cluster == "\n" {
             if lines >= MAX_CAPTURE_LINES || bytes + cluster_bytes > MAX_CAPTURE_BYTES {
@@ -803,10 +796,7 @@ fn capture_viewport(input: &str, width: u16, height: u16) -> String {
     for line in input.split('\n') {
         let mut row = String::new();
         let mut cells = 0usize;
-        let mut index = 0;
-        while index < line.len() {
-            let cluster_end = next_display_cluster_end(line, index);
-            let cluster = &line[index..cluster_end];
+        for cluster in line.graphemes(true) {
             let cluster_width = display_width(cluster);
             if cells > 0 && cells + cluster_width > width {
                 push_viewport_row(&mut rows, std::mem::take(&mut row), height);
@@ -816,7 +806,6 @@ fn capture_viewport(input: &str, width: u16, height: u16) -> String {
                 row.push_str(cluster);
                 cells += cluster_width;
             }
-            index = cluster_end;
         }
         push_viewport_row(&mut rows, row, height);
     }
@@ -862,10 +851,7 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
     let capture = sanitize_capture(input);
     let mut output = String::new();
     let mut cells = 0;
-    let mut index = 0;
-    while index < capture.len() {
-        let cluster_end = next_display_cluster_end(&capture, index);
-        let cluster = &capture[index..cluster_end];
+    for cluster in capture.graphemes(true) {
         let width = if cluster == "\n" {
             1
         } else {
@@ -880,7 +866,6 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
             output.push_str(cluster);
         }
         cells += width;
-        index = cluster_end;
     }
     output
 }
@@ -897,26 +882,6 @@ fn is_unsafe_format(character: char) -> bool {
     )
 }
 
-fn next_display_cluster_end(input: &str, start: usize) -> usize {
-    let mut characters = input[start..].char_indices();
-    let (_, first) = characters
-        .next()
-        .expect("display cluster starts on a character");
-    let mut end = start + first.len_utf8();
-    let mut join_next = false;
-    for (offset, character) in characters {
-        let character_start = start + offset;
-        let extender = (character != '\n' && Line::from(character.to_string()).width() == 0)
-            || matches!(character, '\u{1f3fb}'..='\u{1f3ff}');
-        if join_next || extender {
-            end = character_start + character.len_utf8();
-            join_next = character == '\u{200d}';
-            continue;
-        }
-        break;
-    }
-    end
-}
 
 fn display_width(cluster: &str) -> usize {
     Line::from(cluster).width()
