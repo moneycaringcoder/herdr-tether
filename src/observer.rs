@@ -5,7 +5,7 @@
 //! and translate [`ObserverOutcome`] values back into application actions.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
 };
 
@@ -19,6 +19,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const WORKERS_PER_PAGE: usize = 4;
 pub const MAX_WORKERS: usize = 64;
@@ -58,6 +59,20 @@ impl ObserverLifecycle {
             Self::Unknown => "UNKNOWN",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverCapture {
+    Loading,
+    Ready(String),
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureStatus {
+    Loading,
+    Ready,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +147,12 @@ pub enum ObserverKey {
     Char(char),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserverInputKind {
+    Press,
+    Repeat,
+}
+
 /// Maps a navigation key to a read-only observer action.
 ///
 /// There is intentionally no action carrying arbitrary text or terminal bytes.
@@ -158,9 +179,43 @@ pub fn action_for_key(key: ObserverKey) -> Option<ObserverAction> {
     }
 }
 
+/// Applies event-kind and in-flight-operation gating to Observer keys.
+///
+/// Navigation is repeat-safe and remains available while an operation is busy.
+/// Open and refresh are single-shot and idle-only. Quit remains available while
+/// busy, but release and repeat events never duplicate it.
+pub fn action_for_input(
+    key: ObserverKey,
+    kind: ObserverInputKind,
+    busy: bool,
+) -> Option<ObserverAction> {
+    gate_action_for_input(action_for_key(key)?, kind, busy)
+}
+
+fn gate_action_for_input(
+    action: ObserverAction,
+    kind: ObserverInputKind,
+    busy: bool,
+) -> Option<ObserverAction> {
+    match action {
+        ObserverAction::PreviousWorker
+        | ObserverAction::NextWorker
+        | ObserverAction::PreviousPage
+        | ObserverAction::NextPage => Some(action),
+        ObserverAction::Refresh | ObserverAction::OpenSelected
+            if kind == ObserverInputKind::Press && !busy =>
+        {
+            Some(action)
+        }
+        ObserverAction::Quit if kind == ObserverInputKind::Press => Some(action),
+        ObserverAction::Refresh | ObserverAction::OpenSelected | ObserverAction::Quit => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObserverState {
     workers: Vec<ObserverWorker>,
+    capture_statuses: HashMap<String, CaptureStatus>,
     selected_id: Option<String>,
     notice: Option<String>,
 }
@@ -184,18 +239,67 @@ impl ObserverState {
         self.notice = notice;
     }
 
-    /// Replaces membership while preserving selection by worker identity.
+    /// Projects a key through the actions that are possible in the current view.
     ///
-    /// Duplicate IDs after their first occurrence and workers beyond [`MAX_WORKERS`]
-    /// are ignored. If the selected identity disappeared, the prior numeric position
-    /// is retained where possible.
+    /// With no workers there is nothing to select, page through, or open. Refresh
+    /// and Back remain available so an empty observer is never a dead end.
+    pub fn action_for_key(&self, key: ObserverKey) -> Option<ObserverAction> {
+        let action = action_for_key(key)?;
+        if self.workers.is_empty()
+            && !matches!(action, ObserverAction::Refresh | ObserverAction::Quit)
+        {
+            return None;
+        }
+        Some(action)
+    }
+
+    /// Projects a key through both view availability and input event gating.
+    pub fn action_for_input(
+        &self,
+        key: ObserverKey,
+        kind: ObserverInputKind,
+        busy: bool,
+    ) -> Option<ObserverAction> {
+        gate_action_for_input(self.action_for_key(key)?, kind, busy)
+    }
+
+    /// Replaces membership while preserving selection and capture state by worker identity.
+    ///
+    /// A supplied capture, including an empty capture, completes loading. An absent
+    /// capture preserves the prior lifecycle for an existing worker and starts a new
+    /// worker in loading. Duplicate IDs after their first occurrence and workers beyond
+    /// [`MAX_WORKERS`] are ignored. If the selected identity disappeared, the prior
+    /// numeric position is retained where possible.
     pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) {
         let previous_index = self.selected_index().unwrap_or(0);
+        let previous_workers: HashMap<String, Option<String>> = self
+            .workers
+            .drain(..)
+            .map(|worker| (worker.id, worker.capture))
+            .collect();
+        let previous_statuses = std::mem::take(&mut self.capture_statuses);
         let mut seen = HashSet::with_capacity(workers.len().min(MAX_WORKERS));
         self.workers = workers
             .into_iter()
             .filter(|worker| seen.insert(worker.id.clone()))
             .take(MAX_WORKERS)
+            .map(|mut worker| {
+                let status = if let Some(capture) = worker.capture.take() {
+                    worker.capture = Some(sanitize_capture(&capture));
+                    CaptureStatus::Ready
+                } else {
+                    let status = previous_statuses
+                        .get(&worker.id)
+                        .copied()
+                        .unwrap_or(CaptureStatus::Loading);
+                    if status == CaptureStatus::Ready {
+                        worker.capture = previous_workers.get(&worker.id).cloned().flatten();
+                    }
+                    status
+                };
+                self.capture_statuses.insert(worker.id.clone(), status);
+                worker
+            })
             .collect();
 
         if self.workers.is_empty() {
@@ -209,6 +313,33 @@ impl ObserverState {
         }
         let index = previous_index.min(self.workers.len() - 1);
         self.selected_id = Some(self.workers[index].id.clone());
+    }
+
+    /// Merges one capture result without changing worker identity or membership.
+    pub fn merge_capture(&mut self, worker_id: &str, capture: ObserverCapture) -> bool {
+        let Some(worker) = self
+            .workers
+            .iter_mut()
+            .find(|worker| worker.id == worker_id)
+        else {
+            return false;
+        };
+        let status = match capture {
+            ObserverCapture::Loading => {
+                worker.capture = None;
+                CaptureStatus::Loading
+            }
+            ObserverCapture::Ready(capture) => {
+                worker.capture = Some(sanitize_capture(&capture));
+                CaptureStatus::Ready
+            }
+            ObserverCapture::Unavailable => {
+                worker.capture = None;
+                CaptureStatus::Unavailable
+            }
+        };
+        self.capture_statuses.insert(worker_id.to_owned(), status);
+        true
     }
 
     pub fn selected_id(&self) -> Option<&str> {
@@ -379,10 +510,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     }
     frame.render_widget(Block::default().style(observer_theme_style(false)), area);
 
+    let worker_count = observer.workers.len();
+    let controls_height = if worker_count == 0 || area.width >= 64 {
+        1
+    } else if area.width >= 30 {
+        2
+    } else {
+        3
+    };
+    let notice_height = u16::from(observer.notice().is_some());
+    let bottom_height = controls_height + notice_height;
     let visible_count = observer.visible_workers().len();
-    let canvas_height = area.height.saturating_sub(2);
+    let canvas_height = area.height.saturating_sub(1 + bottom_height);
     let canvas = Rect::new(area.x, area.y.saturating_add(1), area.width, canvas_height);
-    if area.height < 3 || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count)) {
+    if area.height < 2 + bottom_height
+        || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count))
+    {
         frame.render_widget(
             Paragraph::new("Observer\nResize pane").style(observer_theme_style(false)),
             area,
@@ -391,28 +534,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     }
 
     let header = Rect::new(area.x, area.y, area.width, 1);
-    let canvas = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
-    let footer = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-    let worker_count = observer.workers.len();
     let noun = if worker_count == 1 {
         "worker"
     } else {
         "workers"
     };
-    frame.render_widget(
-        Paragraph::new(format!(
+    let header_text = if worker_count == 0 {
+        "Observer  0 workers".to_owned()
+    } else {
+        format!(
             "Observer  {worker_count} {noun}  page {}/{}",
             observer.page() + 1,
             observer.page_count()
-        ))
-        .style(observer_theme_style(false)),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(header_text).style(observer_theme_style(false)),
         header,
     );
 
     let visible = observer.visible_workers();
     if visible.is_empty() {
         frame.render_widget(
-            Paragraph::new("No workers registered").style(observer_theme_style(false)),
+            Paragraph::new("No workers registered\nPress r to refresh")
+                .style(observer_theme_style(false)),
             canvas,
         );
     } else {
@@ -421,28 +566,57 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
                 frame,
                 rect,
                 worker,
+                observer
+                    .capture_statuses
+                    .get(&worker.id)
+                    .copied()
+                    .unwrap_or(CaptureStatus::Loading),
                 &observer.worker_display_title(worker),
                 observer.selected_id() == Some(worker.id.as_str()),
             );
         }
     }
 
+    let mut footer_y = canvas.y.saturating_add(canvas.height);
+    if let Some(notice) = observer.notice() {
+        let notice_area = Rect::new(area.x, footer_y, area.width, 1);
+        let notice = format!("! {}", sanitize_capture(notice).replace('\n', " "));
+        frame.render_widget(
+            Paragraph::new(notice).style(observer_theme_style(false)),
+            notice_area,
+        );
+        footer_y = footer_y.saturating_add(1);
+    }
+
     let hidden = worker_count.saturating_sub((observer.page() + 1) * WORKERS_PER_PAGE);
-    let overflow = if hidden == 0 {
-        String::new()
+    let controls = if worker_count == 0 {
+        "r refresh  q back".to_owned()
+    } else if controls_height == 1 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("+{hidden} more  ")
+        };
+        format!("{overflow}↑↓ select  Tab/[ ] page  r refresh  Enter open  q back")
+    } else if controls_height == 2 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  [] page  r refresh\nEnter open  q back{overflow}")
     } else {
-        format!("+{hidden} more  ")
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  [] page\nr refresh  Enter open\nq back{overflow}")
     };
-    let controls = format!("{overflow}↑↓ select  Tab/[ ] page  r refresh  Enter open  q quit");
-    let footer_text = observer.notice().map_or(controls, |notice| {
-        format!(
-            "! {}  · q quit",
-            sanitize_capture(notice).replace('\n', " ")
-        )
-    });
+    let controls_area = Rect::new(area.x, footer_y, area.width, controls_height);
     frame.render_widget(
-        Paragraph::new(footer_text).style(observer_theme_style(false)),
-        footer,
+        Paragraph::new(controls).style(observer_theme_style(false)),
+        controls_area,
     );
 }
 
@@ -450,6 +624,7 @@ fn render_worker(
     frame: &mut Frame<'_>,
     area: Rect,
     worker: &ObserverWorker,
+    capture_status: CaptureStatus,
     display_title: &str,
     selected: bool,
 ) {
@@ -471,19 +646,23 @@ fn render_worker(
     let body = if !worker.capabilities.observe_output {
         "Output not authorized".to_owned()
     } else {
-        worker
-            .capture
-            .as_deref()
-            .map(sanitize_capture)
-            .filter(|capture| !capture.is_empty())
-            .map(|capture| {
-                capture_viewport(
-                    &capture,
-                    area.width.saturating_sub(2),
-                    area.height.saturating_sub(2),
-                )
-            })
-            .unwrap_or_else(|| "No captured output".to_owned())
+        match capture_status {
+            CaptureStatus::Loading => "Loading output".to_owned(),
+            CaptureStatus::Unavailable => "Output unavailable".to_owned(),
+            CaptureStatus::Ready => worker
+                .capture
+                .as_deref()
+                .map(sanitize_capture)
+                .filter(|capture| !capture.is_empty())
+                .map(|capture| {
+                    capture_viewport(
+                        &capture,
+                        area.width.saturating_sub(2),
+                        area.height.saturating_sub(2),
+                    )
+                })
+                .unwrap_or_else(|| "No captured output".to_owned()),
+        }
     };
     frame.render_widget(
         Paragraph::new(body)
@@ -587,21 +766,21 @@ fn bounded_capture_tail(input: &str) -> String {
     let mut lines = 1usize;
     let mut bytes = 0usize;
     let mut cells = 0usize;
-    for (index, character) in input.char_indices().rev() {
-        let character_bytes = character.len_utf8();
-        if character == '\n' {
-            if lines >= MAX_CAPTURE_LINES || bytes + character_bytes > MAX_CAPTURE_BYTES {
+    for (index, cluster) in input.grapheme_indices(true).rev() {
+        let cluster_bytes = cluster.len();
+        if cluster == "\n" {
+            if lines >= MAX_CAPTURE_LINES || bytes + cluster_bytes > MAX_CAPTURE_BYTES {
                 break;
             }
             lines += 1;
         } else {
-            let width = display_width(character);
-            if bytes + character_bytes > MAX_CAPTURE_BYTES || cells + width > MAX_CAPTURE_CELLS {
+            let width = display_width(cluster);
+            if bytes + cluster_bytes > MAX_CAPTURE_BYTES || cells + width > MAX_CAPTURE_CELLS {
                 break;
             }
             cells += width;
         }
-        bytes += character_bytes;
+        bytes += cluster_bytes;
         start = index;
     }
     input[start..].to_owned()
@@ -617,17 +796,16 @@ fn capture_viewport(input: &str, width: u16, height: u16) -> String {
     for line in input.split('\n') {
         let mut row = String::new();
         let mut cells = 0usize;
-        for character in line.chars() {
-            let character_width = display_width(character);
-            if cells > 0 && cells + character_width > width {
+        for cluster in line.graphemes(true) {
+            let cluster_width = display_width(cluster);
+            if cells > 0 && cells + cluster_width > width {
                 push_viewport_row(&mut rows, std::mem::take(&mut row), height);
                 cells = 0;
             }
-            if character_width > width {
-                continue;
+            if cluster_width <= width {
+                row.push_str(cluster);
+                cells += cluster_width;
             }
-            row.push(character);
-            cells += character_width;
         }
         push_viewport_row(&mut rows, row, height);
     }
@@ -673,13 +851,20 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
     let capture = sanitize_capture(input);
     let mut output = String::new();
     let mut cells = 0;
-    for character in capture.chars() {
-        let character = if character == '\n' { ' ' } else { character };
-        let width = display_width(character);
+    for cluster in capture.graphemes(true) {
+        let width = if cluster == "\n" {
+            1
+        } else {
+            display_width(cluster)
+        };
         if cells + width > max_cells {
             break;
         }
-        output.push(character);
+        if cluster == "\n" {
+            output.push(' ');
+        } else {
+            output.push_str(cluster);
+        }
         cells += width;
     }
     output
@@ -688,40 +873,17 @@ fn sanitize_label(input: &str, max_cells: usize) -> String {
 fn is_unsafe_format(character: char) -> bool {
     matches!(
         character,
-        '\u{0300}'..='\u{036f}'
-            | '\u{0483}'..='\u{0489}'
-            | '\u{0610}'..='\u{061a}'
-            | '\u{061c}'
-            | '\u{064b}'..='\u{065f}'
-            | '\u{200b}'..='\u{200f}'
+        '\u{061c}'
+            | '\u{200b}'..='\u{200c}'
+            | '\u{200e}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
             | '\u{feff}'
-    ) || ('\u{fe00}'..='\u{fe0f}').contains(&character)
-        || ('\u{e0100}'..='\u{e01ef}').contains(&character)
+    )
 }
 
-fn display_width(character: char) -> usize {
-    if character == '\0' || is_unsafe_format(character) || character.is_control() {
-        0
-    } else if matches!(
-        character,
-        '\u{1100}'..='\u{115f}'
-            | '\u{2329}'..='\u{232a}'
-            | '\u{2e80}'..='\u{a4cf}'
-            | '\u{ac00}'..='\u{d7a3}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{fe10}'..='\u{fe19}'
-            | '\u{fe30}'..='\u{fe6f}'
-            | '\u{ff00}'..='\u{ff60}'
-            | '\u{ffe0}'..='\u{ffe6}'
-            | '\u{1f300}'..='\u{1faff}'
-            | '\u{20000}'..='\u{3fffd}'
-    ) {
-        2
-    } else {
-        1
-    }
+fn display_width(cluster: &str) -> usize {
+    Line::from(cluster).width()
 }
 
 #[cfg(test)]

@@ -7,8 +7,9 @@ mod model;
 
 use observer::{
     MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
-    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_key,
-    observer_theme_style, render_to_styles, render_to_text, sanitize_capture, worker_rects,
+    ObserverCapture, ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome,
+    ObserverState, ObserverWorker, action_for_input, action_for_key, observer_theme_style, render,
+    render_to_styles, render_to_text, sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -138,7 +139,7 @@ fn hostile_capture_is_sanitized_and_bounded() {
     let hostile =
         "ok\u{1b}[31mRED\u{1b}[0m\u{1b}]0;secret\u{7}x\r\n\u{202e}bi\u{0301}di\u{200b}\0\tend";
     let clean = sanitize_capture(hostile);
-    assert_eq!(clean, "okREDx\nbidi    end");
+    assert_eq!(clean, "okREDx\nbi\u{301}di    end");
     assert!(!clean.contains('\u{1b}'));
 
     let enormous = format!(
@@ -158,6 +159,68 @@ fn hostile_capture_is_sanitized_and_bounded() {
     );
     assert!(!bounded.contains('界'));
     assert!(bounded.ends_with("x\n"));
+}
+
+#[test]
+fn unicode_grapheme_boundaries_are_atomic_at_capture_limits() {
+    let clusters = [
+        ("regional-indicator flag", "🇺🇸"),
+        ("adjacent regional-indicator flags", "🇺🇸🇨🇦"),
+        ("keycap", "1\u{fe0f}\u{20e3}"),
+        (
+            "emoji zwj with modifier and variation selector",
+            "👩🏽\u{200d}⚕\u{fe0f}",
+        ),
+        ("standalone combining sequence", "\u{301}\u{327}"),
+        ("combining character sequence", "e\u{301}\u{327}"),
+        ("text variation selector", "♥\u{fe0e}"),
+        ("emoji variation selector", "♥\u{fe0f}"),
+    ];
+
+    for (name, cluster) in clusters {
+        let exactly_after = format!("{cluster}{}", "x".repeat(MAX_CAPTURE_BYTES - cluster.len()));
+        assert_eq!(
+            sanitize_capture(&exactly_after),
+            exactly_after,
+            "{name} was split at a limit exactly after the cluster"
+        );
+
+        let exactly_before = format!("{cluster}{}", "x".repeat(MAX_CAPTURE_BYTES));
+        assert_eq!(
+            sanitize_capture(&exactly_before),
+            "x".repeat(MAX_CAPTURE_BYTES),
+            "{name} was split at a limit exactly before the cluster"
+        );
+    }
+}
+
+#[test]
+fn adjacent_flags_are_not_truncated_to_orphan_regional_indicators() {
+    let adjacent_flags = "🇺🇸🇨🇦";
+    let suffix = "x".repeat(MAX_CAPTURE_BYTES - '🇦'.len_utf8());
+    let clean = sanitize_capture(&format!("{adjacent_flags}{suffix}"));
+
+    assert_eq!(clean, suffix);
+    assert!(!clean.starts_with(['🇺', '🇸', '🇨', '🇦']));
+}
+
+#[test]
+fn hostile_controls_and_ansi_cannot_escape_grapheme_sanitization() {
+    let hostile = concat!(
+        "\u{1b}[31m",
+        "🇺🇸",
+        "\u{1b}[0m",
+        "\u{1b}]8;;file:///secret\u{7}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1b}]8;;\u{7}",
+        "\u{0}\u{7}\u{202e}",
+        "👩🏽\u{200d}⚕\u{fe0f}"
+    );
+
+    assert_eq!(
+        sanitize_capture(hostile),
+        "🇺🇸1\u{fe0f}\u{20e3}👩🏽\u{200d}⚕\u{fe0f}"
+    );
 }
 
 #[test]
@@ -316,6 +379,49 @@ fn session_reference_tokens_are_deterministic_ascii_and_bounded() {
 }
 
 #[test]
+fn capture_lifecycle_renders_loading_ready_empty_and_unavailable_distinctly() {
+    let mut loading_worker = worker("capture");
+    loading_worker.capture = None;
+    let mut observer = ObserverState::new(vec![loading_worker]);
+    let loading = render_to_text(40, 8, &observer).unwrap();
+    assert!(loading.contains("Loading output"), "{loading}");
+    assert!(!loading.contains("No captured output"), "{loading}");
+    assert!(!loading.contains("Output unavailable"), "{loading}");
+    observer.merge_capture("capture", ObserverCapture::Ready(String::new()));
+    let ready_empty = render_to_text(40, 8, &observer).unwrap();
+    assert!(ready_empty.contains("No captured output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Loading output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Output unavailable"), "{ready_empty}");
+    observer.merge_capture("capture", ObserverCapture::Unavailable);
+    let unavailable = render_to_text(40, 8, &observer).unwrap();
+    assert!(unavailable.contains("Output unavailable"), "{unavailable}");
+    assert!(!unavailable.contains("Loading output"), "{unavailable}");
+    assert!(!unavailable.contains("No captured output"), "{unavailable}");
+}
+
+#[test]
+fn capture_merge_supports_loading_and_ready_to_unavailable_transitions() {
+    let mut loading_worker = worker("loading");
+    loading_worker.capture = None;
+    let mut ready_worker = worker("ready");
+    ready_worker.capture = Some("existing output".to_owned());
+    let mut observer = ObserverState::new(vec![loading_worker, ready_worker]);
+    observer.merge_capture("loading", ObserverCapture::Unavailable);
+    observer.merge_capture("ready", ObserverCapture::Unavailable);
+    let unavailable = render_to_text(64, 10, &observer).unwrap();
+    assert_eq!(unavailable.matches("Output unavailable").count(), 2);
+    assert!(!unavailable.contains("existing output"), "{unavailable}");
+    observer.merge_capture("loading", ObserverCapture::Loading);
+    observer.update_workers(vec![ObserverWorker {
+        capture: Some(String::new()),
+        ..worker("loading")
+    }]);
+    let ready_empty = render_to_text(40, 8, &observer).unwrap();
+    assert!(ready_empty.contains("No captured output"), "{ready_empty}");
+    assert!(!ready_empty.contains("Loading output"), "{ready_empty}");
+}
+
+#[test]
 fn render_text_is_deterministic_in_normal_and_small_terminals() {
     let one = render_to_text(30, 8, &state(1)).unwrap();
     assert!(one.contains("Observer  1 worker"));
@@ -405,6 +511,117 @@ fn runtime_notices_are_sanitized_without_changing_worker_state() {
 }
 
 #[test]
+fn state_action_projection_accepts_only_possible_zero_worker_actions() {
+    let mut empty = state(0);
+    let impossible = [
+        ObserverKey::Up,
+        ObserverKey::Down,
+        ObserverKey::Left,
+        ObserverKey::Right,
+        ObserverKey::PageUp,
+        ObserverKey::PageDown,
+        ObserverKey::Tab,
+        ObserverKey::BackTab,
+        ObserverKey::Enter,
+        ObserverKey::Char('j'),
+        ObserverKey::Char('['),
+    ];
+    let mut impossible_invocations = 0;
+    for key in impossible {
+        for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+            for busy in [false, true] {
+                let projected = empty.action_for_input(key, kind, busy);
+                if let Some(action) = projected {
+                    impossible_invocations += 1;
+                    let _ = empty.apply(action);
+                }
+                assert_eq!(
+                    projected, None,
+                    "{key:?} {kind:?} busy={busy} must be inert without workers"
+                );
+            }
+        }
+    }
+    assert_eq!(impossible_invocations, 0);
+
+    let mut refresh_invocations = 0;
+    let mut back_invocations = 0;
+    for key in [ObserverKey::Char('r'), ObserverKey::Escape] {
+        let action = empty
+            .action_for_key(key)
+            .unwrap_or_else(|| panic!("{key:?} must remain actionable"));
+        match empty.apply(action) {
+            ObserverOutcome::Refresh => refresh_invocations += 1,
+            ObserverOutcome::Quit => back_invocations += 1,
+            outcome => panic!("unexpected empty-state outcome: {outcome:?}"),
+        }
+    }
+    assert_eq!(refresh_invocations, 1);
+    assert_eq!(back_invocations, 1);
+
+    let nonempty = state(1);
+    for key in [
+        ObserverKey::Up,
+        ObserverKey::Down,
+        ObserverKey::PageUp,
+        ObserverKey::PageDown,
+        ObserverKey::Enter,
+        ObserverKey::Char('r'),
+        ObserverKey::Char('q'),
+    ] {
+        assert_eq!(nonempty.action_for_key(key), action_for_key(key), "{key:?}");
+    }
+}
+
+#[test]
+fn notices_coexist_with_every_valid_control_in_normal_and_narrow_views() {
+    let mut observer = state(1);
+    observer.set_notice(Some(
+        "Refresh failed after a long recoverable transport interruption; showing previous output"
+            .to_owned(),
+    ));
+
+    for (width, height) in [(72, 9), (30, 10)] {
+        let rendered = render_to_text(width, height, &observer).unwrap();
+        for expected in [
+            "! Refresh failed",
+            "select",
+            "page",
+            "r refresh",
+            "Enter open",
+            "q back",
+            "Worker 0",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} at {width}x{height}:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_worker_view_is_actionable_without_impossible_controls() {
+    let observer = state(0);
+    for (width, height) in [(48, 6), (24, 6)] {
+        let rendered = render_to_text(width, height, &observer).unwrap();
+        for expected in ["No workers", "r refresh", "q back"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} at {width}x{height}:\n{rendered}"
+            );
+        }
+        for impossible in ["select", "page", "open"] {
+            assert!(
+                !rendered.contains(impossible),
+                "impossible control {impossible:?} shown at {width}x{height}:\n{rendered}"
+            );
+        }
+        assert!(!rendered.trim().is_empty());
+    }
+}
+
+#[test]
 fn observer_chrome_uses_terminal_default_colors_without_weakening_capture_safety() {
     let normal = observer_theme_style(false);
     assert_eq!(normal.fg, Some(Color::Reset));
@@ -458,4 +675,135 @@ fn lifecycle_and_capability_labels_are_visible() {
     for label in ["MISSING", "REMOVED", "UNKNOWN"] {
         assert!(second.contains(label), "missing {label}:\n{second}");
     }
+}
+
+#[test]
+fn press_repeat_boundary_and_busy_matrix_is_consistent() {
+    for busy in [false, true] {
+        for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+            for (key, expected) in [
+                (ObserverKey::Up, Some(ObserverAction::PreviousWorker)),
+                (ObserverKey::Down, Some(ObserverAction::NextWorker)),
+                (ObserverKey::PageUp, Some(ObserverAction::PreviousPage)),
+                (ObserverKey::PageDown, Some(ObserverAction::NextPage)),
+            ] {
+                assert_eq!(
+                    action_for_input(key, kind, busy),
+                    expected,
+                    "{key:?} {kind:?} busy={busy}"
+                );
+            }
+            let single_action = kind == ObserverInputKind::Press && !busy;
+            assert_eq!(
+                action_for_input(ObserverKey::Enter, kind, busy),
+                single_action.then_some(ObserverAction::OpenSelected)
+            );
+            assert_eq!(
+                action_for_input(ObserverKey::Char('r'), kind, busy),
+                single_action.then_some(ObserverAction::Refresh)
+            );
+            assert_eq!(
+                action_for_input(ObserverKey::Escape, kind, busy),
+                (kind == ObserverInputKind::Press).then_some(ObserverAction::Quit)
+            );
+        }
+    }
+
+    for start in [0, 2, 4] {
+        let mut observer = state(5);
+        for _ in 0..start {
+            observer.apply(ObserverAction::NextWorker);
+        }
+        let before = observer.selected_index().unwrap();
+        for key in [ObserverKey::Up, ObserverKey::Down] {
+            for kind in [ObserverInputKind::Press, ObserverInputKind::Repeat] {
+                let mut candidate = observer.clone();
+                candidate.apply(action_for_input(key, kind, false).unwrap());
+                let expected = match key {
+                    ObserverKey::Up => before.saturating_sub(1),
+                    ObserverKey::Down => before.saturating_add(1).min(4),
+                    _ => unreachable!(),
+                };
+                assert_eq!(candidate.selected_index(), Some(expected));
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let capture = concat!(
+        "界e\u{301} 🇺🇸🇨🇦 1\u{fe0f}\u{20e3} ",
+        "👩🏽\u{200d}⚕\u{fe0f} ♥\u{fe0e} ♥\u{fe0f}",
+        "\t\u{1b}[31mRED\u{1b}[0m\u{7} tail"
+    );
+    let clean = sanitize_capture(capture);
+    assert!(
+        clean.contains("e\u{301}"),
+        "combining mark was discarded: {clean:?}"
+    );
+    assert!(
+        clean.contains("👩🏽\u{200d}⚕\u{fe0f}"),
+        "emoji grapheme was split: {clean:?}"
+    );
+    assert!(!clean.contains('\u{1b}'));
+    assert!(!clean.contains('\u{7}'));
+
+    let mut observed = worker("unicode");
+    observed.capture = Some(clean);
+    let observer = ObserverState::new(vec![observed]);
+    let width = 24;
+    let height = 8;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, frame.area(), &observer))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer.area.width, width);
+    assert_eq!(buffer.area.height, height);
+    assert_eq!(
+        buffer.content().len(),
+        usize::from(width) * usize::from(height)
+    );
+    for y in 0..height {
+        for x in 0..width {
+            let cell = &buffer[(x, y)];
+            assert!(
+                !cell.symbol().contains(['\n', '\r', '\u{1b}', '\u{7}']),
+                "unsafe cell at ({x}, {y}): {:?}",
+                cell.symbol()
+            );
+        }
+    }
+    for grapheme in ["🇺🇸", "🇨🇦", "1\u{fe0f}\u{20e3}", "👩🏽\u{200d}⚕\u{fe0f}"] {
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == grapheme),
+            "rendered buffer split or discarded {grapheme:?}"
+        );
+    }
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !matches!(cell.symbol(), "🇺" | "🇸" | "🇨" | "🇦")),
+        "rendered buffer contains an orphan regional indicator"
+    );
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains("e\u{301}"))
+    );
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains("👩🏽\u{200d}⚕"))
+    );
 }

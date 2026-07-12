@@ -177,8 +177,11 @@ herdr-tether orchestration observe GROUP --placement split-right
 
 Observer renders at most four worker captures per page: one worker fills the
 page, two split side by side, and three or four use a 2×2 grid. More workers use
-deterministic pages. Membership and lifecycle labels refresh while Observer is
-open. Output is never forwarded as worker input.
+deterministic pages. Tiles distinguish loading, ready-but-empty output, and
+unavailable output. A recoverable refresh failure keeps the last authorized
+tiles, page, and selection visible with retry guidance until refresh succeeds.
+An empty group offers only refresh and back; output is never forwarded as
+worker input.
 
 Opening Observer requires the current Herdr plugin context. The native picker
 already supplies it. A standalone adapter nested inside a Tether `tmux` workload
@@ -189,6 +192,12 @@ must explicitly hand the launch back to a Herdr pane. Tether normalizes
 
 Tether is keyboard-operable: use the arrow keys or `Tab`/`Shift+Tab` to move,
 `Enter` to choose the action printed for the selected row, and `Esc` to back out.
+Held navigation keys repeat without wrapping, while refresh and open remain
+single-shot. Long picker and Observer-manager lists show position and
+more-above/more-below guidance; panes that cannot fit actionable content show
+one resize message. Captured Unicode is truncated only at extended grapheme
+boundaries, so flags, keycaps, combining sequences, and emoji remain intact
+within the documented byte, line, and display-cell limits.
 Actions and states are written as text and never conveyed by color alone.
 
 For the most readable picker, use a terminal at least 80 columns wide. The layout

@@ -17,12 +17,14 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
+    backend::{CrosstermBackend, TestBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     config::Config,
@@ -38,6 +40,11 @@ use crate::{
         StatusRequest, StatusRun, StatusService, WorkloadStatus,
     },
 };
+
+const MIN_PICKER_WIDTH: u16 = 40;
+const MIN_PICKER_HEIGHT: u16 = 8;
+const NARROW_GUIDANCE_WIDTH: u16 = 32;
+const PICKER_RESIZE_MESSAGE: &str = "Resize terminal to at least 40x8";
 
 const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
 
@@ -2697,26 +2704,44 @@ fn render_picker(frame: &mut Frame<'_>, state: &PickerState) {
 }
 
 fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, colors_enabled: bool) {
+    let compact_guidance = state.close_modal.is_some()
+        || state.pending_close.is_some()
+        || state.prune_modal.is_some()
+        || state.pending_prune.is_some()
+        || state.operation_error.is_some();
+    let narrow_guidance = compact_guidance && frame.area().width == NARROW_GUIDANCE_WIDTH;
+    let minimum_width = if narrow_guidance {
+        NARROW_GUIDANCE_WIDTH
+    } else {
+        MIN_PICKER_WIDTH
+    };
+    if frame.area().width < minimum_width || frame.area().height < MIN_PICKER_HEIGHT {
+        frame.render_widget(Clear, frame.area());
+        frame.render_widget(
+            Paragraph::new(PICKER_RESIZE_MESSAGE)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            frame.area(),
+        );
+        return;
+    }
     let labels = state.item_labels();
     let visible_rows = labels.len().min(10) as u16;
     let footer = state.footer_text();
     let panel_width = 72.min(frame.area().width);
     let footer_width = panel_width.saturating_sub(6).max(1);
-    let footer_height = wrapped_line_count(&footer, footer_width);
+    let desired_footer_height = wrapped_line_count(&footer, footer_width);
     let area = centered_rect(
         frame.area(),
         72,
         visible_rows
-            .saturating_add(footer_height)
+            .saturating_add(desired_footer_height)
             .saturating_add(4)
             .max(9),
     );
+    let footer_height = desired_footer_height.min(area.height.saturating_sub(4));
     frame.render_widget(Clear, area);
-    let destructive = state.close_modal.is_some()
-        || state.pending_close.is_some()
-        || state.prune_modal.is_some()
-        || state.pending_prune.is_some()
-        || state.operation_error.is_some();
+    let destructive = compact_guidance;
     let accent = if !colors_enabled {
         Color::Reset
     } else if destructive {
@@ -2751,15 +2776,28 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
 
     let selected = state.current_index();
     let has_selection = state.current_len() > 0;
-    let max_rows = chunks[0].height as usize;
-    let start = selected.saturating_sub(max_rows.saturating_sub(1));
+    let list_height = chunks[0].height.saturating_sub(1);
+    let max_rows = usize::from(list_height);
+    let (start, metadata) = viewport_metadata(selected, labels.len(), max_rows);
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(chunks[0]);
+    frame.render_widget(
+        Paragraph::new(metadata).style(Style::default().fg(secondary_text)),
+        list_chunks[0],
+    );
     let lines: Vec<Line<'_>> = labels
         .iter()
         .enumerate()
         .skip(start)
         .take(max_rows)
         .map(|(index, label)| {
-            let label = terminal_safe_text(label);
+            let safe_label = terminal_safe_text(label);
+            let label = bounded_label(
+                &safe_label,
+                usize::from(list_chunks[1].width.saturating_sub(2)),
+            );
             if has_selection && index == selected {
                 Line::from(vec![
                     Span::styled("> ", Style::default().fg(accent)),
@@ -2775,7 +2813,7 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), chunks[0]);
+    frame.render_widget(Paragraph::new(lines), list_chunks[1]);
     frame.render_widget(
         Paragraph::new(footer)
             .style(Style::default().fg(if !colors_enabled {
@@ -2788,6 +2826,70 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
             .wrap(Wrap { trim: true }),
         chunks[1],
     );
+}
+
+fn viewport_metadata(selected: usize, len: usize, rows: usize) -> (usize, String) {
+    if len == 0 {
+        return (0, "0/0".to_owned());
+    }
+    let selected = selected.min(len - 1);
+    let rows = rows.max(1).min(len);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(len.saturating_sub(rows));
+    let end = start.saturating_add(rows).min(len);
+    let mut metadata = format!("{}/{}", selected + 1, len);
+    if start > 0 {
+        metadata.push_str(" · more above");
+    }
+    if end < len {
+        metadata.push_str(" · more below");
+    }
+    (start, metadata)
+}
+
+fn bounded_label(text: &str, max_width: usize) -> String {
+    if Line::from(text).width() <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let content_width = max_width.saturating_sub(1);
+    let mut end = 0;
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let next = index + grapheme.len();
+        if Line::from(&text[..next]).width() > content_width {
+            break;
+        }
+        end = next;
+    }
+    let mut bounded = String::with_capacity(end.saturating_add('…'.len_utf8()));
+    bounded.push_str(&text[..end]);
+    bounded.push('…');
+    bounded
+}
+
+pub fn render_picker_to_text(width: u16, height: u16, state: &PickerState) -> Result<String> {
+    if width == 0 || height == 0 {
+        return Ok(String::new());
+    }
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).context("initialize picker text renderer")?;
+    terminal
+        .draw(|frame| render_picker_with_color_mode(frame, state, false))
+        .context("draw picker text renderer")?;
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        if y + 1 < height {
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
@@ -2837,6 +2939,29 @@ fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rec
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn picker_label_truncation_preserves_extended_graphemes() {
+        let cases = [
+            ("adjacent flags", "🇺🇸", "🇨🇦xxxx"),
+            ("keycap", "1\u{fe0f}\u{20e3}", "xxxx"),
+            ("combining mark", "e\u{301}", "xxxx"),
+            ("text variation selector", "❤\u{fe0e}", "xxxx"),
+            ("emoji variation selector", "❤\u{fe0f}", "xxxx"),
+            ("emoji ZWJ sequence", "👩\u{200d}💻", "xxxx"),
+        ];
+
+        for (name, cluster, tail) in cases {
+            let prefix = "aaaaaaaa";
+            let boundary = format!("{prefix}{cluster}");
+            let max_width = Line::from(boundary.as_str()).width() + 1;
+            assert_eq!(
+                bounded_label(&format!("{boundary}{tail}"), max_width),
+                format!("{boundary}…"),
+                "{name}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -3602,13 +3727,16 @@ mod close_render_tests {
 
     #[test]
     fn tiny_picker_and_modal_geometries_never_panic() {
-        for (width, height) in [(1, 1), (5, 3), (20, 5), (32, 8), (80, 24)] {
+        for (width, height) in [(1, 1), (5, 3), (20, 5), (39, 8), (40, 7), (40, 8), (80, 24)] {
             let (mut picker, _) = close_picker();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| render_picker(frame, &picker))
                 .unwrap();
-            if width >= 20 {
+            let below_minimum = width < MIN_PICKER_WIDTH || height < MIN_PICKER_HEIGHT;
+            if below_minimum && width >= PICKER_RESIZE_MESSAGE.len() as u16 {
+                assert!(rendered_text(&terminal).contains(PICKER_RESIZE_MESSAGE));
+            } else if !below_minimum {
                 let confirmation = rendered_text(&terminal);
                 assert!(confirmation.contains("y confirm"), "{width}x{height}");
                 assert!(confirmation.contains("n/Esc keep"), "{width}x{height}");
@@ -3617,7 +3745,7 @@ mod close_render_tests {
             terminal
                 .draw(|frame| render_picker(frame, &picker))
                 .unwrap();
-            if width >= 20 {
+            if !below_minimum {
                 let picker_text = rendered_text(&terminal);
                 assert!(
                     picker_text.contains("Enter Open"),

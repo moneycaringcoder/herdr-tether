@@ -74,6 +74,69 @@ fn group(state: &State) -> OrchestrationGroup {
     }
 }
 
+fn state_with_groups(count: usize) -> State {
+    let mut state = state_with_sessions();
+    let template = group(&state);
+    state.orchestration_groups = (0..count)
+        .map(|index| {
+            let mut group = template.clone();
+            group.id = format!("observer-group-{index:02}").parse().unwrap();
+            group.title =
+                format!("Observer group {index:02} with a deliberately narrow-terminal label")
+                    .parse()
+                    .unwrap();
+            group
+        })
+        .collect();
+    state
+}
+
+#[test]
+fn manager_uses_one_resize_fallback_until_the_minimum_geometry() {
+    let state = state_with_groups(20);
+    let manager = ObserverManagerState::from_state(&state, None).unwrap();
+    for (width, height) in [(39, 8), (40, 7)] {
+        let rendered = render_to_text(width, height, &manager).unwrap();
+        assert!(
+            rendered.contains("Resize terminal to at least 40x8"),
+            "{width}x{height}: {rendered:?}"
+        );
+        assert!(!rendered.contains("Observer group 00"), "{width}x{height}");
+        assert!(!rendered.contains("Enter manage"), "{width}x{height}");
+    }
+
+    let rendered = render_to_text(40, 8, &manager).unwrap();
+    assert!(!rendered.contains("Resize terminal"));
+    assert!(rendered.contains('…'), "{rendered:?}");
+    assert!(rendered.contains("Observer group 00"));
+    assert!(rendered.contains("Enter manage"));
+    assert!(rendered.contains("Esc/Backspace back"));
+}
+
+#[test]
+fn manager_viewport_reports_position_and_both_directions_without_changing_selection() {
+    let state = state_with_groups(19);
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    let cases = [
+        (0, "1/20 · more below"),
+        (9, "10/20 · more above · more below"),
+        (19, "20/20 · more above"),
+    ];
+    let mut current = 0;
+    for (target, metadata) in cases {
+        for _ in current..target {
+            manager.handle(ObserverManagerEvent::Next);
+        }
+        current = target;
+        let selected = manager.selected_index();
+        let rendered = render_to_text(40, 8, &manager).unwrap();
+        assert!(rendered.contains(metadata), "{metadata}: {rendered:?}");
+        assert_eq!(manager.selected_index(), selected);
+        assert_eq!(rendered.lines().count(), 8);
+        assert!(rendered.lines().all(|line| line.chars().count() <= 40));
+    }
+}
+
 #[test]
 fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() {
     let state = state_with_sessions();
