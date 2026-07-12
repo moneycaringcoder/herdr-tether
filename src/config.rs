@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    env, fs, io,
+    env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -236,6 +237,10 @@ pub struct CommandPreset {
     pub command: String,
 }
 
+impl CommandPreset {
+    pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -243,6 +248,11 @@ pub struct HostConfig {
     pub target: String,
     pub roots: Vec<String>,
     pub presets: Vec<CommandPreset>,
+}
+
+impl HostConfig {
+    pub const MAX_ROOTS: usize = 1_024;
+    pub const MAX_PRESETS: usize = 256;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -268,6 +278,10 @@ pub struct DiscoveryDefaults {
     pub max_results: usize,
     pub timeout_seconds: u64,
     pub workers: usize,
+}
+
+impl DiscoveryDefaults {
+    pub const MAX_LOCAL_ROOTS: usize = 1_024;
 }
 
 impl Default for DiscoveryDefaults {
@@ -307,6 +321,8 @@ pub struct Config {
 
 impl Config {
     pub const CURRENT_VERSION: u32 = 2;
+    pub const MAX_HOSTS: usize = 256;
+    pub const MAX_STRING_BYTES: usize = 16 * 1024;
     pub fn add_host(&mut self, host: HostConfig) -> Result<()> {
         if self.hosts.iter().any(|existing| existing.name == host.name) {
             bail!("host `{}` already exists", host.name);
@@ -351,9 +367,22 @@ impl Config {
                 Self::CURRENT_VERSION
             );
         }
+        if self.hosts.len() > Self::MAX_HOSTS {
+            bail!(
+                "config hosts may contain at most {} entries",
+                Self::MAX_HOSTS
+            );
+        }
+        if self.discovery.local_roots.len() > DiscoveryDefaults::MAX_LOCAL_ROOTS {
+            bail!(
+                "discovery local roots may contain at most {} entries",
+                DiscoveryDefaults::MAX_LOCAL_ROOTS
+            );
+        }
 
         for (root_index, root) in self.discovery.local_roots.iter().enumerate() {
             require_nonempty(root, &format!("discovery local root at index {root_index}"))?;
+            require_max_bytes(root, Self::MAX_STRING_BYTES, "discovery local root")?;
         }
         require_positive_usize(self.discovery.max_depth, "discovery max_depth")?;
         require_positive_usize(self.discovery.max_entries, "discovery max_entries")?;
@@ -368,7 +397,20 @@ impl Config {
         let mut host_names = HashSet::with_capacity(self.hosts.len());
         for (host_index, host) in self.hosts.iter().enumerate() {
             let location = format!("host at index {host_index}");
+            if host.roots.len() > HostConfig::MAX_ROOTS {
+                bail!(
+                    "host roots may contain at most {} entries",
+                    HostConfig::MAX_ROOTS
+                );
+            }
+            if host.presets.len() > HostConfig::MAX_PRESETS {
+                bail!(
+                    "host presets may contain at most {} entries",
+                    HostConfig::MAX_PRESETS
+                );
+            }
             require_nonempty(&host.name, &format!("{location} name"))?;
+            require_max_bytes(&host.name, Self::MAX_STRING_BYTES, "name")?;
             if host.name.eq_ignore_ascii_case("local") {
                 bail!("host name `{}` is reserved", host.name);
             }
@@ -376,6 +418,7 @@ impl Config {
                 bail!("duplicate host name `{}`", host.name);
             }
             require_nonempty(&host.target, &format!("host `{}` target", host.name))?;
+            require_max_bytes(&host.target, Self::MAX_STRING_BYTES, "target")?;
             crate::sshcfg::validate_ssh_target(&host.target)
                 .with_context(|| format!("invalid target for host `{}`", host.name))?;
 
@@ -384,6 +427,7 @@ impl Config {
                     root,
                     &format!("root at index {root_index} for host `{}`", host.name),
                 )?;
+                require_max_bytes(root, Self::MAX_STRING_BYTES, "root")?;
             }
 
             let mut preset_names = HashSet::with_capacity(host.presets.len());
@@ -395,6 +439,7 @@ impl Config {
                         host.name
                     ),
                 )?;
+                require_max_bytes(&preset.name, Self::MAX_STRING_BYTES, "preset name")?;
                 if !preset_names.insert(preset.name.as_str()) {
                     bail!(
                         "duplicate preset name `{}` for host `{}`",
@@ -405,6 +450,11 @@ impl Config {
                 require_nonempty(
                     &preset.command,
                     &format!("preset `{}` for host `{}` command", preset.name, host.name),
+                )?;
+                require_max_bytes(
+                    &preset.command,
+                    CommandPreset::MAX_COMMAND_BYTES,
+                    "preset command",
                 )?;
             }
         }
@@ -434,6 +484,8 @@ impl ConfigStore {
         Self { path }
     }
 
+    pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
     pub fn update<T>(&self, operation: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
         with_advisory_lock(&self.path, || {
             let mut config = self.load_unlocked()?;
@@ -461,9 +513,10 @@ impl ConfigStore {
     }
 
     fn load_unlocked_with_migration(&self, persist_migration: bool) -> Result<Config> {
-        let source = match fs::read_to_string(&self.path) {
+        let source = match read_config_file(&self.path, Self::MAX_INPUT_BYTES) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error.into()),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read config `{}`", self.path.display()));
@@ -521,6 +574,34 @@ impl ConfigStore {
         atomic_write(&self.path, serialized.as_bytes())
             .with_context(|| format!("save config `{}`", self.path.display()))
     }
+}
+
+fn read_config_file(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config input may contain at most {max_bytes} bytes"),
+        ));
+    }
+    let mut source = String::with_capacity(size as usize);
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut source)?;
+    if source.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config input may contain at most {max_bytes} bytes"),
+        ));
+    }
+    Ok(source)
+}
+
+fn require_max_bytes(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+    if value.len() > max_bytes {
+        bail!("{field} may contain at most {max_bytes} bytes");
+    }
+    Ok(())
 }
 
 fn require_nonempty(value: &str, field: &str) -> Result<()> {

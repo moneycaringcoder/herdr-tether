@@ -131,6 +131,9 @@ pub struct State {
 impl State {
     pub const CURRENT_VERSION: u32 = 4;
     pub const MAX_ORCHESTRATION_GROUPS: usize = 32;
+    pub const MAX_SESSIONS: usize = 1_024;
+    pub const MAX_STRING_BYTES: usize = 16 * 1024;
+    pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
 
     pub fn validate(&self) -> Result<()> {
         if self.version != Self::CURRENT_VERSION {
@@ -140,6 +143,18 @@ impl State {
                 Self::CURRENT_VERSION
             );
         }
+        if self.sessions.len() > Self::MAX_SESSIONS {
+            bail!(
+                "state sessions may contain at most {} entries",
+                Self::MAX_SESSIONS
+            );
+        }
+        if self.orchestration_groups.len() > Self::MAX_ORCHESTRATION_GROUPS {
+            bail!(
+                "state orchestration groups may contain at most {} entries",
+                Self::MAX_ORCHESTRATION_GROUPS
+            );
+        }
 
         let mut session_ids = HashSet::with_capacity(self.sessions.len());
         for (index, session) in self.sessions.iter().enumerate() {
@@ -147,13 +162,21 @@ impl State {
                 bail!("duplicate session id `{}`", session.id);
             }
             require_nonempty(&session.host, &format!("session at index {index} host"))?;
+            require_max_bytes(&session.host, Self::MAX_STRING_BYTES, "session host")?;
             require_nonempty(&session.target, &format!("session `{}` target", session.id))?;
             require_nonempty(
                 &session.directory,
                 &format!("session `{}` directory", session.id),
             )?;
+            require_max_bytes(&session.target, Self::MAX_STRING_BYTES, "session target")?;
+            require_max_bytes(
+                &session.directory,
+                Self::MAX_STRING_BYTES,
+                "session directory",
+            )?;
             if let Some(preset) = &session.preset {
                 require_nonempty(preset, &format!("session `{}` preset", session.id))?;
+                require_max_bytes(preset, Self::MAX_STRING_BYTES, "session preset")?;
             }
             if session.last_used_at < session.created_at {
                 bail!(
@@ -189,12 +212,9 @@ impl State {
             if session.command.as_deref().is_some_and(str::is_empty) {
                 bail!("session `{}` command must not be empty", session.id);
             }
-        }
-        if self.orchestration_groups.len() > Self::MAX_ORCHESTRATION_GROUPS {
-            bail!(
-                "state may contain at most {} orchestration groups",
-                Self::MAX_ORCHESTRATION_GROUPS
-            );
+            if let Some(command) = &session.command {
+                require_max_bytes(command, Self::MAX_COMMAND_BYTES, "session command")?;
+            }
         }
         let mut group_ids = HashSet::with_capacity(self.orchestration_groups.len());
         let mut membership_ids = HashSet::new();
@@ -204,8 +224,7 @@ impl State {
             }
             if group.workers.len() > OrchestrationGroup::MAX_WORKERS {
                 bail!(
-                    "orchestration group `{}` may contain at most {} workers",
-                    group.id,
+                    "orchestration group workers may contain at most {} entries",
                     OrchestrationGroup::MAX_WORKERS
                 );
             }
@@ -278,6 +297,8 @@ impl StateStore {
         Self { path }
     }
 
+    pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
     pub fn update<T>(&self, operation: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         with_advisory_lock(&self.path, || {
             let mut state = self.load_unlocked()?;
@@ -311,9 +332,10 @@ impl StateStore {
     }
 
     fn load_unlocked_with_migration(&self, persist_migration: bool) -> Result<State> {
-        let source = match read_regular_state_file(&self.path) {
+        let source = match read_regular_state_file(&self.path, Self::MAX_INPUT_BYTES) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error.into()),
             Err(error) => {
                 return Err(error).with_context(|| format!("read state `{}`", self.path.display()));
             }
@@ -413,13 +435,13 @@ impl StateStore {
     }
 }
 
-fn read_regular_state_file(path: &std::path::Path) -> io::Result<String> {
+fn read_regular_state_file(path: &std::path::Path, max_bytes: usize) -> io::Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
 
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
         #[cfg(unix)]
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
@@ -436,15 +458,36 @@ fn read_regular_state_file(path: &std::path::Path) -> io::Result<String> {
             "state path is not a regular file",
         ));
     }
+    let size = file.metadata()?.len();
+    if size > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("state input may contain at most {max_bytes} bytes"),
+        ));
+    }
 
-    let mut source = String::new();
-    file.read_to_string(&mut source)?;
+    let mut source = String::with_capacity(size as usize);
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut source)?;
+    if source.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("state input may contain at most {max_bytes} bytes"),
+        ));
+    }
     Ok(source)
 }
 
 fn require_nonempty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{field} must not be empty");
+    }
+    Ok(())
+}
+
+fn require_max_bytes(value: &str, max_bytes: usize, field: &str) -> Result<()> {
+    if value.len() > max_bytes {
+        bail!("{field} may contain at most {max_bytes} bytes");
     }
     Ok(())
 }
