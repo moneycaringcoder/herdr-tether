@@ -348,6 +348,7 @@ pub enum PickerSelection {
         name: ExternalSessionName,
         placement: Placement,
     },
+    ManageObservers,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,6 +368,7 @@ pub enum PickerEvent {
     Back,
     Cancel,
     Refresh,
+    ManageObservers,
     Close,
     ConfirmClose,
     DismissClose,
@@ -1552,6 +1554,9 @@ impl PickerState {
             return self.handle_input(event);
         }
         match event {
+            PickerEvent::ManageObservers => {
+                PickerOutcome::Selected(PickerSelection::ManageObservers)
+            }
             PickerEvent::Refresh => PickerOutcome::RefreshRequested,
             PickerEvent::Close => self.begin_close(),
             PickerEvent::BeginPrune => self.begin_prune(),
@@ -2209,7 +2214,7 @@ impl PickerState {
                 parts.insert(
                     0,
                     format!(
-                        "Esc {back_action} · {primary_hint}↑/↓ navigate{destructive_hint}{path_hint} · r {refresh_hint} · Backspace {back_action}"
+                        "Esc {back_action} · {primary_hint}↑/↓ navigate{destructive_hint}{path_hint} · o Observers · r {refresh_hint} · Backspace {back_action}"
                     ),
                 );
                 parts.join(" · ")
@@ -2652,6 +2657,10 @@ fn map_key_with_modals(
         return None;
     }
 
+    if key.kind == KeyEventKind::Press && matches!(key.code, KeyCode::Char('o' | 'O')) {
+        return Some(PickerEvent::ManageObservers);
+    }
+
     match key.code {
         KeyCode::Esc if stage == PickerStage::Host => Some(PickerEvent::Cancel),
         KeyCode::Esc => Some(PickerEvent::Back),
@@ -3028,6 +3037,35 @@ mod tests {
                 true,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn observer_manager_shortcut_is_global_obvious_and_press_only() {
+        let mut picker = navigation_picker();
+        assert!(picker.footer_text().contains("o Observers"));
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                &PickerInput::None,
+                PickerStage::Resource,
+                false,
+            ),
+            Some(PickerEvent::ManageObservers)
+        );
+        for key in [
+            KeyEvent::new_with_kind(KeyCode::Char('o'), KeyModifiers::NONE, KeyEventKind::Repeat),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+        ] {
+            assert_eq!(
+                map_key(key, &PickerInput::None, PickerStage::Resource, false,),
+                None
+            );
+        }
+        assert_eq!(
+            picker.handle(PickerEvent::ManageObservers),
+            PickerOutcome::Selected(PickerSelection::ManageObservers)
         );
     }
 

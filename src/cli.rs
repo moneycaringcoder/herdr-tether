@@ -27,13 +27,14 @@ use crate::{
         ExternalSessionName, OrchestrationGroupId, OrchestrationTitle, OwnershipProof, Placement,
         SessionId,
     },
-    orchestration::{OrchestrationService, companion_placement},
+    observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
+    orchestration::{MANAGER_STALE_GROUP_ERROR, OrchestrationService, companion_placement},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
     state::{
-        OrchestrationCapabilities, SessionRecord, SessionStatus, State, StateStore,
-        compare_normal_sessions, is_normal_session,
+        OrchestrationCapabilities, OrchestrationGroup, SessionRecord, SessionStatus, State,
+        StateStore, compare_normal_sessions, is_normal_session,
     },
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
@@ -42,6 +43,8 @@ use crate::{
         run_picker_with_operation_error,
     },
 };
+
+const OBSERVER_PLUGIN_CONTEXT_ERROR: &str = "Observer must be launched from the Tether plugin pane";
 
 #[derive(Debug, Parser)]
 #[command(name = "herdr-tether", version, about)]
@@ -595,6 +598,10 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         return execute_selection(paths, &config, selection);
     }
 
+    let observer_placement = args
+        .placement
+        .map(Placement::from)
+        .unwrap_or(config.ui.placement);
     let mut operation_error = None;
     PruneService::new(state_store.clone())
         .automatic_cleanup()
@@ -612,6 +619,12 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         else {
             return Ok(());
         };
+        if selection == PickerSelection::ManageObservers {
+            match run_observer_manager_flow(observer_placement, &state_store)? {
+                ObserverManagerFlow::BackToPicker => continue,
+                ObserverManagerFlow::Launched => return Ok(()),
+            }
+        }
         match execute_selection(paths, &config, selection.clone()) {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -619,6 +632,112 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObserverManagerFlow {
+    BackToPicker,
+    Launched,
+}
+
+fn run_observer_manager_flow(
+    placement: Placement,
+    state_store: &StateStore,
+) -> Result<ObserverManagerFlow> {
+    let service = OrchestrationService::new(state_store.clone());
+    let mut notice = None;
+    loop {
+        let state = state_store.load().context("load Observer manager state")?;
+        let manager = ObserverManagerState::from_state(&state, notice.take())?;
+        match run_observer_manager(manager)? {
+            ObserverManagerAction::BackToPicker => return Ok(ObserverManagerFlow::BackToPicker),
+            ObserverManagerAction::Create {
+                id,
+                title,
+                orchestrator_session_id,
+                workers,
+            } => {
+                match service.create_group_with_workers(id, title, orchestrator_session_id, workers)
+                {
+                    Ok(group) => {
+                        notice = Some(format!(
+                            "Created {}; workload lifecycle unchanged",
+                            group.title.as_str()
+                        ));
+                    }
+                    Err(_) => {
+                        notice =
+                            Some("Could not create Observer; metadata was unchanged".to_owned());
+                    }
+                }
+            }
+            ObserverManagerAction::ReplaceWorkers {
+                expected_group,
+                workers,
+            } => match service.replace_workers(&expected_group, workers) {
+                Ok(group) => {
+                    notice = Some(format!(
+                        "Updated {}; workload lifecycle unchanged",
+                        group.title.as_str()
+                    ));
+                }
+                Err(error) => {
+                    notice = Some(observer_metadata_failure_notice("update", &error));
+                }
+            },
+            ObserverManagerAction::Delete { expected_group } => {
+                match service.delete_group_if_unchanged(&expected_group) {
+                    Ok(group) => {
+                        notice = Some(format!(
+                            "Deleted {} metadata; workloads keep running",
+                            group.title.as_str()
+                        ));
+                    }
+                    Err(error) => {
+                        notice = Some(observer_metadata_failure_notice("delete", &error));
+                    }
+                }
+            }
+            ObserverManagerAction::Launch { group_id } => {
+                let launch = (|| {
+                    let group = service.group(&group_id)?;
+                    let context =
+                        HerdrContext::from_plugin_env().context(OBSERVER_PLUGIN_CONTEXT_ERROR)?;
+                    let executable =
+                        env::current_exe().context("locate the bundled Tether executable")?;
+                    place_observer_in_herdr(context, executable, &group, placement)
+                })();
+                match launch {
+                    Ok(()) => return Ok(ObserverManagerFlow::Launched),
+                    Err(error) => notice = Some(observer_launch_failure_notice(&error)),
+                }
+            }
+        }
+    }
+}
+
+fn observer_metadata_failure_notice(operation: &str, error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == MANAGER_STALE_GROUP_ERROR)
+    {
+        return "Observer changed while this screen was open; refreshed current metadata; \
+                review and retry"
+            .to_owned();
+    }
+    format!("Could not {operation} Observer; metadata was unchanged")
+}
+
+fn observer_launch_failure_notice(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == OBSERVER_PLUGIN_CONTEXT_ERROR)
+    {
+        return "Could not launch Observer; open it through prefix+t in a Herdr pane; \
+                source pane was preserved"
+            .to_owned();
+    }
+    "Could not launch Observer; source pane was preserved".to_owned()
 }
 
 fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelection) -> Result<()> {
@@ -632,6 +751,9 @@ fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelecti
             name,
             placement,
         } => attach_external(host, target, name, placement),
+        PickerSelection::ManageObservers => {
+            bail!("Observer management must be entered through the interactive Tether picker")
+        }
     }
 }
 
@@ -755,6 +877,7 @@ fn selection_from_picker(
             name,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
+        PickerSelection::ManageObservers => Ok(Some(PickerSelection::ManageObservers)),
     }
 }
 
@@ -1001,6 +1124,37 @@ where
     Ok(())
 }
 
+fn place_observer_in_herdr(
+    context: HerdrContext,
+    executable: PathBuf,
+    group: &OrchestrationGroup,
+    placement: Placement,
+) -> Result<()> {
+    let title = PaneTitle::observer(group.title.as_str());
+    let group_id = group.id.clone();
+    place_built_in_herdr(
+        HerdrClient::new(context),
+        &title,
+        companion_placement(placement),
+        |destination| {
+            Ok(CommandSpec::new(
+                executable,
+                vec![
+                    "orchestration".to_owned(),
+                    "observer-runtime".to_owned(),
+                    group_id.to_string(),
+                    "--pane-id".to_owned(),
+                    destination.pane_id.clone(),
+                    "--workspace-id".to_owned(),
+                    destination.workspace_id.clone(),
+                    "--herdr-bin".to_owned(),
+                    destination.binary.display().to_string(),
+                ],
+            ))
+        },
+    )
+}
+
 fn confirm_replacement(client: &HerdrClient) -> Result<()> {
     let inspection = client.inspect_replacement_source()?;
     if !inspection.requires_confirmation() {
@@ -1234,29 +1388,7 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
                     .ui
                     .placement,
             );
-            let placement = companion_placement(placement);
-            let title = PaneTitle::observer(persisted.title.as_str());
-            place_built_in_herdr(
-                HerdrClient::new(context),
-                &title,
-                placement,
-                |destination| {
-                    Ok(CommandSpec::new(
-                        executable.clone(),
-                        vec![
-                            "orchestration".to_owned(),
-                            "observer-runtime".to_owned(),
-                            group.to_string(),
-                            "--pane-id".to_owned(),
-                            destination.pane_id.clone(),
-                            "--workspace-id".to_owned(),
-                            destination.workspace_id.clone(),
-                            "--herdr-bin".to_owned(),
-                            destination.binary.display().to_string(),
-                        ],
-                    ))
-                },
-            )
+            place_observer_in_herdr(context, executable, &persisted, placement)
         }
         OrchestrationCommand::ObserverRuntime {
             group,
@@ -1670,5 +1802,30 @@ mod tests {
         assert!(options.hosts.iter().all(|host| host.name == "build"));
         assert_eq!(options.hosts[0].origin, PickerHostOrigin::Effective);
         assert_eq!(options.hosts[1].origin, PickerHostOrigin::Retained);
+    }
+
+    #[test]
+    fn missing_plugin_context_launch_notice_is_actionable_and_safe() {
+        let error = anyhow::anyhow!("HERDR_PANE_ID is not set")
+            .context("Observer must be launched from the Tether plugin pane");
+
+        let notice = observer_launch_failure_notice(&error);
+
+        assert!(notice.contains("prefix+t"));
+        assert!(notice.contains("Herdr pane"));
+        assert!(notice.contains("source pane was preserved"));
+        assert!(!notice.contains("HERDR_PANE_ID"));
+    }
+
+    #[test]
+    fn stale_manager_snapshot_notice_reports_refresh_without_identifiers() {
+        let error = anyhow::anyhow!(MANAGER_STALE_GROUP_ERROR);
+
+        let notice = observer_metadata_failure_notice("delete", &error);
+
+        assert!(notice.contains("changed while this screen was open"));
+        assert!(notice.contains("refreshed current metadata"));
+        assert!(notice.contains("review and retry"));
+        assert!(!notice.contains("observer-"));
     }
 }

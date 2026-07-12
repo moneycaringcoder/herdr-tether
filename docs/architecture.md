@@ -61,6 +61,22 @@ State admits at most 32 groups and 64 workers per group. Identifiers and titles
 are validated and bounded; references carry no host, path, command, or
 orchestration-runtime assumptions.
 
+The native picker exposes groups through a harness-neutral manager projection.
+It derives bounded labels from safe host, repository, and preset metadata,
+persists create/edit/delete requests through `OrchestrationService`,
+and re-reads authoritative state after each mutation. UI defaults grant both
+bounded observation and interactive open to selected workers. The manager never
+renders raw session IDs and never calls workload lifecycle methods.
+The standalone CLI uses the same service and remains an optional adapter API.
+Manager create transactions revalidate the orchestrator and every worker as a
+currently running exact-owned workload while holding the state lock. Edit
+transactions permit already-retained unavailable members, but apply the same
+locked validation to every newly added worker. Edit and delete actions carry the
+complete group snapshot displayed to the user and reject under the lock if its
+title, orchestrator, membership order, membership epoch, capabilities, or
+worker titles changed before commit.
+
+
 ## Observer projection
 
 `orchestration observe` creates exactly one outer Herdr pane. Inside that pane,
@@ -106,6 +122,10 @@ This gate is local to Observer and does not change ordinary intentional
 multi-attachment elsewhere. Companion placement creates and runs only the
 destination pane; it does not run a command in or close the source launcher
 pane.
+Native manager launch also requires a valid
+`HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id`; it fails before placement rather
+than treating the managed picker overlay as the source. The optional standalone
+adapter path retains its generic Herdr environment compatibility.
 Observer terminal teardown independently attempts to restore cursor visibility,
 leave the alternate screen, and disable raw mode on every guarded exit path;
 one restoration error cannot prevent the remaining attempts.

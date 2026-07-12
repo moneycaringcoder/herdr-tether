@@ -40,6 +40,16 @@ use crate::{
     tmux::TmuxBackend,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrchestrationWorkerSpec {
+    pub session_id: SessionId,
+    pub title: Option<OrchestrationTitle>,
+    pub capabilities: OrchestrationCapabilities,
+}
+
+pub const MANAGER_STALE_GROUP_ERROR: &str =
+    "Observer group changed while the manager was open; refresh and retry";
+
 /// State-only management for opt-in orchestration groups.
 #[derive(Clone, Debug)]
 pub struct OrchestrationService {
@@ -82,6 +92,75 @@ impl OrchestrationService {
         })
     }
 
+    pub fn create_group_with_workers(
+        &self,
+        id: OrchestrationGroupId,
+        title: OrchestrationTitle,
+        orchestrator_session_id: SessionId,
+        workers: Vec<OrchestrationWorkerSpec>,
+    ) -> Result<OrchestrationGroup> {
+        validate_worker_specs(orchestrator_session_id, &workers)?;
+        self.store.update(|state| {
+            require_ui_eligible_session(state, orchestrator_session_id, "orchestrator")?;
+            for worker in &workers {
+                require_ui_eligible_session(state, worker.session_id, "worker")?;
+            }
+            if state
+                .orchestration_groups
+                .iter()
+                .any(|group| group.id == id)
+            {
+                bail!("orchestration group `{id}` already exists");
+            }
+            if state.orchestration_groups.len() >= State::MAX_ORCHESTRATION_GROUPS {
+                bail!(
+                    "orchestration group limit of {} has been reached",
+                    State::MAX_ORCHESTRATION_GROUPS
+                );
+            }
+            let group = OrchestrationGroup {
+                id,
+                title,
+                orchestrator_session_id,
+                workers: worker_members(Vec::new(), workers),
+            };
+            state.orchestration_groups.push(group.clone());
+            Ok(group)
+        })
+    }
+
+    pub fn replace_workers(
+        &self,
+        expected: &OrchestrationGroup,
+        workers: Vec<OrchestrationWorkerSpec>,
+    ) -> Result<OrchestrationGroup> {
+        validate_worker_specs(expected.orchestrator_session_id, &workers)?;
+        self.store.update(|state| {
+            let index = state
+                .orchestration_groups
+                .iter()
+                .position(|group| group.id == expected.id)
+                .with_context(|| format!("unknown orchestration group `{}`", expected.id))?;
+            let current = state.orchestration_groups[index].clone();
+            if &current != expected {
+                bail!(MANAGER_STALE_GROUP_ERROR);
+            }
+            let retained = current
+                .workers
+                .iter()
+                .map(|worker| worker.session_id)
+                .collect::<HashSet<_>>();
+            for worker in &workers {
+                if !retained.contains(&worker.session_id) {
+                    require_ui_eligible_session(state, worker.session_id, "new worker")?;
+                }
+            }
+            let group = &mut state.orchestration_groups[index];
+            group.workers = worker_members(std::mem::take(&mut group.workers), workers);
+            Ok(group.clone())
+        })
+    }
+
     pub fn delete_group(&self, id: &OrchestrationGroupId) -> Result<OrchestrationGroup> {
         self.store.update(|state| {
             let index = state
@@ -89,6 +168,23 @@ impl OrchestrationService {
                 .iter()
                 .position(|group| &group.id == id)
                 .with_context(|| format!("unknown orchestration group `{id}`"))?;
+            Ok(state.orchestration_groups.remove(index))
+        })
+    }
+
+    pub fn delete_group_if_unchanged(
+        &self,
+        expected: &OrchestrationGroup,
+    ) -> Result<OrchestrationGroup> {
+        self.store.update(|state| {
+            let index = state
+                .orchestration_groups
+                .iter()
+                .position(|group| group.id == expected.id)
+                .with_context(|| format!("unknown orchestration group `{}`", expected.id))?;
+            if &state.orchestration_groups[index] != expected {
+                bail!(MANAGER_STALE_GROUP_ERROR);
+            }
             Ok(state.orchestration_groups.remove(index))
         })
     }
@@ -172,6 +268,73 @@ impl OrchestrationService {
         })
     }
 }
+
+fn require_ui_eligible_session(state: &State, session_id: SessionId, role: &str) -> Result<()> {
+    let eligible = state.sessions.iter().any(|record| {
+        record.id == session_id
+            && record.status == SessionStatus::Running
+            && record.ownership_proof.is_some()
+            && record.tmux_session_id.is_some()
+    });
+    if !eligible {
+        bail!("{role} is no longer a running exact-owned workload");
+    }
+    Ok(())
+}
+fn validate_worker_specs(
+    orchestrator_session_id: SessionId,
+    workers: &[OrchestrationWorkerSpec],
+) -> Result<()> {
+    if workers.len() > OrchestrationGroup::MAX_WORKERS {
+        bail!(
+            "orchestration group may contain at most {} workers",
+            OrchestrationGroup::MAX_WORKERS
+        );
+    }
+    let mut session_ids = HashSet::with_capacity(workers.len());
+    for worker in workers {
+        if worker.session_id == orchestrator_session_id {
+            bail!("orchestrator must not also be a worker");
+        }
+        if !session_ids.insert(worker.session_id) {
+            bail!("duplicate worker session `{}`", worker.session_id);
+        }
+        if worker.capabilities.is_empty() {
+            bail!(
+                "worker `{}` must declare at least one capability",
+                worker.session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn worker_members(
+    existing: Vec<OrchestrationMember>,
+    workers: Vec<OrchestrationWorkerSpec>,
+) -> Vec<OrchestrationMember> {
+    let existing = existing
+        .into_iter()
+        .map(|worker| (worker.session_id, worker))
+        .collect::<HashMap<_, _>>();
+    workers
+        .into_iter()
+        .map(|worker| {
+            let membership_id = existing
+                .get(&worker.session_id)
+                .map_or_else(OrchestrationMembershipId::new, |member| {
+                    member.membership_id
+                });
+            OrchestrationMember {
+                session_id: worker.session_id,
+                membership_id,
+                title: worker.title,
+                capabilities: worker.capabilities,
+            }
+        })
+        .collect()
+}
+
 pub(crate) const fn companion_placement(placement: Placement) -> Placement {
     if matches!(placement, Placement::ReplaceCurrentPane) {
         Placement::SplitRight
@@ -792,6 +955,34 @@ mod tests {
         }
     }
 
+    fn exact_running_session(id: SessionId, tmux_id: &str) -> SessionRecord {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        SessionRecord {
+            id,
+            host: "local".to_owned(),
+            target: "local".to_owned(),
+            directory: "/tmp".to_owned(),
+            preset: None,
+            command: Some("exec true".to_owned()),
+            tmux_session_id: Some(tmux_id.parse().unwrap()),
+            ownership_proof: Some(
+                format!(
+                    "0197f1980000700080000000000000{:0>2}",
+                    tmux_id.trim_start_matches('$')
+                )
+                .parse()
+                .unwrap(),
+            ),
+            status: SessionStatus::Running,
+            created_at: now,
+            last_used_at: now,
+            closed_at: None,
+            exit_status: None,
+        }
+    }
+
     #[derive(Default)]
     struct MockCleanup {
         attempts: Vec<&'static str>,
@@ -1227,6 +1418,292 @@ mod tests {
             store.load().unwrap().orchestration_groups[0].workers[0].membership_id,
             second.membership_id
         );
+    }
+
+    #[test]
+    fn ui_group_edits_are_atomic_and_preserve_retained_membership_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let group_id: OrchestrationGroupId = "observer-build".parse().unwrap();
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let first_worker: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let second_worker: SessionId = "tether-0197f198000070008000000000000003".parse().unwrap();
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![
+                    exact_running_session(orchestrator, "$1"),
+                    exact_running_session(first_worker, "$2"),
+                    exact_running_session(second_worker, "$3"),
+                ],
+                orchestration_groups: Vec::new(),
+            })
+            .unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        };
+        let first_spec = OrchestrationWorkerSpec {
+            session_id: first_worker,
+            title: Some("build worker".parse().unwrap()),
+            capabilities,
+        };
+
+        let created = service
+            .create_group_with_workers(
+                group_id.clone(),
+                "Observer build".parse().unwrap(),
+                orchestrator,
+                vec![first_spec.clone()],
+            )
+            .unwrap();
+        let retained_epoch = created.workers[0].membership_id;
+        let second_spec = OrchestrationWorkerSpec {
+            session_id: second_worker,
+            title: Some("test worker".parse().unwrap()),
+            capabilities,
+        };
+        let edited = service
+            .replace_workers(&created, vec![first_spec.clone(), second_spec.clone()])
+            .unwrap();
+
+        assert_eq!(edited.workers.len(), 2);
+        assert_eq!(edited.workers[0].membership_id, retained_epoch);
+        assert_eq!(edited.workers[1].session_id, second_worker);
+        assert_ne!(edited.workers[1].membership_id, retained_epoch);
+
+        let duplicate_error = service
+            .replace_workers(&edited, vec![second_spec.clone(), second_spec])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_error.contains("duplicate worker"),
+            "{duplicate_error}"
+        );
+        assert_eq!(
+            store.load().unwrap().orchestration_groups[0].workers,
+            edited.workers,
+            "a rejected edit must not partially rewrite membership"
+        );
+    }
+
+    #[test]
+    fn ui_create_revalidates_exact_running_sessions_under_the_state_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let worker: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let spec = OrchestrationWorkerSpec {
+            session_id: worker,
+            title: None,
+            capabilities: OrchestrationCapabilities {
+                observe_output: true,
+                open_interactive: true,
+            },
+        };
+        let mut state = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![
+                exact_running_session(orchestrator, "$1"),
+                exact_running_session(worker, "$2"),
+            ],
+            orchestration_groups: Vec::new(),
+        };
+        state.sessions[1].status = SessionStatus::Ended;
+        state.sessions[1].closed_at = Some(state.sessions[1].last_used_at);
+        store.save(&state).unwrap();
+
+        let error = service
+            .create_group_with_workers(
+                "observer-stale-worker".parse().unwrap(),
+                "Observer stale worker".parse().unwrap(),
+                orchestrator,
+                vec![spec.clone()],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("running exact-owned"), "{error}");
+        assert!(store.load().unwrap().orchestration_groups.is_empty());
+
+        state.sessions[1] = exact_running_session(worker, "$2");
+        state.sessions[0].ownership_proof = None;
+        store.save(&state).unwrap();
+        let error = service
+            .create_group_with_workers(
+                "observer-stale-orchestrator".parse().unwrap(),
+                "Observer stale orchestrator".parse().unwrap(),
+                orchestrator,
+                vec![spec],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("running exact-owned"), "{error}");
+        assert!(store.load().unwrap().orchestration_groups.is_empty());
+    }
+
+    #[test]
+    fn ui_edit_rejects_stale_snapshots_and_ineligible_new_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let first: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let second: SessionId = "tether-0197f198000070008000000000000003".parse().unwrap();
+        let stale_new: SessionId = "tether-0197f198000070008000000000000004".parse().unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        };
+        let spec = |session_id| OrchestrationWorkerSpec {
+            session_id,
+            title: None,
+            capabilities,
+        };
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![
+                    exact_running_session(orchestrator, "$1"),
+                    exact_running_session(first, "$2"),
+                    exact_running_session(second, "$3"),
+                    exact_running_session(stale_new, "$4"),
+                ],
+                orchestration_groups: Vec::new(),
+            })
+            .unwrap();
+        let group_id: OrchestrationGroupId = "observer-conflict".parse().unwrap();
+        let displayed = service
+            .create_group_with_workers(
+                group_id.clone(),
+                "Observer conflict".parse().unwrap(),
+                orchestrator,
+                vec![spec(first)],
+            )
+            .unwrap();
+        service
+            .add_worker(&group_id, second, None, capabilities)
+            .unwrap();
+
+        let error = service
+            .replace_workers(&displayed, vec![spec(first)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while the manager was open"),
+            "{error}"
+        );
+        let current = service.group(&group_id).unwrap();
+        assert_eq!(current.workers.len(), 2);
+
+        store
+            .update(|state| {
+                let record = state
+                    .sessions
+                    .iter_mut()
+                    .find(|record| record.id == stale_new)
+                    .unwrap();
+                record.status = SessionStatus::Ended;
+                record.closed_at = Some(record.last_used_at);
+                Ok(())
+            })
+            .unwrap();
+        let error = service
+            .replace_workers(&current, vec![spec(first), spec(second), spec(stale_new)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("running exact-owned"), "{error}");
+        assert_eq!(service.group(&group_id).unwrap(), current);
+
+        store
+            .update(|state| {
+                state
+                    .sessions
+                    .iter_mut()
+                    .filter(|record| record.id == first || record.id == second)
+                    .for_each(|record| {
+                        record.status = SessionStatus::Ended;
+                        record.closed_at = Some(record.last_used_at);
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let retained = service
+            .replace_workers(&current, vec![spec(first), spec(second)])
+            .unwrap();
+        assert_eq!(retained.workers, current.workers);
+    }
+
+    #[test]
+    fn ui_delete_rejects_modified_and_recreated_groups() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let first: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let second: SessionId = "tether-0197f198000070008000000000000003".parse().unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        };
+        let spec = |session_id| OrchestrationWorkerSpec {
+            session_id,
+            title: None,
+            capabilities,
+        };
+        store
+            .save(&State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![
+                    exact_running_session(orchestrator, "$1"),
+                    exact_running_session(first, "$2"),
+                    exact_running_session(second, "$3"),
+                ],
+                orchestration_groups: Vec::new(),
+            })
+            .unwrap();
+        let group_id: OrchestrationGroupId = "observer-delete-conflict".parse().unwrap();
+        let displayed = service
+            .create_group_with_workers(
+                group_id.clone(),
+                "Observer delete conflict".parse().unwrap(),
+                orchestrator,
+                vec![spec(first)],
+            )
+            .unwrap();
+        service
+            .add_worker(&group_id, second, None, capabilities)
+            .unwrap();
+
+        let error = service
+            .delete_group_if_unchanged(&displayed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while the manager was open"),
+            "{error}"
+        );
+        let recreated_from = service.group(&group_id).unwrap();
+        service.delete_group(&group_id).unwrap();
+        service
+            .create_group_with_workers(
+                group_id.clone(),
+                recreated_from.title.clone(),
+                orchestrator,
+                vec![spec(first), spec(second)],
+            )
+            .unwrap();
+
+        let error = service
+            .delete_group_if_unchanged(&recreated_from)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while the manager was open"),
+            "{error}"
+        );
+        assert_eq!(service.list_groups().unwrap().len(), 1);
     }
     #[test]
     fn companion_placement_always_preserves_the_source_pane() {

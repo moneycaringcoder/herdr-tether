@@ -144,10 +144,27 @@ The picker keeps actions contextual:
 
 ## Development orchestration and Observer
 
-The opt-in orchestration-group and Observer commands are currently available on
-development `main` and immutable reviewed commits, not in stable v0.3.0. They
-organize existing Tether session references; they do not launch, adopt, stop, or
-remove workloads.
+The opt-in orchestration-group and Observer workflow is currently available on
+development `main` and immutable reviewed commits, not in stable v0.3.0. It
+organizes existing Tether-owned workloads for observation; it does not launch,
+adopt, stop, restart, or remove them.
+
+Use the native workflow from the ordinary `prefix+t` picker:
+
+1. Press `o` to open **Observers**.
+2. Press `n` to create a group, choose one running workload as orchestrator,
+   select one or more running workers with `Space`, then press `Enter`.
+3. Tether generates safe labels and grants each selected worker bounded
+   read-only observation plus interactive-open capability.
+4. Select the group and choose **Open Observer**. The source launcher remains
+   available while one companion pane opens.
+
+Existing groups can be edited or deleted from the same screen. Membership edits
+are metadata-only and reversible; deleting a group requires confirmation and
+does not touch its workloads or panes. Ordinary users never need session IDs,
+shell commands, a standalone Tether installation, or environment setup.
+
+The CLI remains an optional machine/adapter API:
 
 ```sh
 herdr-tether orchestration create GROUP --title TITLE --orchestrator SESSION
@@ -157,26 +174,15 @@ herdr-tether orchestration list --json
 herdr-tether orchestration observe GROUP --placement split-right
 ```
 
-Supply exact group, title, orchestrator-session, and worker-session values.
-Every worker must receive at least one explicit capability:
-`--observe-output` permits bounded read-only output capture, while
-`--open-interactive` permits `Enter` to open a running exact-owned worker as a
-normal Tether view. Use `remove-worker GROUP SESSION` to remove membership and
-`delete GROUP` to remove group metadata; neither command touches sessions or
-panes.
+Observer renders at most four worker captures per page: one worker fills the
+page, two split side by side, and three or four use a 2×2 grid. More workers use
+deterministic pages. Membership and lifecycle labels refresh while Observer is
+open. Output is never forwarded as worker input.
 
-Observer creates one outer Herdr pane and renders at most four worker captures
-per page: one worker fills the page, two split side by side, and three or four
-use a 2×2 grid. More workers use deterministic pages. Membership and lifecycle
-labels refresh while Observer is open. Output is never forwarded as worker
-input.
-
-Launch `orchestration observe` from a Herdr pane so Tether receives Herdr's
-placement context. A process nested inside a Tether `tmux` workload does not
-automatically inherit that plugin context; it should request or hand off the
-explicit launch to a Herdr pane. Prefer a split or new tab for this companion
-view; Tether normalizes `replace-current-pane` to `split-right` so the invoking
-pane remains available.
+Opening Observer requires the current Herdr plugin context. The native picker
+already supplies it. A standalone adapter nested inside a Tether `tmux` workload
+must explicitly hand the launch back to a Herdr pane. Tether normalizes
+`replace-current-pane` to `split-right` so the invoking pane remains available.
 
 ## Terminal and accessibility notes
 
