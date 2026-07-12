@@ -82,7 +82,7 @@ enum TopLevel {
         command: OrchestrationCommand,
     },
     /// Report local installation and configuration health.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Herdr plugin action entrypoints.
     #[command(hide = true)]
     Plugin {
@@ -282,6 +282,13 @@ enum OrchestrationCommand {
 }
 
 #[derive(Clone, Debug, Args)]
+struct DoctorArgs {
+    /// Emit bounded, redacted, schema-versioned JSON instead of human output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
 struct PruneArgs {
     /// Show eligible records without changing state.
     #[arg(long)]
@@ -316,7 +323,7 @@ fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
         TopLevel::Snapshot(args) => snapshot(paths, args),
         TopLevel::Session { command } => session_command(paths, command),
         TopLevel::Orchestration { command } => orchestration_command(paths, command),
-        TopLevel::Doctor => doctor(paths),
+        TopLevel::Doctor(args) => doctor(paths, args),
         TopLevel::Plugin { command } => plugin_command(command),
     }
 }
@@ -1479,9 +1486,165 @@ fn plugin_command(command: PluginCommand) -> Result<()> {
     HerdrClient::new(context).open_plugin_pane(entrypoint)
 }
 
-fn doctor(paths: &AppPaths) -> Result<()> {
-    let mut failures = 0usize;
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorStatus {
+    Ok,
+    Missing,
+    Unusable,
+    Failed,
+    TimedOut,
+    PermissionDenied,
+    Unavailable,
+    Incomplete,
+    Standalone,
+}
 
+#[derive(Debug, Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    status: DoctorStatus,
+    required: bool,
+    diagnostic: Option<&'static str>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    schema_version: u8,
+    completion: &'static str,
+    checks: Vec<DoctorCheck>,
+    failure_count: usize,
+    truncated: bool,
+}
+
+fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
+    if !args.json {
+        return doctor_human(paths);
+    }
+    let mut checks = Vec::with_capacity(7);
+
+    let config_status = if !paths.config_file.exists() {
+        DoctorStatus::Missing
+    } else if ConfigStore::new(paths.config_file.clone()).load().is_ok() {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Unusable
+    };
+    checks.push(doctor_check("config", config_status, true));
+
+    let state_status = if !paths.state_file.exists() {
+        DoctorStatus::Missing
+    } else if StateStore::new(paths.state_file.clone()).load().is_ok() {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Unusable
+    };
+    checks.push(doctor_check("state", state_status, true));
+
+    let binaries = ProcessBinaries::new("ssh", "tmux");
+    checks.push(probe_binary("tmux", binaries.tmux().to_owned()));
+    checks.push(probe_binary("ssh", binaries.ssh().to_owned()));
+    checks.push(probe_binary("cargo", PathBuf::from("cargo")));
+
+    let herdr = env::var_os("HERDR_BIN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("herdr"));
+    checks.push(probe_binary("herdr", herdr));
+    let herdr_binary_provided = env::var_os("HERDR_BIN_PATH")
+        .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
+    let plugin_context_signaled = herdr_binary_provided
+        || env::var_os("HERDR_PANE_ID").is_some()
+        || env::var_os("HERDR_WORKSPACE_ID").is_some();
+    let context_status = if !plugin_context_signaled {
+        DoctorStatus::Standalone
+    } else {
+        let pane = env::var("HERDR_PANE_ID")
+            .or_else(|_| env::var("PANE_ID"))
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        let workspace = env::var("HERDR_WORKSPACE_ID")
+            .or_else(|_| env::var("WORKSPACE_ID"))
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        if pane && workspace && herdr_binary_provided {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Incomplete
+        }
+    };
+    checks.push(doctor_check("herdr_context", context_status, true));
+
+    let failures = checks
+        .iter()
+        .filter(|check| check.required && !doctor_status_passes(check.status))
+        .count();
+    if args.json {
+        let report = DoctorReport {
+            schema_version: 1,
+            completion: if failures == 0 { "complete" } else { "failed" },
+            checks,
+            failure_count: failures,
+            truncated: false,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&report).context("serialize doctor JSON")?
+        );
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        bail!(
+            "doctor found {failures} required failure{}",
+            if failures == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn doctor_check(name: &'static str, status: DoctorStatus, required: bool) -> DoctorCheck {
+    let diagnostic = match status {
+        DoctorStatus::Ok | DoctorStatus::Standalone => None,
+        DoctorStatus::Missing => Some("not_found"),
+        DoctorStatus::Unusable => Some("invalid_data"),
+        DoctorStatus::Failed => Some("nonzero_exit"),
+        DoctorStatus::TimedOut => Some("timeout"),
+        DoctorStatus::PermissionDenied => Some("permission_denied"),
+        DoctorStatus::Unavailable => Some("io_error"),
+        DoctorStatus::Incomplete => Some("missing_context"),
+    };
+    DoctorCheck {
+        name,
+        status,
+        required,
+        diagnostic,
+        truncated: false,
+    }
+}
+
+fn doctor_status_passes(status: DoctorStatus) -> bool {
+    matches!(status, DoctorStatus::Ok | DoctorStatus::Standalone)
+}
+
+fn probe_binary(name: &'static str, program: PathBuf) -> DoctorCheck {
+    let spec = CommandSpec::new(program, vec!["--version".to_owned()]);
+    let cancelled = AtomicBool::new(false);
+    let status = match run_bounded(&spec, StdDuration::from_secs(3), &cancelled) {
+        BoundedOutput::Completed { status, .. } if status.success() => DoctorStatus::Ok,
+        BoundedOutput::Completed { .. } => DoctorStatus::Failed,
+        BoundedOutput::TimedOut => DoctorStatus::TimedOut,
+        BoundedOutput::SpawnError(std::io::ErrorKind::NotFound) => DoctorStatus::Missing,
+        BoundedOutput::SpawnError(std::io::ErrorKind::PermissionDenied) => {
+            DoctorStatus::PermissionDenied
+        }
+        BoundedOutput::SpawnError(_) | BoundedOutput::Error => DoctorStatus::Unavailable,
+        BoundedOutput::Cancelled => unreachable!("doctor probes are never cancelled"),
+    };
+    doctor_check(name, status, true)
+}
+
+fn doctor_human(paths: &AppPaths) -> Result<()> {
+    let mut failures = 0usize;
     if !paths.config_file.exists() {
         println!(
             "config {}: missing (run `herdr-tether setup`)",
@@ -1500,7 +1663,6 @@ fn doctor(paths: &AppPaths) -> Result<()> {
             }
         }
     }
-
     if !paths.state_file.exists() {
         println!(
             "state {}: missing (run `herdr-tether setup`)",
@@ -1516,23 +1678,21 @@ fn doctor(paths: &AppPaths) -> Result<()> {
             }
         }
     }
-
     let binaries = ProcessBinaries::new("ssh", "tmux");
     failures += usize::from(!report_binary_path(binaries.tmux().to_owned(), &["-V"]));
     failures += usize::from(!report_binary_path(binaries.ssh().to_owned(), &["-V"]));
     failures += usize::from(!report_binary("cargo", &["--version"]));
-
     let herdr = env::var_os("HERDR_BIN_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("herdr"));
     println!("Herdr binary: {}", herdr.display());
     failures += usize::from(!report_binary_path(herdr, &["--version"]));
-    let herdr_binary_provided = env::var_os("HERDR_BIN_PATH")
+    let binary = env::var_os("HERDR_BIN_PATH")
         .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
-    let plugin_context_signaled = herdr_binary_provided
+    let signaled = binary
         || env::var_os("HERDR_PANE_ID").is_some()
         || env::var_os("HERDR_WORKSPACE_ID").is_some();
-    if !plugin_context_signaled {
+    if !signaled {
         println!("Herdr context: standalone (no plugin pane selected)");
     } else {
         let pane = env::var("HERDR_PANE_ID")
@@ -1543,9 +1703,9 @@ fn doctor(paths: &AppPaths) -> Result<()> {
             .or_else(|_| env::var("WORKSPACE_ID"))
             .ok()
             .filter(|value| !value.trim().is_empty());
-        match (pane, workspace, herdr_binary_provided) {
+        match (pane, workspace, binary) {
             (Some(pane), Some(workspace), true) => {
-                println!("Herdr context: {pane} in workspace {workspace}");
+                println!("Herdr context: {pane} in workspace {workspace}")
             }
             (pane, workspace, binary) => {
                 let mut missing = Vec::new();
@@ -1566,7 +1726,6 @@ fn doctor(paths: &AppPaths) -> Result<()> {
             }
         }
     }
-
     if failures == 0 {
         Ok(())
     } else {

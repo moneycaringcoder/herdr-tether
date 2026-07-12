@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -11,10 +12,78 @@ from unittest import mock
 
 from live_product_smoke import (
     Smoke,
+    REPORT_MAX_BYTES,
+    failure_category,
+    smoke_report,
     process_fingerprint,
     terminal_screen_text,
     validate_remote_target,
 )
+
+
+class SmokeJsonReportTests(unittest.TestCase):
+    def test_report_is_exact_bounded_and_redacts_adversarial_failures(self) -> None:
+        error = RuntimeError(
+            "command failed credential-token /private/home/repository "
+            "host.internal session-id \x1b]0;owned\x07 " + "x" * 100_000
+        )
+        smoke = mock.Mock(
+            completed_phases=["validate_inputs", "start_herdr"],
+            active_phase="keybinding_contract",
+            cleanup_attempts=4,
+            cleanup_result="failed",
+            tmux_version="tmux 3.4",
+            tether_version="herdr-tether 0.1.0",
+        )
+        report = smoke_report(smoke, "failed", failure_category(error))
+        encoded = json.dumps(report, separators=(",", ":"))
+        self.assertLessEqual(len(encoded.encode()), REPORT_MAX_BYTES)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["completion"], "failed")
+        self.assertEqual(report["failure_category"], "command")
+        self.assertEqual(
+            [phase["status"] for phase in report["phases"]],
+            ["passed", "passed", "failed", "not_run", "not_run"],
+        )
+        self.assertEqual(report["exercised"], {"actions": [], "placements": []})
+        self.assertEqual(report["cleanup"], {"attempts": 4, "result": "failed"})
+        self.assertFalse(report["truncated"])
+        for forbidden in (
+            "credential-token",
+            "/private/home",
+            "host.internal",
+            "session-id",
+            "\x1b",
+            "x" * 100,
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_success_report_has_stable_actions_placements_and_versions(self) -> None:
+        smoke = mock.Mock(
+            completed_phases=[
+                "validate_inputs",
+                "start_herdr",
+                "keybinding_contract",
+                "plugin_contract",
+                "product_lifecycle",
+            ],
+            active_phase=None,
+            cleanup_attempts=3,
+            cleanup_result="passed",
+            tmux_version="tmux 3.4",
+            tether_version="herdr-tether 0.1.0",
+        )
+        report = smoke_report(smoke, "passed")
+        self.assertEqual(report["completion"], "complete")
+        self.assertEqual(
+            report["exercised"]["placements"],
+            ["split-right", "split-down", "new-tab"],
+        )
+        self.assertEqual(
+            report["exercised"]["actions"],
+            ["setup", "doctor", "open", "resume", "stop", "replace", "observe"],
+        )
+        self.assertIsNone(report["failure_category"])
 
 
 class SmokeEnvironmentTests(unittest.TestCase):

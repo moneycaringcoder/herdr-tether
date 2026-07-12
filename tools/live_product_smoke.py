@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import platform
 import threading
 import time
 from typing import Any, Callable, Iterable
@@ -37,6 +38,90 @@ SSH_TARGET_RE = re.compile(
     r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
 )
 
+REPORT_SCHEMA_VERSION = 1
+REPORT_MAX_BYTES = 4096
+PHASE_NAMES = (
+    "validate_inputs",
+    "start_herdr",
+    "keybinding_contract",
+    "plugin_contract",
+    "product_lifecycle",
+)
+EXERCISED_ACTIONS = (
+    "setup",
+    "doctor",
+    "open",
+    "resume",
+    "stop",
+    "replace",
+    "observe",
+)
+EXERCISED_PLACEMENTS = ("split-right", "split-down", "new-tab")
+
+
+def safe_version(value: str) -> str:
+    """Bound tool versions to a printable token grammar with no paths."""
+    value = value.strip()
+    if len(value) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+()-]*", value):
+        return "unknown"
+    return value
+
+
+def failure_category(error: BaseException) -> str:
+    """Return a stable category without exposing exception text or arguments."""
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    message = str(error).lower()
+    if "timed out" in message or "deadline" in message:
+        return "timeout"
+    if "requires" in message or "must be" in message or "missing or not executable" in message:
+        return "validation"
+    if "command failed" in message or "exit" in message:
+        return "command"
+    return "contract"
+
+
+def smoke_report(
+    smoke: "Smoke | None",
+    result: str,
+    category: str | None = None,
+) -> dict[str, object]:
+    completed = set(smoke.completed_phases if smoke is not None else ())
+    report: dict[str, object] = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "completion": "complete" if result == "passed" else "failed",
+        "phases": [
+            {
+                "name": name,
+                "status": "passed" if name in completed else (
+                    "failed" if smoke is not None and smoke.active_phase == name else "not_run"
+                ),
+            }
+            for name in PHASE_NAMES
+        ],
+        "exercised": {
+            "actions": list(EXERCISED_ACTIONS) if result == "passed" else [],
+            "placements": list(EXERCISED_PLACEMENTS) if result == "passed" else [],
+        },
+        "result": result,
+        "cleanup": {
+            "attempts": smoke.cleanup_attempts if smoke is not None else 0,
+            "platform": safe_version(sys.platform),
+            "python": safe_version(platform.python_version()),
+            "herdr": HERDR_VERSION,
+            "tmux": safe_version(smoke.tmux_version) if smoke is not None else "unknown",
+            "tether": safe_version(smoke.tether_version) if smoke is not None else "unknown",
+            "herdr": HERDR_VERSION,
+            "tmux": smoke.tmux_version if smoke is not None else "unknown",
+            "tether": smoke.tether_version if smoke is not None else "unknown",
+        },
+        "failure_category": category,
+        "truncated": False,
+    }
+    encoded = json.dumps(report, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > REPORT_MAX_BYTES:
+        raise AssertionError("live smoke report exceeded its fixed JSON bound")
+    return report
 
 def validate_remote_target(target: str) -> str:
     """Accept one explicit SSH destination, never options, URLs, or extra hosts."""
@@ -200,6 +285,12 @@ class Smoke:
         self.owned_ids: set[str] = set()
         self.plugin_config: Path | None = None
         self.plugin_state: Path | None = None
+        self.completed_phases: list[str] = []
+        self.active_phase: str | None = None
+        self.cleanup_attempts = 0
+        self.cleanup_result = "not_started"
+        self.tmux_version = "unknown"
+        self.tether_version = "unknown"
 
         inherited_path = os.environ.get("PATH", "")
         resolved_tmux = shutil.which("tmux", path=inherited_path)
@@ -1640,20 +1731,22 @@ class Smoke:
                 "required executable tmux could not be resolved before entering "
                 "the restricted GUI PATH"
             )
-        tmux_version = self.run([str(self.tmux), "-V"]).stdout.strip()
-        match = re.fullmatch(r"tmux (\d+)\.(\d+)[a-z]?", tmux_version)
+        self.tmux_version = self.run([str(self.tmux), "-V"]).stdout.strip()[:64]
+        match = re.fullmatch(r"tmux (\d+)\.(\d+)[a-z]?", self.tmux_version)
         if not match or tuple(map(int, match.groups())) < (3, 3):
-            fail(f"live smoke requires tmux 3.3 or newer; got {tmux_version!r}")
+            fail(f"live smoke requires tmux 3.3 or newer; got {self.tmux_version!r}")
         version = self.run([str(self.herdr), "--version"])
         if version.stdout.strip() != f"herdr {HERDR_VERSION}":
             fail(
                 f"live smoke requires official Herdr {HERDR_VERSION}; got {version.stdout.strip()!r}"
             )
+        self.tether_version = self.run([str(self.tether), "--version"]).stdout.strip()[:64]
 
     def cleanup(self) -> None:
         if self._cleaned:
             return
         self._cleaned = True
+        cleanup_failed = False
         # Close exact Tether-owned workloads first. The deliberately external
         # session is cleaned separately and is never passed to Tether close.
         for session_id in sorted(
@@ -1661,6 +1754,7 @@ class Smoke:
             for session_id in self.owned_ids
             if OWNED_SESSION_RE.fullmatch(session_id)
         ):
+            self.cleanup_attempts += 1
             try:
                 self.run(
                     [str(self.tether), "session", "stop", session_id],
@@ -1669,16 +1763,19 @@ class Smoke:
                 )
             except SmokeFailure as error:
                 print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
+                cleanup_failed = True
         cleanup_commands = (
             ([str(self.tmux), "kill-session", "-t", f"={self.external_session}"], 5.0),
             ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
             ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
         for command, timeout in cleanup_commands:
+            self.cleanup_attempts += 1
             try:
                 self.run(command, check=False, timeout=timeout)
             except SmokeFailure as error:
                 print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
+                cleanup_failed = True
         if self.herdr_client and self.herdr_client.poll() is None:
             try:
                 os.killpg(self.herdr_client.pid, signal.SIGTERM)
@@ -1697,13 +1794,21 @@ class Smoke:
             self.herdr_master = None
         if not self.keep:
             shutil.rmtree(self.root, ignore_errors=True)
+        self.cleanup_result = "failed" if cleanup_failed else "passed"
 
     def execute(self) -> None:
-        self.validate_inputs()
-        self.start_herdr()
-        self.keybinding_contract()
-        self.plugin_contract()
-        self.product_lifecycle()
+        phases = (
+            ("validate_inputs", self.validate_inputs),
+            ("start_herdr", self.start_herdr),
+            ("keybinding_contract", self.keybinding_contract),
+            ("plugin_contract", self.plugin_contract),
+            ("product_lifecycle", self.product_lifecycle),
+        )
+        for name, operation in phases:
+            self.active_phase = name
+            operation()
+            self.completed_phases.append(name)
+        self.active_phase = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -1716,6 +1821,9 @@ def parse_args() -> argparse.Namespace:
         "--repo-root", type=Path, default=Path.cwd(), help="checkout containing herdr-plugin.toml"
     )
     parser.add_argument("--keep", action="store_true", help="retain the disposable root for debugging")
+    parser.add_argument(
+        "--json", action="store_true", help="emit bounded machine-readable result JSON"
+    )
     parser.add_argument(
         "--remote-target",
         help="optional disposable SSH target for the remote cwd branch",
@@ -1739,21 +1847,23 @@ def main() -> int:
         args.remote_directory,
         args.remote_known_hosts,
     )
+    validation_error: ValueError | None = None
     if any(value is not None for value in remote_values) and not all(
         value is not None for value in remote_values
     ):
-        print(
-            "live product smoke FAILED: --remote-target, --remote-directory, and "
-            "--remote-known-hosts must be supplied together",
-            file=sys.stderr,
-        )
-        return 2
-    if args.remote_target is not None:
+        validation_error = ValueError("remote options must be supplied together")
+    elif args.remote_target is not None:
         try:
             validate_remote_target(args.remote_target)
         except ValueError as error:
-            print(f"live product smoke FAILED: {error}", file=sys.stderr)
-            return 2
+            validation_error = error
+    if validation_error is not None:
+        if args.json:
+            print(json.dumps(smoke_report(None, "failed", "validation"), separators=(",", ":")))
+        else:
+            print(f"live product smoke FAILED: {validation_error}", file=sys.stderr)
+        return 2
+
     smoke = Smoke(
         args.herdr,
         args.tether,
@@ -1770,23 +1880,35 @@ def main() -> int:
 
     signal.signal(signal.SIGHUP, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
+    result = "passed"
+    category: str | None = None
+    exit_code = 0
     try:
         smoke.execute()
     except SmokeFailure as error:
-        print(f"live product smoke FAILED: {error}", file=sys.stderr)
-        output = smoke.herdr_output.decode("utf-8", "replace").strip()
-        if output:
-            print(f"Herdr PTY tail:\n{output[-8000:]}", file=sys.stderr)
-        if args.keep:
-            print(f"disposable root retained at {smoke.root}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("live product smoke interrupted", file=sys.stderr)
-        return 130
+        result = "failed"
+        category = failure_category(error)
+        exit_code = 1
+        if not args.json:
+            print(f"live product smoke FAILED: {error}", file=sys.stderr)
+            output = smoke.herdr_output.decode("utf-8", "replace").strip()
+            if output:
+                print(f"Herdr PTY tail:\n{output[-8000:]}", file=sys.stderr)
+            if args.keep:
+                print(f"disposable root retained at {smoke.root}", file=sys.stderr)
+    except KeyboardInterrupt as error:
+        result = "interrupted"
+        category = failure_category(error)
+        exit_code = 130
+        if not args.json:
+            print("live product smoke interrupted", file=sys.stderr)
     finally:
         smoke.cleanup()
-    print("live product smoke passed: actions, continuity, exact close, and all placements")
-    return 0
+    if args.json:
+        print(json.dumps(smoke_report(smoke, result, category), separators=(",", ":")))
+    elif result == "passed":
+        print("live product smoke passed: actions, continuity, exact close, and all placements")
+    return exit_code
 
 
 if __name__ == "__main__":
