@@ -504,8 +504,7 @@ pub fn run_observer(
         loop {
             match observer_results.try_recv() {
                 Ok(result) if visible_worker_ids(&observer) == result.visible => {
-                    let merge =
-                        merge_captured_workers(&store, &group_id, &mut observer, result);
+                    let merge = merge_captured_workers(&store, &group_id, &mut observer, result);
                     apply_observer_capture_merge_result(&mut observer, merge);
                 }
                 Ok(_) => {}
@@ -592,10 +591,7 @@ pub fn run_observer(
     }
 }
 
-fn clear_transient_observer_notice(
-    observer: &mut ObserverState,
-    outcome: &ObserverOutcome,
-) {
+fn clear_transient_observer_notice(observer: &mut ObserverState, outcome: &ObserverOutcome) {
     if !matches!(outcome, ObserverOutcome::OpenSelected { .. })
         && observer.notice() != Some(OBSERVER_REFRESH_FAILURE_NOTICE)
     {
@@ -616,10 +612,7 @@ fn apply_observer_refresh_result(observer: &mut ObserverState, result: Result<()
     }
 }
 
-fn apply_observer_capture_merge_result(
-    observer: &mut ObserverState,
-    result: Result<()>,
-) -> bool {
+fn apply_observer_capture_merge_result(observer: &mut ObserverState, result: Result<()>) -> bool {
     match result {
         Ok(()) => true,
         Err(_) => {
@@ -1262,7 +1255,6 @@ mod tests {
                         Some(&format!("first-{index}")),
                     )
                 })
-
                 .collect(),
         );
         for _ in 0..4 {
@@ -1317,8 +1309,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.json");
         let store = StateStore::new(state_path.clone());
-        let (state, group_id, _) =
-            capture_state("0197f198000070008000000000000011");
+        let (state, group_id, _) = capture_state("0197f198000070008000000000000011");
         let fingerprint = capture_fingerprint(
             &state.orchestration_groups[0].workers[0],
             &state.sessions[0],
@@ -1443,8 +1434,7 @@ mod tests {
 
     #[test]
     fn capture_backend_failure_becomes_unavailable_without_exposing_error_text() {
-        let (mut state, _, _) =
-            capture_state("0197f198000070008000000000000011");
+        let (mut state, _, _) = capture_state("0197f198000070008000000000000011");
         state.sessions[0].target = String::new();
 
         assert_eq!(

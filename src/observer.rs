@@ -882,7 +882,6 @@ fn is_unsafe_format(character: char) -> bool {
     )
 }
 
-
 fn display_width(cluster: &str) -> usize {
     Line::from(cluster).width()
 }
