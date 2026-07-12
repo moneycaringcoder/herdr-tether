@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in orchestration groups in development state schema version 3, with harness-neutral orchestrator/worker references, explicit output-observation and interactive-open capabilities, and metadata-only membership lifecycle commands.
+- Added a read-only Observer companion that uses one outer Herdr pane, dynamically refreshes exact-owned worker status and authorized bounded captures, renders deterministic four-worker pages, and can open an authorized running worker without replacing Observer.
+- Added development `main` and immutable exact-SHA operating guidance for groups and Observer while retaining stable v0.3.0 installation instructions.
+
+### Limitations
+
+- Observer launch requires an invoking Herdr pane context; processes nested inside Tether workloads must request or hand off that explicit launch rather than assuming Herdr's plugin environment.
+- Observer is bounded to 32 groups, 64 workers per group, four captures per page, and 200 lines, 16 KiB, and 16,384 display cells per rendered capture.
+- Companion Observer launches normalize `replace-current-pane` to `split-right` so the invoking or Observer pane remains available.
+
 ## [0.3.0] - 2026-07-11
 
 ### Added

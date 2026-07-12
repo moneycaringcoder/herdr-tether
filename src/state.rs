@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
-    model::{OwnershipProof, SessionId, TmuxSessionId},
+    model::{OrchestrationGroupId, OrchestrationTitle, OwnershipProof, SessionId, TmuxSessionId},
     storage::{atomic_write, with_advisory_lock},
 };
 
@@ -81,15 +81,52 @@ pub struct SessionRecord {
     pub exit_status: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationCapabilities {
+    pub observe_output: bool,
+    pub open_interactive: bool,
+}
+
+impl OrchestrationCapabilities {
+    pub fn is_empty(self) -> bool {
+        !self.observe_output && !self.open_interactive
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationMember {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<OrchestrationTitle>,
+    pub capabilities: OrchestrationCapabilities,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationGroup {
+    pub id: OrchestrationGroupId,
+    pub title: OrchestrationTitle,
+    pub orchestrator_session_id: SessionId,
+    pub workers: Vec<OrchestrationMember>,
+}
+
+impl OrchestrationGroup {
+    pub const MAX_WORKERS: usize = 64;
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     pub version: u32,
     pub sessions: Vec<SessionRecord>,
+    pub orchestration_groups: Vec<OrchestrationGroup>,
 }
 
 impl State {
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const CURRENT_VERSION: u32 = 3;
+    pub const MAX_ORCHESTRATION_GROUPS: usize = 32;
 
     pub fn validate(&self) -> Result<()> {
         if self.version != Self::CURRENT_VERSION {
@@ -149,6 +186,49 @@ impl State {
                 bail!("session `{}` command must not be empty", session.id);
             }
         }
+        if self.orchestration_groups.len() > Self::MAX_ORCHESTRATION_GROUPS {
+            bail!(
+                "state may contain at most {} orchestration groups",
+                Self::MAX_ORCHESTRATION_GROUPS
+            );
+        }
+        let mut group_ids = HashSet::with_capacity(self.orchestration_groups.len());
+        for group in &self.orchestration_groups {
+            if !group_ids.insert(&group.id) {
+                bail!("duplicate orchestration group id `{}`", group.id);
+            }
+            if group.workers.len() > OrchestrationGroup::MAX_WORKERS {
+                bail!(
+                    "orchestration group `{}` may contain at most {} workers",
+                    group.id,
+                    OrchestrationGroup::MAX_WORKERS
+                );
+            }
+            let mut worker_ids = HashSet::with_capacity(group.workers.len());
+            for worker in &group.workers {
+                if worker.session_id == group.orchestrator_session_id {
+                    bail!(
+                        "orchestration group `{}` orchestrator must not also be a worker",
+                        group.id
+                    );
+                }
+                if !worker_ids.insert(worker.session_id) {
+                    bail!(
+                        "duplicate worker session `{}` in orchestration group `{}`",
+                        worker.session_id,
+                        group.id
+                    );
+                }
+                if worker.capabilities.is_empty() {
+                    bail!(
+                        "worker session `{}` in orchestration group `{}` must declare a capability",
+                        worker.session_id,
+                        group.id
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -158,6 +238,7 @@ impl Default for State {
         Self {
             version: Self::CURRENT_VERSION,
             sessions: Vec::new(),
+            orchestration_groups: Vec::new(),
         }
     }
 }
@@ -228,11 +309,21 @@ impl StateStore {
             })?;
 
         match version {
-            2 => {
+            3 => {
                 let state: State = serde_json::from_str(&source).with_context(|| {
-                    format!("decode state version 2 from `{}`", self.path.display())
+                    format!("decode state version 3 from `{}`", self.path.display())
                 })?;
                 state.validate()?;
+                Ok(state)
+            }
+            2 => {
+                let legacy: StateV2 = serde_json::from_str(&source).with_context(|| {
+                    format!("decode state version 2 from `{}`", self.path.display())
+                })?;
+                let state = legacy.migrate();
+                state.validate()?;
+                self.save_unlocked(&state)
+                    .with_context(|| format!("rewrite migrated state `{}`", self.path.display()))?;
                 Ok(state)
             }
             1 => {
@@ -315,6 +406,68 @@ fn require_nonempty(value: &str, field: &str) -> Result<()> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StateV2 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    sessions: Vec<SessionRecordV2>,
+}
+
+/// Frozen v0.3.0 session shape used only for the v2-to-v3 migration.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRecordV2 {
+    id: SessionId,
+    host: String,
+    target: String,
+    directory: String,
+    preset: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    tmux_session_id: Option<TmuxSessionId>,
+    #[serde(default)]
+    ownership_proof: Option<OwnershipProof>,
+    status: SessionStatus,
+    created_at: DateTime<Utc>,
+    last_used_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    exit_status: Option<i32>,
+}
+
+impl From<SessionRecordV2> for SessionRecord {
+    fn from(record: SessionRecordV2) -> Self {
+        Self {
+            id: record.id,
+            host: record.host,
+            target: record.target,
+            directory: record.directory,
+            preset: record.preset,
+            command: record.command,
+            tmux_session_id: record.tmux_session_id,
+            ownership_proof: record.ownership_proof,
+            status: record.status,
+            created_at: record.created_at,
+            last_used_at: record.last_used_at,
+            closed_at: record.closed_at,
+            exit_status: record.exit_status,
+        }
+    }
+}
+
+impl StateV2 {
+    fn migrate(self) -> State {
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: self.sessions.into_iter().map(Into::into).collect(),
+            orchestration_groups: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StateV1 {
     #[allow(dead_code)]
     version: u32,
@@ -374,6 +527,7 @@ impl StateV1 {
                     }
                 })
                 .collect(),
+            orchestration_groups: Vec::new(),
         }
     }
 }
@@ -421,6 +575,7 @@ impl StateV0 {
                     exit_status: None,
                 })
                 .collect(),
+            orchestration_groups: Vec::new(),
         }
     }
 }

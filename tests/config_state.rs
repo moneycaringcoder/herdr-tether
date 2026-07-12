@@ -12,8 +12,11 @@ use herdr_tether::{
         CommandPreset, Config, ConfigStore, DiscoveryDefaults, HerdrKeybindingInstall,
         HerdrKeybindingRollback, HerdrKeybindingStore, HostConfig, RetentionDefaults, UiDefaults,
     },
-    model::Placement,
-    state::{SessionRecord, SessionStatus, State, StateStore},
+    model::{OrchestrationGroupId, OrchestrationTitle, Placement},
+    state::{
+        OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
+        SessionStatus, State, StateStore,
+    },
 };
 use tempfile::tempdir;
 
@@ -384,6 +387,7 @@ fn state_round_trips_and_migrates_v0() {
             closed_at: None,
             exit_status: None,
         }],
+        orchestration_groups: Vec::new(),
     };
 
     store.save(&state).unwrap();
@@ -404,7 +408,271 @@ fn state_round_trips_and_migrates_v0() {
     assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
     assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
+    assert!(migrated.orchestration_groups.is_empty());
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 3"));
+}
+
+#[test]
+fn state_v2_migration_preserves_sessions_and_creates_no_groups() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    fs::write(
+        &path,
+        r#"{"version":2,"sessions":[{"id":"tether-0197f198000070008000000000000001","host":"build-box","target":"builder@example.test","directory":"/srv/code","preset":"shell","command":"exec shell","tmux_session_id":7,"ownership_proof":null,"status":"running","created_at":"2026-07-10T12:00:00Z","last_used_at":"2026-07-10T12:00:00Z","closed_at":null,"exit_status":null}]}"#,
+    )
+    .unwrap();
+
+    let migrated = StateStore::new(path.clone()).load().unwrap();
+
+    assert_eq!(migrated.version, 3);
+    assert_eq!(migrated.sessions.len(), 1);
+    assert_eq!(migrated.sessions[0].host, "build-box");
+    assert_eq!(migrated.sessions[0].target, "builder@example.test");
+    assert_eq!(migrated.sessions[0].directory, "/srv/code");
+    assert_eq!(migrated.sessions[0].preset.as_deref(), Some("shell"));
+    assert_eq!(migrated.sessions[0].command.as_deref(), Some("exec shell"));
+    assert_eq!(
+        migrated.sessions[0].tmux_session_id,
+        Some("$7".parse().unwrap())
+    );
+    assert!(migrated.sessions[0].ownership_proof.is_none());
+    assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
+    assert!(migrated.orchestration_groups.is_empty());
+    let rewritten = fs::read_to_string(path).unwrap();
+    assert!(rewritten.contains("\"version\": 3"));
+    assert!(rewritten.contains("\"orchestration_groups\": []"));
+}
+
+#[test]
+fn future_state_version_fails_closed_without_rewriting_data() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let source = br#"{"version":4,"sessions":[],"orchestration_groups":[]}"#;
+    fs::write(&path, source).unwrap();
+
+    let error = StateStore::new(path.clone())
+        .load()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("unsupported state version 4"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), source);
+}
+
+#[test]
+fn state_v3_orchestration_groups_round_trip_arbitrary_references() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let orchestrator = "tether-0197f198000070008000000000000010".parse().unwrap();
+    let observer = "tether-0197f198000070008000000000000011".parse().unwrap();
+    let interactive = "tether-0197f198000070008000000000000012".parse().unwrap();
+    let both = "tether-0197f198000070008000000000000013".parse().unwrap();
+    let state = State {
+        version: State::CURRENT_VERSION,
+        sessions: Vec::new(),
+        orchestration_groups: vec![OrchestrationGroup {
+            id: "generic-build".parse().unwrap(),
+            title: "Generic Build".parse().unwrap(),
+            orchestrator_session_id: orchestrator,
+            workers: vec![
+                OrchestrationMember {
+                    session_id: observer,
+                    title: None,
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: true,
+                        open_interactive: false,
+                    },
+                },
+                OrchestrationMember {
+                    session_id: interactive,
+                    title: Some("Interactive worker".parse().unwrap()),
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: false,
+                        open_interactive: true,
+                    },
+                },
+                OrchestrationMember {
+                    session_id: both,
+                    title: Some("Both capabilities".parse().unwrap()),
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: true,
+                        open_interactive: true,
+                    },
+                },
+            ],
+        }],
+    };
+
+    let store = StateStore::new(path);
+    store.save(&state).unwrap();
+    assert_eq!(store.load().unwrap(), state);
+}
+
+#[test]
+fn orchestration_identifiers_and_titles_are_safe_and_bounded() {
+    for invalid in [
+        "",
+        "Uppercase",
+        "-leading",
+        "trailing-",
+        "two--separators",
+        "contains space",
+        "contains/slash",
+        &"a".repeat(OrchestrationGroupId::MAX_BYTES + 1),
+    ] {
+        assert!(
+            invalid.parse::<OrchestrationGroupId>().is_err(),
+            "{invalid:?}"
+        );
+    }
+    for valid in [
+        "a",
+        "generic-build_2",
+        &"a".repeat(OrchestrationGroupId::MAX_BYTES),
+    ] {
+        assert!(valid.parse::<OrchestrationGroupId>().is_ok(), "{valid:?}");
+    }
+    for invalid in [
+        "",
+        " leading",
+        "trailing ",
+        "line\nbreak",
+        "escape\u{1b}",
+        "non\u{00a0}ascii",
+        &"a".repeat(OrchestrationTitle::MAX_BYTES + 1),
+    ] {
+        assert!(
+            invalid.parse::<OrchestrationTitle>().is_err(),
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn state_v3_orchestration_validation_fails_closed() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let store = StateStore::new(path);
+    let session = |suffix: usize| {
+        format!("tether-0197f19800007000800000000000{suffix:04}")
+            .parse()
+            .unwrap()
+    };
+    let group = |id: &str| OrchestrationGroup {
+        id: id.parse().unwrap(),
+        title: "Group".parse().unwrap(),
+        orchestrator_session_id: session(1),
+        workers: vec![OrchestrationMember {
+            session_id: session(2),
+            title: None,
+            capabilities: OrchestrationCapabilities {
+                observe_output: true,
+                open_interactive: false,
+            },
+        }],
+    };
+    let mut state = State {
+        version: State::CURRENT_VERSION,
+        sessions: Vec::new(),
+        orchestration_groups: vec![group("one"), group("one")],
+    };
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate orchestration group id")
+    );
+
+    state.orchestration_groups = (0..=State::MAX_ORCHESTRATION_GROUPS)
+        .map(|index| group(&format!("group-{index}")))
+        .collect();
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("at most")
+    );
+
+    state.orchestration_groups = vec![group("workers")];
+    state.orchestration_groups[0].workers = (0..=OrchestrationGroup::MAX_WORKERS)
+        .map(|index| OrchestrationMember {
+            session_id: session(index + 10),
+            title: None,
+            capabilities: OrchestrationCapabilities {
+                observe_output: true,
+                open_interactive: false,
+            },
+        })
+        .collect();
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("at most")
+    );
+
+    state.orchestration_groups = vec![group("duplicate-worker")];
+    let duplicate_worker = state.orchestration_groups[0].workers[0].clone();
+    state.orchestration_groups[0].workers.push(duplicate_worker);
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate worker session")
+    );
+
+    state.orchestration_groups = vec![group("orchestrator-worker")];
+    state.orchestration_groups[0].workers[0].session_id =
+        state.orchestration_groups[0].orchestrator_session_id;
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("orchestrator")
+    );
+
+    state.orchestration_groups = vec![group("no-capability")];
+    state.orchestration_groups[0].workers[0].capabilities = OrchestrationCapabilities::default();
+    assert!(
+        store
+            .save(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("capability")
+    );
+}
+
+#[test]
+fn state_v3_rejects_unsafe_orchestration_json() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let store = StateStore::new(path.clone());
+    let orchestrator = "tether-0197f198000070008000000000000001";
+    let worker = "tether-0197f198000070008000000000000002";
+    let invalid_sources = [
+        format!(
+            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+        ),
+        format!(
+            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+        ),
+        format!(
+            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","capabilities":{{"observe_output":true}}}}]}}]}}"#
+        ),
+    ];
+
+    for source in invalid_sources {
+        fs::write(&path, source).unwrap();
+        assert!(store.load().is_err());
+    }
 }
 
 #[test]
@@ -427,6 +695,9 @@ fn every_state_schema_rejects_unknown_fields() {
         format!(
             r#"{{"version":2,"sessions":[{{"id":"{id}","host":"local","target":"local","directory":"/tmp","preset":null,"command":null,"tmux_session_id":null,"ownership_proof":null,"status":"running",{timestamps},"closed_at":null,"exit_status":null,"unknown":true}}]}}"#
         ),
+        r#"{"version":3,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
+        r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
+        r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
     ];
 
     for source in sources {
@@ -450,7 +721,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 2"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 3"));
 }
 
 #[test]

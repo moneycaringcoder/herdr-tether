@@ -5,6 +5,8 @@ pub mod discovery;
 pub mod herdr;
 pub mod lifecycle;
 pub mod model;
+pub mod observer;
+pub mod orchestration;
 pub mod paths;
 pub mod quote;
 pub mod snapshot;

@@ -197,13 +197,13 @@ workers = 2
 [retention]
 closed_days = 30
 "#;
-    let state = r#"{"version":2,"sessions":[
+    let state = r#"{"version":3,"sessions":[
 {"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000005","host":"retired","target":"retired@example.test","directory":"/retired","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-06T00:00:00Z","closed_at":"2026-01-06T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/closed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/closing","preset":"named","status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
 {"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/active","preset":null,"status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null}
-]}"#;
+],"orchestration_groups":[]}"#;
     fs::write(sandbox.path("xdg-config/herdr-tether/config.toml"), config).unwrap();
     fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();
     let argv = sandbox.path("tmux.argv");

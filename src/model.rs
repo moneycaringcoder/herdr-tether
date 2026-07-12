@@ -198,6 +198,132 @@ impl FromStr for ExternalSessionName {
     }
 }
 
+/// A harness-neutral identifier for a persisted orchestration group.
+///
+/// The restricted representation is safe for logs, terminal labels, and exact
+/// state lookups without carrying host, path, or command data.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OrchestrationGroupId(String);
+
+impl OrchestrationGroupId {
+    pub const MAX_BYTES: usize = 64;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OrchestrationGroupId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid orchestration group id")]
+pub struct OrchestrationGroupIdError;
+
+impl FromStr for OrchestrationGroupId {
+    type Err = OrchestrationGroupIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > Self::MAX_BYTES
+            || !bytes[0].is_ascii_lowercase()
+            || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            || !bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+            || bytes
+                .windows(2)
+                .any(|pair| matches!(pair[0], b'-' | b'_') && matches!(pair[1], b'-' | b'_'))
+        {
+            return Err(OrchestrationGroupIdError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for OrchestrationGroupId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrchestrationGroupId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+/// A bounded, display-safe label for an orchestration group or member.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OrchestrationTitle(String);
+
+impl OrchestrationTitle {
+    pub const MAX_BYTES: usize = 128;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OrchestrationTitle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("unsafe orchestration title")]
+pub struct OrchestrationTitleError;
+
+impl FromStr for OrchestrationTitle {
+    type Err = OrchestrationTitleError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > Self::MAX_BYTES
+            || value.trim() != value
+            || !value
+                .bytes()
+                .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+        {
+            return Err(OrchestrationTitleError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for OrchestrationTitle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrchestrationTitle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
 impl Serialize for SessionId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
