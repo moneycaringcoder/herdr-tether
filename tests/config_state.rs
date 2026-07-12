@@ -382,15 +382,17 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     let boundary = "x".repeat(Config::MAX_STRING_BYTES);
     let mut cases: Vec<(&str, Config, Config)> = Vec::new();
 
-    let mut host_count = Config::default();
-    host_count.hosts = (0..Config::MAX_HOSTS)
-        .map(|index| HostConfig {
-            name: format!("host-{index}"),
-            target: "example.test".into(),
-            roots: Vec::new(),
-            presets: Vec::new(),
-        })
-        .collect();
+    let host_count = Config {
+        hosts: (0..Config::MAX_HOSTS)
+            .map(|index| HostConfig {
+                name: format!("host-{index}"),
+                target: "example.test".into(),
+                roots: Vec::new(),
+                presets: Vec::new(),
+            })
+            .collect(),
+        ..Config::default()
+    };
     let mut host_count_over = host_count.clone();
     host_count_over.hosts.push(HostConfig {
         name: "host-over-limit".into(),
