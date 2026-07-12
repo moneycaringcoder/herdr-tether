@@ -51,8 +51,7 @@ pub const MANAGER_STALE_GROUP_ERROR: &str =
     "Observer group changed while the manager was open; refresh and retry";
 const OBSERVER_REFRESH_FAILURE_NOTICE: &str =
     "Refresh failed; stale output retained · r retry · q back";
-const OBSERVER_GROUP_DELETED_ERROR: &str =
-    "Observer group was deleted; access revoked";
+const OBSERVER_GROUP_DELETED_ERROR: &str = "Observer group was deleted; access revoked";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObserverAuthorityOutcome {
@@ -60,7 +59,6 @@ enum ObserverAuthorityOutcome {
     RecoverableFailure,
     GroupDeleted,
 }
-
 
 /// State-only management for opt-in orchestration groups.
 #[derive(Clone, Debug)]
@@ -643,11 +641,12 @@ fn apply_observer_capture_merge_result(
         }
     }
 }
- 
+
 fn require_observer_authority(outcome: ObserverAuthorityOutcome) -> Result<()> {
     match outcome {
-        ObserverAuthorityOutcome::Authorized
-        | ObserverAuthorityOutcome::RecoverableFailure => Ok(()),
+        ObserverAuthorityOutcome::Authorized | ObserverAuthorityOutcome::RecoverableFailure => {
+            Ok(())
+        }
         ObserverAuthorityOutcome::GroupDeleted => bail!(OBSERVER_GROUP_DELETED_ERROR),
     }
 }
@@ -1318,9 +1317,10 @@ mod tests {
                 ObserverAuthorityOutcome::RecoverableFailure
             };
             assert_eq!(
-                apply_observer_refresh_result(&mut observer, result.map(|()| {
-                    ObserverAuthorityOutcome::Authorized
-                })),
+                apply_observer_refresh_result(
+                    &mut observer,
+                    result.map(|()| { ObserverAuthorityOutcome::Authorized })
+                ),
                 expected_outcome
             );
             assert_eq!(observer.selected_id(), Some(selected.as_str()));
@@ -1431,8 +1431,7 @@ mod tests {
     fn authoritative_capture_merge_reports_group_deleted_without_merging_stale_capture() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(temp.path().join("state.json"));
-        let (mut state, group_id, worker_id) =
-            capture_state("0197f198000070008000000000000011");
+        let (mut state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
         let captured = capture_fingerprint(
             &state.orchestration_groups[0].workers[0],
             &state.sessions[0],
@@ -1477,10 +1476,7 @@ mod tests {
         assert_eq!(observer.notice(), Some(OBSERVER_REFRESH_FAILURE_NOTICE));
 
         assert_eq!(
-            apply_observer_refresh_result(
-                &mut observer,
-                Ok(ObserverAuthorityOutcome::Authorized),
-            ),
+            apply_observer_refresh_result(&mut observer, Ok(ObserverAuthorityOutcome::Authorized),),
             ObserverAuthorityOutcome::Authorized
         );
         assert!(observer.notice().is_none());
