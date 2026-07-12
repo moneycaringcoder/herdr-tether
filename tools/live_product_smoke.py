@@ -1051,6 +1051,16 @@ class Smoke:
         if mouse != "on":
             fail(f"owned session {session_id} did not enable mouse; got {mouse!r}")
 
+    def state_payload(self) -> dict[str, Any]:
+        state_path = self.root / "state" / "herdr-tether" / "state.json"
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            fail(f"could not read Tether state {state_path}: {error}")
+        if not isinstance(payload, dict):
+            fail(f"Tether state returned an unexpected shape: {payload}")
+        return payload
+
     def state_records(self) -> list[dict[str, Any]]:
         payload = self.decode_json(
             self.run([str(self.tether), "session", "list", "--json"]),
@@ -1185,6 +1195,94 @@ class Smoke:
         self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
 
+    def observer_manager_contract(
+        self,
+        workspace_id: str,
+        invoking_pane: str,
+        owned_ids: set[str],
+    ) -> None:
+        picker_env = self.tether_env(workspace_id, invoking_pane)
+        before_panes = self.pane_ids()
+        before_tmux = self.tmux_sessions()
+        before_status = {
+            str(record.get("id")): str(record.get("status"))
+            for record in self.state_records()
+            if record.get("id") in owned_ids
+        }
+
+        self.interact(
+            [str(self.tether), "open"],
+            picker_env,
+            [
+                ("Hosts", b"o"),
+                ("Tether \u00b7 Observers", b"n"),
+                ("Choose orchestrator", b"\r"),
+                ("Choose workers", b" \r"),
+                ("Created Observer", b"\r"),
+                ("Observer actions", b"\r"),
+            ],
+        )
+        observer_pane = self.wait_new_pane(before_panes, "UI-first Observer companion")
+        panes = self.pane_ids()
+        if invoking_pane not in panes:
+            fail("UI-first Observer launch closed its source launcher pane")
+        if panes - before_panes != {observer_pane}:
+            fail(
+                "UI-first Observer launch did not create exactly one outer pane: "
+                f"before={sorted(before_panes)}, after={sorted(panes)}"
+            )
+        if self.tmux_sessions() != before_tmux:
+            fail("Observer metadata/create launch changed workload lifecycle")
+
+        payload = self.state_payload()
+        groups = payload.get("orchestration_groups") if isinstance(payload, dict) else None
+        if not isinstance(groups, list) or len(groups) != 1:
+            fail(f"UI-first Observer did not persist one group: {payload}")
+        group = groups[0]
+        workers = group.get("workers") if isinstance(group, dict) else None
+        if not isinstance(workers, list) or len(workers) != 1:
+            fail(f"UI-first Observer did not persist one selected worker: {group}")
+        capabilities = workers[0].get("capabilities")
+        if capabilities != {"observe_output": True, "open_interactive": True}:
+            fail(f"UI-first Observer used unexpected capability defaults: {capabilities}")
+        if group.get("orchestrator_session_id") == workers[0].get("session_id"):
+            fail("UI-first Observer persisted its orchestrator as a worker")
+        after_status = {
+            str(record.get("id")): str(record.get("status"))
+            for record in self.state_records()
+            if record.get("id") in owned_ids
+        }
+        if after_status != before_status:
+            fail(
+                "UI-first Observer create/open changed workload state: "
+                f"before={before_status}, after={after_status}"
+            )
+
+        self.close_pane(observer_pane)
+        self.interact(
+            [str(self.tether), "open"],
+            picker_env,
+            [
+                ("Hosts", b"o"),
+                ("Tether \u00b7 Observers", b"\r"),
+                ("Observer actions", b"d"),
+                ("Confirm delete", b"y"),
+                ("Deleted Observer", b"\x1b"),
+                ("Hosts", b"\x1b"),
+            ],
+        )
+        payload = self.state_payload()
+        groups = payload.get("orchestration_groups")
+        if groups != []:
+            fail(f"UI-first Observer deletion left group metadata: {groups}")
+        final_status = {
+            str(record.get("id")): str(record.get("status"))
+            for record in self.state_records()
+            if record.get("id") in owned_ids
+        }
+        if final_status != before_status or self.tmux_sessions() != before_tmux:
+            fail("UI-first Observer deletion touched workload lifecycle")
+
     def product_lifecycle(self) -> None:
         setup = self.run([str(self.tether), "setup", "--yes"])
         if "Tether configuration:" not in setup.stdout or "Tether state:" not in setup.stdout:
@@ -1306,6 +1404,12 @@ class Smoke:
         self.wait_until(
             "symlink-cwd tmux detach after Herdr view close",
             lambda: self.tmux_attached(symlink_id) == 0,
+        )
+
+        self.observer_manager_contract(
+            workspace_id,
+            initial_pane,
+            {first_id, second_id, third_id, symlink_id},
         )
 
         for session_id in (first_id, second_id, third_id, symlink_id):

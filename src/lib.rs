@@ -6,6 +6,7 @@ pub mod herdr;
 pub mod lifecycle;
 pub mod model;
 pub mod observer;
+pub mod observer_manager;
 pub mod orchestration;
 pub mod paths;
 pub mod quote;

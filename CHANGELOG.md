@@ -7,6 +7,7 @@
 - Added opt-in orchestration groups in development state schema version 4, with harness-neutral orchestrator/worker references, persisted membership epochs, explicit output-observation and interactive-open capabilities, and metadata-only membership lifecycle commands. Development schema version 3 migrates forward with fresh epochs.
 - Added a read-only Observer companion that uses one outer Herdr pane, dynamically refreshes exact-owned worker status and authorized bounded captures, rejects stale asynchronous results against complete authorization fingerprints, restores terminal state defensively, renders deterministic four-worker pages, and can open an authorized running worker without replacing Observer.
 - Added development `main` and immutable exact-SHA operating guidance for groups and Observer while retaining stable v0.3.0 installation instructions.
+- Added a native `prefix+t` Observer manager that creates safe group metadata from running workloads, edits membership reversibly, confirms metadata-only deletion, and launches one companion pane from the current Herdr plugin context without exposing session IDs or requiring standalone CLI setup.
 
 ### Fixed
 

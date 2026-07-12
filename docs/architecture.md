@@ -61,6 +61,14 @@ State admits at most 32 groups and 64 workers per group. Identifiers and titles
 are validated and bounded; references carry no host, path, command, or
 orchestration-runtime assumptions.
 
+The native picker exposes groups through a harness-neutral manager projection.
+It derives bounded labels from safe host, repository, preset, and command
+metadata, persists create/edit/delete requests through `OrchestrationService`,
+and re-reads authoritative state after each mutation. UI defaults grant both
+bounded observation and interactive open to selected workers. The manager never
+renders raw session IDs and never calls workload lifecycle methods.
+The standalone CLI uses the same service and remains an optional adapter API.
+
 ## Observer projection
 
 `orchestration observe` creates exactly one outer Herdr pane. Inside that pane,

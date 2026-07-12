@@ -40,6 +40,13 @@ use crate::{
     tmux::TmuxBackend,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrchestrationWorkerSpec {
+    pub session_id: SessionId,
+    pub title: Option<OrchestrationTitle>,
+    pub capabilities: OrchestrationCapabilities,
+}
+
 /// State-only management for opt-in orchestration groups.
 #[derive(Clone, Debug)]
 pub struct OrchestrationService {
@@ -79,6 +86,56 @@ impl OrchestrationService {
             };
             state.orchestration_groups.push(group.clone());
             Ok(group)
+        })
+    }
+
+    pub fn create_group_with_workers(
+        &self,
+        id: OrchestrationGroupId,
+        title: OrchestrationTitle,
+        orchestrator_session_id: SessionId,
+        workers: Vec<OrchestrationWorkerSpec>,
+    ) -> Result<OrchestrationGroup> {
+        validate_worker_specs(orchestrator_session_id, &workers)?;
+        self.store.update(|state| {
+            if state
+                .orchestration_groups
+                .iter()
+                .any(|group| group.id == id)
+            {
+                bail!("orchestration group `{id}` already exists");
+            }
+            if state.orchestration_groups.len() >= State::MAX_ORCHESTRATION_GROUPS {
+                bail!(
+                    "orchestration group limit of {} has been reached",
+                    State::MAX_ORCHESTRATION_GROUPS
+                );
+            }
+            let group = OrchestrationGroup {
+                id,
+                title,
+                orchestrator_session_id,
+                workers: worker_members(Vec::new(), workers),
+            };
+            state.orchestration_groups.push(group.clone());
+            Ok(group)
+        })
+    }
+
+    pub fn replace_workers(
+        &self,
+        group_id: &OrchestrationGroupId,
+        workers: Vec<OrchestrationWorkerSpec>,
+    ) -> Result<OrchestrationGroup> {
+        self.store.update(|state| {
+            let group = state
+                .orchestration_groups
+                .iter_mut()
+                .find(|group| &group.id == group_id)
+                .with_context(|| format!("unknown orchestration group `{group_id}`"))?;
+            validate_worker_specs(group.orchestrator_session_id, &workers)?;
+            group.workers = worker_members(std::mem::take(&mut group.workers), workers);
+            Ok(group.clone())
         })
     }
 
@@ -172,6 +229,60 @@ impl OrchestrationService {
         })
     }
 }
+fn validate_worker_specs(
+    orchestrator_session_id: SessionId,
+    workers: &[OrchestrationWorkerSpec],
+) -> Result<()> {
+    if workers.len() > OrchestrationGroup::MAX_WORKERS {
+        bail!(
+            "orchestration group may contain at most {} workers",
+            OrchestrationGroup::MAX_WORKERS
+        );
+    }
+    let mut session_ids = HashSet::with_capacity(workers.len());
+    for worker in workers {
+        if worker.session_id == orchestrator_session_id {
+            bail!("orchestrator must not also be a worker");
+        }
+        if !session_ids.insert(worker.session_id) {
+            bail!("duplicate worker session `{}`", worker.session_id);
+        }
+        if worker.capabilities.is_empty() {
+            bail!(
+                "worker `{}` must declare at least one capability",
+                worker.session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn worker_members(
+    existing: Vec<OrchestrationMember>,
+    workers: Vec<OrchestrationWorkerSpec>,
+) -> Vec<OrchestrationMember> {
+    let existing = existing
+        .into_iter()
+        .map(|worker| (worker.session_id, worker))
+        .collect::<HashMap<_, _>>();
+    workers
+        .into_iter()
+        .map(|worker| {
+            let membership_id = existing
+                .get(&worker.session_id)
+                .map_or_else(OrchestrationMembershipId::new, |member| {
+                    member.membership_id
+                });
+            OrchestrationMember {
+                session_id: worker.session_id,
+                membership_id,
+                title: worker.title,
+                capabilities: worker.capabilities,
+            }
+        })
+        .collect()
+}
+
 pub(crate) const fn companion_placement(placement: Placement) -> Placement {
     if matches!(placement, Placement::ReplaceCurrentPane) {
         Placement::SplitRight
@@ -1226,6 +1337,63 @@ mod tests {
         assert_eq!(
             store.load().unwrap().orchestration_groups[0].workers[0].membership_id,
             second.membership_id
+        );
+    }
+
+    #[test]
+    fn ui_group_edits_are_atomic_and_preserve_retained_membership_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let group_id: OrchestrationGroupId = "observer-build".parse().unwrap();
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let first_worker: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let second_worker: SessionId = "tether-0197f198000070008000000000000003".parse().unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        };
+        let first_spec = OrchestrationWorkerSpec {
+            session_id: first_worker,
+            title: Some("build worker".parse().unwrap()),
+            capabilities,
+        };
+
+        let created = service
+            .create_group_with_workers(
+                group_id.clone(),
+                "Observer build".parse().unwrap(),
+                orchestrator,
+                vec![first_spec.clone()],
+            )
+            .unwrap();
+        let retained_epoch = created.workers[0].membership_id;
+        let second_spec = OrchestrationWorkerSpec {
+            session_id: second_worker,
+            title: Some("test worker".parse().unwrap()),
+            capabilities,
+        };
+        let edited = service
+            .replace_workers(&group_id, vec![first_spec.clone(), second_spec.clone()])
+            .unwrap();
+
+        assert_eq!(edited.workers.len(), 2);
+        assert_eq!(edited.workers[0].membership_id, retained_epoch);
+        assert_eq!(edited.workers[1].session_id, second_worker);
+        assert_ne!(edited.workers[1].membership_id, retained_epoch);
+
+        let duplicate_error = service
+            .replace_workers(&group_id, vec![second_spec.clone(), second_spec])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_error.contains("duplicate worker"),
+            "{duplicate_error}"
+        );
+        assert_eq!(
+            store.load().unwrap().orchestration_groups[0].workers,
+            edited.workers,
+            "a rejected edit must not partially rewrite membership"
         );
     }
     #[test]

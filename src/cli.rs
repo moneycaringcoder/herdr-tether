@@ -27,13 +27,14 @@ use crate::{
         ExternalSessionName, OrchestrationGroupId, OrchestrationTitle, OwnershipProof, Placement,
         SessionId,
     },
+    observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
     orchestration::{OrchestrationService, companion_placement},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
     state::{
-        OrchestrationCapabilities, SessionRecord, SessionStatus, State, StateStore,
-        compare_normal_sessions, is_normal_session,
+        OrchestrationCapabilities, OrchestrationGroup, SessionRecord, SessionStatus, State,
+        StateStore, compare_normal_sessions, is_normal_session,
     },
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
@@ -612,10 +613,96 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         else {
             return Ok(());
         };
+        if selection == PickerSelection::ManageObservers {
+            match run_observer_manager_flow(&config, &state_store)? {
+                ObserverManagerFlow::BackToPicker => continue,
+                ObserverManagerFlow::Launched => return Ok(()),
+            }
+        }
         match execute_selection(paths, &config, selection.clone()) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 operation_error = Some((selection, format!("{error:#}")));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObserverManagerFlow {
+    BackToPicker,
+    Launched,
+}
+
+fn run_observer_manager_flow(
+    config: &Config,
+    state_store: &StateStore,
+) -> Result<ObserverManagerFlow> {
+    let service = OrchestrationService::new(state_store.clone());
+    let mut notice = None;
+    loop {
+        let state = state_store.load().context("load Observer manager state")?;
+        let manager = ObserverManagerState::from_state(&state, notice.take())?;
+        match run_observer_manager(manager)? {
+            ObserverManagerAction::BackToPicker => return Ok(ObserverManagerFlow::BackToPicker),
+            ObserverManagerAction::Create {
+                id,
+                title,
+                orchestrator_session_id,
+                workers,
+            } => {
+                match service.create_group_with_workers(id, title, orchestrator_session_id, workers)
+                {
+                    Ok(group) => {
+                        notice = Some(format!(
+                            "Created {}; workload lifecycle unchanged",
+                            group.title.as_str()
+                        ));
+                    }
+                    Err(_) => {
+                        notice =
+                            Some("Could not create Observer; metadata was unchanged".to_owned());
+                    }
+                }
+            }
+            ObserverManagerAction::ReplaceWorkers { group_id, workers } => {
+                match service.replace_workers(&group_id, workers) {
+                    Ok(group) => {
+                        notice = Some(format!(
+                            "Updated {}; workload lifecycle unchanged",
+                            group.title.as_str()
+                        ));
+                    }
+                    Err(_) => {
+                        notice =
+                            Some("Could not update Observer; metadata was unchanged".to_owned());
+                    }
+                }
+            }
+            ObserverManagerAction::Delete { group_id } => match service.delete_group(&group_id) {
+                Ok(group) => {
+                    notice = Some(format!(
+                        "Deleted {} metadata; workloads keep running",
+                        group.title.as_str()
+                    ));
+                }
+                Err(_) => {
+                    notice = Some("Could not delete Observer; metadata was unchanged".to_owned());
+                }
+            },
+            ObserverManagerAction::Launch { group_id } => {
+                let launch = (|| {
+                    let group = service.group(&group_id)?;
+                    let context = HerdrContext::from_env()
+                        .context("Observer must be launched from the Tether plugin pane")?;
+                    let executable =
+                        env::current_exe().context("locate the bundled Tether executable")?;
+                    place_observer_in_herdr(context, executable, &group, config.ui.placement)
+                })();
+                if launch.is_ok() {
+                    return Ok(ObserverManagerFlow::Launched);
+                }
+                notice = Some("Could not launch Observer; source pane was preserved".to_owned());
             }
         }
     }
@@ -632,6 +719,9 @@ fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelecti
             name,
             placement,
         } => attach_external(host, target, name, placement),
+        PickerSelection::ManageObservers => {
+            bail!("Observer management must be entered through the interactive Tether picker")
+        }
     }
 }
 
@@ -755,6 +845,7 @@ fn selection_from_picker(
             name,
             placement: args.placement.map(Placement::from).unwrap_or(placement),
         })),
+        PickerSelection::ManageObservers => Ok(Some(PickerSelection::ManageObservers)),
     }
 }
 
@@ -1001,6 +1092,37 @@ where
     Ok(())
 }
 
+fn place_observer_in_herdr(
+    context: HerdrContext,
+    executable: PathBuf,
+    group: &OrchestrationGroup,
+    placement: Placement,
+) -> Result<()> {
+    let title = PaneTitle::observer(group.title.as_str());
+    let group_id = group.id.clone();
+    place_built_in_herdr(
+        HerdrClient::new(context),
+        &title,
+        companion_placement(placement),
+        |destination| {
+            Ok(CommandSpec::new(
+                executable,
+                vec![
+                    "orchestration".to_owned(),
+                    "observer-runtime".to_owned(),
+                    group_id.to_string(),
+                    "--pane-id".to_owned(),
+                    destination.pane_id.clone(),
+                    "--workspace-id".to_owned(),
+                    destination.workspace_id.clone(),
+                    "--herdr-bin".to_owned(),
+                    destination.binary.display().to_string(),
+                ],
+            ))
+        },
+    )
+}
+
 fn confirm_replacement(client: &HerdrClient) -> Result<()> {
     let inspection = client.inspect_replacement_source()?;
     if !inspection.requires_confirmation() {
@@ -1234,29 +1356,7 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
                     .ui
                     .placement,
             );
-            let placement = companion_placement(placement);
-            let title = PaneTitle::observer(persisted.title.as_str());
-            place_built_in_herdr(
-                HerdrClient::new(context),
-                &title,
-                placement,
-                |destination| {
-                    Ok(CommandSpec::new(
-                        executable.clone(),
-                        vec![
-                            "orchestration".to_owned(),
-                            "observer-runtime".to_owned(),
-                            group.to_string(),
-                            "--pane-id".to_owned(),
-                            destination.pane_id.clone(),
-                            "--workspace-id".to_owned(),
-                            destination.workspace_id.clone(),
-                            "--herdr-bin".to_owned(),
-                            destination.binary.display().to_string(),
-                        ],
-                    ))
-                },
-            )
+            place_observer_in_herdr(context, executable, &persisted, placement)
         }
         OrchestrationCommand::ObserverRuntime {
             group,

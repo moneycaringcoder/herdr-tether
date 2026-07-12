@@ -136,54 +136,39 @@ Tether also discovers literal aliases in the primary `~/.ssh/config`. It does no
 
 Orchestration groups and Observer are available from development `main` or an
 immutable reviewed commit; stable v0.3.0 remains the durable-workload workflow
-described above. Install the standalone CLI from the matching development
-source using the commands in step 5.
+described above.
 
-Groups opt existing session references into presentation only. Obtain exact
-Tether-owned IDs from `herdr-tether snapshot`, then supply the values chosen by
-the user or adapter:
+From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
-```sh
-herdr-tether orchestration create GROUP --title TITLE --orchestrator SESSION
-herdr-tether orchestration add-worker GROUP SESSION \
-  --title TITLE --observe-output --open-interactive
-herdr-tether orchestration list --json
-```
+1. Press `n` for **Create Observer**.
+2. Choose one running workload as orchestrator.
+3. Select one or more running workers with `Space`, then press `Enter`.
+4. Select the new group and press `Enter` for its actions.
+5. Choose **Open Observer**.
 
-Each worker must declare `--observe-output`, `--open-interactive`, or both.
-Output observation is bounded and read-only. Interactive open is independently
-authorized and is available only while that exact owned worker is running.
-Group membership does not create, adopt, stop, restart, remove, or send input to
-the referenced session. Up to 32 groups and 64 workers per group are accepted.
-
-From a Herdr pane, open the companion Observer:
-
-```sh
-herdr-tether orchestration observe GROUP --placement split-right
-```
+Tether derives bounded labels from safe workload metadata. New workers receive
+the safe default capabilities: bounded read-only output observation and
+interactive open. Group creation does not create, adopt, stop, restart, remove,
+or send input to a workload. Up to 32 groups and 64 workers per group are
+accepted.
 
 One outer pane renders one worker full-size, two side by side, or three to four
 in a 2×2 grid. Additional workers appear on deterministic four-worker pages.
-Use arrows to select, Page Up/Page Down, `Tab`/`Shift+Tab`, or `[`/`]` to
-page; use `r` to refresh and `Enter` to open an authorized running worker as a
-normal Tether view. Press `q`, `Esc`, or `Ctrl+C` to leave Observer.
-Membership and lifecycle labels refresh while it runs; worker input is never
-forwarded.
+Use arrows to select, Page Up/Page Down, `Tab`/`Shift+Tab`, or `[`/`]` to page;
+use `r` to refresh and `Enter` to open an authorized running worker as a normal
+Tether view. Press `q`, `Esc`, or `Ctrl+C` to leave Observer. Membership and
+lifecycle labels refresh while it runs; worker input is never forwarded.
 
-`observe` requires the environment of an invoking Herdr pane. An agent or other
-process nested inside a Tether `tmux` workload cannot assume that context is
-available; it should ask a Herdr-pane operator to run the command or explicitly
-hand off the launch there. Use a split or new tab for this companion view.
-`replace-current-pane` is normalized to `split-right` so the invoking pane remains available.
+To change a group, choose **Edit workers**, toggle running workloads with
+`Space`, and press `Enter`. To remove a group, press `d` and confirm. Both
+operations change only group metadata and leave every workload and pane alone.
 
-Membership cleanup is metadata-only:
-
-```sh
-herdr-tether orchestration remove-worker GROUP SESSION
-herdr-tether orchestration delete GROUP
-```
-
-Neither command touches a workload or pane.
+The standalone `herdr-tether orchestration` commands remain available as an
+optional machine/adapter API. Native picker users do not need exact IDs, shell
+commands, a separate CLI installation, or exported Herdr environment variables.
+Opening Observer still occurs at Herdr's plugin placement boundary; Tether
+normalizes `replace-current-pane` to `split-right` so the source pane remains
+available.
 
 ## Update or remove Tether
 

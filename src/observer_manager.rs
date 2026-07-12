@@ -1,0 +1,981 @@
+//! Pure state, input, and rendering for the native Observer manager.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, io,
+};
+
+use anyhow::{Context, Result};
+use crossterm::{
+    cursor::Show,
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::{CrosstermBackend, TestBackend},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+
+use crate::{
+    model::{OrchestrationGroupId, OrchestrationTitle, SessionId},
+    orchestration::OrchestrationWorkerSpec,
+    state::{
+        OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
+        SessionStatus, State, compare_normal_sessions,
+    },
+};
+
+const MAX_PANEL_WIDTH: u16 = 72;
+const MAX_VISIBLE_ROWS: usize = 12;
+const DEFAULT_CAPABILITIES: OrchestrationCapabilities = OrchestrationCapabilities {
+    observe_output: true,
+    open_interactive: true,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserverManagerScreen {
+    Groups,
+    CreateOrchestrator,
+    CreateWorkers,
+    GroupActions,
+    EditWorkers,
+    ConfirmDelete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserverManagerEvent {
+    Previous,
+    Next,
+    Confirm,
+    Back,
+    Toggle,
+    Create,
+    Edit,
+    Delete,
+    ConfirmDelete,
+    DismissDelete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverManagerAction {
+    Create {
+        id: OrchestrationGroupId,
+        title: OrchestrationTitle,
+        orchestrator_session_id: SessionId,
+        workers: Vec<OrchestrationWorkerSpec>,
+    },
+    ReplaceWorkers {
+        group_id: OrchestrationGroupId,
+        workers: Vec<OrchestrationWorkerSpec>,
+    },
+    Delete {
+        group_id: OrchestrationGroupId,
+    },
+    Launch {
+        group_id: OrchestrationGroupId,
+    },
+    BackToPicker,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverManagerOutcome {
+    Continue,
+    Action(ObserverManagerAction),
+}
+
+#[derive(Clone, Debug)]
+struct Candidate {
+    session_id: SessionId,
+    label: String,
+    host: String,
+    repository: String,
+    title: OrchestrationTitle,
+    existing: Option<OrchestrationMember>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObserverManagerState {
+    screen: ObserverManagerScreen,
+    groups: Vec<OrchestrationGroup>,
+    eligible: Vec<Candidate>,
+    screen_candidates: Vec<Candidate>,
+    selected_index: usize,
+    selected_group: Option<usize>,
+    selected_orchestrator: Option<SessionId>,
+    selected_workers: HashSet<SessionId>,
+    notice: Option<String>,
+}
+
+impl ObserverManagerState {
+    pub fn from_state(state: &State, notice: Option<String>) -> Result<Self> {
+        let labels = candidate_labels(&state.sessions);
+        let mut eligible = state
+            .sessions
+            .iter()
+            .filter(|record| is_eligible(record))
+            .map(|record| {
+                candidate(
+                    record,
+                    labels.get(&record.id).expect("eligible label exists"),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        eligible.sort_by(|left, right| {
+            let left_record = state
+                .sessions
+                .iter()
+                .find(|record| record.id == left.session_id)
+                .expect("candidate session exists");
+            let right_record = state
+                .sessions
+                .iter()
+                .find(|record| record.id == right.session_id)
+                .expect("candidate session exists");
+            compare_normal_sessions(
+                left_record.status,
+                left_record.last_used_at,
+                left_record.id,
+                right_record.status,
+                right_record.last_used_at,
+                right_record.id,
+            )
+        });
+        Ok(Self {
+            screen: ObserverManagerScreen::Groups,
+            groups: state.orchestration_groups.clone(),
+            eligible,
+            screen_candidates: Vec::new(),
+            selected_index: 0,
+            selected_group: None,
+            selected_orchestrator: None,
+            selected_workers: HashSet::new(),
+            notice,
+        })
+    }
+
+    pub fn screen(&self) -> ObserverManagerScreen {
+        self.screen
+    }
+
+    pub fn frame_title(&self) -> &'static str {
+        match self.screen {
+            ObserverManagerScreen::Groups => "Observers",
+            ObserverManagerScreen::CreateOrchestrator => "Choose orchestrator",
+            ObserverManagerScreen::CreateWorkers => "Choose workers",
+            ObserverManagerScreen::GroupActions => "Observer actions",
+            ObserverManagerScreen::EditWorkers => "Edit workers",
+            ObserverManagerScreen::ConfirmDelete => "Confirm delete",
+        }
+    }
+
+    pub fn item_labels(&self) -> Vec<String> {
+        match self.screen {
+            ObserverManagerScreen::Groups => {
+                let mut occurrences = HashMap::<&str, usize>::new();
+                let mut labels = self
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        let title = group.title.as_str();
+                        let occurrence = occurrences.entry(title).or_default();
+                        *occurrence += 1;
+                        if *occurrence == 1 {
+                            title.to_owned()
+                        } else {
+                            format!("{title} ({occurrence})")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                labels.push("+ Create Observer".to_owned());
+                labels
+            }
+            ObserverManagerScreen::CreateOrchestrator => self
+                .screen_candidates
+                .iter()
+                .map(|candidate| candidate.label.clone())
+                .collect(),
+            ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::EditWorkers => self
+                .screen_candidates
+                .iter()
+                .map(|candidate| {
+                    let marker = if self.selected_workers.contains(&candidate.session_id) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+                    format!("{marker} {}", candidate.label)
+                })
+                .collect(),
+            ObserverManagerScreen::GroupActions => vec![
+                "Open Observer".to_owned(),
+                "Edit workers".to_owned(),
+                "Delete group".to_owned(),
+            ],
+            ObserverManagerScreen::ConfirmDelete => vec![format!(
+                "Delete {}? Metadata only; workloads keep running.",
+                self.selected_group_title()
+            )],
+        }
+    }
+
+    pub fn footer_text(&self) -> String {
+        let guidance = match self.screen {
+            ObserverManagerScreen::Groups => {
+                "n Create · Enter manage · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::CreateOrchestrator => {
+                "Enter choose orchestrator · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::CreateWorkers => {
+                "Space select workers · Enter create · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::GroupActions => {
+                "Enter choose · e Edit · d Delete · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::EditWorkers => {
+                "Space add/remove · Enter save metadata · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::ConfirmDelete => {
+                "y delete metadata · n/Esc keep · workloads are untouched"
+            }
+        };
+        self.notice.as_ref().map_or_else(
+            || guidance.to_owned(),
+            |notice| format!("{notice} · {guidance}"),
+        )
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    pub fn handle(&mut self, event: ObserverManagerEvent) -> ObserverManagerOutcome {
+        if self.screen == ObserverManagerScreen::ConfirmDelete {
+            return match event {
+                ObserverManagerEvent::ConfirmDelete => self.delete_action(),
+                ObserverManagerEvent::DismissDelete | ObserverManagerEvent::Back => {
+                    self.screen = ObserverManagerScreen::GroupActions;
+                    self.selected_index = 2;
+                    ObserverManagerOutcome::Continue
+                }
+                _ => ObserverManagerOutcome::Continue,
+            };
+        }
+        match event {
+            ObserverManagerEvent::Previous => {
+                self.move_selection(-1);
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Next => {
+                self.move_selection(1);
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Back => self.back(),
+            ObserverManagerEvent::Toggle => {
+                self.toggle_worker();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Create if self.screen == ObserverManagerScreen::Groups => {
+                self.begin_create();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Edit if self.screen == ObserverManagerScreen::GroupActions => {
+                self.begin_edit();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Delete if self.screen == ObserverManagerScreen::GroupActions => {
+                self.screen = ObserverManagerScreen::ConfirmDelete;
+                self.selected_index = 0;
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::Confirm => self.confirm(),
+            _ => ObserverManagerOutcome::Continue,
+        }
+    }
+
+    fn confirm(&mut self) -> ObserverManagerOutcome {
+        match self.screen {
+            ObserverManagerScreen::Groups => {
+                if self.selected_index < self.groups.len() {
+                    self.selected_group = Some(self.selected_index);
+                    self.screen = ObserverManagerScreen::GroupActions;
+                    self.selected_index = 0;
+                } else {
+                    self.begin_create();
+                }
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::CreateOrchestrator => {
+                let Some(candidate) = self.screen_candidates.get(self.selected_index) else {
+                    self.notice = Some("No running exact-owned workloads are available".to_owned());
+                    return ObserverManagerOutcome::Continue;
+                };
+                self.selected_orchestrator = Some(candidate.session_id);
+                self.screen_candidates = self
+                    .eligible
+                    .iter()
+                    .filter(|worker| worker.session_id != candidate.session_id)
+                    .cloned()
+                    .collect();
+                self.selected_workers.clear();
+                self.screen = ObserverManagerScreen::CreateWorkers;
+                self.selected_index = 0;
+                self.notice = None;
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::CreateWorkers => self.create_action(),
+            ObserverManagerScreen::GroupActions => match self.selected_index {
+                0 => ObserverManagerOutcome::Action(ObserverManagerAction::Launch {
+                    group_id: self.selected_group_id(),
+                }),
+                1 => {
+                    self.begin_edit();
+                    ObserverManagerOutcome::Continue
+                }
+                2 => {
+                    self.screen = ObserverManagerScreen::ConfirmDelete;
+                    self.selected_index = 0;
+                    ObserverManagerOutcome::Continue
+                }
+                _ => ObserverManagerOutcome::Continue,
+            },
+            ObserverManagerScreen::EditWorkers => self.replace_action(),
+            ObserverManagerScreen::ConfirmDelete => ObserverManagerOutcome::Continue,
+        }
+    }
+
+    fn begin_create(&mut self) {
+        self.screen = ObserverManagerScreen::CreateOrchestrator;
+        self.screen_candidates.clone_from(&self.eligible);
+        self.selected_index = 0;
+        self.selected_group = None;
+        self.selected_orchestrator = None;
+        self.selected_workers.clear();
+        self.notice = None;
+    }
+
+    fn begin_edit(&mut self) {
+        let group = self.selected_group().clone();
+        let mut candidates = self
+            .eligible
+            .iter()
+            .filter(|candidate| candidate.session_id != group.orchestrator_session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let known = candidates
+            .iter()
+            .map(|candidate| candidate.session_id)
+            .collect::<HashSet<_>>();
+        for (index, member) in group.workers.iter().enumerate() {
+            if known.contains(&member.session_id) {
+                if let Some(candidate) = candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.session_id == member.session_id)
+                {
+                    candidate.existing = Some(member.clone());
+                }
+                continue;
+            }
+            let label = member
+                .title
+                .as_ref()
+                .map(|title| title.as_str().to_owned())
+                .unwrap_or_else(|| format!("Unavailable worker {}", index + 1));
+            candidates.push(Candidate {
+                session_id: member.session_id,
+                label: safe_component(&label, 72),
+                host: "unavailable".to_owned(),
+                repository: format!("worker-{}", index + 1),
+                title: safe_component(&label, 96)
+                    .parse()
+                    .expect("safe member title"),
+                existing: Some(member.clone()),
+            });
+        }
+        self.selected_workers = group
+            .workers
+            .iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        self.screen_candidates = candidates;
+        self.screen = ObserverManagerScreen::EditWorkers;
+        self.selected_index = 0;
+        self.notice = None;
+    }
+
+    fn create_action(&mut self) -> ObserverManagerOutcome {
+        if self.selected_workers.is_empty() {
+            self.notice = Some("Select at least one worker".to_owned());
+            return ObserverManagerOutcome::Continue;
+        }
+        let orchestrator = self
+            .selected_orchestrator
+            .expect("create worker screen has an orchestrator");
+        let candidate = self
+            .eligible
+            .iter()
+            .find(|candidate| candidate.session_id == orchestrator)
+            .expect("selected orchestrator remains eligible");
+        let (id, title) = self.next_group_identity(candidate);
+        ObserverManagerOutcome::Action(ObserverManagerAction::Create {
+            id,
+            title,
+            orchestrator_session_id: orchestrator,
+            workers: self.selected_worker_specs(),
+        })
+    }
+
+    fn replace_action(&mut self) -> ObserverManagerOutcome {
+        if self.selected_workers.is_empty() {
+            self.notice = Some("Select at least one worker".to_owned());
+            return ObserverManagerOutcome::Continue;
+        }
+        ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
+            group_id: self.selected_group_id(),
+            workers: self.selected_worker_specs(),
+        })
+    }
+
+    fn delete_action(&self) -> ObserverManagerOutcome {
+        ObserverManagerOutcome::Action(ObserverManagerAction::Delete {
+            group_id: self.selected_group_id(),
+        })
+    }
+
+    fn selected_worker_specs(&self) -> Vec<OrchestrationWorkerSpec> {
+        self.screen_candidates
+            .iter()
+            .filter(|candidate| self.selected_workers.contains(&candidate.session_id))
+            .map(|candidate| {
+                candidate.existing.as_ref().map_or_else(
+                    || OrchestrationWorkerSpec {
+                        session_id: candidate.session_id,
+                        title: Some(candidate.title.clone()),
+                        capabilities: DEFAULT_CAPABILITIES,
+                    },
+                    |existing| OrchestrationWorkerSpec {
+                        session_id: existing.session_id,
+                        title: existing
+                            .title
+                            .clone()
+                            .or_else(|| Some(candidate.title.clone())),
+                        capabilities: existing.capabilities,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn next_group_identity(
+        &self,
+        orchestrator: &Candidate,
+    ) -> (OrchestrationGroupId, OrchestrationTitle) {
+        let base = format!(
+            "observer-{}-{}",
+            slug(&orchestrator.host, 24),
+            slug(&orchestrator.repository, 24)
+        );
+        let existing = self
+            .groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut suffix = 1usize;
+        loop {
+            let id = if suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{suffix}")
+            };
+            if !existing.contains(id.as_str()) {
+                let title = if suffix == 1 {
+                    format!("Observer {} {}", orchestrator.host, orchestrator.repository)
+                } else {
+                    format!(
+                        "Observer {} {} {suffix}",
+                        orchestrator.host, orchestrator.repository
+                    )
+                };
+                return (
+                    id.parse().expect("generated group id is safe"),
+                    safe_component(&title, OrchestrationTitle::MAX_BYTES)
+                        .parse()
+                        .expect("generated group title is safe"),
+                );
+            }
+            suffix += 1;
+        }
+    }
+
+    fn toggle_worker(&mut self) {
+        if !matches!(
+            self.screen,
+            ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::EditWorkers
+        ) {
+            return;
+        }
+        let Some(candidate) = self.screen_candidates.get(self.selected_index) else {
+            return;
+        };
+        if !self.selected_workers.remove(&candidate.session_id) {
+            self.selected_workers.insert(candidate.session_id);
+        }
+        self.notice = None;
+    }
+
+    fn move_selection(&mut self, offset: isize) {
+        let length = self.item_labels().len();
+        if length == 0 {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = if offset < 0 {
+            self.selected_index.checked_sub(1).unwrap_or(length - 1)
+        } else {
+            (self.selected_index + 1) % length
+        };
+    }
+
+    fn back(&mut self) -> ObserverManagerOutcome {
+        self.notice = None;
+        match self.screen {
+            ObserverManagerScreen::Groups => {
+                ObserverManagerOutcome::Action(ObserverManagerAction::BackToPicker)
+            }
+            ObserverManagerScreen::CreateOrchestrator | ObserverManagerScreen::GroupActions => {
+                self.screen = ObserverManagerScreen::Groups;
+                self.selected_index = self.selected_group.unwrap_or(0).min(self.groups.len());
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::CreateWorkers => {
+                self.screen = ObserverManagerScreen::CreateOrchestrator;
+                self.screen_candidates.clone_from(&self.eligible);
+                self.selected_index = 0;
+                self.selected_workers.clear();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::EditWorkers => {
+                self.screen = ObserverManagerScreen::GroupActions;
+                self.selected_index = 1;
+                self.selected_workers.clear();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::ConfirmDelete => unreachable!(),
+        }
+    }
+
+    fn selected_group(&self) -> &OrchestrationGroup {
+        &self.groups[self
+            .selected_group
+            .expect("group action has a selected group")]
+    }
+
+    fn selected_group_id(&self) -> OrchestrationGroupId {
+        self.selected_group().id.clone()
+    }
+
+    fn selected_group_title(&self) -> &str {
+        self.selected_group().title.as_str()
+    }
+}
+
+fn is_eligible(record: &SessionRecord) -> bool {
+    record.status == SessionStatus::Running
+        && record.ownership_proof.is_some()
+        && record.tmux_session_id.is_some()
+}
+
+fn candidate_labels(records: &[SessionRecord]) -> HashMap<SessionId, String> {
+    let mut occurrences = HashMap::<String, usize>::new();
+    records
+        .iter()
+        .filter(|record| is_eligible(record))
+        .map(|record| {
+            let base = candidate_label(record);
+            let occurrence = occurrences.entry(base.clone()).or_default();
+            *occurrence += 1;
+            let label = if *occurrence == 1 {
+                base
+            } else {
+                format!("{base} ({occurrence})")
+            };
+            (record.id, label)
+        })
+        .collect()
+}
+
+fn candidate(record: &SessionRecord, label: &str) -> Result<Candidate> {
+    let host = safe_component(&record.host, 24);
+    let repository = safe_component(repository_name(&record.directory), 32);
+    Ok(Candidate {
+        session_id: record.id,
+        label: label.to_owned(),
+        host,
+        repository,
+        title: safe_component(label, 96)
+            .parse()
+            .context("generate safe Observer member title")?,
+        existing: None,
+    })
+}
+
+fn candidate_label(record: &SessionRecord) -> String {
+    format!(
+        "{} / {} / {}",
+        safe_component(&record.host, 24),
+        safe_component(repository_name(&record.directory), 32),
+        safe_component(record.preset.as_deref().unwrap_or("shell"), 24)
+    )
+}
+
+fn repository_name(directory: &str) -> &str {
+    directory
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|component| !component.is_empty())
+        .unwrap_or("workspace")
+}
+
+fn safe_component(input: &str, max_bytes: usize) -> String {
+    let mut output = String::with_capacity(input.len().min(max_bytes));
+    let mut pending_space = false;
+    for byte in input.bytes() {
+        let character = if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            Some(char::from(byte))
+        } else {
+            None
+        };
+        if let Some(character) = character {
+            if pending_space && !output.is_empty() && output.len() < max_bytes {
+                output.push(' ');
+            }
+            pending_space = false;
+            if output.len() < max_bytes {
+                output.push(character);
+            }
+        } else {
+            pending_space = true;
+        }
+        if output.len() >= max_bytes {
+            break;
+        }
+    }
+    while output.ends_with([' ', '-', '_', '.']) {
+        output.pop();
+    }
+    if output.is_empty() {
+        "workspace".to_owned()
+    } else {
+        output
+    }
+}
+
+fn slug(input: &str, max_bytes: usize) -> String {
+    let mut output = String::with_capacity(input.len().min(max_bytes));
+    let mut separator = false;
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if separator && !output.is_empty() && output.len() < max_bytes {
+                output.push('-');
+            }
+            separator = false;
+            if output.len() < max_bytes {
+                output.push(char::from(byte.to_ascii_lowercase()));
+            }
+        } else {
+            separator = true;
+        }
+        if output.len() >= max_bytes {
+            break;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        return "group".to_owned();
+    }
+    if !output.as_bytes()[0].is_ascii_lowercase() {
+        output.truncate(max_bytes.saturating_sub("group-".len()));
+        while output.ends_with('-') {
+            output.pop();
+        }
+        return format!("group-{output}");
+    }
+    output
+}
+
+pub fn run_observer_manager(mut state: ObserverManagerState) -> Result<ObserverManagerAction> {
+    enable_raw_mode().context("enable Observer manager raw mode")?;
+    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error).context("enter Observer manager alternate screen");
+    }
+    let result = run_terminal_manager(&mut state);
+    let screen = execute!(io::stdout(), LeaveAlternateScreen, Show)
+        .context("restore Observer manager screen");
+    let raw = disable_raw_mode().context("disable Observer manager raw mode");
+    match (result, screen, raw) {
+        (Ok(action), Ok(()), Ok(())) => Ok(action),
+        (result, screen, raw) => {
+            let mut failures = Vec::new();
+            if let Err(error) = result {
+                failures.push(format!("manager: {error:#}"));
+            }
+            if let Err(error) = screen {
+                failures.push(format!("screen cleanup: {error:#}"));
+            }
+            if let Err(error) = raw {
+                failures.push(format!("terminal cleanup: {error:#}"));
+            }
+            Err(anyhow::anyhow!(failures.join("; ")))
+        }
+    }
+}
+
+fn run_terminal_manager(state: &mut ObserverManagerState) -> Result<ObserverManagerAction> {
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("initialize Observer manager")?;
+    terminal.clear().context("clear Observer manager")?;
+    loop {
+        terminal
+            .draw(|frame| render(frame, frame.area(), state))
+            .context("draw Observer manager")?;
+        if !event::poll(std::time::Duration::from_millis(50))
+            .context("poll Observer manager input")?
+        {
+            continue;
+        }
+        let Event::Key(key) = event::read().context("read Observer manager input")? else {
+            continue;
+        };
+        let Some(event) = event_for_key(key, state.screen) else {
+            continue;
+        };
+        if let ObserverManagerOutcome::Action(action) = state.handle(event) {
+            return Ok(action);
+        }
+    }
+}
+
+fn event_for_key(key: KeyEvent, screen: ObserverManagerScreen) -> Option<ObserverManagerEvent> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return Some(ObserverManagerEvent::Back);
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    if screen == ObserverManagerScreen::ConfirmDelete {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Some(ObserverManagerEvent::ConfirmDelete),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Backspace => {
+                Some(ObserverManagerEvent::DismissDelete)
+            }
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Some(ObserverManagerEvent::Previous),
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Some(ObserverManagerEvent::Next),
+        KeyCode::Esc | KeyCode::Backspace => Some(ObserverManagerEvent::Back),
+        KeyCode::Enter if key.kind == KeyEventKind::Press => Some(ObserverManagerEvent::Confirm),
+        KeyCode::Char(' ') if key.kind == KeyEventKind::Press => Some(ObserverManagerEvent::Toggle),
+        KeyCode::Char('n' | 'N') if key.kind == KeyEventKind::Press => {
+            Some(ObserverManagerEvent::Create)
+        }
+        KeyCode::Char('e' | 'E') if key.kind == KeyEventKind::Press => {
+            Some(ObserverManagerEvent::Edit)
+        }
+        KeyCode::Char('d' | 'D') if key.kind == KeyEventKind::Press => {
+            Some(ObserverManagerEvent::Delete)
+        }
+        _ => None,
+    }
+}
+
+fn manager_style(selected: bool) -> Style {
+    let style = Style::default().fg(Color::Reset).bg(Color::Reset);
+    if selected {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(Block::default().style(manager_style(false)), area);
+    let labels = state.item_labels();
+    let visible_rows = labels.len().clamp(1, MAX_VISIBLE_ROWS) as u16;
+    let panel_width = area.width.min(MAX_PANEL_WIDTH);
+    let footer = state.footer_text();
+    let footer_width = panel_width.saturating_sub(4).max(1);
+    let footer_height = wrapped_line_count(&footer, footer_width);
+    let panel_height = visible_rows
+        .saturating_add(footer_height)
+        .saturating_add(4)
+        .min(area.height);
+    let panel = Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(panel_width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(panel_height) / 2),
+        panel_width,
+        panel_height,
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::default()
+            .title(format!(" Tether · {} ", state.frame_title()))
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .style(manager_style(false)),
+        panel,
+    );
+    let inner = panel.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
+        .split(inner);
+    let max_rows = usize::from(chunks[0].height);
+    let start = state
+        .selected_index()
+        .saturating_sub(max_rows.saturating_sub(1));
+    let lines = labels
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+        .map(|(index, label)| {
+            let selected = index == state.selected_index() && !labels.is_empty();
+            Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, manager_style(selected)),
+                Span::styled(label.clone(), manager_style(selected)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).style(manager_style(false)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(footer)
+            .style(manager_style(false))
+            .wrap(Wrap { trim: true }),
+        chunks[1],
+    );
+}
+
+#[derive(Debug)]
+pub enum ObserverManagerRenderError {}
+
+impl fmt::Display for ObserverManagerRenderError {
+    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl std::error::Error for ObserverManagerRenderError {}
+
+pub fn render_to_text(
+    width: u16,
+    height: u16,
+    state: &ObserverManagerState,
+) -> Result<String, ObserverManagerRenderError> {
+    if width == 0 || height == 0 {
+        return Ok(String::new());
+    }
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).map_err(|error| match error {})?;
+    terminal
+        .draw(|frame| render(frame, frame.area(), state))
+        .map_err(|error| match error {})?;
+    let buffer = terminal.backend().buffer();
+    let mut output = String::with_capacity((usize::from(width) + 1) * usize::from(height));
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        if y + 1 < height {
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+pub fn render_to_styles(
+    width: u16,
+    height: u16,
+    state: &ObserverManagerState,
+) -> Result<Vec<(Color, Color, Modifier)>, ObserverManagerRenderError> {
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).map_err(|error| match error {})?;
+    terminal
+        .draw(|frame| render(frame, frame.area(), state))
+        .map_err(|error| match error {})?;
+    Ok(terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| (cell.fg, cell.bg, cell.modifier))
+        .collect())
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    text.lines()
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum::<usize>()
+        .clamp(1, usize::from(u16::MAX)) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_mapping_keeps_mutations_press_only() {
+        for key in [
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat),
+            KeyEvent::new_with_kind(KeyCode::Char('d'), KeyModifiers::NONE, KeyEventKind::Repeat),
+        ] {
+            assert_eq!(event_for_key(key, ObserverManagerScreen::EditWorkers), None);
+        }
+    }
+
+    #[test]
+    fn manager_chrome_uses_terminal_default_colors_with_bold_selection() {
+        let manager = ObserverManagerState::from_state(&State::default(), None).unwrap();
+        let styles = render_to_styles(60, 12, &manager).unwrap();
+        assert!(styles.iter().all(|(foreground, background, _)| {
+            *foreground == Color::Reset && *background == Color::Reset
+        }));
+        assert!(
+            styles
+                .iter()
+                .any(|(_, _, modifier)| modifier.contains(Modifier::BOLD))
+        );
+    }
+}
