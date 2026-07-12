@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     fs,
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -19,6 +19,10 @@ use crate::{
 const MAX_DISCOVERY_WORKERS: usize = 16;
 const MAX_DISCOVERY_ENTRIES: usize = 100_000;
 const MAX_DISCOVERY_RESULTS: usize = 4_096;
+const MAX_DISCOVERY_LOCATIONS: usize = 256;
+const MAX_DISCOVERY_ROOTS: usize = 256;
+const MAX_DISCOVERY_MESSAGES: usize =
+    MAX_DISCOVERY_RESULTS + MAX_DISCOVERY_ROOTS + MAX_DISCOVERY_LOCATIONS + 1;
 
 const REMOTE_SCAN_SCRIPT: &str = r#"max_depth=$1
 result_limit=$2
@@ -218,19 +222,41 @@ impl DiscoveryService {
     }
 
     pub fn start(&self, request: DiscoveryRequest) -> DiscoveryRun {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_DISCOVERY_MESSAGES);
         let cancelled = Arc::new(AtomicBool::new(false));
         let completion = Arc::new(AtomicUsize::new(0));
-        let jobs = Arc::new(Mutex::new(
-            request
-                .locations
-                .into_iter()
-                .enumerate()
-                .collect::<VecDeque<_>>(),
-        ));
-        let location_count = jobs.lock().expect("discovery jobs lock").len();
+        let generation = request.generation;
+        let root_count = request
+            .locations
+            .iter()
+            .try_fold(0usize, |count, location| {
+                count.checked_add(location.roots.len())
+            });
+        if request.locations.len() > MAX_DISCOVERY_LOCATIONS
+            || root_count.is_none_or(|count| count > MAX_DISCOVERY_ROOTS)
+        {
+            completion.store(DiscoveryRunCompletion::Error as usize, Ordering::Release);
+            let _ = sender.send(DiscoveryMessage::Finished { generation });
+            return DiscoveryRun {
+                receiver,
+                cancelled,
+                completion,
+            };
+        }
+
+        let location_count = request.locations.len();
         let worker_count = self.limits.workers.min(location_count.max(1));
-        let (outcome_sender, outcome_receiver) = mpsc::sync_channel(worker_count);
+        let mut outcome_receivers = Vec::with_capacity(location_count);
+        let mut queued_jobs = VecDeque::with_capacity(location_count);
+        for location in request.locations {
+            // A single pending message per location gives ordered publication
+            // backpressure without allowing a slow early location to make later
+            // locations accumulate whole scan outcomes.
+            let (outcomes, receiver) = mpsc::sync_channel(1);
+            queued_jobs.push_back(DiscoveryJob { location, outcomes });
+            outcome_receivers.push(receiver);
+        }
+        let jobs = Arc::new(Mutex::new(queued_jobs));
         let entries = Arc::new(AtomicUsize::new(0));
         let started = (self.clock)();
         let deadline = started.checked_add(self.limits.timeout).unwrap_or(started);
@@ -238,8 +264,7 @@ impl DiscoveryService {
         for _ in 0..worker_count {
             let jobs = Arc::clone(&jobs);
             let context = WorkerContext {
-                generation: request.generation,
-                outcomes: outcome_sender.clone(),
+                generation,
                 cancelled: Arc::clone(&cancelled),
                 entries: Arc::clone(&entries),
                 binaries: self.binaries.clone(),
@@ -249,14 +274,13 @@ impl DiscoveryService {
             };
             handles.push(thread::spawn(move || worker_loop(jobs, &context)));
         }
-        drop(outcome_sender);
         let supervisor_cancelled = Arc::clone(&cancelled);
         let supervisor_completion = Arc::clone(&completion);
         let max_results = self.limits.max_results;
         thread::spawn(move || {
             let outcome = publish_outcomes(
-                request.generation,
-                outcome_receiver,
+                generation,
+                outcome_receivers,
                 &sender,
                 &supervisor_cancelled,
                 max_results,
@@ -267,12 +291,11 @@ impl DiscoveryService {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            supervisor_cancelled.store(true, Ordering::Release);
             for handle in handles {
                 let _ = handle.join();
             }
-            let _ = sender.send(DiscoveryMessage::Finished {
-                generation: request.generation,
-            });
+            let _ = sender.send(DiscoveryMessage::Finished { generation });
         });
         DiscoveryRun {
             receiver,
@@ -324,7 +347,6 @@ impl Drop for DiscoveryRun {
 
 struct WorkerContext {
     generation: u64,
-    outcomes: SyncSender<LocationOutcome>,
     cancelled: Arc<AtomicBool>,
     entries: Arc<AtomicUsize>,
     binaries: ProcessBinaries,
@@ -333,33 +355,49 @@ struct WorkerContext {
     clock: DiscoveryClock,
 }
 
+struct DiscoveryJob {
+    location: DiscoveryLocation,
+    outcomes: SyncSender<DiscoveryMessage>,
+}
+
 struct ScanContext<'a> {
     generation: u64,
-    sender: &'a Sender<DiscoveryMessage>,
+    sender: &'a SyncSender<DiscoveryMessage>,
     cancelled: &'a AtomicBool,
     entries: &'a AtomicUsize,
     limits: DiscoveryLimits,
     deadline: Instant,
     clock: &'a DiscoveryClock,
 }
-
-struct LocationOutcome {
-    index: usize,
-    messages: Vec<DiscoveryMessage>,
+fn send_scan(context: &ScanContext<'_>, mut message: DiscoveryMessage) -> bool {
+    loop {
+        if context.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        match context.sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                message = returned;
+                thread::yield_now();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
 }
 
-fn worker_loop(jobs: Arc<Mutex<VecDeque<(usize, DiscoveryLocation)>>>, context: &WorkerContext) {
+fn worker_loop(jobs: Arc<Mutex<VecDeque<DiscoveryJob>>>, context: &WorkerContext) {
     loop {
         if context.cancelled.load(Ordering::Acquire) {
             return;
         }
-        let Some((index, location)) = jobs.lock().expect("discovery jobs lock").pop_front() else {
+        let Some(DiscoveryJob { location, outcomes }) =
+            jobs.lock().expect("discovery jobs lock").pop_front()
+        else {
             return;
         };
-        let (sender, receiver) = mpsc::channel();
         let scan_context = ScanContext {
             generation: context.generation,
-            sender: &sender,
+            sender: &outcomes,
             cancelled: &context.cancelled,
             entries: &context.entries,
             limits: context.limits,
@@ -372,74 +410,68 @@ fn worker_loop(jobs: Arc<Mutex<VecDeque<(usize, DiscoveryLocation)>>>, context: 
             }
             None => scan_local(&location, &scan_context),
         }
-        drop(sender);
-        let outcome = LocationOutcome {
-            index,
-            messages: receiver.into_iter().collect(),
-        };
-        if context.outcomes.send(outcome).is_err() {
-            return;
-        }
     }
 }
 
 fn publish_outcomes(
     generation: u64,
-    outcomes: Receiver<LocationOutcome>,
-    sender: &Sender<DiscoveryMessage>,
+    outcomes: Vec<Receiver<DiscoveryMessage>>,
+    sender: &SyncSender<DiscoveryMessage>,
     cancelled: &AtomicBool,
     max_results: usize,
 ) -> DiscoveryRunCompletion {
     let mut overall = DiscoveryRunCompletion::Complete;
-    let mut pending = BTreeMap::new();
-    let mut next = 0;
-    let mut published_results = 0;
+    let published_results = AtomicUsize::new(0);
     for outcome in outcomes {
-        pending.insert(outcome.index, outcome.messages);
-        while let Some(messages) = pending.remove(&next) {
-            let mut exceeded_results = false;
-            for message in messages {
-                if cancelled.load(Ordering::Acquire) {
-                    return DiscoveryRunCompletion::Cancelled;
+        let mut exceeded_results = false;
+        for message in outcome {
+            if cancelled.load(Ordering::Acquire) {
+                return DiscoveryRunCompletion::Cancelled;
+            }
+            match message {
+                DiscoveryMessage::Repository { .. }
+                    if published_results
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |results| {
+                            (results < max_results).then_some(results + 1)
+                        })
+                        .is_err() =>
+                {
+                    exceeded_results = true;
                 }
-                match message {
-                    DiscoveryMessage::Repository { .. } if published_results >= max_results => {
-                        exceeded_results = true;
+                DiscoveryMessage::Repository { .. } => {
+                    if sender.send(message).is_err() {
+                        return overall;
                     }
-                    DiscoveryMessage::Repository { .. } => {
-                        published_results += 1;
-                        if sender.send(message).is_err() {
-                            return overall;
-                        }
+                }
+                DiscoveryMessage::HostFinished {
+                    host, completion, ..
+                } => {
+                    let completion = if exceeded_results {
+                        DiscoveryCompletion::ResultsLimit
+                    } else {
+                        completion
+                    };
+                    overall = more_significant_completion(overall, completion);
+                    if sender
+                        .send(DiscoveryMessage::HostFinished {
+                            generation,
+                            host,
+                            completion,
+                        })
+                        .is_err()
+                    {
+                        return overall;
                     }
-                    DiscoveryMessage::HostFinished {
-                        host, completion, ..
-                    } => {
-                        let completion = if exceeded_results {
-                            DiscoveryCompletion::ResultsLimit
-                        } else {
-                            completion
-                        };
-                        overall = more_significant_completion(overall, completion);
-                        if sender
-                            .send(DiscoveryMessage::HostFinished {
-                                generation,
-                                host,
-                                completion,
-                            })
-                            .is_err()
-                        {
-                            return overall;
-                        }
-                    }
-                    _ => {
-                        if sender.send(message).is_err() {
-                            return overall;
-                        }
+                }
+                _ => {
+                    if sender.send(message).is_err() {
+                        return overall;
                     }
                 }
             }
-            next += 1;
+        }
+        if exceeded_results {
+            return DiscoveryRunCompletion::ResultsLimit;
         }
     }
     overall
@@ -510,19 +542,25 @@ fn scan_local(location: &DiscoveryLocation, context: &ScanContext<'_>) {
         };
         if result.is_err() && !scan.context.cancelled.load(Ordering::Acquire) {
             scan.completion = DiscoveryCompletion::Error;
-            let _ = scan.context.sender.send(DiscoveryMessage::RootError {
-                generation: scan.context.generation,
-                host: location.host.clone(),
-                root: root.clone(),
-            });
+            let _ = send_scan(
+                scan.context,
+                DiscoveryMessage::RootError {
+                    generation: scan.context.generation,
+                    host: location.host.clone(),
+                    root: root.clone(),
+                },
+            );
         }
     }
     if !context.cancelled.load(Ordering::Acquire) {
-        let _ = context.sender.send(DiscoveryMessage::HostFinished {
-            generation: context.generation,
-            host: location.host.clone(),
-            completion: scan.completion,
-        });
+        let _ = send_scan(
+            context,
+            DiscoveryMessage::HostFinished {
+                generation: context.generation,
+                host: location.host.clone(),
+                completion: scan.completion,
+            },
+        );
     }
 }
 
@@ -594,11 +632,14 @@ impl LocalScan<'_> {
                     )
                 })?;
                 self.results += 1;
-                let _ = self.context.sender.send(DiscoveryMessage::Repository {
-                    generation: self.context.generation,
-                    host: self.host.to_owned(),
-                    path: path.to_owned(),
-                });
+                let _ = send_scan(
+                    self.context,
+                    DiscoveryMessage::Repository {
+                        generation: self.context.generation,
+                        host: self.host.to_owned(),
+                        path: path.to_owned(),
+                    },
+                );
             }
             return Ok(());
         }
@@ -686,11 +727,14 @@ fn scan_remote(
 ) {
     let now = (context.clock)();
     if now >= context.deadline {
-        let _ = context.sender.send(DiscoveryMessage::HostFinished {
-            generation: context.generation,
-            host: location.host.clone(),
-            completion: DiscoveryCompletion::TimedOut,
-        });
+        let _ = send_scan(
+            context,
+            DiscoveryMessage::HostFinished {
+                generation: context.generation,
+                host: location.host.clone(),
+                completion: DiscoveryCompletion::TimedOut,
+            },
+        );
         return;
     }
     let remaining = context.deadline.saturating_duration_since(now);
@@ -725,23 +769,25 @@ fn scan_remote(
         if context.cancelled.load(Ordering::Acquire) {
             return;
         }
-        if context
-            .sender
-            .send(DiscoveryMessage::Repository {
+        if !send_scan(
+            context,
+            DiscoveryMessage::Repository {
                 generation: context.generation,
                 host: location.host.clone(),
                 path,
-            })
-            .is_err()
-        {
+            },
+        ) {
             return;
         }
     }
-    let _ = context.sender.send(DiscoveryMessage::HostFinished {
-        generation: context.generation,
-        host: location.host.clone(),
-        completion,
-    });
+    let _ = send_scan(
+        context,
+        DiscoveryMessage::HostFinished {
+            generation: context.generation,
+            host: location.host.clone(),
+            completion,
+        },
+    );
 }
 
 fn remote_spec(
