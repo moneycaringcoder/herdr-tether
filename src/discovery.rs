@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn expired_local_scan_stops_before_touching_the_filesystem() {
-        let (sender, _receiver) = mpsc::channel();
+        let (sender, _receiver) = mpsc::sync_channel(1);
         let cancelled = AtomicBool::new(false);
         let entries = AtomicUsize::new(0);
         let now = Instant::now();
