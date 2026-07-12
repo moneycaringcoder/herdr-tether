@@ -178,10 +178,7 @@ fn unicode_grapheme_boundaries_are_atomic_at_capture_limits() {
     ];
 
     for (name, cluster) in clusters {
-        let exactly_after = format!(
-            "{cluster}{}",
-            "x".repeat(MAX_CAPTURE_BYTES - cluster.len())
-        );
+        let exactly_after = format!("{cluster}{}", "x".repeat(MAX_CAPTURE_BYTES - cluster.len()));
         assert_eq!(
             sanitize_capture(&exactly_after),
             exactly_after,
@@ -791,10 +788,10 @@ fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
         );
     }
     assert!(
-        buffer.content().iter().all(|cell| !matches!(
-            cell.symbol(),
-            "🇺" | "🇸" | "🇨" | "🇦"
-        )),
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !matches!(cell.symbol(), "🇺" | "🇸" | "🇨" | "🇦")),
         "rendered buffer contains an orphan regional indicator"
     );
     assert!(
