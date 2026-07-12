@@ -49,6 +49,8 @@ pub struct OrchestrationWorkerSpec {
 
 pub const MANAGER_STALE_GROUP_ERROR: &str =
     "Observer group changed while the manager was open; refresh and retry";
+const OBSERVER_REFRESH_FAILURE_NOTICE: &str =
+    "Refresh failed; stale output retained · r retry · q back";
 
 /// State-only management for opt-in orchestration groups.
 #[derive(Clone, Debug)]
@@ -502,7 +504,9 @@ pub fn run_observer(
         loop {
             match observer_results.try_recv() {
                 Ok(result) if visible_worker_ids(&observer) == result.visible => {
-                    merge_captured_workers(&store, &group_id, &mut observer, result)?;
+                    let merge =
+                        merge_captured_workers(&store, &group_id, &mut observer, result);
+                    apply_observer_capture_merge_result(&mut observer, merge);
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -538,9 +542,7 @@ pub fn run_observer(
         };
         let previous_page = observer.page();
         let outcome = observer.apply(action);
-        if !matches!(&outcome, ObserverOutcome::OpenSelected { .. }) {
-            observer.set_notice(None);
-        }
+        clear_transient_observer_notice(&mut observer, &outcome);
         match outcome {
             ObserverOutcome::None if observer.page() != previous_page => {
                 let refresh = refresh_observer_metadata(
@@ -590,6 +592,17 @@ pub fn run_observer(
     }
 }
 
+fn clear_transient_observer_notice(
+    observer: &mut ObserverState,
+    outcome: &ObserverOutcome,
+) {
+    if !matches!(outcome, ObserverOutcome::OpenSelected { .. })
+        && observer.notice() != Some(OBSERVER_REFRESH_FAILURE_NOTICE)
+    {
+        observer.set_notice(None);
+    }
+}
+
 fn apply_observer_refresh_result(observer: &mut ObserverState, result: Result<()>) -> bool {
     match result {
         Ok(()) => {
@@ -597,9 +610,20 @@ fn apply_observer_refresh_result(observer: &mut ObserverState, result: Result<()
             true
         }
         Err(_) => {
-            observer.set_notice(Some(
-                "Refresh failed; stale output retained · r retry · q back".to_owned(),
-            ));
+            observer.set_notice(Some(OBSERVER_REFRESH_FAILURE_NOTICE.to_owned()));
+            false
+        }
+    }
+}
+
+fn apply_observer_capture_merge_result(
+    observer: &mut ObserverState,
+    result: Result<()>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(_) => {
+            observer.set_notice(Some(OBSERVER_REFRESH_FAILURE_NOTICE.to_owned()));
             false
         }
     }
@@ -650,7 +674,7 @@ struct CaptureFingerprint {
 
 struct CapturedWorker {
     fingerprint: CaptureFingerprint,
-    capture: Option<String>,
+    capture: ObserverCapture,
 }
 
 struct CaptureResult {
@@ -759,7 +783,6 @@ fn merge_captured_workers(
         return Ok(());
     };
     let current_fingerprints = capture_fingerprints_for(group, &state.sessions);
-    let mut workers = observer.workers().to_vec();
     for captured in result.workers {
         let id = captured.fingerprint.session_id.to_string();
         if !result.visible.contains(&id)
@@ -767,11 +790,8 @@ fn merge_captured_workers(
         {
             continue;
         }
-        if let Some(worker) = workers.iter_mut().find(|worker| worker.id == id) {
-            worker.capture = captured.capture;
-        }
+        observer.merge_capture(&id, captured.capture);
     }
-    observer.update_workers(workers);
     Ok(())
 }
 
@@ -877,28 +897,23 @@ fn captured_workers(
             .into_iter()
             .map(|(fingerprint, handle)| CapturedWorker {
                 fingerprint,
-                capture: handle
-                    .join()
-                    .unwrap_or_else(|_| Some("[capture unavailable: worker panicked]".to_owned())),
+                capture: handle.join().unwrap_or(ObserverCapture::Unavailable),
             })
             .collect()
     })
 }
 
-fn capture_record(record: &SessionRecord) -> Option<String> {
+fn capture_record(record: &SessionRecord) -> ObserverCapture {
     let (Some(proof), Some(identity)) = (&record.ownership_proof, record.tmux_session_id) else {
-        return None;
+        return ObserverCapture::Unavailable;
     };
-    let backend = match backend_for_target(&record.target) {
-        Ok(backend) => backend,
-        Err(error) => return Some(format!("[capture unavailable: {error}]")),
+    let Ok(backend) = backend_for_target(&record.target) else {
+        return ObserverCapture::Unavailable;
     };
-    Some(
-        backend
-            .capture_owned(&record.id, proof, identity)
-            .map(|capture| capture.into_text())
-            .unwrap_or_else(|error| format!("[capture unavailable: {error}]")),
-    )
+    match backend.capture_owned(&record.id, proof, identity) {
+        Ok(capture) => ObserverCapture::Ready(capture.into_text()),
+        Err(_) => ObserverCapture::Unavailable,
+    }
 }
 
 fn open_worker(
@@ -1247,6 +1262,7 @@ mod tests {
                         Some(&format!("first-{index}")),
                     )
                 })
+
                 .collect(),
         );
         for _ in 0..4 {
@@ -1294,6 +1310,77 @@ mod tests {
                 .and_then(|worker| worker.capture.as_deref()),
             Some("retry-4")
         );
+    }
+
+    #[test]
+    fn post_initial_capture_merge_load_failure_retains_stale_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let store = StateStore::new(state_path.clone());
+        let (state, group_id, _) =
+            capture_state("0197f198000070008000000000000011");
+        let fingerprint = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(
+            (0..5)
+                .map(|index| {
+                    worker(
+                        &index.to_string(),
+                        ObserverLifecycle::Running,
+                        Some(&format!("stale-{index}")),
+                    )
+                })
+                .collect(),
+        );
+        for _ in 0..4 {
+            observer.apply(ObserverAction::NextWorker);
+        }
+        let stale = observer.workers().to_vec();
+        let selected = observer.selected_id().unwrap().to_owned();
+        let page = observer.page();
+        std::fs::write(&state_path, "raw-store-error /private/state.json").unwrap();
+
+        let result = merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(fingerprint, "new"),
+        );
+        assert!(!apply_observer_capture_merge_result(&mut observer, result));
+
+        assert_eq!(observer.workers(), stale);
+        assert_eq!(observer.selected_id(), Some(selected.as_str()));
+        assert_eq!(observer.page(), page);
+        let rendered = crate::observer::render_to_text(100, 14, &observer).unwrap();
+        assert!(rendered.contains("stale-4"), "{rendered}");
+        assert!(rendered.contains("r retry"), "{rendered}");
+        assert!(rendered.contains("q back"), "{rendered}");
+        assert!(!rendered.contains("raw-store-error"), "{rendered}");
+
+        assert!(!rendered.contains("/private/state.json"), "{rendered}");
+    }
+
+    #[test]
+    fn navigation_preserves_refresh_failure_notice_until_refresh_succeeds() {
+        let mut observer = ObserverState::new(vec![
+            worker("first", ObserverLifecycle::Running, Some("one")),
+            worker("second", ObserverLifecycle::Running, Some("two")),
+        ]);
+        apply_observer_refresh_result(
+            &mut observer,
+            Err(anyhow::anyhow!("raw backend failure /private/state.json")),
+        );
+
+        let outcome = observer.apply(ObserverAction::NextWorker);
+        clear_transient_observer_notice(&mut observer, &outcome);
+        assert_eq!(observer.notice(), Some(OBSERVER_REFRESH_FAILURE_NOTICE));
+
+        assert!(apply_observer_refresh_result(&mut observer, Ok(())));
+        assert!(observer.notice().is_none());
     }
 
     fn fingerprint(membership: &str, identity: &str) -> CaptureFingerprint {
@@ -1354,12 +1441,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn capture_backend_failure_becomes_unavailable_without_exposing_error_text() {
+        let (mut state, _, _) =
+            capture_state("0197f198000070008000000000000011");
+        state.sessions[0].target = String::new();
+
+        assert_eq!(
+            capture_record(&state.sessions[0]),
+            ObserverCapture::Unavailable
+        );
+    }
+
     fn capture_result(fingerprint: CaptureFingerprint, capture: &str) -> CaptureResult {
         CaptureResult {
             visible: HashSet::from([fingerprint.session_id.to_string()]),
             workers: vec![CapturedWorker {
                 fingerprint,
-                capture: Some(capture.to_owned()),
+                capture: ObserverCapture::Ready(capture.to_owned()),
             }],
         }
     }
