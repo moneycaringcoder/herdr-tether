@@ -265,6 +265,74 @@ impl<'de> Deserialize<'de> for OrchestrationGroupId {
     }
 }
 
+/// A persisted opaque epoch for one exact orchestration membership.
+///
+/// Removing and re-adding the same session always creates a new value so
+/// asynchronous observation from an earlier authorization cannot cross epochs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OrchestrationMembershipId(Uuid);
+
+impl OrchestrationMembershipId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for OrchestrationMembershipId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for OrchestrationMembershipId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0.simple().to_string())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid orchestration membership id")]
+pub struct OrchestrationMembershipIdError;
+
+impl FromStr for OrchestrationMembershipId {
+    type Err = OrchestrationMembershipIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(OrchestrationMembershipIdError);
+        }
+        let uuid = Uuid::parse_str(value).map_err(|_| OrchestrationMembershipIdError)?;
+        if uuid.get_version_num() != 7 {
+            return Err(OrchestrationMembershipIdError);
+        }
+        Ok(Self(uuid))
+    }
+}
+
+impl Serialize for OrchestrationMembershipId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrchestrationMembershipId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
 /// A bounded, display-safe label for an orchestration group or member.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OrchestrationTitle(String);

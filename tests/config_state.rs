@@ -156,6 +156,19 @@ placement = "split-down"
 }
 
 #[test]
+fn read_only_config_migration_preserves_legacy_bytes() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let source = b"version = 1\nhosts = []\n\n[ui]\nplacement = \"split-right\"\n";
+    fs::write(&path, source).unwrap();
+
+    let migrated = ConfigStore::new(path.clone()).load_read_only().unwrap();
+
+    assert_eq!(migrated.version, Config::CURRENT_VERSION);
+    assert_eq!(fs::read(path).unwrap(), source);
+}
+
+#[test]
 fn every_config_schema_rejects_unknown_fields() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
@@ -409,7 +422,7 @@ fn state_round_trips_and_migrates_v0() {
     assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
     assert!(migrated.orchestration_groups.is_empty());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 3"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 4"));
 }
 
 #[test]
@@ -424,7 +437,7 @@ fn state_v2_migration_preserves_sessions_and_creates_no_groups() {
 
     let migrated = StateStore::new(path.clone()).load().unwrap();
 
-    assert_eq!(migrated.version, 3);
+    assert_eq!(migrated.version, State::CURRENT_VERSION);
     assert_eq!(migrated.sessions.len(), 1);
     assert_eq!(migrated.sessions[0].host, "build-box");
     assert_eq!(migrated.sessions[0].target, "builder@example.test");
@@ -439,15 +452,38 @@ fn state_v2_migration_preserves_sessions_and_creates_no_groups() {
     assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
     assert!(migrated.orchestration_groups.is_empty());
     let rewritten = fs::read_to_string(path).unwrap();
-    assert!(rewritten.contains("\"version\": 3"));
+    assert!(rewritten.contains("\"version\": 4"));
     assert!(rewritten.contains("\"orchestration_groups\": []"));
+}
+
+#[test]
+fn state_v3_migration_assigns_and_persists_membership_epochs() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let source = r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"group","title":"Group","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","capabilities":{"observe_output":true,"open_interactive":false}}]}]}"#;
+    fs::write(&path, source).unwrap();
+    let store = StateStore::new(path.clone());
+
+    let migrated = store.load().unwrap();
+    let membership_id = migrated.orchestration_groups[0].workers[0].membership_id;
+
+    assert_eq!(migrated.version, State::CURRENT_VERSION);
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"membership_id\"")
+    );
+    assert_eq!(
+        store.load().unwrap().orchestration_groups[0].workers[0].membership_id,
+        membership_id
+    );
 }
 
 #[test]
 fn future_state_version_fails_closed_without_rewriting_data() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
-    let source = br#"{"version":4,"sessions":[],"orchestration_groups":[]}"#;
+    let source = br#"{"version":5,"sessions":[],"orchestration_groups":[]}"#;
     fs::write(&path, source).unwrap();
 
     let error = StateStore::new(path.clone())
@@ -455,12 +491,12 @@ fn future_state_version_fails_closed_without_rewriting_data() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("unsupported state version 4"), "{error}");
+    assert!(error.contains("unsupported state version 5"), "{error}");
     assert_eq!(fs::read(path).unwrap(), source);
 }
 
 #[test]
-fn state_v3_orchestration_groups_round_trip_arbitrary_references() {
+fn state_v4_orchestration_groups_round_trip_arbitrary_references() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
     let orchestrator = "tether-0197f198000070008000000000000010".parse().unwrap();
@@ -477,6 +513,7 @@ fn state_v3_orchestration_groups_round_trip_arbitrary_references() {
             workers: vec![
                 OrchestrationMember {
                     session_id: observer,
+                    membership_id: Default::default(),
                     title: None,
                     capabilities: OrchestrationCapabilities {
                         observe_output: true,
@@ -485,6 +522,7 @@ fn state_v3_orchestration_groups_round_trip_arbitrary_references() {
                 },
                 OrchestrationMember {
                     session_id: interactive,
+                    membership_id: Default::default(),
                     title: Some("Interactive worker".parse().unwrap()),
                     capabilities: OrchestrationCapabilities {
                         observe_output: false,
@@ -493,6 +531,7 @@ fn state_v3_orchestration_groups_round_trip_arbitrary_references() {
                 },
                 OrchestrationMember {
                     session_id: both,
+                    membership_id: Default::default(),
                     title: Some("Both capabilities".parse().unwrap()),
                     capabilities: OrchestrationCapabilities {
                         observe_output: true,
@@ -549,7 +588,7 @@ fn orchestration_identifiers_and_titles_are_safe_and_bounded() {
 }
 
 #[test]
-fn state_v3_orchestration_validation_fails_closed() {
+fn state_v4_orchestration_validation_fails_closed() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
     let store = StateStore::new(path);
@@ -564,6 +603,7 @@ fn state_v3_orchestration_validation_fails_closed() {
         orchestrator_session_id: session(1),
         workers: vec![OrchestrationMember {
             session_id: session(2),
+            membership_id: Default::default(),
             title: None,
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
@@ -599,6 +639,7 @@ fn state_v3_orchestration_validation_fails_closed() {
     state.orchestration_groups[0].workers = (0..=OrchestrationGroup::MAX_WORKERS)
         .map(|index| OrchestrationMember {
             session_id: session(index + 10),
+            membership_id: Default::default(),
             title: None,
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
@@ -648,7 +689,7 @@ fn state_v3_orchestration_validation_fails_closed() {
 }
 
 #[test]
-fn state_v3_rejects_unsafe_orchestration_json() {
+fn state_v4_rejects_unsafe_orchestration_json() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
     let store = StateStore::new(path.clone());
@@ -656,16 +697,16 @@ fn state_v3_rejects_unsafe_orchestration_json() {
     let worker = "tether-0197f198000070008000000000000002";
     let invalid_sources = [
         format!(
-            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
+            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
         ),
         format!(
-            r#"{{"version":3,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","capabilities":{{"observe_output":true}}}}]}}]}}"#
+            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","capabilities":{{"observe_output":true}}}}]}}]}}"#
         ),
     ];
 
@@ -698,6 +739,9 @@ fn every_state_schema_rejects_unknown_fields() {
         r#"{"version":3,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
+        r#"{"version":4,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
+        r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
+        r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
     ];
 
     for source in sources {
@@ -721,7 +765,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 3"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 4"));
 }
 
 #[test]

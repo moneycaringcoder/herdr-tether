@@ -64,7 +64,7 @@ const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
 fn active_state(id: &str) -> String {
     format!(
         r#"{{
-  "version": 3,
+  "version": 4,
   "sessions": [{{
     "id": "{id}",
     "host": "local",
@@ -179,6 +179,7 @@ fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
         .success()
         .stdout(predicate::str::contains("\"id\": \"build-fleet\""))
         .stdout(predicate::str::contains("\"session_id\""))
+        .stdout(predicate::str::contains("\"membership_id\""))
         .stdout(predicate::str::contains("\"observe_output\": true"))
         .stdout(predicate::str::contains("\"open_interactive\": true"));
 
@@ -218,7 +219,7 @@ fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
         ));
 
     let state = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(state.contains("\"version\": 3"));
+    assert!(state.contains("\"version\": 4"));
     assert!(state.contains("\"orchestration_groups\": []"));
 }
 
@@ -1002,7 +1003,7 @@ fn migrated_v022_record_can_only_remove_metadata_without_transport() {
         ));
     assert!(!log.exists(), "legacy Remove must not invoke tmux");
     let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(migrated.contains(r#""version": 3"#));
+    assert!(migrated.contains(r#""version": 4"#));
     assert!(migrated.contains(r#""status": "removed""#));
     assert!(!migrated.contains("ownership_proof"));
 }
@@ -1027,7 +1028,7 @@ fn session_list_json_never_exposes_private_ownership_proof() {
 fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":3,"sessions":[
+    let state = r#"{"version":4,"sessions":[
 {"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/ended","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/older-active","preset":null,"status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},

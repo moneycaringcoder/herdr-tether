@@ -133,6 +133,19 @@ Use this procedure only with Tether development `main` or an immutable reviewed
 commit containing orchestration commands. Stable v0.3.0 users should continue
 using the snapshot and lifecycle procedures above.
 
+Before running any command in this development-only section, perform the
+side-effect-free capability probe:
+
+```sh
+herdr-tether orchestration --help
+```
+
+Require a successful exit and help that lists the orchestration subcommands.
+`herdr-tether --version` is not sufficient because stable and development
+builds may report the same package version. If the probe fails or the command is
+absent, stop and report that this Tether installation does not provide the
+preview orchestration capability; do not attempt any orchestration mutation.
+
 The user or calling adapter must provide all orchestration values externally:
 
 - a safe group ID and display title;

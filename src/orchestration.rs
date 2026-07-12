@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -23,7 +24,10 @@ use crate::{
     config::ConfigStore,
     herdr::{HerdrClient, HerdrContext, PaneTitle},
     lifecycle::LifecycleService,
-    model::{OrchestrationGroupId, OrchestrationTitle, Placement, SessionId},
+    model::{
+        OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle, OwnershipProof,
+        Placement, SessionId, TmuxSessionId,
+    },
     observer::{
         ObserverCapabilities, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
         ObserverWorker, action_for_key, render,
@@ -135,6 +139,7 @@ impl OrchestrationService {
             }
             let worker = OrchestrationMember {
                 session_id,
+                membership_id: OrchestrationMembershipId::new(),
                 title,
                 capabilities,
             };
@@ -189,15 +194,18 @@ pub fn run_observer(
     let service = OrchestrationService::new(store.clone());
     let group = service.group(&group_id)?;
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
+    let mut capture_fingerprints = HashMap::new();
     let (capture_worker, observer_results) = CaptureWorker::spawn();
-    refresh_observer_metadata(&store, &group_id, &mut observer, capture_worker.sender())?;
-
+    refresh_observer_metadata(
+        &store,
+        &group_id,
+        &mut observer,
+        &mut capture_fingerprints,
+        capture_worker.sender(),
+    )?;
     enable_raw_mode().context("enable Observer terminal raw mode")?;
-    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
-        let _ = disable_raw_mode();
-        return Err(error).context("enter Observer alternate screen");
-    }
     let _guard = ObserverTerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen).context("enter Observer alternate screen")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize Observer terminal")?;
     terminal.clear().context("clear Observer terminal")?;
@@ -213,8 +221,8 @@ pub fn run_observer(
 
         loop {
             match observer_results.try_recv() {
-                Ok((visible, workers)) if visible_worker_ids(&observer) == visible => {
-                    merge_captured_workers(&mut observer, &visible, workers);
+                Ok(result) if visible_worker_ids(&observer) == result.visible => {
+                    merge_captured_workers(&store, &group_id, &mut observer, result)?;
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -224,7 +232,13 @@ pub fn run_observer(
             }
         }
         if last_refresh.elapsed() >= OBSERVER_REFRESH_INTERVAL {
-            refresh_observer_metadata(&store, &group_id, &mut observer, capture_worker.sender())?;
+            refresh_observer_metadata(
+                &store,
+                &group_id,
+                &mut observer,
+                &mut capture_fingerprints,
+                capture_worker.sender(),
+            )?;
             last_refresh = Instant::now();
         }
         if !event::poll(OBSERVER_INPUT_POLL).context("poll Observer input")? {
@@ -267,6 +281,7 @@ pub fn run_observer(
                     &store,
                     &group_id,
                     &mut observer,
+                    &mut capture_fingerprints,
                     capture_worker.sender(),
                 )?;
                 last_refresh = Instant::now();
@@ -277,6 +292,7 @@ pub fn run_observer(
                     &store,
                     &group_id,
                     &mut observer,
+                    &mut capture_fingerprints,
                     capture_worker.sender(),
                 )?;
                 last_refresh = Instant::now();
@@ -302,6 +318,7 @@ fn refresh_observer_metadata(
     store: &StateStore,
     group_id: &OrchestrationGroupId,
     observer: &mut ObserverState,
+    capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
     capture_requests: &SyncSender<CaptureRequest>,
 ) -> Result<()> {
     let state = store.load()?;
@@ -310,10 +327,14 @@ fn refresh_observer_metadata(
         .iter()
         .find(|group| &group.id == group_id)
         .with_context(|| format!("orchestration group `{group_id}` was deleted"))?;
+    let next_fingerprints = capture_fingerprints_for(group, &state.sessions);
     update_observer_metadata(
         observer,
-        observer_workers(group, &state.sessions, &HashSet::new()),
+        capture_fingerprints,
+        &next_fingerprints,
+        observer_workers(group, &state.sessions),
     );
+    *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
         group: group.clone(),
         sessions: state.sessions,
@@ -327,7 +348,24 @@ fn refresh_observer_metadata(
     }
 }
 
-type CaptureResult = (HashSet<String>, Vec<ObserverWorker>);
+#[derive(Clone, Eq, PartialEq)]
+struct CaptureFingerprint {
+    membership_id: OrchestrationMembershipId,
+    session_id: SessionId,
+    ownership_proof: OwnershipProof,
+    tmux_session_id: TmuxSessionId,
+    capabilities: OrchestrationCapabilities,
+}
+
+struct CapturedWorker {
+    fingerprint: CaptureFingerprint,
+    capture: Option<String>,
+}
+
+struct CaptureResult {
+    visible: HashSet<String>,
+    workers: Vec<CapturedWorker>,
+}
 
 struct CaptureWorker {
     sender: Option<SyncSender<CaptureRequest>>,
@@ -346,8 +384,14 @@ impl CaptureWorker {
                 if worker_shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                let workers = observer_workers(&request.group, &request.sessions, &request.visible);
-                if results.send((request.visible, workers)).is_err() {
+                let workers = captured_workers(&request.group, &request.sessions, &request.visible);
+                if results
+                    .send(CaptureResult {
+                        visible: request.visible,
+                        workers,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -377,7 +421,12 @@ impl Drop for CaptureWorker {
     }
 }
 
-fn update_observer_metadata(observer: &mut ObserverState, mut workers: Vec<ObserverWorker>) {
+fn update_observer_metadata(
+    observer: &mut ObserverState,
+    previous_fingerprints: &HashMap<String, CaptureFingerprint>,
+    current_fingerprints: &HashMap<String, CaptureFingerprint>,
+    mut workers: Vec<ObserverWorker>,
+) {
     let previous_captures: HashMap<_, _> = observer
         .workers()
         .iter()
@@ -389,8 +438,7 @@ fn update_observer_metadata(observer: &mut ObserverState, mut workers: Vec<Obser
         })
         .collect();
     for worker in &mut workers {
-        if worker.lifecycle == ObserverLifecycle::Running
-            && worker.capabilities.observe_output
+        if previous_fingerprints.get(&worker.id) == current_fingerprints.get(&worker.id)
             && let Some(capture) = previous_captures.get(&worker.id)
         {
             worker.capture = Some(capture.clone());
@@ -400,27 +448,67 @@ fn update_observer_metadata(observer: &mut ObserverState, mut workers: Vec<Obser
 }
 
 fn merge_captured_workers(
+    store: &StateStore,
+    group_id: &OrchestrationGroupId,
     observer: &mut ObserverState,
-    visible: &HashSet<String>,
-    captured: Vec<ObserverWorker>,
-) {
+    result: CaptureResult,
+) -> Result<()> {
+    let state = store.load()?;
+    let Some(group) = state
+        .orchestration_groups
+        .iter()
+        .find(|group| &group.id == group_id)
+    else {
+        return Ok(());
+    };
+    let current_fingerprints = capture_fingerprints_for(group, &state.sessions);
     let mut workers = observer.workers().to_vec();
-    for worker in &mut workers {
-        if !visible.contains(&worker.id) {
+    for captured in result.workers {
+        let id = captured.fingerprint.session_id.to_string();
+        if !result.visible.contains(&id)
+            || current_fingerprints.get(&id) != Some(&captured.fingerprint)
+        {
             continue;
         }
-        let Some(result) = captured.iter().find(|candidate| {
-            candidate.id == worker.id
-                && candidate.title == worker.title
-                && candidate.capabilities == worker.capabilities
-                && candidate.lifecycle == worker.lifecycle
-                && candidate.owned == worker.owned
-        }) else {
-            continue;
-        };
-        worker.capture.clone_from(&result.capture);
+        if let Some(worker) = workers.iter_mut().find(|worker| worker.id == id) {
+            worker.capture = captured.capture;
+        }
     }
     observer.update_workers(workers);
+    Ok(())
+}
+
+fn capture_fingerprints_for(
+    group: &OrchestrationGroup,
+    sessions: &[SessionRecord],
+) -> HashMap<String, CaptureFingerprint> {
+    let sessions_by_id: HashMap<_, _> = sessions.iter().map(|record| (record.id, record)).collect();
+    group
+        .workers
+        .iter()
+        .filter(|member| member.capabilities.observe_output)
+        .filter_map(|member| {
+            let record = sessions_by_id.get(&member.session_id)?;
+            capture_fingerprint(member, record)
+                .map(|fingerprint| (member.session_id.to_string(), fingerprint))
+        })
+        .collect()
+}
+
+fn capture_fingerprint(
+    member: &OrchestrationMember,
+    record: &SessionRecord,
+) -> Option<CaptureFingerprint> {
+    if record.status != SessionStatus::Running {
+        return None;
+    }
+    Some(CaptureFingerprint {
+        membership_id: member.membership_id,
+        session_id: member.session_id,
+        ownership_proof: record.ownership_proof?,
+        tmux_session_id: record.tmux_session_id?,
+        capabilities: member.capabilities,
+    })
 }
 
 struct CaptureRequest {
@@ -437,13 +525,9 @@ fn visible_worker_ids(observer: &ObserverState) -> HashSet<String> {
         .collect()
 }
 
-fn observer_workers(
-    group: &OrchestrationGroup,
-    sessions: &[SessionRecord],
-    visible: &HashSet<String>,
-) -> Vec<ObserverWorker> {
+fn observer_workers(group: &OrchestrationGroup, sessions: &[SessionRecord]) -> Vec<ObserverWorker> {
     let sessions_by_id: HashMap<_, _> = sessions.iter().map(|record| (record.id, record)).collect();
-    let mut workers = group
+    group
         .workers
         .iter()
         .map(|member| {
@@ -471,38 +555,37 @@ fn observer_workers(
                 capture: None,
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let captures = thread::scope(|scope| {
+fn captured_workers(
+    group: &OrchestrationGroup,
+    sessions: &[SessionRecord],
+    visible: &HashSet<String>,
+) -> Vec<CapturedWorker> {
+    let sessions_by_id: HashMap<_, _> = sessions.iter().map(|record| (record.id, record)).collect();
+    thread::scope(|scope| {
         let handles = group
             .workers
             .iter()
-            .enumerate()
-            .filter_map(|(index, member)| {
+            .filter_map(|member| {
                 let id = member.session_id.to_string();
                 let record = sessions_by_id.get(&member.session_id).copied()?;
-                (visible.contains(&id)
-                    && member.capabilities.observe_output
-                    && record.status == SessionStatus::Running)
-                    .then(|| (index, scope.spawn(move || capture_record(record))))
+                let fingerprint = capture_fingerprint(member, record)?;
+                (visible.contains(&id) && member.capabilities.observe_output)
+                    .then(|| (fingerprint, scope.spawn(move || capture_record(record))))
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(index, handle)| {
-                (
-                    index,
-                    handle.join().unwrap_or_else(|_| {
-                        Some("[capture unavailable: worker panicked]".to_owned())
-                    }),
-                )
+            .map(|(fingerprint, handle)| CapturedWorker {
+                fingerprint,
+                capture: handle
+                    .join()
+                    .unwrap_or_else(|_| Some("[capture unavailable: worker panicked]".to_owned())),
             })
-            .collect::<Vec<_>>()
-    });
-    for (index, capture) in captures {
-        workers[index].capture = capture;
-    }
-    workers
+            .collect()
+    })
 }
 
 fn capture_record(record: &SessionRecord) -> Option<String> {
@@ -580,12 +663,39 @@ fn backend_for_target(target: &str) -> Result<TmuxBackend> {
     }
 }
 
+trait TerminalCleanup {
+    fn show_cursor(&mut self) -> io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+}
+
+struct CrosstermCleanup;
+
+impl TerminalCleanup for CrosstermCleanup {
+    fn show_cursor(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen)
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+}
+
+fn restore_terminal(cleanup: &mut impl TerminalCleanup) {
+    let _ = cleanup.show_cursor();
+    let _ = cleanup.leave_alternate_screen();
+    let _ = cleanup.disable_raw_mode();
+}
+
 struct ObserverTerminalGuard;
 
 impl Drop for ObserverTerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal(&mut CrosstermCleanup);
     }
 }
 
@@ -607,50 +717,313 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockCleanup {
+        attempts: Vec<&'static str>,
+        fail: HashSet<&'static str>,
+    }
+
+    impl TerminalCleanup for MockCleanup {
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.attempts.push("show");
+            if self.fail.contains("show") {
+                return Err(io::Error::other("show failed"));
+            }
+            Ok(())
+        }
+
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.attempts.push("leave");
+            if self.fail.contains("leave") {
+                return Err(io::Error::other("leave failed"));
+            }
+            Ok(())
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.attempts.push("raw");
+            if self.fail.contains("raw") {
+                return Err(io::Error::other("raw failed"));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn metadata_refresh_preserves_only_still_authorized_running_captures() {
+    fn terminal_cleanup_attempts_every_restoration_on_normal_exit() {
+        let mut cleanup = MockCleanup::default();
+        restore_terminal(&mut cleanup);
+        assert_eq!(cleanup.attempts, ["show", "leave", "raw"]);
+    }
+
+    #[test]
+    fn terminal_cleanup_attempts_every_restoration_after_errors() {
+        let mut cleanup = MockCleanup {
+            fail: HashSet::from(["show", "leave", "raw"]),
+            ..MockCleanup::default()
+        };
+        restore_terminal(&mut cleanup);
+        assert_eq!(cleanup.attempts, ["show", "leave", "raw"]);
+    }
+
+    fn fingerprint(membership: &str, identity: &str) -> CaptureFingerprint {
+        CaptureFingerprint {
+            membership_id: membership.parse().unwrap(),
+            session_id: "tether-0197f198000070008000000000000002".parse().unwrap(),
+            ownership_proof: "0197f198000070008000000000000099".parse().unwrap(),
+            tmux_session_id: identity.parse().unwrap(),
+            capabilities: OrchestrationCapabilities {
+                observe_output: true,
+                open_interactive: true,
+            },
+        }
+    }
+
+    fn capture_state(membership: &str) -> (State, OrchestrationGroupId, SessionId) {
+        let orchestrator = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let worker_id = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let group_id: OrchestrationGroupId = "group".parse().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        (
+            State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![SessionRecord {
+                    id: worker_id,
+                    host: "local".to_owned(),
+                    target: "local".to_owned(),
+                    directory: "/tmp".to_owned(),
+                    preset: None,
+                    command: Some("exec true".to_owned()),
+                    tmux_session_id: Some("$7".parse().unwrap()),
+                    ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
+                    status: SessionStatus::Running,
+                    created_at: now,
+                    last_used_at: now,
+                    closed_at: None,
+                    exit_status: None,
+                }],
+                orchestration_groups: vec![OrchestrationGroup {
+                    id: group_id.clone(),
+                    title: "Group".parse().unwrap(),
+                    orchestrator_session_id: orchestrator,
+                    workers: vec![OrchestrationMember {
+                        session_id: worker_id,
+                        membership_id: membership.parse().unwrap(),
+                        title: None,
+                        capabilities: OrchestrationCapabilities {
+                            observe_output: true,
+                            open_interactive: true,
+                        },
+                    }],
+                }],
+            },
+            group_id,
+            worker_id,
+        )
+    }
+
+    fn capture_result(fingerprint: CaptureFingerprint, capture: &str) -> CaptureResult {
+        CaptureResult {
+            visible: HashSet::from([fingerprint.session_id.to_string()]),
+            workers: vec![CapturedWorker {
+                fingerprint,
+                capture: Some(capture.to_owned()),
+            }],
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_preserves_captures_only_within_the_same_exact_epoch() {
         let mut observer = ObserverState::new(vec![
-            worker("running", ObserverLifecycle::Running, Some("previous")),
-            worker("ended", ObserverLifecycle::Running, Some("stale")),
+            worker("same", ObserverLifecycle::Running, Some("previous")),
+            worker("changed", ObserverLifecycle::Running, Some("stale")),
+        ]);
+        let previous = HashMap::from([
+            (
+                "same".to_owned(),
+                fingerprint("0197f198000070008000000000000011", "$7"),
+            ),
+            (
+                "changed".to_owned(),
+                fingerprint("0197f198000070008000000000000012", "$7"),
+            ),
+        ]);
+        let current = HashMap::from([
+            (
+                "same".to_owned(),
+                fingerprint("0197f198000070008000000000000011", "$7"),
+            ),
+            (
+                "changed".to_owned(),
+                fingerprint("0197f198000070008000000000000012", "$8"),
+            ),
         ]);
 
         update_observer_metadata(
             &mut observer,
+            &previous,
+            &current,
             vec![
+                worker("same", ObserverLifecycle::Running, None),
+                worker("changed", ObserverLifecycle::Running, None),
                 worker("new", ObserverLifecycle::Starting, None),
-                worker("running", ObserverLifecycle::Running, None),
-                worker("ended", ObserverLifecycle::Ended, None),
             ],
         );
 
-        assert_eq!(observer.workers()[0].capture, None);
-        assert_eq!(observer.workers()[1].capture.as_deref(), Some("previous"));
+        assert_eq!(observer.workers()[0].capture.as_deref(), Some("previous"));
+        assert_eq!(observer.workers()[1].capture, None);
         assert_eq!(observer.workers()[2].capture, None);
     }
 
     #[test]
-    fn capture_results_merge_by_identity_and_current_metadata_only() {
-        let mut observer = ObserverState::new(vec![
-            worker("current", ObserverLifecycle::Running, Some("old")),
-            worker("changed", ObserverLifecycle::Ended, None),
-            worker("off-page", ObserverLifecycle::Running, Some("kept")),
-        ]);
-        let captured = vec![
-            worker("current", ObserverLifecycle::Running, Some("new")),
-            worker("changed", ObserverLifecycle::Running, Some("stale")),
-            worker("removed", ObserverLifecycle::Running, Some("irrelevant")),
-            worker("off-page", ObserverLifecycle::Running, None),
-        ];
+    fn capture_merge_accepts_the_complete_current_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
+        let fingerprint = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            Some("old"),
+        )]);
 
-        let visible = HashSet::from(["current".to_owned(), "changed".to_owned()]);
-        merge_captured_workers(&mut observer, &visible, captured);
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(fingerprint, "new"),
+        )
+        .unwrap();
 
         assert_eq!(observer.workers()[0].capture.as_deref(), Some("new"));
-        assert_eq!(observer.workers()[1].capture, None);
-        assert_eq!(observer.workers()[2].capture.as_deref(), Some("kept"));
-        assert_eq!(observer.selected_id(), Some("current"));
     }
 
+    #[test]
+    fn capture_merge_rejects_a_changed_tmux_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
+        let captured = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        state.sessions[0].tmux_session_id = Some("$8".parse().unwrap());
+        let store = StateStore::new(temp.path().join("state.json"));
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            Some("current"),
+        )]);
+
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(captured, "stale-$7"),
+        )
+        .unwrap();
+
+        assert_eq!(observer.workers()[0].capture.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn capture_merge_rejects_capability_revocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
+        let captured = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        state.orchestration_groups[0].workers[0]
+            .capabilities
+            .observe_output = false;
+        let store = StateStore::new(temp.path().join("state.json"));
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            Some("current"),
+        )]);
+
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(captured, "revoked"),
+        )
+        .unwrap();
+
+        assert_eq!(observer.workers()[0].capture.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn capture_merge_rejects_remove_and_readd_with_identical_visible_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
+        let captured = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        state.orchestration_groups[0].workers[0].membership_id =
+            "0197f198000070008000000000000012".parse().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            Some("current"),
+        )]);
+
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(captured, "pre-removal"),
+        )
+        .unwrap();
+
+        assert_eq!(observer.workers()[0].capture.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn remove_and_readd_allocates_a_new_persisted_membership_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let service = OrchestrationService::new(store.clone());
+        let group_id: OrchestrationGroupId = "group".parse().unwrap();
+        let orchestrator: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+        let worker_id: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let capabilities = OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: false,
+        };
+        service
+            .create_group(group_id.clone(), "Group".parse().unwrap(), orchestrator)
+            .unwrap();
+        let first = service
+            .add_worker(&group_id, worker_id, None, capabilities)
+            .unwrap();
+        service.remove_worker(&group_id, worker_id).unwrap();
+        let second = service
+            .add_worker(&group_id, worker_id, None, capabilities)
+            .unwrap();
+
+        assert_ne!(first.membership_id, second.membership_id);
+        assert_eq!(
+            store.load().unwrap().orchestration_groups[0].workers[0].membership_id,
+            second.membership_id
+        );
+    }
     #[test]
     fn companion_placement_always_preserves_the_source_pane() {
         assert_eq!(
@@ -693,6 +1066,7 @@ mod tests {
         };
         let member = OrchestrationMember {
             session_id: worker_id,
+            membership_id: OrchestrationMembershipId::new(),
             title: None,
             capabilities: OrchestrationCapabilities {
                 observe_output: true,

@@ -319,8 +319,8 @@ fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
 }
 
 fn snapshot(paths: &AppPaths, args: SnapshotArgs) -> Result<()> {
-    let config = ConfigStore::new(paths.config_file.clone()).load()?;
-    let state = StateStore::new(paths.state_file.clone()).load()?;
+    let config = ConfigStore::new(paths.config_file.clone()).load_read_only()?;
+    let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let snapshot = collect_snapshot(

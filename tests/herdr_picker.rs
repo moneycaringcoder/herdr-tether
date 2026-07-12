@@ -440,7 +440,7 @@ fn orchestration_observe_creates_one_outer_pane_with_exact_destination_context()
     fs::write(
         state_file,
         r#"{
-  "version": 3,
+  "version": 4,
   "sessions": [],
   "orchestration_groups": [{
     "id": "build-fleet",
