@@ -1,10 +1,18 @@
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use herdr_tether::{
     backend::ProcessBinaries,
     discovery::{
         DiscoveryCompletion, DiscoveryLimits, DiscoveryLocation, DiscoveryMessage,
-        DiscoveryRequest, DiscoveryService,
+        DiscoveryRequest, DiscoveryRun, DiscoveryRunCompletion, DiscoveryService,
     },
 };
 use tempfile::tempdir;
@@ -34,6 +42,10 @@ fn limits() -> DiscoveryLimits {
 fn collect(service: &DiscoveryService, request: DiscoveryRequest) -> Vec<DiscoveryMessage> {
     let generation = request.generation;
     let run = service.start(request);
+    collect_messages(&run, generation)
+}
+
+fn collect_messages(run: &DiscoveryRun, generation: u64) -> Vec<DiscoveryMessage> {
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -528,4 +540,176 @@ fn remote_entry_limit_stops_directory_enumeration_incrementally() {
         )),
         "remote enumeration did not stop at the entry bound: {messages:?}"
     );
+}
+
+#[test]
+fn result_budget_is_global_and_truncation_preserves_request_and_lexical_order() {
+    let temp = tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    repo(&first.join("a"), false);
+    repo(&first.join("b"), false);
+    repo(&second.join("c"), false);
+    repo(&second.join("d"), false);
+    let mut bounded = limits();
+    bounded.max_results = 2;
+    bounded.workers = 2;
+    let service = DiscoveryService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+        bounded,
+    );
+    let run = service.start(DiscoveryRequest {
+        generation: 30,
+        locations: vec![
+            DiscoveryLocation {
+                host: "first".into(),
+                target: None,
+                roots: vec![first.to_string_lossy().into_owned()],
+            },
+            DiscoveryLocation {
+                host: "second".into(),
+                target: None,
+                roots: vec![second.to_string_lossy().into_owned()],
+            },
+        ],
+    });
+    let messages = collect_messages(&run, 30);
+
+    assert_eq!(
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                DiscoveryMessage::Repository { host, path, .. } => {
+                    Some((
+                        host.as_str(),
+                        Path::new(path).file_name().unwrap().to_str().unwrap(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![("first", "a"), ("first", "b")],
+    );
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        DiscoveryMessage::HostFinished {
+            host,
+            completion: DiscoveryCompletion::ResultsLimit,
+            ..
+        } if host == "second"
+    )));
+    assert_eq!(run.completion(), Some(DiscoveryRunCompletion::ResultsLimit));
+}
+
+#[test]
+fn all_locations_share_one_injected_request_deadline() {
+    let temp = tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    repo(&first.join("a"), false);
+    repo(&second.join("b"), false);
+    let base = Instant::now();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let service = DiscoveryService::new_with_clock(
+        ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+        limits(),
+        move || {
+            if clock_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                base
+            } else {
+                base + Duration::from_secs(2)
+            }
+        },
+    );
+    let run = service.start(DiscoveryRequest {
+        generation: 31,
+        locations: vec![
+            DiscoveryLocation {
+                host: "first".into(),
+                target: None,
+                roots: vec![first.to_string_lossy().into_owned()],
+            },
+            DiscoveryLocation {
+                host: "second".into(),
+                target: None,
+                roots: vec![second.to_string_lossy().into_owned()],
+            },
+        ],
+    });
+    let messages = collect_messages(&run, 31);
+
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                DiscoveryMessage::HostFinished {
+                    completion: DiscoveryCompletion::TimedOut,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, DiscoveryMessage::Repository { .. }))
+    );
+    assert_eq!(run.completion(), Some(DiscoveryRunCompletion::TimedOut));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_stops_queued_fanout_and_reports_cancelled_completion() {
+    let temp = tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let ssh = temp.path().join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nwhile :; do :; done\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut bounded = limits();
+    bounded.workers = 1;
+    bounded.timeout = Duration::from_secs(2);
+    let service = DiscoveryService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        bounded,
+    );
+    let run = service.start(DiscoveryRequest {
+        generation: 32,
+        locations: (0..8)
+            .map(|index| DiscoveryLocation {
+                host: format!("host-{index}"),
+                target: Some(format!("host-{index}.example")),
+                roots: vec!["/work".into()],
+            })
+            .collect(),
+    });
+    let marker_deadline = Instant::now() + Duration::from_secs(1);
+    while !calls.exists() {
+        assert!(
+            Instant::now() < marker_deadline,
+            "injected probe never started"
+        );
+        std::thread::yield_now();
+    }
+    run.cancel();
+    loop {
+        if matches!(
+            run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            DiscoveryMessage::Finished { generation: 32 }
+        ) {
+            break;
+        }
+    }
+
+    assert_eq!(fs::read_to_string(calls).unwrap(), "x");
+    assert_eq!(run.completion(), Some(DiscoveryRunCompletion::Cancelled));
 }

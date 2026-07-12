@@ -5,7 +5,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -25,6 +25,8 @@ const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_DRAIN_BYTES_PER_TICK: usize = MAX_CAPTURE_BYTES + 8192;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_STATUS_WORKERS: usize = 16;
+pub const MAX_STATUS_HOSTS: usize = 1_024;
+pub const MAX_STATUS_WORKLOADS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostReachability {
@@ -69,6 +71,12 @@ pub struct StatusHost {
 pub struct StatusRequest {
     pub generation: u64,
     pub hosts: Vec<StatusHost>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatusRequestError {
+    TooManyHosts { actual: usize, maximum: usize },
+    TooManyWorkloads { actual: usize, maximum: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +136,20 @@ impl StatusService {
     }
 
     pub fn start(&self, request: StatusRequest) -> StatusRun {
-        let (sender, receiver) = mpsc::channel();
+        let generation = request.generation;
+        self.try_start(request)
+            .unwrap_or_else(|_| finished_run(generation))
+    }
+
+    pub fn try_start(&self, mut request: StatusRequest) -> Result<StatusRun, StatusRequestError> {
+        validate_status_request(&request)?;
+        request.hosts = normalize_status_hosts(request.hosts);
+        Ok(self.start_validated(request))
+    }
+
+    fn start_validated(&self, request: StatusRequest) -> StatusRun {
+        let (sender, receiver) =
+            mpsc::sync_channel(MAX_STATUS_WORKLOADS + MAX_STATUS_HOSTS * 2 + 1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let jobs = Arc::new(Mutex::new(VecDeque::from(request.hosts)));
         let worker_count = self
@@ -164,6 +185,69 @@ impl StatusService {
     }
 }
 
+fn validate_status_request(request: &StatusRequest) -> Result<(), StatusRequestError> {
+    if request.hosts.len() > MAX_STATUS_HOSTS {
+        return Err(StatusRequestError::TooManyHosts {
+            actual: request.hosts.len(),
+            maximum: MAX_STATUS_HOSTS,
+        });
+    }
+    let workload_count = request
+        .hosts
+        .iter()
+        .try_fold(0usize, |total, host| {
+            total.checked_add(host.workloads.len())
+        })
+        .unwrap_or(usize::MAX);
+    if workload_count > MAX_STATUS_WORKLOADS {
+        return Err(StatusRequestError::TooManyWorkloads {
+            actual: workload_count,
+            maximum: MAX_STATUS_WORKLOADS,
+        });
+    }
+    Ok(())
+}
+
+fn normalize_status_hosts(hosts: Vec<StatusHost>) -> Vec<StatusHost> {
+    let mut normalized = Vec::<StatusHost>::new();
+    let mut host_indexes = HashMap::<(String, Option<String>), usize>::new();
+    let mut workload_sets = Vec::<HashSet<SessionId>>::new();
+    for host in hosts {
+        let key = (host.name.clone(), host.target.clone());
+        let index = match host_indexes.get(&key).copied() {
+            Some(index) => index,
+            None => {
+                let index = normalized.len();
+                host_indexes.insert(key, index);
+                normalized.push(StatusHost {
+                    name: host.name,
+                    target: host.target,
+                    workloads: Vec::new(),
+                });
+                workload_sets.push(HashSet::new());
+                index
+            }
+        };
+        for workload in host.workloads {
+            if workload_sets[index].insert(workload) {
+                normalized[index].workloads.push(workload);
+            }
+        }
+    }
+    normalized
+}
+
+fn finished_run(generation: u64) -> StatusRun {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _ = sender.send(StatusMessage::Finished { generation });
+    StatusRun {
+        receiver,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+#[derive(Debug)]
+
 pub struct StatusRun {
     pub receiver: Receiver<StatusMessage>,
     cancelled: Arc<AtomicBool>,
@@ -184,7 +268,7 @@ impl Drop for StatusRun {
 fn worker_loop(
     generation: u64,
     jobs: Arc<Mutex<VecDeque<StatusHost>>>,
-    sender: &Sender<StatusMessage>,
+    sender: &SyncSender<StatusMessage>,
     cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
     timeout: Duration,
@@ -203,7 +287,7 @@ fn worker_loop(
 fn probe_host(
     generation: u64,
     host: StatusHost,
-    sender: &Sender<StatusMessage>,
+    sender: &SyncSender<StatusMessage>,
     cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
     timeout: Duration,
@@ -279,6 +363,7 @@ struct ClassifiedResult {
 }
 
 fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult {
+    let requested = host.workloads.iter().copied().collect::<HashSet<_>>();
     match result {
         BoundedOutput::Completed {
             status,
@@ -311,7 +396,7 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                     + catalog
                         .owned
                         .keys()
-                        .filter(|id| !host.workloads.contains(id))
+                        .filter(|id| !requested.contains(id))
                         .count(),
                 hidden_unsafe: catalog.unsafe_names,
             },

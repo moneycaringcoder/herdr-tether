@@ -8,8 +8,8 @@ use herdr_tether::{
     backend::ProcessBinaries,
     model::{ExternalSessionName, SessionId},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
-        StatusRequest, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS, StatusHost,
+        StatusMessage, StatusRequest, StatusRequestError, StatusService, WorkloadStatus,
     },
 };
 use tempfile::tempdir;
@@ -583,4 +583,106 @@ fn successful_probe_does_not_leave_background_descendants_running() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
+    let temp = tempdir().unwrap();
+    let marker = temp.path().join("probed");
+    let tmux = temp.path().join("tmux");
+    fs::write(
+        &tmux,
+        format!("#!/bin/sh\nprintf x >> '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        1,
+    );
+    let workload = id("tether-0197f198000070008000000000000001");
+    let error = service
+        .try_start(StatusRequest {
+            generation: 20,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: vec![workload; MAX_STATUS_WORKLOADS + 1],
+            }],
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        StatusRequestError::TooManyWorkloads {
+            actual: MAX_STATUS_WORKLOADS + 1,
+            maximum: MAX_STATUS_WORKLOADS,
+        }
+    );
+    assert!(!marker.exists(), "an invalid request reached the probe");
+}
+
+#[test]
+fn duplicate_heavy_status_request_probes_and_reports_each_exact_target_once() {
+    let temp = tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let tmux = temp.path().join("tmux");
+    let first = id("tether-0197f198000070008000000000000001");
+    let second = id("tether-0197f198000070008000000000000002");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf '{}: 1 windows (created now) (attached)\\n{}: 1 windows (created now)\\n'\n",
+            calls.display(),
+            first,
+            second,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        2,
+    );
+    let duplicate = StatusHost {
+        name: "local".into(),
+        target: None,
+        workloads: vec![second, first, second, first],
+    };
+    let run = service
+        .try_start(StatusRequest {
+            generation: 21,
+            hosts: vec![duplicate.clone(), duplicate],
+        })
+        .unwrap();
+    let mut messages = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { generation: 21 });
+        messages.push(message);
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(fs::read_to_string(calls).unwrap(), "x");
+    assert_eq!(
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                StatusMessage::Workload { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![second, first],
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(message, StatusMessage::Host { .. }))
+            .count(),
+        1,
+    );
 }

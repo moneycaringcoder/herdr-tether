@@ -1,11 +1,11 @@
 use std::{
-    collections::{BinaryHeap, HashSet, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashSet, VecDeque},
     fs,
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -106,6 +106,20 @@ pub enum DiscoveryCompletion {
     Error,
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryRunCompletion {
+    Complete = 1,
+    ResultsLimit = 2,
+    EntriesLimit = 3,
+    TimedOut = 4,
+    Unavailable = 5,
+    OutputLimit = 6,
+    Malformed = 7,
+    Error = 8,
+    Cancelled = 9,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveryMessage {
     Repository {
@@ -161,41 +175,107 @@ pub struct DiscoveryLimits {
     pub workers: usize,
 }
 
-#[derive(Clone, Debug)]
+type DiscoveryClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+#[derive(Clone)]
 pub struct DiscoveryService {
     binaries: ProcessBinaries,
     limits: DiscoveryLimits,
+    clock: DiscoveryClock,
+}
+
+impl std::fmt::Debug for DiscoveryService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryService")
+            .field("binaries", &self.binaries)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiscoveryService {
-    pub fn new(binaries: ProcessBinaries, mut limits: DiscoveryLimits) -> Self {
+    pub fn new(binaries: ProcessBinaries, limits: DiscoveryLimits) -> Self {
+        Self::new_with_clock(binaries, limits, Instant::now)
+    }
+
+    pub fn new_with_clock<F>(
+        binaries: ProcessBinaries,
+        mut limits: DiscoveryLimits,
+        clock: F,
+    ) -> Self
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
         limits.workers = limits.workers.clamp(1, MAX_DISCOVERY_WORKERS);
         limits.max_entries = limits.max_entries.clamp(1, MAX_DISCOVERY_ENTRIES);
         limits.max_results = limits.max_results.clamp(1, MAX_DISCOVERY_RESULTS);
-        Self { binaries, limits }
+        Self {
+            binaries,
+            limits,
+            clock: Arc::new(clock),
+        }
     }
 
     pub fn start(&self, request: DiscoveryRequest) -> DiscoveryRun {
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let jobs = Arc::new(Mutex::new(VecDeque::from(request.locations)));
-        let worker_count = self
-            .limits
-            .workers
-            .min(jobs.lock().expect("discovery jobs lock").len().max(1));
+        let completion = Arc::new(AtomicUsize::new(0));
+        let jobs = Arc::new(Mutex::new(
+            request
+                .locations
+                .into_iter()
+                .enumerate()
+                .collect::<VecDeque<_>>(),
+        ));
+        let location_count = jobs.lock().expect("discovery jobs lock").len();
+        let worker_count = self.limits.workers.min(location_count.max(1));
+        let (outcome_sender, outcome_receiver) = mpsc::sync_channel(worker_count);
+        let entries = Arc::new(AtomicUsize::new(0));
+        let started = (self.clock)();
+        let deadline = started.checked_add(self.limits.timeout).unwrap_or(started);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let jobs = Arc::clone(&jobs);
-            let sender = sender.clone();
+            let outcome_sender = outcome_sender.clone();
             let cancelled = Arc::clone(&cancelled);
+            let entries = Arc::clone(&entries);
             let binaries = self.binaries.clone();
             let limits = self.limits;
+            let clock = Arc::clone(&self.clock);
             let generation = request.generation;
             handles.push(thread::spawn(move || {
-                worker_loop(generation, jobs, &sender, &cancelled, &binaries, limits);
+                worker_loop(
+                    generation,
+                    jobs,
+                    &outcome_sender,
+                    &cancelled,
+                    &entries,
+                    &binaries,
+                    limits,
+                    deadline,
+                    &clock,
+                );
             }));
         }
+        drop(outcome_sender);
+        let supervisor_cancelled = Arc::clone(&cancelled);
+        let supervisor_completion = Arc::clone(&completion);
+        let max_results = self.limits.max_results;
         thread::spawn(move || {
+            let outcome = publish_outcomes(
+                request.generation,
+                outcome_receiver,
+                &sender,
+                &supervisor_cancelled,
+                max_results,
+            );
+            let _ = supervisor_completion.compare_exchange(
+                0,
+                outcome as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             for handle in handles {
                 let _ = handle.join();
             }
@@ -206,6 +286,7 @@ impl DiscoveryService {
         DiscoveryRun {
             receiver,
             cancelled,
+            completion,
         }
     }
 }
@@ -213,11 +294,34 @@ impl DiscoveryService {
 pub struct DiscoveryRun {
     pub receiver: Receiver<DiscoveryMessage>,
     cancelled: Arc<AtomicBool>,
+    completion: Arc<AtomicUsize>,
 }
 
 impl DiscoveryRun {
     pub fn cancel(&self) {
+        let _ = self.completion.compare_exchange(
+            0,
+            DiscoveryRunCompletion::Cancelled as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn completion(&self) -> Option<DiscoveryRunCompletion> {
+        match self.completion.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(DiscoveryRunCompletion::Complete),
+            2 => Some(DiscoveryRunCompletion::ResultsLimit),
+            3 => Some(DiscoveryRunCompletion::EntriesLimit),
+            4 => Some(DiscoveryRunCompletion::TimedOut),
+            5 => Some(DiscoveryRunCompletion::Unavailable),
+            6 => Some(DiscoveryRunCompletion::OutputLimit),
+            7 => Some(DiscoveryRunCompletion::Malformed),
+            8 => Some(DiscoveryRunCompletion::Error),
+            9 => Some(DiscoveryRunCompletion::Cancelled),
+            _ => unreachable!("invalid discovery completion"),
+        }
     }
 }
 
@@ -227,27 +331,144 @@ impl Drop for DiscoveryRun {
     }
 }
 
+struct LocationOutcome {
+    index: usize,
+    messages: Vec<DiscoveryMessage>,
+}
+
 fn worker_loop(
     generation: u64,
-    jobs: Arc<Mutex<VecDeque<DiscoveryLocation>>>,
-    sender: &Sender<DiscoveryMessage>,
+    jobs: Arc<Mutex<VecDeque<(usize, DiscoveryLocation)>>>,
+    outcomes: &SyncSender<LocationOutcome>,
     cancelled: &AtomicBool,
+    entries: &AtomicUsize,
     binaries: &ProcessBinaries,
     limits: DiscoveryLimits,
+    deadline: Instant,
+    clock: &DiscoveryClock,
 ) {
     loop {
         if cancelled.load(Ordering::Acquire) {
             return;
         }
-        let Some(location) = jobs.lock().expect("discovery jobs lock").pop_front() else {
+        let Some((index, location)) = jobs.lock().expect("discovery jobs lock").pop_front() else {
             return;
         };
+        let (sender, receiver) = mpsc::channel();
         match &location.target {
             Some(target) => scan_remote(
-                generation, &location, target, sender, cancelled, binaries, limits,
+                generation, &location, target, &sender, cancelled, binaries, limits, deadline,
+                clock,
             ),
-            None => scan_local(generation, &location, sender, cancelled, limits),
+            None => scan_local(
+                generation, &location, &sender, cancelled, entries, limits, deadline, clock,
+            ),
         }
+        drop(sender);
+        let outcome = LocationOutcome {
+            index,
+            messages: receiver.into_iter().collect(),
+        };
+        if outcomes.send(outcome).is_err() {
+            return;
+        }
+    }
+}
+
+fn publish_outcomes(
+    generation: u64,
+    outcomes: Receiver<LocationOutcome>,
+    sender: &Sender<DiscoveryMessage>,
+    cancelled: &AtomicBool,
+    max_results: usize,
+) -> DiscoveryRunCompletion {
+    let mut overall = DiscoveryRunCompletion::Complete;
+    let mut pending = BTreeMap::new();
+    let mut next = 0;
+    let mut published_results = 0;
+    for outcome in outcomes {
+        pending.insert(outcome.index, outcome.messages);
+        while let Some(messages) = pending.remove(&next) {
+            let mut exceeded_results = false;
+            for message in messages {
+                if cancelled.load(Ordering::Acquire) {
+                    return DiscoveryRunCompletion::Cancelled;
+                }
+                match message {
+                    DiscoveryMessage::Repository { .. } if published_results >= max_results => {
+                        exceeded_results = true;
+                    }
+                    DiscoveryMessage::Repository { .. } => {
+                        published_results += 1;
+                        if sender.send(message).is_err() {
+                            return overall;
+                        }
+                    }
+                    DiscoveryMessage::HostFinished {
+                        host, completion, ..
+                    } => {
+                        let completion = if exceeded_results {
+                            DiscoveryCompletion::ResultsLimit
+                        } else {
+                            completion
+                        };
+                        overall = more_significant_completion(overall, completion);
+                        if sender
+                            .send(DiscoveryMessage::HostFinished {
+                                generation,
+                                host,
+                                completion,
+                            })
+                            .is_err()
+                        {
+                            return overall;
+                        }
+                    }
+                    _ => {
+                        if sender.send(message).is_err() {
+                            return overall;
+                        }
+                    }
+                }
+            }
+            next += 1;
+        }
+    }
+    overall
+}
+
+fn more_significant_completion(
+    current: DiscoveryRunCompletion,
+    completion: DiscoveryCompletion,
+) -> DiscoveryRunCompletion {
+    let candidate = match completion {
+        DiscoveryCompletion::Complete => DiscoveryRunCompletion::Complete,
+        DiscoveryCompletion::ResultsLimit => DiscoveryRunCompletion::ResultsLimit,
+        DiscoveryCompletion::EntriesLimit => DiscoveryRunCompletion::EntriesLimit,
+        DiscoveryCompletion::TimedOut => DiscoveryRunCompletion::TimedOut,
+        DiscoveryCompletion::Unavailable => DiscoveryRunCompletion::Unavailable,
+        DiscoveryCompletion::OutputLimit => DiscoveryRunCompletion::OutputLimit,
+        DiscoveryCompletion::Malformed => DiscoveryRunCompletion::Malformed,
+        DiscoveryCompletion::Error => DiscoveryRunCompletion::Error,
+    };
+    if completion_priority(candidate) > completion_priority(current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+fn completion_priority(completion: DiscoveryRunCompletion) -> usize {
+    match completion {
+        DiscoveryRunCompletion::Complete => 0,
+        DiscoveryRunCompletion::Unavailable => 1,
+        DiscoveryRunCompletion::Malformed => 2,
+        DiscoveryRunCompletion::Error => 3,
+        DiscoveryRunCompletion::OutputLimit => 4,
+        DiscoveryRunCompletion::EntriesLimit => 5,
+        DiscoveryRunCompletion::ResultsLimit => 6,
+        DiscoveryRunCompletion::TimedOut => 7,
+        DiscoveryRunCompletion::Cancelled => 8,
     }
 }
 
@@ -257,8 +478,9 @@ struct LocalScan<'a> {
     sender: &'a Sender<DiscoveryMessage>,
     cancelled: &'a AtomicBool,
     limits: DiscoveryLimits,
-    started: Instant,
-    entries: usize,
+    deadline: Instant,
+    entries: &'a AtomicUsize,
+    clock: &'a DiscoveryClock,
     results: usize,
     seen: HashSet<PathBuf>,
     completion: DiscoveryCompletion,
@@ -269,7 +491,10 @@ fn scan_local(
     location: &DiscoveryLocation,
     sender: &Sender<DiscoveryMessage>,
     cancelled: &AtomicBool,
+    entries: &AtomicUsize,
     limits: DiscoveryLimits,
+    deadline: Instant,
+    clock: &DiscoveryClock,
 ) {
     let mut scan = LocalScan {
         generation,
@@ -277,8 +502,9 @@ fn scan_local(
         sender,
         cancelled,
         limits,
-        started: Instant::now(),
-        entries: 0,
+        deadline,
+        entries,
+        clock,
         results: 0,
         seen: HashSet::new(),
         completion: DiscoveryCompletion::Complete,
@@ -321,11 +547,11 @@ impl LocalScan<'_> {
         if self.completion == DiscoveryCompletion::ResultsLimit {
             return true;
         }
-        if self.started.elapsed() >= self.limits.timeout {
+        if (self.clock)() >= self.deadline {
             self.completion = DiscoveryCompletion::TimedOut;
             return true;
         }
-        if self.entries >= self.limits.max_entries {
+        if self.entries.load(Ordering::Acquire) >= self.limits.max_entries {
             self.completion = DiscoveryCompletion::EntriesLimit;
             return true;
         }
@@ -342,7 +568,16 @@ impl LocalScan<'_> {
         if self.stopped() {
             return Ok(());
         }
-        self.entries += 1;
+        if self
+            .entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
+                (entries < self.limits.max_entries).then_some(entries + 1)
+            })
+            .is_err()
+        {
+            self.completion = DiscoveryCompletion::EntriesLimit;
+            return Ok(());
+        }
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Ok(());
@@ -382,7 +617,10 @@ impl LocalScan<'_> {
         if depth >= self.limits.max_depth {
             return Ok(());
         }
-        let remaining_entries = self.limits.max_entries.saturating_sub(self.entries);
+        let remaining_entries = self
+            .limits
+            .max_entries
+            .saturating_sub(self.entries.load(Ordering::Acquire));
         let mut children = BinaryHeap::new();
         for entry in fs::read_dir(path)? {
             if self.stopped() {
@@ -459,10 +697,22 @@ fn scan_remote(
     cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
     limits: DiscoveryLimits,
+    deadline: Instant,
+    clock: &DiscoveryClock,
 ) {
+    let now = (clock)();
+    if now >= deadline {
+        let _ = sender.send(DiscoveryMessage::HostFinished {
+            generation,
+            host: location.host.clone(),
+            completion: DiscoveryCompletion::TimedOut,
+        });
+        return;
+    }
+    let remaining = deadline.saturating_duration_since(now);
     let result = remote_spec(target, &location.roots, binaries, limits)
         .map_or(BoundedOutput::Error, |spec| {
-            run_bounded(&spec, limits.timeout, cancelled)
+            run_bounded(&spec, remaining, cancelled)
         });
     if cancelled.load(Ordering::Acquire) || matches!(result, BoundedOutput::Cancelled) {
         return;
