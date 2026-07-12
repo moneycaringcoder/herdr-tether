@@ -9,18 +9,23 @@
 - Added an ended-workload lifecycle with native pane-exit observation, retained exit context, safe Restart in the original directory, and metadata-only Remove.
 - Added automatic cleanup of safely finalized history after the configured retention period; cleanup has no SSH, `tmux`, probe, or Stop capability.
 - Added focused quickstart, lifecycle, configuration, troubleshooting, architecture/security, and contribution paths plus original light/dark-ready project artwork.
+- Added an optional first-party Hermes skill for observable, configurable orchestration through Tether's public snapshot and lifecycle interfaces.
 
 ### Changed
 
 - Simplified the picker around contextual `Enter Open` / `x Stop`, `Enter Restart` / `x Remove`, and `r Retry` actions, with history maintenance moved out of the primary workflow.
 - Stop, Restart, Remove, and migration transitions now preserve recoverable identity and state across persistence, transport, placement, and concurrent-operation failures.
 - Public installation, lifecycle, security, and limitations guidance now uses a concise first-visit path and evergreen support wording.
+- Normal picker, snapshot, and session-list views now hide Removed tombstones, group active/transitional workloads ahead of ended workloads, and retain recent-first deterministic ordering within each group.
+- Public installation guidance now distinguishes stable v0.3.0, development `main`, and immutable exact-SHA installs; Herdr marketplace metadata now describes the durable-workload benefit directly.
 
 ### Fixed
 
 - Workloads whose commands exit are no longer left as contradictory active/missing rows or offered as failed attachments.
 - Status and discovery refreshes no longer dismiss or route input around active confirmation and error dialogs.
 - Preserved remote `~` expansion and captured-internal-identity rollback while extending lifecycle behavior.
+- Herdr panes now receive concise bounded titles from safe host, directory, and command metadata instead of a generic session label.
+- Corrected the README mark's cursor/tether alignment across all public logo assets and removed an unsupported Herdr build-manifest field.
 
 ### Limitations
 

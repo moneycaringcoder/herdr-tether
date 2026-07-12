@@ -16,14 +16,35 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 ## 2. Install the plugin
 
+Choose one source:
+
+**Stable v0.3.0.** Install the release tag:
+
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref main
-herdr plugin action list --plugin moneycaringcoder.tether
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
 ```
 
-Until `v0.3.0` is tagged, `main` is the public development line, not a release.
-Herdr previews the source and build commands before confirmation. Review them;
-replace `main` with a full reviewed commit SHA for a reproducible install.
+**Development (`main`).** Use this to follow the public development line, not
+a release:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref main
+```
+
+**Immutable reviewed commit.** Replace the value below with the full commit SHA
+you reviewed:
+
+```sh
+TETHER_REV=FULL_COMMIT_SHA_YOU_REVIEWED
+herdr plugin install moneycaringcoder/herdr-tether --ref "$TETHER_REV"
+```
+
+Herdr previews the source and build commands before confirmation. Review them,
+then verify the installed action list:
+
+```sh
+herdr plugin action list --plugin moneycaringcoder.tether
+```
 
 Herdr keeps the plugin binary in its managed checkout; it does not add `herdr-tether` to your shell's `PATH`.
 
@@ -69,15 +90,28 @@ Closing the view leaves the workload running. Open Tether again and press `Enter
 
 ## 5. Add a remote host (optional)
 
-Install the standalone CLI when you want administration commands in your shell:
+Install the standalone CLI when you want administration commands in your shell.
+The stable release is:
+
+```sh
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.3.0 --locked herdr-tether
+```
+
+For development `main`:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
   --branch main --locked herdr-tether
 ```
 
-For a reproducible standalone install, replace `--branch main` with
-`--rev <full-commit-sha>`.
+For an immutable reviewed commit:
+
+```sh
+TETHER_REV=FULL_COMMIT_SHA_YOU_REVIEWED
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --rev "$TETHER_REV" --locked herdr-tether
+```
 
 Herdr passes authoritative plugin directories to plugin actions. To have standalone commands edit those same stores, export the corresponding directories first:
 

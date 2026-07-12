@@ -21,13 +21,15 @@ use crate::{
         HostConfig,
     },
     discovery::{DiscoveryLimits, DiscoveryService},
-    herdr::{HerdrClient, HerdrContext},
+    herdr::{HerdrClient, HerdrContext, PaneTitle},
     lifecycle::{LifecycleService, PruneError, PruneService},
     model::{ExternalSessionName, OwnershipProof, Placement, SessionId},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
-    state::{SessionRecord, SessionStatus, State, StateStore},
+    state::{
+        SessionRecord, SessionStatus, State, StateStore, compare_normal_sessions, is_normal_session,
+    },
     status::{BoundedOutput, StatusService, run_bounded},
     tmux::TmuxBackend,
     tui::{
@@ -565,11 +567,11 @@ fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelecti
         PickerSelection::Resume { id, placement } => resume_and_attach(paths, id, placement),
         PickerSelection::Restart { id, placement } => restart_and_attach(paths, id, placement),
         PickerSelection::AttachExternal {
+            host,
             target,
             name,
             placement,
-            ..
-        } => attach_external(target, name, placement),
+        } => attach_external(host, target, name, placement),
     }
 }
 
@@ -721,6 +723,12 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         command: selection.command.clone(),
     };
     let now = Utc::now();
+    let title = PaneTitle::owned(
+        &selection.host,
+        &selection.directory,
+        selection.preset.as_deref(),
+        Some(&selection.command),
+    );
     let record = SessionRecord {
         id,
         host: selection.host,
@@ -781,13 +789,15 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let attach = backend.attach_command(&id, &ownership_proof, identity)?;
-        place_in_herdr(HerdrClient::new(context), &attach, selection.placement).with_context(
-            || {
-                format!(
-                    "place newly created session `{id}`; it remains running and recorded for retry"
-                )
-            },
-        )?;
+        place_in_herdr(
+            HerdrClient::new(context),
+            &attach,
+            &title,
+            selection.placement,
+        )
+        .with_context(|| {
+            format!("place newly created session `{id}`; it remains running and recorded for retry")
+        })?;
         println!("created {id}");
         Ok(())
     } else {
@@ -831,12 +841,25 @@ fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> R
             StateStore::new(paths.state_file.clone()),
             ProcessBinaries::new("ssh", "tmux"),
         );
+        let record = service
+            .owned_record(id)?
+            .with_context(|| format!("unknown Tether session `{id}`"))?;
+        let title = pane_title_for_record(&record);
         let attach = service.open_owned(id)?;
-        place_in_herdr(HerdrClient::new(context), &attach, placement)?;
+        place_in_herdr(HerdrClient::new(context), &attach, &title, placement)?;
         Ok(())
     } else {
         session_command(paths, SessionCommand::Open { id })
     }
+}
+
+fn pane_title_for_record(record: &SessionRecord) -> PaneTitle {
+    PaneTitle::owned(
+        &record.host,
+        &record.directory,
+        record.preset.as_deref(),
+        record.command.as_deref(),
+    )
 }
 
 fn external_attach_command(
@@ -858,16 +881,18 @@ fn external_attach_command(
 }
 
 fn attach_external(
+    host: String,
     target: Option<String>,
     name: ExternalSessionName,
     placement: Placement,
 ) -> Result<()> {
     let target = target.unwrap_or_else(|| "local".to_owned());
+    let title = PaneTitle::external(&host, name.as_str());
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
         let attach = external_attach_command(executable, &target, &name);
-        place_in_herdr(HerdrClient::new(context), &attach, placement)?;
+        place_in_herdr(HerdrClient::new(context), &attach, &title, placement)?;
         Ok(())
     } else {
         let backend = backend_for(&target)?;
@@ -875,9 +900,14 @@ fn attach_external(
     }
 }
 
-fn place_in_herdr(client: HerdrClient, command: &CommandSpec, placement: Placement) -> Result<()> {
+fn place_in_herdr(
+    client: HerdrClient,
+    command: &CommandSpec,
+    title: &PaneTitle,
+    placement: Placement,
+) -> Result<()> {
     if placement != Placement::ReplaceCurrentPane {
-        client.place(command, placement)?;
+        client.place(command, title, placement)?;
         return Ok(());
     }
 
@@ -904,7 +934,7 @@ fn place_in_herdr(client: HerdrClient, command: &CommandSpec, placement: Placeme
             bail!("Replace current pane was cancelled; the source pane was preserved");
         }
     }
-    if let Some(warning) = client.replace_current(command)?.warning {
+    if let Some(warning) = client.replace_current(command, title)?.warning {
         eprintln!("warning: {warning}");
     }
     Ok(())
@@ -915,8 +945,23 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
     match command {
         SessionCommand::List(args) => {
             let state = store.load()?;
+            let mut sessions = state
+                .sessions
+                .iter()
+                .filter(|record| is_normal_session(record))
+                .collect::<Vec<_>>();
+            sessions.sort_by(|left, right| {
+                compare_normal_sessions(
+                    left.status,
+                    left.last_used_at,
+                    left.id,
+                    right.status,
+                    right.last_used_at,
+                    right.id,
+                )
+            });
             if args.json {
-                let mut sessions = serde_json::to_value(&state.sessions)?;
+                let mut sessions = serde_json::to_value(&sessions)?;
                 if let Some(records) = sessions.as_array_mut() {
                     for record in records {
                         record
@@ -927,7 +972,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 }
                 println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else {
-                for session in state.sessions {
+                for session in sessions {
                     println!(
                         "{}\t{}\t{}\t{}\t{:?}",
                         session.id,
@@ -1366,6 +1411,31 @@ mod tests {
                 "--",
                 "-work 'quoted'"
             ]
+        );
+    }
+
+    #[test]
+    fn reopening_uses_only_safe_stored_presentation_metadata() {
+        let now = Utc::now();
+        let record = SessionRecord {
+            id: SessionId::new(),
+            host: "build-box".into(),
+            target: "builder@example.test".into(),
+            directory: "/srv/repository".into(),
+            preset: None,
+            command: Some("exec /opt/agents/codex --token raw-secret".into()),
+            tmux_session_id: None,
+            ownership_proof: None,
+            status: SessionStatus::Running,
+            created_at: now,
+            last_used_at: now,
+            closed_at: None,
+            exit_status: None,
+        };
+
+        assert_eq!(
+            pane_title_for_record(&record),
+            PaneTitle::owned("build-box", "/srv/repository", None, Some("codex"),)
         );
     }
 

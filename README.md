@@ -37,30 +37,90 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 - Git and Rust 1.88 or newer
 - OpenSSH with non-interactive access already configured for remote hosts
 
-Install from a revision you have reviewed, then run the setup action once. Until
-`v0.3.0` is tagged, `main` is the public development line—not a release. Replace
-`main` with a full commit SHA for a reproducible install. Herdr shows the source
-and build commands for review before you confirm:
+Choose the source that matches your stability and reproducibility needs. Herdr
+shows the source and build commands for review before you confirm.
+
+**Stable v0.3.0.** Install the release tag:
+
+```sh
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
+```
+
+**Development (`main`).** This follows the public development line, not a
+release:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref main
+```
+
+**Immutable reviewed commit.** Replace the value with the full commit SHA you
+reviewed; unlike a branch, that revision cannot move:
+
+```sh
+TETHER_REV=FULL_COMMIT_SHA_YOU_REVIEWED
+herdr plugin install moneycaringcoder/herdr-tether --ref "$TETHER_REV"
+```
+
+Whichever source you choose, run the setup action once:
+
+```sh
 herdr plugin action invoke moneycaringcoder.tether.setup
 ```
 
 The setup action safely adds the `prefix+t` launcher and reloads Herdr's configuration. It refuses a conflicting binding and keeps an exact backup for rollback. After setup, press your Herdr prefix followed by `t`.
 
-Want the standalone administration commands too?
+Want the standalone administration commands too? The stable install is:
+
+```sh
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --tag v0.3.0 --locked herdr-tether
+```
+
+For development `main`:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
   --branch main --locked herdr-tether
-herdr-tether doctor
 ```
 
-For a reproducible standalone install, replace `--branch main` with
-`--rev <full-commit-sha>`.
+For an immutable reviewed commit:
+
+```sh
+TETHER_REV=FULL_COMMIT_SHA_YOU_REVIEWED
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
+  --rev "$TETHER_REV" --locked herdr-tether
+```
+
+Then run `herdr-tether doctor`.
 
 See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollback, updates, and uninstalling.
+
+### Optional Hermes skill
+
+Hermes users can install Tether's first-party, runtime-independent orchestration
+guide directly from this repository.
+
+**Stable v0.3.0:**
+
+```sh
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.3.0/integrations/hermes/SKILL.md
+```
+
+**Development (`main`):**
+
+```sh
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/main/integrations/hermes/SKILL.md
+```
+
+**Immutable reviewed commit:**
+
+```sh
+TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED
+hermes skills install "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/${TETHER_SKILL_REF}/integrations/hermes/SKILL.md"
+```
+
+The [skill source](integrations/hermes/SKILL.md) uses Tether's public snapshot
+and lifecycle commands; Hermes is not a Tether runtime dependency.
 
 ## The `prefix+t` workflow
 

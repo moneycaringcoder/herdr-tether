@@ -16,7 +16,7 @@ use crate::{
         DiscoveryRequest, DiscoveryRun, DiscoveryService,
     },
     model::SessionId,
-    state::{SessionStatus, State},
+    state::{SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
         StatusRequest, StatusRun, StatusService, WorkloadStatus,
@@ -305,13 +305,29 @@ pub fn collect(
             let mut root_errors = result.root_errors;
             root_errors.sort();
             root_errors.dedup();
-            let mut owned_sessions: Vec<_> = state
+            let mut records: Vec<_> = state
                 .sessions
                 .iter()
-                .filter(|record| record.host == host.name && record.target == retained_target)
+                .filter(|record| {
+                    record.host == host.name
+                        && record.target == retained_target
+                        && is_normal_session(record)
+                })
+                .collect();
+            records.sort_by(|left, right| {
+                compare_normal_sessions(
+                    left.status,
+                    left.last_used_at,
+                    left.id,
+                    right.status,
+                    right.last_used_at,
+                    right.id,
+                )
+            });
+            let owned_sessions = records
+                .into_iter()
                 .map(|record| owned_session(record, result.workloads.get(&record.id).copied()))
                 .collect();
-            owned_sessions.sort_by(|a, b| a.id.cmp(&b.id));
             let catalog_collected = result.catalog.is_some();
             let (catalog_status, external, hidden_reserved, hidden_unsafe) = result
                 .catalog
@@ -368,7 +384,11 @@ pub fn collect(
         .collect();
 
     let mut state_groups: BTreeMap<(String, String), Vec<_>> = BTreeMap::new();
-    for record in &state.sessions {
+    for record in state
+        .sessions
+        .iter()
+        .filter(|record| is_normal_session(record))
+    {
         let key = (record.host.clone(), record.target.clone());
         if !effective_keys.contains(&key) {
             state_groups.entry(key).or_default().push(record);
@@ -378,11 +398,21 @@ pub fn collect(
         completion = Completion::Partial;
     }
     for ((name, target), records) in state_groups {
-        let mut owned_sessions: Vec<_> = records
+        let mut records = records;
+        records.sort_by(|left, right| {
+            compare_normal_sessions(
+                left.status,
+                left.last_used_at,
+                left.id,
+                right.status,
+                right.last_used_at,
+                right.id,
+            )
+        });
+        let owned_sessions = records
             .into_iter()
             .map(|record| owned_session(record, None))
             .collect();
-        owned_sessions.sort_by(|left, right| left.id.cmp(&right.id));
         hosts.push(SnapshotHost {
             name,
             origin: HostOrigin::State,

@@ -5,7 +5,7 @@ use herdr_tether::{
     backend::CommandSpec,
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
-    herdr::{HerdrClient, HerdrContext},
+    herdr::{HerdrClient, HerdrContext, PaneTitle},
     lifecycle::{CloseOwnedError, PrunePreview, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -53,6 +53,27 @@ fi
     file.write_all(script.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn write_fake_rename_failure_herdr(path: &Path, log: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+printf 'CALL' >> '{log}'
+for arg do printf '\t%s' "$arg" >> '{log}'; done
+printf '\n' >> '{log}'
+if [ "$1 $2" = "pane split" ]; then
+  printf '%s' '{{"id":"split","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
+elif [ "$1 $2" = "pane rename" ]; then
+  printf '%s' '{{"id":"rename","error":{{"message":"titles unavailable"}}}}'
+elif [ "$1 $2" = "pane run" ]; then
+  printf '%s' '{{"id":"run","result":{{"type":"pane_ran","pane_id":"w1:p9"}}}}'
+fi
+"#,
+        log = log.display(),
+    );
+    fs::write(path, script).unwrap();
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
@@ -132,12 +153,186 @@ fi
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn write_fake_tmux_for_open(path: &Path, state: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+command=$1
+shift
+case "$command" in
+  new-session)
+    previous=
+    for arg do
+      if [ "$previous" = '-s' ]; then printf '%s' "$arg" > '{id}'; fi
+      if [ "$previous" = '-c' ]; then printf '%s' "$arg" > '{cwd}'; fi
+      case "$arg" in TETHER_OWNERSHIP_PROOF=*) printf '%s' "${{arg#*=}}" > '{proof}' ;; esac
+      previous=$arg
+    done
+    printf '$7:%%3'
+    ;;
+  list-sessions)
+    id=$(cat '{id}' 2>/dev/null)
+    proof=$(cat '{proof}' 2>/dev/null)
+    case "$*" in
+      *TETHER_OWNERSHIP_PROOF*) [ -n "$id" ] && printf '%s:$7:0:0::%s' "$id" "$proof" ;;
+      *) [ -n "$id" ] && printf '%s:$7' "$id" ;;
+    esac
+    ;;
+  display-message) cat '{cwd}' 2>/dev/null ;;
+esac
+"#,
+        id = state.with_extension("id").display(),
+        proof = state.with_extension("proof").display(),
+        cwd = state.with_extension("cwd").display(),
+    );
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn write_fake_ssh_for_open(path: &Path, state: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+for remote do :; done
+case "$remote" in
+  *"'new-session'"*)
+    value=${{remote#*"'new-session' '-d' '-s' '"}}
+    printf '%s' "${{value%%\'*}}" > '{id}'
+    value=${{remote#*"'TETHER_OWNERSHIP_PROOF="}}
+    printf '%s' "${{value%%\'*}}" > '{proof}'
+    value=${{remote#*"'-c' '"}}
+    printf '%s' "${{value%%\'*}}" > '{cwd}'
+    printf '$7:%%3'
+    ;;
+  *"'list-sessions'"*)
+    id=$(cat '{id}' 2>/dev/null)
+    proof=$(cat '{proof}' 2>/dev/null)
+    case "$remote" in
+      *TETHER_OWNERSHIP_PROOF*) [ -n "$id" ] && printf '%s:$7:0:0::%s' "$id" "$proof" ;;
+      *) [ -n "$id" ] && printf '%s:$7' "$id" ;;
+    esac
+    ;;
+  *"'display-message'"*) cat '{cwd}' 2>/dev/null ;;
+esac
+"#,
+        id = state.with_extension("id").display(),
+        proof = state.with_extension("proof").display(),
+        cwd = state.with_extension("cwd").display(),
+    );
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn run_real_open(
+    temp: &Path,
+    herdr: &Path,
+    path: &std::ffi::OsStr,
+    arguments: &[&str],
+) -> std::process::Output {
+    let home = temp.join("home");
+    let config = temp.join("config");
+    let state = temp.join("state");
+    fs::create_dir_all(&home).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_herdr-tether"))
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_STATE_HOME", state)
+        .env("PATH", path)
+        .env("HERDR_BIN_PATH", herdr)
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+        .env_remove("HERDR_PLUGIN_STATE_DIR")
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
 fn context(binary: &Path) -> HerdrContext {
     HerdrContext {
         binary: binary.into(),
         pane_id: "w1:p1".into(),
         workspace_id: "w1".into(),
     }
+}
+
+#[test]
+fn real_new_open_callsites_supply_owned_workload_titles() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let herdr = bin.join("herdr");
+    let transcript = temp.path().join("herdr.log");
+    write_fake_herdr(
+        &herdr,
+        &transcript,
+        r#"printf '%s' '{"id":"run","result":{"type":"pane_ran","pane_id":"w1:p9"}}'"#,
+    );
+    write_fake_tmux_for_open(&bin.join("tmux"), &temp.path().join("tmux-state"));
+    write_fake_ssh_for_open(&bin.join("ssh"), &temp.path().join("ssh-state"));
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+
+    let config = Config {
+        hosts: vec![HostConfig {
+            name: "build-box".into(),
+            target: "builder@example.test".into(),
+            roots: vec!["/srv".into()],
+            presets: Vec::new(),
+        }],
+        ..Config::default()
+    };
+    let config_file = temp.path().join("config/herdr-tether/config.toml");
+    fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+    fs::write(config_file, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    for arguments in [
+        [
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            "/work/project",
+            "--command",
+            "exec /opt/agents/codex --quiet",
+            "--placement",
+            "split-right",
+        ],
+        [
+            "open",
+            "--host",
+            "build-box",
+            "--directory",
+            "/srv/monorepo",
+            "--command",
+            "exec /opt/agents/claude --resume",
+            "--placement",
+            "split-right",
+        ],
+    ] {
+        let output = run_real_open(temp.path(), &herdr, &path, &arguments);
+        assert!(
+            output.status.success(),
+            "open failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let transcript = fs::read_to_string(transcript).unwrap();
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\tproject · codex"));
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\tbuild-box · monorepo · claude"));
+    assert!(
+        transcript
+            .lines()
+            .filter(|line| line.starts_with("CALL\tpane\trename"))
+            .all(|line| !line.contains("builder@example.test"))
+    );
 }
 
 #[test]
@@ -159,11 +354,17 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
         ],
     };
 
-    let right = client.place(&command, Placement::SplitRight).unwrap();
+    let right = client
+        .place(&command, &PaneTitle::fallback(), Placement::SplitRight)
+        .unwrap();
     assert_eq!(right.pane_id, "w1:p9");
-    let down = client.place(&command, Placement::SplitDown).unwrap();
+    let down = client
+        .place(&command, &PaneTitle::fallback(), Placement::SplitDown)
+        .unwrap();
     assert_eq!(down.pane_id, "w1:p9");
-    let tab = client.place(&command, Placement::NewTab).unwrap();
+    let tab = client
+        .place(&command, &PaneTitle::fallback(), Placement::NewTab)
+        .unwrap();
     assert_eq!(tab.pane_id, "w1:p10");
 
     let transcript = fs::read_to_string(log).unwrap();
@@ -176,6 +377,96 @@ fn placement_parses_returned_ids_and_runs_one_quoted_command_argument() {
     assert!(transcript.contains(
         "'/tmp/plugin root/herdr-tether' 'session' 'resume' 'tether-0197f198000070008000000000000001'"
     ));
+}
+
+#[test]
+fn placement_titles_use_available_context_and_bound_hostile_input() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log, ":");
+    let client = HerdrClient::new(context(&binary));
+
+    let cases = [
+        PaneTitle::owned(
+            "local",
+            "/srv/repositories/tether",
+            None,
+            Some("codex --cd ."),
+        ),
+        PaneTitle::owned("local", "/", None, Some("codex")),
+        PaneTitle::owned("local", "/srv/仓库", None, Some("codex")),
+        PaneTitle::owned(
+            "dev@example.test",
+            "/srv/repository",
+            Some("review"),
+            Some("ignored-secret --token=hunter2"),
+        ),
+        PaneTitle::external("local", "workspace"),
+        PaneTitle::external("build-box", "repository"),
+        PaneTitle::external(
+            "bad\t|·\u{202e}host",
+            &format!("agent\u{200b}\n{}", "x".repeat(80)),
+        ),
+        PaneTitle::owned("\t|·", "\t|·", Some("\t|·"), Some("\t|·")),
+        PaneTitle::fallback(),
+    ];
+    for title in &cases {
+        client
+            .place(
+                &CommandSpec::new("/opaque/herdr-tether", vec!["attach".into()]),
+                title,
+                Placement::SplitRight,
+            )
+            .unwrap();
+    }
+
+    let transcript = fs::read_to_string(log).unwrap();
+    let titles = transcript
+        .lines()
+        .filter_map(|line| line.strip_prefix("CALL\tpane\trename\tw1:p9\t"))
+        .collect::<Vec<_>>();
+    assert_eq!(titles[0], "tether · codex");
+    assert_eq!(titles[1], "/ · codex");
+    assert_eq!(titles[2], "仓库 · codex");
+    assert_eq!(titles[3], "dev@example.test · repository · review");
+    assert_eq!(titles[4], "workspace");
+    assert_eq!(titles[5], "build-box · repository");
+    assert_eq!(titles[7], "Tether session");
+    assert_eq!(titles[8], "Tether session");
+    assert_eq!(titles.len(), 9);
+    assert!(!titles[6].chars().any(char::is_control));
+    assert!(!titles[6].contains('|'));
+    assert!(!titles[6].contains(['\u{202e}', '\u{200b}']));
+    assert!(titles[6].chars().count() <= 48);
+    assert!(titles[6].ends_with('…'));
+}
+
+#[test]
+fn placement_runs_in_the_created_pane_when_rename_fails() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_rename_failure_herdr(&binary, &log);
+
+    let placed = HerdrClient::new(context(&binary))
+        .place(
+            &CommandSpec::new("codex", vec!["--cd".into(), "/srv/repository".into()]),
+            &PaneTitle::owned("local", "/srv/repository", None, Some("codex")),
+            Placement::SplitRight,
+        )
+        .unwrap();
+
+    assert_eq!(placed.pane_id, "w1:p9");
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\trepository · codex"));
+    assert!(transcript.contains("CALL\tpane\trun\tw1:p9"));
 }
 
 #[test]
@@ -197,6 +488,7 @@ fn placement_rejects_failed_or_mismatched_pane_run() {
         let error = HerdrClient::new(context(&binary))
             .place(
                 &CommandSpec::new("/plugin/herdr-tether", vec!["resume".into()]),
+                &PaneTitle::fallback(),
                 Placement::SplitRight,
             )
             .unwrap_err();
@@ -223,20 +515,25 @@ fn replacement_inspects_source_then_closes_it_only_after_destination_is_running(
         CLOSE_OK,
     );
     let client = HerdrClient::new(context(&binary));
+    let title = PaneTitle::owned("local", "/srv/repository", None, Some("codex"));
 
     let inspection = client.inspect_replacement_source().unwrap();
     assert_eq!(inspection.pane_id, "w1:p1");
     assert!(inspection.requires_confirmation());
     assert!(inspection.safe_summary().contains("vim"));
     let pane = client
-        .replace_current(&CommandSpec::new(
-            "/usr/bin/tmux",
-            vec!["attach-session".into(), "-t".into(), "$7".into()],
-        ))
+        .replace_current(
+            &CommandSpec::new(
+                "/usr/bin/tmux",
+                vec!["attach-session".into(), "-t".into(), "$7".into()],
+            ),
+            &title,
+        )
         .unwrap();
     assert_eq!(pane.pane_id, "w1:p9");
 
     let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("CALL\tpane\trename\tw1:p9\trepository · codex"));
     let source_info = transcript
         .find("CALL\tpane\tprocess-info\t--pane\tw1:p1")
         .unwrap();
@@ -267,10 +564,13 @@ fn replacement_close_failure_warns_without_invalidating_running_destination() {
     );
 
     let pane = HerdrClient::new(context(&binary))
-        .replace_current(&CommandSpec::new(
-            "/usr/bin/tmux",
-            vec!["attach-session".into(), "-t".into(), "$7".into()],
-        ))
+        .replace_current(
+            &CommandSpec::new(
+                "/usr/bin/tmux",
+                vec!["attach-session".into(), "-t".into(), "$7".into()],
+            ),
+            &PaneTitle::fallback(),
+        )
         .unwrap();
 
     assert_eq!(pane.pane_id, "w1:p9");
@@ -294,10 +594,13 @@ fn replacement_preserves_source_when_destination_reports_unrelated_process() {
         CLOSE_OK,
     );
     let error = HerdrClient::new(context(&binary))
-        .replace_current(&CommandSpec::new(
-            "/usr/bin/tmux",
-            vec!["attach-session".into(), "-t".into(), "$7".into()],
-        ))
+        .replace_current(
+            &CommandSpec::new(
+                "/usr/bin/tmux",
+                vec!["attach-session".into(), "-t".into(), "$7".into()],
+            ),
+            &PaneTitle::fallback(),
+        )
         .unwrap_err();
 
     assert!(
@@ -321,10 +624,13 @@ fn replacement_preserves_reused_source_pane_id() {
     write_fake_reused_source_herdr(&binary, &log);
 
     let pane = HerdrClient::new(context(&binary))
-        .replace_current(&CommandSpec::new(
-            "/usr/bin/tmux",
-            vec!["attach-session".into(), "-t".into(), "$7".into()],
-        ))
+        .replace_current(
+            &CommandSpec::new(
+                "/usr/bin/tmux",
+                vec!["attach-session".into(), "-t".into(), "$7".into()],
+            ),
+            &PaneTitle::fallback(),
+        )
         .unwrap();
 
     assert_eq!(pane.pane_id, "w1:p9");
@@ -448,6 +754,235 @@ fn picker_fixture() -> (Config, State) {
 }
 
 #[test]
+fn picker_hides_removed_workloads_on_construction_and_lifecycle_refresh() {
+    let (config, mut state) = picker_fixture();
+    let removed_id = state.sessions[0].id;
+    state.sessions[0].status = SessionStatus::Removed;
+    state.sessions[0].closed_at = Some(state.sessions[0].last_used_at);
+    state.sessions[0].directory = "/srv/removed-only".into();
+    let ended_id = state.sessions[1].id;
+    state.sessions[1].status = SessionStatus::Ended;
+    state.sessions[1].closed_at = Some(state.sessions[1].last_used_at);
+    let mut retained_removed = state.sessions[0].clone();
+    retained_removed.id = "tether-0197f198000070008000000000000099".parse().unwrap();
+    retained_removed.host = "removed-box".into();
+    retained_removed.target = "removed@example.test".into();
+    state.sessions.push(retained_removed);
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    assert!(
+        options.hosts[0]
+            .workloads
+            .iter()
+            .all(|workload| workload.id != removed_id)
+    );
+    assert!(
+        !options.hosts[0]
+            .directories
+            .iter()
+            .any(|path| path == "/srv/removed-only")
+    );
+    assert!(!options.hosts.iter().any(|host| host.name == "removed-box"));
+    assert_eq!(state.sessions.len(), 3);
+    assert_eq!(state.sessions[0].status, SessionStatus::Removed);
+
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(7);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 7,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert_eq!(
+        picker.handle(PickerEvent::ConfirmClose),
+        PickerOutcome::CloseOwnedRequested {
+            id: ended_id,
+            generation: 7,
+            action: PickerCloseAction::Remove,
+        }
+    );
+    let mut removed_record = state.sessions[1].clone();
+    removed_record.status = SessionStatus::Removed;
+    assert!(picker.apply_close_result(PickerCloseResult {
+        id: ended_id,
+        generation: 7,
+        record: Some(removed_record),
+        error: None,
+    }));
+    assert!(picker.workload_label(ended_id).is_none());
+}
+
+#[test]
+fn picker_orders_lifecycle_groups_recent_first_with_stable_ties() {
+    let (mut config, mut state) = picker_fixture();
+    config.hosts.push(HostConfig {
+        name: "alpha-box".into(),
+        target: "alpha@example.test".into(),
+        roots: vec!["/srv/alpha".into()],
+        presets: Vec::new(),
+    });
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let template = state.sessions[0].clone();
+    state.sessions.clear();
+    let mut add = |suffix: &str,
+                   host: &str,
+                   target: &str,
+                   directory: &str,
+                   status: SessionStatus,
+                   age_hours: i64| {
+        let mut record = template.clone();
+        record.id = format!("tether-0197f1980000700080000000000000{suffix}")
+            .parse()
+            .unwrap();
+        record.host = host.into();
+        record.target = target.into();
+        record.directory = directory.into();
+        record.status = status;
+        record.last_used_at = now - Duration::hours(age_hours);
+        record.closed_at = matches!(status, SessionStatus::Ended | SessionStatus::Removed)
+            .then_some(record.last_used_at);
+        state.sessions.push(record);
+    };
+    add(
+        "12",
+        "build-box",
+        "builder@example.test",
+        "/ended-new",
+        SessionStatus::Ended,
+        1,
+    );
+    add(
+        "11",
+        "build-box",
+        "builder@example.test",
+        "/running-old",
+        SessionStatus::Running,
+        8,
+    );
+    add(
+        "10",
+        "build-box",
+        "builder@example.test",
+        "/running-tie-a",
+        SessionStatus::Running,
+        2,
+    );
+    add(
+        "09",
+        "build-box",
+        "builder@example.test",
+        "/running-new",
+        SessionStatus::Running,
+        1,
+    );
+    add(
+        "08",
+        "build-box",
+        "builder@example.test",
+        "/running-tie-b",
+        SessionStatus::Running,
+        2,
+    );
+    add(
+        "07",
+        "build-box",
+        "builder@example.test",
+        "/stopping",
+        SessionStatus::Stopping,
+        1,
+    );
+    add(
+        "06",
+        "build-box",
+        "builder@example.test",
+        "/creating",
+        SessionStatus::Creating,
+        9,
+    );
+    add(
+        "05",
+        "alpha-box",
+        "alpha@example.test",
+        "/alpha-ended",
+        SessionStatus::Ended,
+        1,
+    );
+    add(
+        "04",
+        "alpha-box",
+        "alpha@example.test",
+        "/alpha-running",
+        SessionStatus::Running,
+        9,
+    );
+
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    assert_eq!(
+        options
+            .hosts
+            .iter()
+            .map(|host| host.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build-box", "alpha-box"]
+    );
+    let ordered = |host: &str| {
+        options
+            .hosts
+            .iter()
+            .find(|candidate| candidate.name == host)
+            .unwrap()
+            .workloads
+            .iter()
+            .map(|workload| (workload.status, workload.id.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ordered("build-box"),
+        [
+            (
+                SessionStatus::Stopping,
+                "tether-0197f198000070008000000000000007".into()
+            ),
+            (
+                SessionStatus::Running,
+                "tether-0197f198000070008000000000000009".into()
+            ),
+            (
+                SessionStatus::Running,
+                "tether-0197f198000070008000000000000008".into()
+            ),
+            (
+                SessionStatus::Running,
+                "tether-0197f198000070008000000000000010".into()
+            ),
+            (
+                SessionStatus::Running,
+                "tether-0197f198000070008000000000000011".into()
+            ),
+            (
+                SessionStatus::Creating,
+                "tether-0197f198000070008000000000000006".into()
+            ),
+            (
+                SessionStatus::Ended,
+                "tether-0197f198000070008000000000000012".into()
+            ),
+        ]
+    );
+    assert_eq!(
+        ordered("alpha-box")
+            .into_iter()
+            .map(|(status, _)| status)
+            .collect::<Vec<_>>(),
+        [SessionStatus::Running, SessionStatus::Ended]
+    );
+}
+
+#[test]
 fn proofless_legacy_workload_offers_only_metadata_remove() {
     let (config, mut state) = picker_fixture();
     state.sessions.truncate(1);
@@ -542,7 +1077,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
             .iter()
             .map(|workload| workload.status)
             .collect::<Vec<_>>(),
-        vec![SessionStatus::Ended, SessionStatus::Stopping]
+        vec![SessionStatus::Stopping, SessionStatus::Ended]
     );
     assert!(
         options.hosts[1]
@@ -1341,13 +1876,14 @@ fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
     let labels = picker.resource_labels("build-box").unwrap();
     assert_eq!(labels.len(), 3);
     assert!(labels.iter().any(|label| label.contains("ended")));
-    assert!(labels[0].contains("00000002"));
+    assert!(labels[0].contains("00000001"));
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert_eq!(
         picker.close_modal(),
         Some(&PickerCloseModal::Confirm { id: first_id })
     );
     picker.handle(PickerEvent::DismissClose);
+    picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Next);
     assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
     assert_eq!(
@@ -1630,7 +2166,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
     let mut records = Vec::new();
     for (suffix, status, age) in [
         (200, SessionStatus::Ended, 40),
-        (201, SessionStatus::Running, 41),
+        (201, SessionStatus::Ended, 41),
         (202, SessionStatus::Stopping, 42),
     ] {
         records.push(SessionRecord {
@@ -1669,14 +2205,9 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
         detail: None,
         checked_at: SystemTime::now(),
     }));
-    assert!(picker.apply_status(StatusMessage::Workload {
-        generation: 11,
-        id: records[1].id,
-        status: WorkloadStatus::Running { attached: 0 },
-        checked_at: SystemTime::now(),
-    }));
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::Next);
     picker.handle(PickerEvent::BeginPrune);
     picker.apply_prune_result(PickerPruneResult::Preview {
@@ -1688,7 +2219,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
         generation: 11,
         preview,
         removed_ids: Some(vec![records[0].id]),
-        skipped_ids: Some(Vec::new()),
+        skipped_ids: Some(vec![records[1].id]),
         error: None,
     });
 

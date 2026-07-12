@@ -10,6 +10,31 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     assert_eq!(value["version"].as_str(), Some("0.3.0"));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
     assert_eq!(
+        value["description"].as_str(),
+        Some("Keep local and remote terminal workloads running after their Herdr view closes.")
+    );
+    let supported_top_level_fields = [
+        "id",
+        "name",
+        "version",
+        "min_herdr_version",
+        "description",
+        "platforms",
+        "build",
+        "actions",
+        "events",
+        "panes",
+        "link_handlers",
+    ];
+    assert!(
+        value
+            .as_table()
+            .unwrap()
+            .keys()
+            .all(|field| supported_top_level_fields.contains(&field.as_str())),
+        "manifest contains a field outside Herdr's documented schema"
+    );
+    assert_eq!(
         value["platforms"].as_array().unwrap(),
         &[
             toml::Value::String("linux".into()),
@@ -18,6 +43,14 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
     );
 
     let build = value["build"].as_array().unwrap();
+    assert!(
+        build[0]
+            .as_table()
+            .unwrap()
+            .keys()
+            .all(|field| ["command", "platforms"].contains(&field.as_str())),
+        "build entry contains a field outside Herdr's documented schema"
+    );
     assert_eq!(
         build[0]["command"].as_array().unwrap(),
         &[
