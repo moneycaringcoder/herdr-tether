@@ -29,8 +29,8 @@ use crate::{
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        ObserverCapabilities, ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome,
-        ObserverState, ObserverWorker, render,
+        ObserverCapabilities, ObserverCapture, ObserverInputKind, ObserverKey, ObserverLifecycle,
+        ObserverOutcome, ObserverState, ObserverWorker, render,
     },
     paths::AppPaths,
     state::{
@@ -729,10 +729,16 @@ fn update_observer_metadata(
         })
         .collect();
     for worker in &mut workers {
-        if previous_fingerprints.get(&worker.id) == current_fingerprints.get(&worker.id)
-            && let Some(capture) = previous_captures.get(&worker.id)
-        {
-            worker.capture = Some(capture.clone());
+        let same_epoch = previous_fingerprints
+            .get(&worker.id)
+            .zip(current_fingerprints.get(&worker.id))
+            .is_some_and(|(previous, current)| previous == current);
+        if same_epoch {
+            if let Some(capture) = previous_captures.get(&worker.id) {
+                worker.capture = Some(capture.clone());
+            }
+        } else {
+            observer.merge_capture(&worker.id, ObserverCapture::Loading);
         }
     }
     observer.update_workers(workers);
