@@ -4,13 +4,20 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import gzip
+import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
-from typing import Iterable
+from typing import BinaryIO, Iterable
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = {
@@ -28,6 +35,78 @@ GENERATED_FILES = {".cargo_vcs_info.json", "Cargo.toml.orig"}
 ALLOWED_PREFIXES = ("assets/", "docs/", "src/", "tests/")
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
+EXPECTED_PACKAGE_FILES = frozenset(
+    {
+        ".cargo_vcs_info.json",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "Cargo.toml.orig",
+        "LICENSE",
+        "README.md",
+        "SECURITY.md",
+        "assets/README.md",
+        "assets/social-preview.svg",
+        "assets/tether-mark.svg",
+        "assets/tether-wordmark.svg",
+        "docs/architecture.md",
+        "docs/configuration.md",
+        "docs/lifecycle.md",
+        "docs/quickstart.md",
+        "docs/troubleshooting.md",
+        "herdr-plugin.toml",
+        "src/backend.rs",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/discovery.rs",
+        "src/herdr.rs",
+        "src/lib.rs",
+        "src/lifecycle.rs",
+        "src/main.rs",
+        "src/model.rs",
+        "src/observer.rs",
+        "src/observer_manager.rs",
+        "src/orchestration.rs",
+        "src/paths.rs",
+        "src/quote.rs",
+        "src/snapshot.rs",
+        "src/sshcfg.rs",
+        "src/state.rs",
+        "src/status.rs",
+        "src/storage.rs",
+        "src/tmux.rs",
+        "src/tui.rs",
+        "tests/backend_lifecycle.rs",
+        "tests/cli.rs",
+        "tests/config_state.rs",
+        "tests/discovery.rs",
+        "tests/herdr_picker.rs",
+        "tests/hosts.rs",
+        "tests/observer.rs",
+        "tests/observer_manager.rs",
+        "tests/plugin_manifest.rs",
+        "tests/snapshot.rs",
+        "tests/status.rs",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ArchiveLimits:
+    max_members: int = 128
+    max_member_bytes: int = 2 * 1024 * 1024
+    max_total_bytes: int = 8 * 1024 * 1024
+    max_archive_bytes: int = 2 * 1024 * 1024
+
+    @property
+    def max_decompressed_stream_bytes(self) -> int:
+        # A tar has 512-byte records plus optional format metadata. Keep that
+        # overhead bounded independently of the declared regular-file sizes.
+        return self.max_total_bytes + (self.max_members + 4) * 64 * 1024
+
+
+DEFAULT_ARCHIVE_LIMITS = ArchiveLimits()
 
 
 class PackageError(RuntimeError):
@@ -40,6 +119,8 @@ def validate_relative_path(path: str) -> None:
         not path
         or "\\" in path
         or "\0" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or unicodedata.normalize("NFC", path) != path
         or parsed.is_absolute()
         or any(part in ("", ".", "..") for part in parsed.parts)
         or parsed.as_posix() != path
@@ -61,6 +142,19 @@ def validate_entries(entries: set[str], required_assets: set[str]) -> None:
     missing = sorted((REQUIRED_FILES | required_assets) - entries)
     if missing:
         raise PackageError(f"package omits required public files: {', '.join(missing)}")
+    if entries != EXPECTED_PACKAGE_FILES:
+        missing_expected = sorted(EXPECTED_PACKAGE_FILES - entries)
+        added = sorted(entries - EXPECTED_PACKAGE_FILES)
+        details = []
+        if missing_expected:
+            details.append(f"missing: {', '.join(missing_expected)}")
+        if added:
+            details.append(f"unexpected: {', '.join(added)}")
+        raise PackageError(
+            "package surface differs from the explicit 51-file contract ("
+            + "; ".join(details)
+            + ")"
+        )
     for prefix in REQUIRED_PREFIXES:
         if not any(entry.startswith(prefix) for entry in entries):
             raise PackageError(f"package contains no {prefix} files")
@@ -104,12 +198,19 @@ def validate_source_paths(root: Path, entries: set[str]) -> None:
 
 
 def validate_archive_members(
-    members: Iterable[tarfile.TarInfo], root_prefix: str
+    members: Iterable[tarfile.TarInfo],
+    root_prefix: str,
+    limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
 ) -> set[str]:
     validate_relative_path(root_prefix)
     entries: set[str] = set()
     seen_members: set[str] = set()
-    for member in members:
+    total_bytes = 0
+    for count, member in enumerate(members, start=1):
+        if count > limits.max_members:
+            raise PackageError(
+                f"package archive exceeds {limits.max_members} members"
+            )
         member_name = (
             member.name[:-1]
             if member.isdir() and member.name.endswith("/")
@@ -131,10 +232,280 @@ def validate_archive_members(
                 f"package archive contains link or special member {member.name!r}"
             )
         if member.isfile():
+            if member.size < 0 or member.size > limits.max_member_bytes:
+                raise PackageError(
+                    f"package archive member {member.name!r} exceeds "
+                    f"{limits.max_member_bytes} bytes"
+                )
+            total_bytes += member.size
+            if total_bytes > limits.max_total_bytes:
+                raise PackageError(
+                    f"package archive exceeds {limits.max_total_bytes} total bytes"
+                )
             entry = PurePosixPath(*path.parts[1:]).as_posix()
             validate_relative_path(entry)
             entries.add(entry)
     return entries
+
+
+class _BoundedReader:
+    def __init__(self, source: BinaryIO, limit: int) -> None:
+        self.source = source
+        self.remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        requested = self.remaining + 1 if size < 0 else min(size, self.remaining + 1)
+        data = self.source.read(requested)
+        if len(data) > self.remaining:
+            raise PackageError("package archive decompression exceeds safety limit")
+        self.remaining -= len(data)
+        return data
+
+
+def _read_validated_members(
+    package_archive: tarfile.TarFile,
+) -> Iterable[tarfile.TarInfo]:
+    for member in package_archive:
+        yield member
+        if not member.isfile():
+            continue
+        extracted = package_archive.extractfile(member)
+        if extracted is None:
+            raise PackageError(f"could not read package member {member.name!r}")
+        remaining = member.size
+        while remaining:
+            chunk = extracted.read(min(64 * 1024, remaining))
+            if not chunk:
+                raise PackageError(f"package member {member.name!r} is truncated")
+            remaining -= len(chunk)
+
+
+def inspect_archive(
+    archive: Path,
+    root_prefix: str,
+    limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
+) -> set[str]:
+    try:
+        if archive.is_symlink() or not archive.is_file():
+            raise PackageError(f"Cargo package archive is not a regular file: {archive}")
+        archive_bytes = archive.stat().st_size
+        if archive_bytes > limits.max_archive_bytes:
+            raise PackageError(
+                f"package archive exceeds {limits.max_archive_bytes} compressed bytes"
+            )
+        with archive.open("rb") as raw_archive:
+            with gzip.GzipFile(fileobj=raw_archive, mode="rb") as decompressed:
+                bounded = _BoundedReader(
+                    decompressed, limits.max_decompressed_stream_bytes
+                )
+                with tarfile.open(fileobj=bounded, mode="r|") as package_archive:
+                    return validate_archive_members(
+                        _read_validated_members(package_archive), root_prefix, limits
+                    )
+    except PackageError:
+        raise
+    except (OSError, EOFError, tarfile.TarError) as error:
+        raise PackageError(f"could not inspect Cargo package archive: {error}") from error
+
+
+def extract_validated_archive(
+    archive: Path, root_prefix: str, destination: Path
+) -> Path:
+    """Materialize only already-validated regular files, ignoring archive modes."""
+    inspect_archive(archive, root_prefix)
+    package_root = destination / root_prefix
+    with tarfile.open(archive, mode="r:gz") as package_archive:
+        for member in package_archive:
+            if not member.isfile():
+                continue
+            relative = PurePosixPath(member.name).relative_to(root_prefix)
+            target = package_root.joinpath(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = package_archive.extractfile(member)
+            if source is None:
+                raise PackageError(f"could not read package member {member.name!r}")
+            remaining = member.size
+            try:
+                with target.open("xb") as output:
+                    while remaining:
+                        chunk = source.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            raise PackageError(
+                                f"package member {member.name!r} is truncated"
+                            )
+                        output.write(chunk)
+                        remaining -= len(chunk)
+            except FileExistsError as error:
+                raise PackageError(
+                    f"package extraction repeats destination {relative.as_posix()!r}"
+                ) from error
+    return package_root
+
+
+def _run_runtime_command(
+    command: list[str],
+    environment: dict[str, str],
+    *,
+    expected_code: int = 0,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PackageError(f"installed runtime command failed to execute: {error}") from error
+    if result.returncode != expected_code:
+        rendered = " ".join(command[1:])
+        raise PackageError(
+            f"installed runtime `{rendered}` exited {result.returncode}, "
+            f"expected {expected_code}: {result.stderr[:1000]}"
+        )
+    return result
+
+
+def _write_probe(path: Path, output: str) -> None:
+    path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n", encoding="utf-8")
+    path.chmod(0o700)
+
+
+def verify_installed_runtime(cargo: str, archive: Path, root_prefix: str) -> None:
+    cargo_path = shutil.which(cargo)
+    if cargo_path is None:
+        raise PackageError(f"Cargo executable is unavailable: {cargo}")
+    with tempfile.TemporaryDirectory(prefix="tether-package-runtime-") as directory:
+        sandbox = Path(directory)
+        source = extract_validated_archive(archive, root_prefix, sandbox / "source")
+        cargo_home = sandbox / "cargo-home"
+        install_root = sandbox / "install"
+        target_dir = sandbox / "build"
+        home = sandbox / "home"
+        xdg_config = sandbox / "config"
+        xdg_state = sandbox / "state"
+        probes = sandbox / "probes"
+        for path in (cargo_home, install_root, home, xdg_config, xdg_state, probes):
+            path.mkdir(parents=True)
+
+        existing_cargo_home = Path(
+            os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+        )
+        registry = existing_cargo_home / "registry"
+        if registry.is_dir():
+            (cargo_home / "registry").symlink_to(registry, target_is_directory=True)
+
+        build_environment = os.environ.copy()
+        build_environment.update(
+            {
+                "CARGO_HOME": str(cargo_home),
+                "CARGO_NET_OFFLINE": "true",
+                "HOME": str(home),
+            }
+        )
+        install = _run_runtime_command(
+            [
+                cargo_path,
+                "install",
+                "--offline",
+                "--locked",
+                "--no-track",
+                "--root",
+                str(install_root),
+                "--target-dir",
+                str(target_dir),
+                "--path",
+                str(source),
+            ],
+            build_environment,
+            timeout=180,
+        )
+        binary = install_root / "bin" / "herdr-tether"
+        if not binary.is_file():
+            raise PackageError("cargo install did not produce herdr-tether")
+
+        for name, output in (
+            ("cargo", "cargo 1.88.0"),
+            ("herdr", "herdr 0.1.0"),
+            ("ssh", "OpenSSH_9.0"),
+            ("tmux", "tmux 3.4"),
+        ):
+            _write_probe(probes / name, output)
+        runtime_environment = build_environment | {
+            "HERDR_BIN_PATH": str(probes / "herdr"),
+            "PATH": str(probes),
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "XDG_STATE_HOME": str(xdg_state),
+        }
+        repository_paths = (str(ROOT), str(ROOT / "target"))
+
+        help_result = _run_runtime_command(
+            [str(binary), "setup", "--help"], runtime_environment
+        )
+        if not home_empty(home) or any(xdg_config.iterdir()) or any(xdg_state.iterdir()):
+            raise PackageError("setup --help mutated isolated user paths")
+
+        setup_result = _run_runtime_command(
+            [str(binary), "setup", "--yes"], runtime_environment
+        )
+        expected_files = {
+            xdg_config / "herdr-tether" / "config.toml",
+            xdg_state / "herdr-tether" / "state.json",
+        }
+        actual_files = {
+            path for root in (xdg_config, xdg_state) for path in root.rglob("*") if path.is_file()
+        }
+        if actual_files != expected_files:
+            raise PackageError("installed setup wrote an unexpected isolated file surface")
+        if not home_empty(home):
+            raise PackageError("installed runtime mutated isolated HOME")
+
+        doctor_result = _run_runtime_command(
+            [str(binary), "doctor", "--json"], runtime_environment
+        )
+        try:
+            doctor = json.loads(doctor_result.stdout)
+        except json.JSONDecodeError as error:
+            raise PackageError("installed doctor did not emit valid JSON") from error
+        if (
+            doctor.get("schema_version") != 1
+            or doctor.get("completion") != "complete"
+            or doctor.get("failure_count") != 0
+            or not isinstance(doctor.get("checks"), list)
+        ):
+            raise PackageError("installed doctor JSON violates the stable success contract")
+
+        snapshot_result = _run_runtime_command(
+            [str(binary), "snapshot"], runtime_environment
+        )
+        try:
+            snapshot = json.loads(snapshot_result.stdout)
+        except json.JSONDecodeError as error:
+            raise PackageError("installed snapshot did not emit valid JSON") from error
+        if snapshot.get("schema_version") != 1:
+            raise PackageError("installed snapshot JSON has an unexpected schema version")
+
+        results = (
+            install,
+            help_result,
+            setup_result,
+            doctor_result,
+            snapshot_result,
+            _run_runtime_command([str(binary), "--help"], runtime_environment),
+            _run_runtime_command([str(binary), "--version"], runtime_environment),
+        )
+        combined = "\n".join(result.stdout + result.stderr for result in results)
+        leaked = next((path for path in repository_paths if path in combined), None)
+        if leaked is not None:
+            raise PackageError("installed runtime output leaked a source or target path")
+
+
+def home_empty(home: Path) -> bool:
+    return next(home.iterdir(), None) is None
 
 
 def public_assets(root: Path) -> set[str]:
@@ -177,11 +548,10 @@ def package_entries(cargo: str, allow_dirty: bool) -> set[str]:
         )
     if not archive.is_file():
         raise PackageError(f"cargo package did not create expected archive {archive}")
-    try:
-        with tarfile.open(archive, mode="r:gz") as package_archive:
-            return validate_archive_members(package_archive, root_prefix)
-    except (OSError, tarfile.TarError) as error:
-        raise PackageError(f"could not inspect Cargo package archive: {error}") from error
+    entries = inspect_archive(archive, root_prefix)
+    validate_entries(entries, public_assets(ROOT))
+    verify_installed_runtime(cargo, archive, root_prefix)
+    return entries
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
