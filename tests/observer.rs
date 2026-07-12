@@ -674,7 +674,10 @@ fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
 
     let capture = "界e\u{301} 👩\u{200d}💻\u{fe0f}\t\u{1b}[31mRED\u{1b}[0m\u{7} tail";
     let clean = sanitize_capture(capture);
-    assert!(clean.contains("e\u{301}"), "combining mark was discarded: {clean:?}");
+    assert!(
+        clean.contains("e\u{301}"),
+        "combining mark was discarded: {clean:?}"
+    );
     assert!(
         clean.contains("👩\u{200d}💻\u{fe0f}"),
         "emoji grapheme was split: {clean:?}"
