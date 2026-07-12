@@ -297,7 +297,8 @@ impl StateStore {
         Self { path }
     }
 
-    pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+    pub const MAX_PERSISTED_BYTES: usize = 8 * 1024 * 1024;
+    pub const MAX_INPUT_BYTES: usize = Self::MAX_PERSISTED_BYTES;
 
     pub fn update<T>(&self, operation: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         with_advisory_lock(&self.path, || {
@@ -430,9 +431,20 @@ impl StateStore {
         let mut serialized =
             serde_json::to_string_pretty(state).context("serialize state as JSON")?;
         serialized.push('\n');
+        require_serialized_state_size(&serialized)?;
         atomic_write(&self.path, serialized.as_bytes())
             .with_context(|| format!("save state `{}`", self.path.display()))
     }
+}
+
+fn require_serialized_state_size(serialized: &str) -> Result<()> {
+    if serialized.len() > StateStore::MAX_PERSISTED_BYTES {
+        bail!(
+            "serialized state may contain at most {} bytes",
+            StateStore::MAX_PERSISTED_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn read_regular_state_file(path: &std::path::Path, max_bytes: usize) -> io::Result<String> {

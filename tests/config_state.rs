@@ -46,6 +46,77 @@ fn sample_config() -> Config {
     }
 }
 
+fn config_at_serialized_limit() -> Config {
+    let mut config = Config {
+        hosts: vec![HostConfig {
+            name: "boundary".into(),
+            target: "example.test".into(),
+            roots: Vec::new(),
+            presets: (0..33)
+                .map(|index| CommandPreset {
+                    name: format!("preset-{index}"),
+                    command: "x".into(),
+                })
+                .collect(),
+        }],
+        ..Config::default()
+    };
+    let current = toml::to_string_pretty(&config).unwrap().len();
+    let mut remaining = ConfigStore::MAX_INPUT_BYTES - current;
+    for preset in &mut config.hosts[0].presets {
+        let added = remaining.min(CommandPreset::MAX_COMMAND_BYTES - preset.command.len());
+        preset.command.push_str(&"x".repeat(added));
+        remaining -= added;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        toml::to_string_pretty(&config).unwrap().len(),
+        ConfigStore::MAX_INPUT_BYTES
+    );
+    config
+}
+
+fn state_at_serialized_limit() -> State {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let mut state = State {
+        version: State::CURRENT_VERSION,
+        sessions: (0..33)
+            .map(|index| SessionRecord {
+                id: format!("tether-0197f19800007000800000000000{index:04x}")
+                    .parse()
+                    .unwrap(),
+                host: "host".into(),
+                target: "example.test".into(),
+                directory: "/work".into(),
+                preset: None,
+                command: Some("x".into()),
+                tmux_session_id: None,
+                ownership_proof: None,
+                status: SessionStatus::Running,
+                created_at: now,
+                last_used_at: now,
+                closed_at: None,
+                exit_status: None,
+            })
+            .collect(),
+        orchestration_groups: Vec::new(),
+    };
+    let current = serde_json::to_string_pretty(&state).unwrap().len() + 1;
+    let mut remaining = StateStore::MAX_INPUT_BYTES - current;
+    for session in &mut state.sessions {
+        let command = session.command.as_mut().unwrap();
+        let added = remaining.min(State::MAX_COMMAND_BYTES - command.len());
+        command.push_str(&"x".repeat(added));
+        remaining -= added;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        serde_json::to_string_pretty(&state).unwrap().len() + 1,
+        StateStore::MAX_INPUT_BYTES
+    );
+    state
+}
+
 #[test]
 fn config_round_trips_atomically_with_private_permissions() {
     let temp = tempdir().unwrap();
@@ -483,6 +554,59 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
         );
         assert_eq!(fs::read(path).unwrap(), before);
     }
+}
+
+#[test]
+fn config_serialized_ceiling_round_trips_current_and_migrated_bytes() {
+    let config = config_at_serialized_limit();
+    for migrated in [false, true] {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = ConfigStore::new(path.clone());
+        if migrated {
+            let mut legacy = toml::Value::try_from(&config).unwrap();
+            let table = legacy.as_table_mut().unwrap();
+            table.insert("version".into(), 1.into());
+            table.remove("discovery");
+            table.remove("retention");
+            let source = toml::to_string(&legacy).unwrap();
+            assert!(source.len() <= ConfigStore::MAX_INPUT_BYTES);
+            fs::write(&path, source).unwrap();
+            assert_eq!(store.load().unwrap(), config);
+        } else {
+            store.save(&config).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), ConfigStore::MAX_INPUT_BYTES);
+        assert_eq!(store.load().unwrap(), config);
+        store.save(&config).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn config_serialized_n_plus_one_is_rejected_without_changing_file() {
+    let mut config = config_at_serialized_limit();
+    config.hosts[0]
+        .presets
+        .last_mut()
+        .unwrap()
+        .command
+        .push('x');
+    config.validate().unwrap();
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let before = b"existing config bytes";
+    fs::write(&path, before).unwrap();
+
+    let error = ConfigStore::new(path.clone())
+        .save(&config)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("serialized config"), "{error}");
+    assert!(error.contains("at most"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), before);
 }
 
 #[test]
@@ -957,6 +1081,58 @@ fn orchestration_collection_boundaries_succeed_and_n_plus_one_preserves_file() {
         );
         assert_eq!(fs::read(path).unwrap(), before);
     }
+}
+
+#[test]
+fn state_serialized_ceiling_round_trips_current_and_migrated_bytes() {
+    let state = state_at_serialized_limit();
+    for migrated in [false, true] {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let store = StateStore::new(path.clone());
+        if migrated {
+            let mut legacy = serde_json::to_value(&state).unwrap();
+            legacy["version"] = 3.into();
+            let source = serde_json::to_vec(&legacy).unwrap();
+            assert!(source.len() <= StateStore::MAX_INPUT_BYTES);
+            fs::write(&path, source).unwrap();
+            assert_eq!(store.load().unwrap(), state);
+        } else {
+            store.save(&state).unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), StateStore::MAX_INPUT_BYTES);
+        assert_eq!(store.load().unwrap(), state);
+        store.save(&state).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn state_serialized_n_plus_one_is_rejected_without_changing_file() {
+    let mut state = state_at_serialized_limit();
+    state
+        .sessions
+        .last_mut()
+        .unwrap()
+        .command
+        .as_mut()
+        .unwrap()
+        .push('x');
+    state.validate().unwrap();
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let before = b"existing state bytes";
+    fs::write(&path, before).unwrap();
+
+    let error = StateStore::new(path.clone())
+        .save(&state)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("serialized state"), "{error}");
+    assert!(error.contains("at most"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), before);
 }
 
 #[test]

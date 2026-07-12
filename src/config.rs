@@ -484,7 +484,8 @@ impl ConfigStore {
         Self { path }
     }
 
-    pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+    pub const MAX_PERSISTED_BYTES: usize = 8 * 1024 * 1024;
+    pub const MAX_INPUT_BYTES: usize = Self::MAX_PERSISTED_BYTES;
 
     pub fn update<T>(&self, operation: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
         with_advisory_lock(&self.path, || {
@@ -571,9 +572,20 @@ impl ConfigStore {
     fn save_unlocked(&self, config: &Config) -> Result<()> {
         config.validate()?;
         let serialized = toml::to_string_pretty(config).context("serialize config as TOML")?;
+        require_serialized_config_size(&serialized)?;
         atomic_write(&self.path, serialized.as_bytes())
             .with_context(|| format!("save config `{}`", self.path.display()))
     }
+}
+
+fn require_serialized_config_size(serialized: &str) -> Result<()> {
+    if serialized.len() > ConfigStore::MAX_PERSISTED_BYTES {
+        bail!(
+            "serialized config may contain at most {} bytes",
+            ConfigStore::MAX_PERSISTED_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn read_config_file(path: &Path, max_bytes: usize) -> io::Result<String> {
