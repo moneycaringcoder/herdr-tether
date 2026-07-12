@@ -154,14 +154,15 @@ Use the native workflow from the ordinary `prefix+t` picker:
 1. Press `o` to open **Observers**.
 2. Press `n` to create a group, choose one running workload as orchestrator,
    select one or more running workers with `Space`, then press `Enter`.
-3. Tether generates safe labels and grants each selected worker bounded
-   read-only observation plus interactive-open capability.
+3. Review the explicit `ORCHESTRATOR` and `WORKER` topology, then press `Enter`
+   again to create it. Ambiguous safe labels receive stable bounded references.
 4. Select the group and choose **Open Observer**. The source launcher remains
    available while one companion pane opens.
 
-Existing groups can be edited or deleted from the same screen. Membership edits
-are metadata-only and reversible; deleting a group requires confirmation and
-does not touch its workloads or panes. Ordinary users never need session IDs,
+Existing groups can change orchestrator, edit workers, or be deleted from the
+same screen. Every role change has a topology review; metadata edits are
+reversible, and confirmed deletion does not touch workloads or panes. Ordinary
+users never need session IDs,
 shell commands, a standalone Tether installation, or environment setup.
 
 The CLI remains an optional machine/adapter API:

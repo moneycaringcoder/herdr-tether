@@ -44,6 +44,8 @@ pub enum ObserverManagerScreen {
     CreateWorkers,
     GroupActions,
     EditWorkers,
+    ChangeOrchestrator,
+    ReviewTopology,
     ConfirmDelete,
 }
 
@@ -73,6 +75,10 @@ pub enum ObserverManagerAction {
         expected_group: OrchestrationGroup,
         workers: Vec<OrchestrationWorkerSpec>,
     },
+    ReassignOrchestrator {
+        expected_group: OrchestrationGroup,
+        orchestrator_session_id: SessionId,
+    },
     Delete {
         expected_group: OrchestrationGroup,
     },
@@ -98,16 +104,27 @@ struct Candidate {
     existing: Option<OrchestrationMember>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewKind {
+    Create,
+    ReplaceWorkers,
+    ReassignOrchestrator,
+}
+
 #[derive(Clone, Debug)]
 pub struct ObserverManagerState {
     screen: ObserverManagerScreen,
     groups: Vec<OrchestrationGroup>,
     eligible: Vec<Candidate>,
     screen_candidates: Vec<Candidate>,
+    session_labels: HashMap<SessionId, String>,
+    running_sessions: HashSet<SessionId>,
     selected_index: usize,
     selected_group: Option<usize>,
     selected_orchestrator: Option<SessionId>,
     selected_workers: HashSet<SessionId>,
+    review_kind: Option<ReviewKind>,
+    review_return_index: usize,
     notice: Option<String>,
 }
 
@@ -145,15 +162,26 @@ impl ObserverManagerState {
                 right_record.id,
             )
         });
+        let session_labels = labels;
+        let running_sessions = state
+            .sessions
+            .iter()
+            .filter(|record| record.status == SessionStatus::Running)
+            .map(|record| record.id)
+            .collect();
         Ok(Self {
             screen: ObserverManagerScreen::Groups,
             groups: state.orchestration_groups.clone(),
             eligible,
             screen_candidates: Vec::new(),
+            session_labels,
+            running_sessions,
             selected_index: 0,
             selected_group: None,
             selected_orchestrator: None,
             selected_workers: HashSet::new(),
+            review_kind: None,
+            review_return_index: 0,
             notice,
         })
     }
@@ -169,6 +197,8 @@ impl ObserverManagerState {
             ObserverManagerScreen::CreateWorkers => "Choose workers",
             ObserverManagerScreen::GroupActions => "Observer actions",
             ObserverManagerScreen::EditWorkers => "Edit workers",
+            ObserverManagerScreen::ChangeOrchestrator => "Change orchestrator",
+            ObserverManagerScreen::ReviewTopology => "Review topology",
             ObserverManagerScreen::ConfirmDelete => "Confirm delete",
         }
     }
@@ -176,28 +206,19 @@ impl ObserverManagerState {
     pub fn item_labels(&self) -> Vec<String> {
         match self.screen {
             ObserverManagerScreen::Groups => {
-                let mut occurrences = HashMap::<&str, usize>::new();
                 let mut labels = self
                     .groups
                     .iter()
-                    .map(|group| {
-                        let title = group.title.as_str();
-                        let occurrence = occurrences.entry(title).or_default();
-                        *occurrence += 1;
-                        if *occurrence == 1 {
-                            title.to_owned()
-                        } else {
-                            format!("{title} ({occurrence})")
-                        }
-                    })
+                    .map(|group| self.group_summary(group))
                     .collect::<Vec<_>>();
                 labels.push("+ Create Observer".to_owned());
                 labels
             }
-            ObserverManagerScreen::CreateOrchestrator => self
+            ObserverManagerScreen::CreateOrchestrator
+            | ObserverManagerScreen::ChangeOrchestrator => self
                 .screen_candidates
                 .iter()
-                .map(|candidate| candidate.label.clone())
+                .map(|candidate| format!("ORCHESTRATOR {}", candidate.label))
                 .collect(),
             ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::EditWorkers => self
                 .screen_candidates
@@ -208,18 +229,47 @@ impl ObserverManagerState {
                     } else {
                         "[ ]"
                     };
-                    format!("{marker} {}", candidate.label)
+                    format!("{marker} WORKER {}", candidate.label)
                 })
                 .collect(),
             ObserverManagerScreen::GroupActions => vec![
                 "Open Observer".to_owned(),
                 "Edit workers".to_owned(),
+                "Change orchestrator".to_owned(),
                 "Delete group".to_owned(),
             ],
+            ObserverManagerScreen::ReviewTopology => self.review_labels(),
             ObserverManagerScreen::ConfirmDelete => vec![format!(
                 "Metadata only; workloads keep running. Delete {}?",
                 self.selected_group_title()
             )],
+        }
+    }
+
+    pub fn context_text(&self) -> Option<String> {
+        match self.screen {
+            ObserverManagerScreen::ReviewTopology
+                if self.review_kind == Some(ReviewKind::ReassignOrchestrator) =>
+            {
+                None
+            }
+            ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::ReviewTopology
+                if self.selected_group.is_none() =>
+            {
+                let orchestrator = self.selected_orchestrator?;
+                let label = self
+                    .eligible
+                    .iter()
+                    .find(|candidate| candidate.session_id == orchestrator)?
+                    .label
+                    .clone();
+                Some(format!("ORCHESTRATOR {label}"))
+            }
+            ObserverManagerScreen::GroupActions
+            | ObserverManagerScreen::EditWorkers
+            | ObserverManagerScreen::ChangeOrchestrator
+            | ObserverManagerScreen::ReviewTopology => Some(self.selected_group_summary()),
+            _ => None,
         }
     }
 
@@ -232,14 +282,18 @@ impl ObserverManagerState {
                 "Enter choose orchestrator · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::CreateWorkers => {
-                "Space select workers · Enter create · ↑/↓ navigate · Esc/Backspace back"
+                "Space select workers · Enter review · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::GroupActions => {
                 "Enter choose · e Edit · d Delete · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::EditWorkers => {
-                "Space add/remove · Enter save metadata · ↑/↓ navigate · Esc/Backspace back"
+                "Space add/remove · Enter review · ↑/↓ navigate · Esc/Backspace back"
             }
+            ObserverManagerScreen::ChangeOrchestrator => {
+                "Enter review replacement · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::ReviewTopology => "Enter apply once · Esc/Backspace revise",
             ObserverManagerScreen::ConfirmDelete => {
                 "y delete metadata · n/Esc keep · workloads are untouched"
             }
@@ -260,7 +314,7 @@ impl ObserverManagerState {
                 ObserverManagerEvent::ConfirmDelete => self.delete_action(),
                 ObserverManagerEvent::DismissDelete | ObserverManagerEvent::Back => {
                     self.screen = ObserverManagerScreen::GroupActions;
-                    self.selected_index = 2;
+                    self.selected_index = 3;
                     ObserverManagerOutcome::Continue
                 }
                 _ => ObserverManagerOutcome::Continue,
@@ -328,7 +382,7 @@ impl ObserverManagerState {
                 self.notice = None;
                 ObserverManagerOutcome::Continue
             }
-            ObserverManagerScreen::CreateWorkers => self.create_action(),
+            ObserverManagerScreen::CreateWorkers => self.begin_review(ReviewKind::Create),
             ObserverManagerScreen::GroupActions => match self.selected_index {
                 0 => ObserverManagerOutcome::Action(ObserverManagerAction::Launch {
                     group_id: self.selected_group_id(),
@@ -338,13 +392,25 @@ impl ObserverManagerState {
                     ObserverManagerOutcome::Continue
                 }
                 2 => {
+                    self.begin_reassign();
+                    ObserverManagerOutcome::Continue
+                }
+                3 => {
                     self.screen = ObserverManagerScreen::ConfirmDelete;
                     self.selected_index = 0;
                     ObserverManagerOutcome::Continue
                 }
                 _ => ObserverManagerOutcome::Continue,
             },
-            ObserverManagerScreen::EditWorkers => self.replace_action(),
+            ObserverManagerScreen::EditWorkers => self.begin_review(ReviewKind::ReplaceWorkers),
+            ObserverManagerScreen::ChangeOrchestrator => {
+                let Some(candidate) = self.screen_candidates.get(self.selected_index) else {
+                    return ObserverManagerOutcome::Continue;
+                };
+                self.selected_orchestrator = Some(candidate.session_id);
+                self.begin_review(ReviewKind::ReassignOrchestrator)
+            }
+            ObserverManagerScreen::ReviewTopology => self.review_action(),
             ObserverManagerScreen::ConfirmDelete => ObserverManagerOutcome::Continue,
         }
     }
@@ -419,14 +485,58 @@ impl ObserverManagerState {
         self.notice = None;
     }
 
-    fn create_action(&mut self) -> ObserverManagerOutcome {
-        if self.selected_workers.is_empty() {
+    fn begin_reassign(&mut self) {
+        let current = self.selected_group().orchestrator_session_id;
+        self.screen_candidates = self
+            .eligible
+            .iter()
+            .filter(|candidate| candidate.session_id != current)
+            .cloned()
+            .collect();
+        self.selected_orchestrator = None;
+        self.screen = ObserverManagerScreen::ChangeOrchestrator;
+        self.selected_index = 0;
+        self.notice = if self.screen_candidates.is_empty() {
+            Some("No other running exact-owned workload is available".to_owned())
+        } else {
+            None
+        };
+    }
+
+    fn begin_review(&mut self, kind: ReviewKind) -> ObserverManagerOutcome {
+        if matches!(kind, ReviewKind::Create | ReviewKind::ReplaceWorkers)
+            && self.selected_workers.is_empty()
+        {
             self.notice = Some("Select at least one worker".to_owned());
             return ObserverManagerOutcome::Continue;
         }
+        self.review_kind = Some(kind);
+        self.review_return_index = self.selected_index;
+        self.screen = ObserverManagerScreen::ReviewTopology;
+        self.selected_index = 0;
+        self.notice = None;
+        ObserverManagerOutcome::Continue
+    }
+
+    fn review_action(&self) -> ObserverManagerOutcome {
+        match self.review_kind.expect("review screen has a mutation") {
+            ReviewKind::Create => self.create_action(),
+            ReviewKind::ReplaceWorkers => self.replace_action(),
+            ReviewKind::ReassignOrchestrator => {
+                ObserverManagerOutcome::Action(ObserverManagerAction::ReassignOrchestrator {
+                    expected_group: self.selected_group().clone(),
+                    orchestrator_session_id: self
+                        .selected_orchestrator
+                        .expect("reassign review has a replacement"),
+                })
+            }
+        }
+    }
+
+    fn create_action(&self) -> ObserverManagerOutcome {
         let orchestrator = self
             .selected_orchestrator
-            .expect("create worker screen has an orchestrator");
+            .expect("create review has an orchestrator");
         let candidate = self
             .eligible
             .iter()
@@ -441,11 +551,7 @@ impl ObserverManagerState {
         })
     }
 
-    fn replace_action(&mut self) -> ObserverManagerOutcome {
-        if self.selected_workers.is_empty() {
-            self.notice = Some("Select at least one worker".to_owned());
-            return ObserverManagerOutcome::Continue;
-        }
+    fn replace_action(&self) -> ObserverManagerOutcome {
         ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
             expected_group: self.selected_group().clone(),
             workers: self.selected_worker_specs(),
@@ -573,6 +679,22 @@ impl ObserverManagerState {
                 self.selected_workers.clear();
                 ObserverManagerOutcome::Continue
             }
+            ObserverManagerScreen::ChangeOrchestrator => {
+                self.screen = ObserverManagerScreen::GroupActions;
+                self.selected_index = 2;
+                self.selected_orchestrator = None;
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerScreen::ReviewTopology => {
+                self.screen = match self.review_kind.expect("review has a mutation") {
+                    ReviewKind::Create => ObserverManagerScreen::CreateWorkers,
+                    ReviewKind::ReplaceWorkers => ObserverManagerScreen::EditWorkers,
+                    ReviewKind::ReassignOrchestrator => ObserverManagerScreen::ChangeOrchestrator,
+                };
+                self.selected_index = self.review_return_index;
+                self.review_kind = None;
+                ObserverManagerOutcome::Continue
+            }
             ObserverManagerScreen::ConfirmDelete => unreachable!(),
         }
     }
@@ -590,6 +712,95 @@ impl ObserverManagerState {
     fn selected_group_title(&self) -> &str {
         self.selected_group().title.as_str()
     }
+
+    fn selected_group_summary(&self) -> String {
+        self.group_summary(self.selected_group())
+    }
+
+    fn group_summary(&self, group: &OrchestrationGroup) -> String {
+        let orchestrator_label = self
+            .session_labels
+            .get(&group.orchestrator_session_id)
+            .map(String::as_str)
+            .unwrap_or("unavailable");
+        let orchestrator_health = if self
+            .running_sessions
+            .contains(&group.orchestrator_session_id)
+        {
+            ""
+        } else {
+            " unavailable"
+        };
+        let unavailable = group
+            .workers
+            .iter()
+            .filter(|worker| !self.running_sessions.contains(&worker.session_id))
+            .count();
+        format!(
+            "{} · ORCHESTRATOR {}{} · {} workers · {} unavailable",
+            group.title.as_str(),
+            orchestrator_label,
+            orchestrator_health,
+            group.workers.len(),
+            unavailable
+        )
+    }
+
+    fn review_labels(&self) -> Vec<String> {
+        let orchestrator = self
+            .selected_orchestrator
+            .or_else(|| {
+                self.selected_group
+                    .map(|_| self.selected_group().orchestrator_session_id)
+            })
+            .expect("review has an orchestrator");
+        let orchestrator_label = self
+            .eligible
+            .iter()
+            .find(|candidate| candidate.session_id == orchestrator)
+            .map(|candidate| candidate.label.as_str())
+            .or_else(|| self.session_labels.get(&orchestrator).map(String::as_str))
+            .unwrap_or("unavailable");
+        let mut labels = vec![format!("ORCHESTRATOR {orchestrator_label}")];
+        if self.review_kind == Some(ReviewKind::ReassignOrchestrator)
+            && self
+                .selected_group()
+                .workers
+                .iter()
+                .any(|worker| worker.session_id == orchestrator)
+        {
+            labels.push("Promote selected WORKER; remove from workers".to_owned());
+        }
+        let workers: Vec<(SessionId, String)> = match self.review_kind {
+            Some(ReviewKind::ReassignOrchestrator) => self
+                .selected_group()
+                .workers
+                .iter()
+                .filter(|worker| worker.session_id != orchestrator)
+                .map(|worker| {
+                    let label = worker
+                        .title
+                        .as_ref()
+                        .map(|title| title.as_str().to_owned())
+                        .or_else(|| self.session_labels.get(&worker.session_id).cloned())
+                        .unwrap_or_else(|| "unavailable".to_owned());
+                    (worker.session_id, label)
+                })
+                .collect(),
+            _ => self
+                .screen_candidates
+                .iter()
+                .filter(|candidate| self.selected_workers.contains(&candidate.session_id))
+                .map(|candidate| (candidate.session_id, candidate.label.clone()))
+                .collect(),
+        };
+        labels.extend(
+            workers
+                .into_iter()
+                .map(|(_, label)| format!("WORKER {label}")),
+        );
+        labels
+    }
 }
 
 fn is_eligible(record: &SessionRecord) -> bool {
@@ -599,22 +810,35 @@ fn is_eligible(record: &SessionRecord) -> bool {
 }
 
 fn candidate_labels(records: &[SessionRecord]) -> HashMap<SessionId, String> {
-    let mut occurrences = HashMap::<String, usize>::new();
-    records
-        .iter()
-        .filter(|record| is_eligible(record))
-        .map(|record| {
-            let base = candidate_label(record);
-            let occurrence = occurrences.entry(base.clone()).or_default();
-            *occurrence += 1;
-            let label = if *occurrence == 1 {
-                base
-            } else {
-                format!("{base} ({occurrence})")
-            };
-            (record.id, label)
-        })
-        .collect()
+    let mut groups = HashMap::<String, Vec<SessionId>>::new();
+    for record in records.iter().filter(|record| is_eligible(record)) {
+        groups
+            .entry(candidate_label(record))
+            .or_default()
+            .push(record.id);
+    }
+    let mut labels = HashMap::new();
+    for (base, ids) in groups {
+        if ids.len() == 1 {
+            labels.insert(ids[0], base);
+            continue;
+        }
+        let mut width = SessionId::SHORT_REFERENCE_WIDTH;
+        loop {
+            let tokens = ids
+                .iter()
+                .map(|id| id.reference_token(width))
+                .collect::<HashSet<_>>();
+            if tokens.len() == ids.len() || width == SessionId::MAX_REFERENCE_WIDTH {
+                break;
+            }
+            width += 1;
+        }
+        for id in ids {
+            labels.insert(id, format!("{base} [{}]", id.reference_token(width)));
+        }
+    }
+    labels
 }
 
 fn candidate(record: &SessionRecord, label: &str) -> Result<Candidate> {
@@ -834,9 +1058,14 @@ fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
     let visible_rows = labels.len().clamp(1, MAX_VISIBLE_ROWS) as u16;
     let panel_width = area.width.min(MAX_PANEL_WIDTH);
     let footer = state.footer_text();
+    let context = state.context_text();
     let footer_width = panel_width.saturating_sub(4).max(1);
+    let context_height = context
+        .as_deref()
+        .map_or(0, |text| wrapped_line_count(text, footer_width));
     let footer_height = wrapped_line_count(&footer, footer_width);
     let panel_height = visible_rows
+        .saturating_add(context_height)
         .saturating_add(footer_height)
         .saturating_add(4)
         .min(area.height);
@@ -863,9 +1092,21 @@ fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
+        .constraints([
+            Constraint::Length(context_height),
+            Constraint::Min(1),
+            Constraint::Length(footer_height),
+        ])
         .split(inner);
-    let max_rows = usize::from(chunks[0].height);
+    if let Some(context) = context {
+        frame.render_widget(
+            Paragraph::new(context)
+                .style(manager_style(false))
+                .wrap(Wrap { trim: true }),
+            chunks[0],
+        );
+    }
+    let max_rows = usize::from(chunks[1].height);
     let start = state
         .selected_index()
         .saturating_sub(max_rows.saturating_sub(1));
@@ -882,12 +1123,12 @@ fn render(frame: &mut Frame<'_>, area: Rect, state: &ObserverManagerState) {
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines).style(manager_style(false)), chunks[0]);
+    frame.render_widget(Paragraph::new(lines).style(manager_style(false)), chunks[1]);
     frame.render_widget(
         Paragraph::new(footer)
             .style(manager_style(false))
             .wrap(Wrap { trim: true }),
-        chunks[1],
+        chunks[2],
     );
 }
 

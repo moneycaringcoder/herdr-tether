@@ -9,6 +9,8 @@ use std::{
     fmt,
 };
 
+use crate::model::SessionId;
+
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
@@ -76,13 +78,20 @@ impl ObserverWorker {
             && self.capabilities.open_interactive
     }
 
-    fn display_title(&self) -> String {
-        let title = self
-            .title
+    fn human_display_title(&self) -> Option<String> {
+        self.title
             .as_deref()
             .filter(|title| !title.is_empty())
-            .unwrap_or(&self.id);
-        sanitize_label(title, 160)
+            .map(|title| sanitize_label(title, 160))
+    }
+
+    fn display_title(&self) -> String {
+        self.human_display_title().unwrap_or_else(|| {
+            self.id
+                .parse::<SessionId>()
+                .map(|id| id.reference_token(SessionId::SHORT_REFERENCE_WIDTH))
+                .unwrap_or_else(|_| sanitize_label(&self.id, 160))
+        })
     }
 }
 
@@ -227,6 +236,33 @@ impl ObserverState {
         let start = self.page() * WORKERS_PER_PAGE;
         let end = (start + WORKERS_PER_PAGE).min(self.workers.len());
         &self.workers[start..end]
+    }
+
+    fn worker_display_title(&self, worker: &ObserverWorker) -> String {
+        let Some(title) = worker.human_display_title() else {
+            return worker.display_title();
+        };
+        let matching_ids: Vec<SessionId> = self
+            .workers
+            .iter()
+            .filter(|candidate| candidate.human_display_title().as_deref() == Some(&title))
+            .filter_map(|candidate| candidate.id.parse().ok())
+            .collect();
+        if matching_ids.len() < 2 {
+            return title;
+        }
+        let Ok(worker_id) = worker.id.parse::<SessionId>() else {
+            return title;
+        };
+        let width = (SessionId::SHORT_REFERENCE_WIDTH..=SessionId::MAX_REFERENCE_WIDTH)
+            .find(|width| {
+                let mut references = HashSet::with_capacity(matching_ids.len());
+                matching_ids
+                    .iter()
+                    .all(|id| references.insert(id.reference_token(*width)))
+            })
+            .unwrap_or(SessionId::MAX_REFERENCE_WIDTH);
+        format!("{title} · {}", worker_id.reference_token(width))
     }
 
     pub fn apply(&mut self, action: ObserverAction) -> ObserverOutcome {
@@ -385,6 +421,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
                 frame,
                 rect,
                 worker,
+                &observer.worker_display_title(worker),
                 observer.selected_id() == Some(worker.id.as_str()),
             );
         }
@@ -409,7 +446,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     );
 }
 
-fn render_worker(frame: &mut Frame<'_>, area: Rect, worker: &ObserverWorker, selected: bool) {
+fn render_worker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    worker: &ObserverWorker,
+    display_title: &str,
+    selected: bool,
+) {
     if area.is_empty() {
         return;
     }
@@ -417,7 +460,7 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, worker: &ObserverWorker, sel
     let eligibility = if worker.can_open() { " · OPEN" } else { "" };
     let title = format!(
         "{marker}{} · {}{eligibility}",
-        worker.display_title(),
+        display_title,
         worker.lifecycle.label()
     );
     let style = observer_theme_style(selected);

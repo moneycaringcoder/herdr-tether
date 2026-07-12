@@ -8,13 +8,15 @@
 - Added a read-only Observer companion that uses one outer Herdr pane, dynamically refreshes exact-owned worker status and authorized bounded captures, rejects stale asynchronous results against complete authorization fingerprints, restores terminal state defensively, renders deterministic four-worker pages, and can open an authorized running worker without replacing Observer.
 - Added development `main` and immutable exact-SHA operating guidance for groups and Observer while retaining stable v0.3.0 installation instructions.
 - Added a native `prefix+t` Observer manager that creates safe group metadata from running workloads, edits membership reversibly, confirms metadata-only deletion, and launches one companion pane from the current Herdr plugin context without exposing session IDs or requiring standalone CLI setup.
+- Added explicit topology review with visible `ORCHESTRATOR` and `WORKER` roles, group health summaries, and metadata-only orchestrator reassignment that preserves unaffected worker membership.
+- Added stable bounded reference tokens only when otherwise-safe workload or Observer tile labels are ambiguous, while retaining exact internal identity for every action.
 
 ### Fixed
 
 - Debounced queued or repeated `Enter` events inside Observer so one open gesture places one interactive view, reports progress, and does not change ordinary intentional multi-attach behavior.
 - Replaced collapsed tile borders at tiny pane sizes with a bounded resize message and made Observer chrome use terminal-default foreground and background colors while retaining sanitized capture text.
 - Kept companion creation from running in or closing its source launcher pane, including when configured placement requests replacement.
-- Revalidated UI-selected orchestrators and newly added workers as running exact-owned workloads inside the locked state transaction, while preserving already-retained unavailable members.
+- Revalidated every newly admitted orchestrator or worker as a running exact-owned workload inside the locked state transaction, including optional CLI adapter operations, while preserving already-retained unavailable members.
 - Rejected manager edit or delete requests when the displayed group snapshot changed before commit, preventing stale screens from overwriting or deleting concurrent metadata updates.
 - Required native Observer-manager placement to use `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` and fail closed instead of falling back to a managed overlay pane ID.
 

@@ -4,7 +4,7 @@ use herdr_tether::observer_manager::{
     ObserverManagerState, render_to_text,
 };
 use herdr_tether::{
-    model::OrchestrationMembershipId,
+    model::{OrchestrationMembershipId, SessionId},
     state::{
         OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
         SessionStatus, State,
@@ -92,14 +92,24 @@ fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() 
         ObserverManagerOutcome::Continue
     );
     assert_eq!(manager.screen(), ObserverManagerScreen::CreateOrchestrator);
-    assert_eq!(
-        manager.item_labels(),
-        vec![
-            "test / checks / shell",
-            "build / atlas / dev (2)",
-            "build / atlas / dev",
-        ]
+    let orchestrator_labels = manager.item_labels();
+    assert_eq!(orchestrator_labels.len(), 3);
+    assert!(
+        orchestrator_labels
+            .iter()
+            .all(|label| label.starts_with("ORCHESTRATOR "))
     );
+    assert!(
+        orchestrator_labels
+            .iter()
+            .any(|label| label.contains("test / checks / shell"))
+    );
+    let duplicate_labels = orchestrator_labels
+        .iter()
+        .filter(|label| label.contains("build / atlas / dev"))
+        .collect::<Vec<_>>();
+    assert_eq!(duplicate_labels.len(), 2);
+    assert_ne!(duplicate_labels[0], duplicate_labels[1]);
     for id in &session_ids {
         assert!(!manager.item_labels().join(" ").contains(id));
         assert!(!manager.footer_text().contains(id));
@@ -110,13 +120,21 @@ fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() 
         ObserverManagerOutcome::Continue
     );
     assert_eq!(manager.screen(), ObserverManagerScreen::CreateWorkers);
-    assert_eq!(
-        manager.item_labels(),
-        vec!["[ ] build / atlas / dev (2)", "[ ] build / atlas / dev"]
+    let worker_labels = manager.item_labels();
+    assert_eq!(worker_labels.len(), 2);
+    assert!(
+        worker_labels
+            .iter()
+            .all(|label| label.starts_with("[ ] WORKER "))
     );
     manager.handle(ObserverManagerEvent::Toggle);
     manager.handle(ObserverManagerEvent::Next);
     manager.handle(ObserverManagerEvent::Toggle);
+    assert_eq!(
+        manager.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Continue
+    );
+    assert_eq!(manager.screen(), ObserverManagerScreen::ReviewTopology);
     let ObserverManagerOutcome::Action(ObserverManagerAction::Create {
         id,
         title,
@@ -168,7 +186,12 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     assert_eq!(open.screen(), ObserverManagerScreen::GroupActions);
     assert_eq!(
         open.item_labels(),
-        vec!["Open Observer", "Edit workers", "Delete group"]
+        vec![
+            "Open Observer",
+            "Edit workers",
+            "Change orchestrator",
+            "Delete group"
+        ]
     );
     assert_eq!(
         open.handle(ObserverManagerEvent::Confirm),
@@ -182,13 +205,18 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     edit.handle(ObserverManagerEvent::Next);
     edit.handle(ObserverManagerEvent::Confirm);
     assert_eq!(edit.screen(), ObserverManagerScreen::EditWorkers);
-    assert_eq!(
-        edit.item_labels(),
-        vec!["[x] build / atlas / dev (2)", "[ ] test / checks / shell",]
-    );
+    let edit_labels = edit.item_labels();
+    assert_eq!(edit_labels.len(), 2);
+    assert!(edit_labels[0].starts_with("[x] WORKER "));
+    assert!(edit_labels[1].starts_with("[ ] WORKER "));
     edit.handle(ObserverManagerEvent::Toggle);
     edit.handle(ObserverManagerEvent::Next);
     edit.handle(ObserverManagerEvent::Toggle);
+    assert_eq!(
+        edit.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Continue
+    );
+    assert_eq!(edit.screen(), ObserverManagerScreen::ReviewTopology);
     let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
         expected_group,
         workers,
@@ -243,6 +271,10 @@ fn edit_without_changes_preserves_and_displays_non_running_existing_members() {
             .any(|label| label.contains("Unavailable worker 1")),
         "{labels:?}"
     );
+    assert_eq!(
+        manager.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Continue
+    );
     let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers { workers, .. }) =
         manager.handle(ObserverManagerEvent::Confirm)
     else {
@@ -276,6 +308,10 @@ fn edit_without_changes_preserves_existing_worker_order() {
     manager.handle(ObserverManagerEvent::Confirm);
     manager.handle(ObserverManagerEvent::Next);
     manager.handle(ObserverManagerEvent::Confirm);
+    assert_eq!(
+        manager.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Continue
+    );
     let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers { workers, .. }) =
         manager.handle(ObserverManagerEvent::Confirm)
     else {
@@ -316,6 +352,7 @@ fn group_ids_get_deterministic_safe_suffixes() {
     manager.handle(ObserverManagerEvent::Next);
     manager.handle(ObserverManagerEvent::Confirm);
     manager.handle(ObserverManagerEvent::Toggle);
+    manager.handle(ObserverManagerEvent::Confirm);
     let ObserverManagerOutcome::Action(ObserverManagerAction::Create { id, title, .. }) =
         manager.handle(ObserverManagerEvent::Confirm)
     else {
@@ -368,6 +405,7 @@ fn generated_identity_never_exceeds_validation_bounds_for_long_digit_labels() {
     manager.handle(ObserverManagerEvent::Create);
     manager.handle(ObserverManagerEvent::Confirm);
     manager.handle(ObserverManagerEvent::Toggle);
+    manager.handle(ObserverManagerEvent::Confirm);
     let ObserverManagerOutcome::Action(ObserverManagerAction::Create { id, title, .. }) =
         manager.handle(ObserverManagerEvent::Confirm)
     else {
@@ -375,6 +413,167 @@ fn generated_identity_never_exceeds_validation_bounds_for_long_digit_labels() {
     };
     assert!(id.as_str().len() <= 64);
     assert!(title.as_str().len() <= 128);
+}
+
+#[test]
+fn create_edit_and_reassign_require_review_before_one_exact_action() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+
+    let mut create = ObserverManagerState::from_state(&state, None).unwrap();
+    create.handle(ObserverManagerEvent::Create);
+    create.handle(ObserverManagerEvent::Confirm);
+    create.handle(ObserverManagerEvent::Toggle);
+    assert_eq!(
+        create.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Continue
+    );
+    assert_eq!(create.screen(), ObserverManagerScreen::ReviewTopology);
+    assert!(
+        create
+            .item_labels()
+            .iter()
+            .any(|row| row.contains("ORCHESTRATOR"))
+    );
+    assert!(
+        create
+            .item_labels()
+            .iter()
+            .any(|row| row.contains("WORKER"))
+    );
+    assert_eq!(
+        create.handle(ObserverManagerEvent::Back),
+        ObserverManagerOutcome::Continue
+    );
+    assert_eq!(create.screen(), ObserverManagerScreen::CreateWorkers);
+    assert!(create.item_labels()[0].starts_with("[x] WORKER"));
+    create.handle(ObserverManagerEvent::Confirm);
+    assert!(matches!(
+        create.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::Create { .. })
+    ));
+
+    let mut edit = ObserverManagerState::from_state(&state, None).unwrap();
+    edit.handle(ObserverManagerEvent::Confirm);
+    edit.handle(ObserverManagerEvent::Edit);
+    assert_eq!(edit.screen(), ObserverManagerScreen::EditWorkers);
+    edit.handle(ObserverManagerEvent::Confirm);
+    assert_eq!(edit.screen(), ObserverManagerScreen::ReviewTopology);
+    edit.handle(ObserverManagerEvent::Back);
+    assert_eq!(edit.screen(), ObserverManagerScreen::EditWorkers);
+    edit.handle(ObserverManagerEvent::Confirm);
+    let expected = state.orchestration_groups[0].clone();
+    assert_eq!(
+        edit.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
+            expected_group: expected.clone(),
+            workers: vec![herdr_tether::orchestration::OrchestrationWorkerSpec {
+                session_id: expected.workers[0].session_id,
+                title: expected.workers[0].title.clone(),
+                capabilities: expected.workers[0].capabilities,
+            }],
+        })
+    );
+
+    let mut reassign = ObserverManagerState::from_state(&state, None).unwrap();
+    reassign.handle(ObserverManagerEvent::Confirm);
+    reassign.handle(ObserverManagerEvent::Next);
+    reassign.handle(ObserverManagerEvent::Next);
+    reassign.handle(ObserverManagerEvent::Confirm);
+    assert_eq!(reassign.screen(), ObserverManagerScreen::ChangeOrchestrator);
+    let worker_index = reassign
+        .item_labels()
+        .iter()
+        .position(|row| row.contains("build / atlas / dev"))
+        .unwrap();
+    while reassign.selected_index() != worker_index {
+        reassign.handle(ObserverManagerEvent::Next);
+    }
+    reassign.handle(ObserverManagerEvent::Confirm);
+    assert_eq!(reassign.screen(), ObserverManagerScreen::ReviewTopology);
+    let review = reassign.item_labels().join("\n");
+    assert!(review.contains("Promote selected WORKER"));
+    assert!(review.contains("remove from workers"));
+    assert_eq!(
+        reassign.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::ReassignOrchestrator {
+            expected_group: expected,
+            orchestrator_session_id: state.sessions[1].id,
+        })
+    );
+}
+
+#[test]
+fn reassignment_review_renders_only_the_proposed_orchestrator_topology() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Confirm);
+    let worker_index = manager
+        .item_labels()
+        .iter()
+        .position(|row| row.contains("build / atlas / dev"))
+        .unwrap();
+    while manager.selected_index() != worker_index {
+        manager.handle(ObserverManagerEvent::Next);
+    }
+    let proposed_orchestrator = manager.item_labels()[worker_index].clone();
+    manager.handle(ObserverManagerEvent::Confirm);
+
+    assert_eq!(manager.screen(), ObserverManagerScreen::ReviewTopology);
+    let rendered = render_to_text(100, 16, &manager).unwrap();
+    assert_eq!(rendered.matches("ORCHESTRATOR").count(), 1);
+    assert!(rendered.contains(&proposed_orchestrator));
+    assert!(!rendered.contains("Observer build atlas · ORCHESTRATOR"));
+}
+
+#[test]
+fn ambiguous_orchestrator_labels_keep_the_candidate_reference_token() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+
+    let manager = ObserverManagerState::from_state(&state, None).unwrap();
+    let row = &manager.item_labels()[0];
+    let reference = state.sessions[0]
+        .id
+        .reference_token(SessionId::MAX_REFERENCE_WIDTH);
+
+    assert!(row.contains(&format!("ORCHESTRATOR build / atlas / dev [{reference}]")));
+    assert_eq!(row.matches('[').count(), 1);
+    assert_eq!(row.matches(']').count(), 1);
+}
+
+#[test]
+fn group_rows_report_topology_health_without_raw_session_ids() {
+    let mut state = state_with_sessions();
+    let mut existing = group(&state);
+    existing.workers.push(OrchestrationMember {
+        session_id: "tether-0197f198000070008000000000000099".parse().unwrap(),
+        membership_id: OrchestrationMembershipId::new(),
+        title: Some("missing worker".parse().unwrap()),
+        capabilities: OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        },
+    });
+    state.sessions[1].status = SessionStatus::Ended;
+    state.sessions[1].closed_at = Some(state.sessions[1].last_used_at);
+    existing.orchestrator_session_id = state.sessions[2].id;
+    state.orchestration_groups.push(existing);
+    let manager = ObserverManagerState::from_state(&state, None).unwrap();
+    let row = &manager.item_labels()[0];
+    assert!(row.contains("ORCHESTRATOR test / checks / shell"));
+    assert!(!row.contains('['));
+    assert!(!row.contains(']'));
+    assert!(row.contains("2 workers"));
+    assert!(row.contains("2 unavailable"));
+    for record in &state.sessions {
+        assert!(!row.contains(&record.id.to_string()));
+    }
 }
 #[test]
 fn back_from_group_list_returns_to_the_main_tether_picker() {

@@ -66,15 +66,17 @@ It derives bounded labels from safe host, repository, and preset metadata,
 persists create/edit/delete requests through `OrchestrationService`,
 and re-reads authoritative state after each mutation. UI defaults grant both
 bounded observation and interactive open to selected workers. The manager never
-renders raw session IDs and never calls workload lifecycle methods.
-The standalone CLI uses the same service and remains an optional adapter API.
-Manager create transactions revalidate the orchestrator and every worker as a
-currently running exact-owned workload while holding the state lock. Edit
-transactions permit already-retained unavailable members, but apply the same
-locked validation to every newly added worker. Edit and delete actions carry the
-complete group snapshot displayed to the user and reject under the lock if its
-title, orchestrator, membership order, membership epoch, capabilities, or
-worker titles changed before commit.
+renders full raw session IDs: only ambiguous safe labels receive bounded opaque
+collision references. It never calls workload lifecycle methods. The standalone
+CLI uses the same service and remains an optional adapter API.
+Every new orchestrator or worker admission revalidates that session as a
+currently running exact-owned workload while holding the state lock, including
+optional CLI adapter operations. Manager edits permit already-retained
+unavailable members. Worker-edit, reassignment, and delete actions carry the
+complete topology snapshot displayed to the user and reject under the lock if
+its title, orchestrator, membership order, membership epoch, capabilities, or
+worker titles changed before commit. Promoting a worker to orchestrator removes
+that worker role while preserving every unaffected membership.
 
 
 ## Observer projection
