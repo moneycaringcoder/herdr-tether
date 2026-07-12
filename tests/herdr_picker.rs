@@ -490,6 +490,12 @@ fn orchestration_observe_creates_one_outer_pane_with_exact_destination_context()
             .count(),
         1
     );
+    assert!(
+        !transcript
+            .lines()
+            .any(|line| line.starts_with("CALL\tpane\trun\tw1:p1\t")),
+        "Observer launch must not replace the source shell command: {transcript}"
+    );
     assert!(transcript.contains("CALL\tpane\trename\tw1:p9\tObserver · Build fleet"));
     assert!(transcript.contains(
         "'observer-runtime' 'build-fleet' '--pane-id' 'w1:p9' '--workspace-id' 'w1' '--herdr-bin'"

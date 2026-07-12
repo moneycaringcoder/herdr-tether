@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -184,6 +184,89 @@ const _: () = assert!(crate::observer::MAX_WORKERS == OrchestrationGroup::MAX_WO
 
 const OBSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const OBSERVER_INPUT_POLL: Duration = Duration::from_millis(50);
+const OBSERVER_OPEN_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct ObserverOpenGate {
+    last_completed: Option<(String, Instant)>,
+}
+
+impl ObserverOpenGate {
+    fn suppresses(&mut self, worker_id: &str, now: Instant) -> bool {
+        let Some((previous_worker, completed_at)) = &mut self.last_completed else {
+            return false;
+        };
+        if previous_worker != worker_id
+            || now.saturating_duration_since(*completed_at) >= OBSERVER_OPEN_DEBOUNCE
+        {
+            return false;
+        }
+        *completed_at = now;
+        true
+    }
+
+    fn record(&mut self, worker_id: &str, completed_at: Instant) {
+        self.last_completed = Some((worker_id.to_owned(), completed_at));
+    }
+}
+
+fn observer_key_for_event(key: KeyEvent) -> Option<ObserverKey> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return Some(ObserverKey::ControlC);
+    }
+    match key.code {
+        KeyCode::Up => Some(ObserverKey::Up),
+        KeyCode::Down => Some(ObserverKey::Down),
+        KeyCode::Left => Some(ObserverKey::Left),
+        KeyCode::Right => Some(ObserverKey::Right),
+        KeyCode::PageUp => Some(ObserverKey::PageUp),
+        KeyCode::PageDown => Some(ObserverKey::PageDown),
+        KeyCode::Tab => Some(ObserverKey::Tab),
+        KeyCode::BackTab => Some(ObserverKey::BackTab),
+        KeyCode::Enter => Some(ObserverKey::Enter),
+        KeyCode::Esc => Some(ObserverKey::Escape),
+        KeyCode::Char(character) => Some(ObserverKey::Char(character)),
+        _ => None,
+    }
+}
+
+fn handle_observer_open(
+    observer: &mut ObserverState,
+    gate: &mut ObserverOpenGate,
+    worker_id: &str,
+    mut now: impl FnMut() -> Instant,
+    mut render_feedback: impl FnMut(&ObserverState) -> Result<()>,
+    mut open: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if gate.suppresses(worker_id, now()) {
+        let queued = "wait before retrying";
+        let notice = observer.notice().map(str::to_owned);
+        if let Some(failure) = notice.filter(|notice| notice.starts_with("Open failed:")) {
+            if !failure.contains("queued Enter ignored") {
+                observer.set_notice(Some(format!("{failure} · queued Enter ignored; {queued}")));
+            }
+        } else {
+            observer.set_notice(Some(format!("Queued Enter ignored; {queued}")));
+        }
+        return Ok(());
+    }
+
+    observer.set_notice(Some("Opening selected worker…".to_owned()));
+    render_feedback(observer)?;
+    let result = open(worker_id);
+    gate.record(worker_id, now());
+    match result {
+        Ok(()) => observer.set_notice(Some(
+            "Worker opened; queued Enter will be ignored briefly".to_owned(),
+        )),
+        Err(error) => observer.set_notice(Some(format!("Open failed: {error:#}"))),
+    }
+    Ok(())
+}
 
 pub fn run_observer(
     paths: &AppPaths,
@@ -210,6 +293,7 @@ pub fn run_observer(
     let mut terminal = Terminal::new(backend).context("initialize Observer terminal")?;
     terminal.clear().context("clear Observer terminal")?;
     let mut last_refresh = Instant::now();
+    let mut open_gate = ObserverOpenGate::default();
 
     loop {
         terminal
@@ -247,35 +331,18 @@ pub fn run_observer(
         let Event::Key(key) = event::read().context("read Observer input")? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        let Some(observer_key) = observer_key_for_event(key) else {
             continue;
-        }
-        let observer_key = if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c' | 'C'))
-        {
-            ObserverKey::ControlC
-        } else {
-            match key.code {
-                KeyCode::Up => ObserverKey::Up,
-                KeyCode::Down => ObserverKey::Down,
-                KeyCode::Left => ObserverKey::Left,
-                KeyCode::Right => ObserverKey::Right,
-                KeyCode::PageUp => ObserverKey::PageUp,
-                KeyCode::PageDown => ObserverKey::PageDown,
-                KeyCode::Tab => ObserverKey::Tab,
-                KeyCode::BackTab => ObserverKey::BackTab,
-                KeyCode::Enter => ObserverKey::Enter,
-                KeyCode::Esc => ObserverKey::Escape,
-                KeyCode::Char(character) => ObserverKey::Char(character),
-                _ => continue,
-            }
         };
         let Some(action) = action_for_key(observer_key) else {
             continue;
         };
-        observer.set_notice(None);
         let previous_page = observer.page();
-        match observer.apply(action) {
+        let outcome = observer.apply(action);
+        if !matches!(&outcome, ObserverOutcome::OpenSelected { .. }) {
+            observer.set_notice(None);
+        }
+        match outcome {
             ObserverOutcome::None if observer.page() != previous_page => {
                 refresh_observer_metadata(
                     &store,
@@ -298,11 +365,19 @@ pub fn run_observer(
                 last_refresh = Instant::now();
             }
             ObserverOutcome::OpenSelected { worker_id } => {
-                if let Err(error) =
-                    open_worker(paths, &store, &group_id, &worker_id, &herdr_context)
-                {
-                    observer.set_notice(Some(format!("Open failed: {error:#}")));
-                }
+                handle_observer_open(
+                    &mut observer,
+                    &mut open_gate,
+                    &worker_id,
+                    Instant::now,
+                    |state| {
+                        terminal
+                            .draw(|frame| render(frame, frame.area(), state))
+                            .context("draw Observer open feedback")?;
+                        Ok(())
+                    },
+                    |worker_id| open_worker(paths, &store, &group_id, worker_id, &herdr_context),
+                )?;
             }
             ObserverOutcome::OpenUnavailable { worker_id } => {
                 observer.set_notice(Some(format!(
@@ -764,6 +839,135 @@ mod tests {
         };
         restore_terminal(&mut cleanup);
         assert_eq!(cleanup.attempts, ["show", "leave", "raw"]);
+    }
+
+    #[test]
+    fn queued_enter_events_place_the_selected_worker_once_until_input_is_quiet() {
+        use std::cell::{Cell, RefCell};
+
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let placements = Cell::new(0usize);
+        let feedback = RefCell::new(Vec::new());
+        let mut gate = ObserverOpenGate::default();
+        let mut observer = ObserverState::new(vec![worker(
+            "selected",
+            ObserverLifecycle::Running,
+            Some("output"),
+        )]);
+
+        macro_rules! press_enter {
+            () => {{
+                let key = crossterm::event::KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                );
+                let observer_key = observer_key_for_event(key).expect("Enter press is handled");
+                let action = action_for_key(observer_key).expect("Enter maps to an action");
+                let ObserverOutcome::OpenSelected { worker_id } = observer.apply(action) else {
+                    panic!("eligible Enter must request an open");
+                };
+                handle_observer_open(
+                    &mut observer,
+                    &mut gate,
+                    &worker_id,
+                    || now.get(),
+                    |state| {
+                        feedback
+                            .borrow_mut()
+                            .push(state.notice().unwrap_or_default().to_owned());
+                        Ok(())
+                    },
+                    |_| {
+                        placements.set(placements.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }};
+        }
+
+        press_enter!();
+        now.set(start + Duration::from_millis(25));
+        press_enter!();
+        now.set(start + Duration::from_millis(50));
+        press_enter!();
+
+        assert_eq!(placements.get(), 1, "queued Enter must not fan out panes");
+        assert!(
+            feedback
+                .borrow()
+                .iter()
+                .any(|notice| notice.contains("Opening"))
+        );
+        assert_eq!(
+            observer.notice(),
+            Some("Queued Enter ignored; wait before retrying")
+        );
+        now.set(start + OBSERVER_OPEN_DEBOUNCE + Duration::from_millis(20));
+        press_enter!();
+        assert_eq!(
+            placements.get(),
+            1,
+            "suppressed input must extend the quiet window"
+        );
+
+        now.set(start + OBSERVER_OPEN_DEBOUNCE * 2 + Duration::from_millis(21));
+        press_enter!();
+        assert_eq!(
+            placements.get(),
+            2,
+            "a later intentional gesture remains available"
+        );
+    }
+
+    #[test]
+    fn queued_enter_preserves_open_failure_feedback() {
+        let start = Instant::now();
+        let mut gate = ObserverOpenGate::default();
+        let mut observer = ObserverState::new(vec![worker(
+            "selected",
+            ObserverLifecycle::Running,
+            Some("output"),
+        )]);
+
+        handle_observer_open(
+            &mut observer,
+            &mut gate,
+            "selected",
+            || start,
+            |_| Ok(()),
+            |_| bail!("destination unavailable"),
+        )
+        .unwrap();
+        assert!(
+            observer
+                .notice()
+                .is_some_and(|notice| notice.contains("destination unavailable"))
+        );
+
+        handle_observer_open(
+            &mut observer,
+            &mut gate,
+            "selected",
+            || start + Duration::from_millis(25),
+            |_| Ok(()),
+            |_| panic!("queued Enter must not place again"),
+        )
+        .unwrap();
+        let notice = observer.notice().unwrap();
+        assert!(notice.contains("destination unavailable"), "{notice}");
+        assert!(notice.contains("ignored"), "{notice}");
+    }
+
+    #[test]
+    fn observer_input_ignores_repeat_and_release_enter_events() {
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let key =
+                crossterm::event::KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind);
+            assert_eq!(observer_key_for_event(key), None);
+        }
     }
 
     fn fingerprint(membership: &str, identity: &str) -> CaptureFingerprint {

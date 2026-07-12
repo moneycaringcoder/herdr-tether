@@ -70,6 +70,10 @@ the full canvas, two divide it side by side, and three or four use a 2×2 grid.
 Additional workers remain in membership order on deterministic pages; the
 footer reports overflow. The persisted 64-worker limit also bounds projection
 work.
+When the available geometry cannot fit useful bordered tiles, Observer renders
+one bounded resize message instead of subdividing the pane. Observer chrome
+uses terminal-default foreground and background colors; untrusted captured
+output remains sanitized rather than interpreting its color escapes.
 
 Observer reloads group and session metadata while it runs, so membership,
 selection, and lifecycle labels follow state changes without creating one Herdr
@@ -96,6 +100,12 @@ exact-owned session. Tether then opens it through the ordinary lifecycle and
 Herdr placement boundary while Observer remains available. Both the outer
 Observer launch and an interactive worker open normalize configured or explicit
 `replace-current-pane` to `split-right`, preserving the companion/source pane.
+Observer debounces repeated opens of the same selected worker after one
+placement completes, so queued `Enter` presses cannot fan out duplicate panes.
+This gate is local to Observer and does not change ordinary intentional
+multi-attachment elsewhere. Companion placement creates and runs only the
+destination pane; it does not run a command in or close the source launcher
+pane.
 Observer terminal teardown independently attempts to restore cursor visibility,
 leave the alternate screen, and disable raw mode on every guarded exit path;
 one restoration error cannot prevent the remaining attempts.

@@ -8,6 +8,12 @@
 - Added a read-only Observer companion that uses one outer Herdr pane, dynamically refreshes exact-owned worker status and authorized bounded captures, rejects stale asynchronous results against complete authorization fingerprints, restores terminal state defensively, renders deterministic four-worker pages, and can open an authorized running worker without replacing Observer.
 - Added development `main` and immutable exact-SHA operating guidance for groups and Observer while retaining stable v0.3.0 installation instructions.
 
+### Fixed
+
+- Debounced queued or repeated `Enter` events inside Observer so one open gesture places one interactive view, reports progress, and does not change ordinary intentional multi-attach behavior.
+- Replaced collapsed tile borders at tiny pane sizes with a bounded resize message and made Observer chrome use terminal-default foreground and background colors while retaining sanitized capture text.
+- Kept companion creation from running in or closing its source launcher pane, including when configured placement requests replacement.
+
 ### Limitations
 
 - Observer launch requires an invoking Herdr pane context; processes nested inside Tether workloads must request or hand off that explicit launch rather than assuming Herdr's plugin environment.

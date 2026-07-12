@@ -4,9 +4,10 @@ mod observer;
 use observer::{
     MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
     ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_key,
-    render_to_text, sanitize_capture, worker_rects,
+    observer_theme_style, render_to_styles, render_to_text, sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 
 fn worker(id: &str) -> ObserverWorker {
     ObserverWorker {
@@ -277,6 +278,39 @@ fn render_text_is_deterministic_in_normal_and_small_terminals() {
     assert_eq!(tiny.chars().count(), 1);
     let short = render_to_text(12, 2, &state(3)).unwrap();
     assert_eq!(short.lines().count(), 2);
+    assert_eq!(render_to_text(0, 0, &state(4)).unwrap(), "");
+    let degenerate = render_to_text(8, 2, &state(4)).unwrap();
+    assert_eq!(degenerate.lines().count(), 2);
+    assert!(degenerate.lines().all(|line| line.chars().count() == 8));
+}
+
+#[test]
+fn cramped_observer_geometry_renders_one_useful_bounded_resize_message() {
+    for (width, height, workers) in [(20, 4, 2), (20, 7, 4), (12, 3, 1)] {
+        let rendered = render_to_text(width, height, &state(workers)).unwrap();
+        assert!(
+            rendered.contains("Observer"),
+            "{width}x{height}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Resize pane"),
+            "{width}x{height}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(['┌', '┐', '└', '┘', '─', '│']),
+            "cramped fallback must not collapse borders into punctuation:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("output-"),
+            "{width}x{height}:\n{rendered}"
+        );
+        assert_eq!(rendered.lines().count(), usize::from(height));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() == usize::from(width))
+        );
+    }
 }
 
 #[test]
@@ -296,6 +330,31 @@ fn runtime_notices_are_sanitized_without_changing_worker_state() {
     let rendered = render_to_text(48, 8, &ObserverState::new(vec![unauthorized])).unwrap();
     assert!(rendered.contains("Output not authorized"));
     assert!(!rendered.contains("must-not-render"));
+}
+
+#[test]
+fn observer_chrome_uses_terminal_default_colors_without_weakening_capture_safety() {
+    let normal = observer_theme_style(false);
+    assert_eq!(normal.fg, Some(Color::Reset));
+    assert_eq!(normal.bg, Some(Color::Reset));
+    assert!(!normal.add_modifier.contains(Modifier::BOLD));
+
+    let selected = observer_theme_style(true);
+    assert_eq!(selected.fg, Some(Color::Reset));
+    assert_eq!(selected.bg, Some(Color::Reset));
+    assert!(selected.add_modifier.contains(Modifier::BOLD));
+
+    for (width, height) in [(48, 14), (20, 4), (8, 2)] {
+        let styles = render_to_styles(width, height, &state(4)).unwrap();
+        assert!(
+            styles
+                .iter()
+                .all(|(fg, bg, _)| *fg == Color::Reset && *bg == Color::Reset),
+            "Observer chrome forced a color at {width}x{height}"
+        );
+    }
+
+    assert_eq!(sanitize_capture("\u{1b}[31mred\u{1b}[0m safe"), "red safe");
 }
 
 #[test]
