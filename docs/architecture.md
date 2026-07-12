@@ -62,8 +62,8 @@ are validated and bounded; references carry no host, path, command, or
 orchestration-runtime assumptions.
 
 The native picker exposes groups through a harness-neutral manager projection.
-It derives bounded labels from safe host, repository, preset, and command
-metadata, persists create/edit/delete requests through `OrchestrationService`,
+It derives bounded labels from safe host, repository, and preset metadata,
+persists create/edit/delete requests through `OrchestrationService`,
 and re-reads authoritative state after each mutation. UI defaults grant both
 bounded observation and interactive open to selected workers. The manager never
 renders raw session IDs and never calls workload lifecycle methods.

@@ -44,6 +44,8 @@ use crate::{
     },
 };
 
+const OBSERVER_PLUGIN_CONTEXT_ERROR: &str = "Observer must be launched from the Tether plugin pane";
+
 #[derive(Debug, Parser)]
 #[command(name = "herdr-tether", version, about)]
 pub struct Cli {
@@ -596,6 +598,10 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
         return execute_selection(paths, &config, selection);
     }
 
+    let observer_placement = args
+        .placement
+        .map(Placement::from)
+        .unwrap_or(config.ui.placement);
     let mut operation_error = None;
     PruneService::new(state_store.clone())
         .automatic_cleanup()
@@ -614,7 +620,7 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
             return Ok(());
         };
         if selection == PickerSelection::ManageObservers {
-            match run_observer_manager_flow(&config, &state_store)? {
+            match run_observer_manager_flow(observer_placement, &state_store)? {
                 ObserverManagerFlow::BackToPicker => continue,
                 ObserverManagerFlow::Launched => return Ok(()),
             }
@@ -635,7 +641,7 @@ enum ObserverManagerFlow {
 }
 
 fn run_observer_manager_flow(
-    config: &Config,
+    placement: Placement,
     state_store: &StateStore,
 ) -> Result<ObserverManagerFlow> {
     let service = OrchestrationService::new(state_store.clone());
@@ -693,19 +699,31 @@ fn run_observer_manager_flow(
             ObserverManagerAction::Launch { group_id } => {
                 let launch = (|| {
                     let group = service.group(&group_id)?;
-                    let context = HerdrContext::from_env()
-                        .context("Observer must be launched from the Tether plugin pane")?;
+                    let context =
+                        HerdrContext::from_env().context(OBSERVER_PLUGIN_CONTEXT_ERROR)?;
                     let executable =
                         env::current_exe().context("locate the bundled Tether executable")?;
-                    place_observer_in_herdr(context, executable, &group, config.ui.placement)
+                    place_observer_in_herdr(context, executable, &group, placement)
                 })();
-                if launch.is_ok() {
-                    return Ok(ObserverManagerFlow::Launched);
+                match launch {
+                    Ok(()) => return Ok(ObserverManagerFlow::Launched),
+                    Err(error) => notice = Some(observer_launch_failure_notice(&error)),
                 }
-                notice = Some("Could not launch Observer; source pane was preserved".to_owned());
             }
         }
     }
+}
+
+fn observer_launch_failure_notice(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == OBSERVER_PLUGIN_CONTEXT_ERROR)
+    {
+        return "Could not launch Observer; open it through prefix+t in a Herdr pane; \
+                source pane was preserved"
+            .to_owned();
+    }
+    "Could not launch Observer; source pane was preserved".to_owned()
 }
 
 fn execute_selection(paths: &AppPaths, config: &Config, selection: PickerSelection) -> Result<()> {
@@ -1770,5 +1788,18 @@ mod tests {
         assert!(options.hosts.iter().all(|host| host.name == "build"));
         assert_eq!(options.hosts[0].origin, PickerHostOrigin::Effective);
         assert_eq!(options.hosts[1].origin, PickerHostOrigin::Retained);
+    }
+
+    #[test]
+    fn missing_plugin_context_launch_notice_is_actionable_and_safe() {
+        let error = anyhow::anyhow!("HERDR_PANE_ID is not set")
+            .context("Observer must be launched from the Tether plugin pane");
+
+        let notice = observer_launch_failure_notice(&error);
+
+        assert!(notice.contains("prefix+t"));
+        assert!(notice.contains("Herdr pane"));
+        assert!(notice.contains("source pane was preserved"));
+        assert!(!notice.contains("HERDR_PANE_ID"));
     }
 }

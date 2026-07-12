@@ -137,6 +137,27 @@ fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() 
 }
 
 #[test]
+fn create_explains_missing_or_insufficient_running_workloads_immediately() {
+    let mut empty = state_with_sessions();
+    empty.sessions.clear();
+    let mut manager = ObserverManagerState::from_state(&empty, None).unwrap();
+    manager.handle(ObserverManagerEvent::Create);
+    assert_eq!(manager.screen(), ObserverManagerScreen::Groups);
+    assert!(
+        manager
+            .footer_text()
+            .contains("No running exact-owned workloads")
+    );
+
+    let mut single = state_with_sessions();
+    single.sessions.truncate(1);
+    let mut manager = ObserverManagerState::from_state(&single, None).unwrap();
+    manager.handle(ObserverManagerEvent::Create);
+    assert_eq!(manager.screen(), ObserverManagerScreen::Groups);
+    assert!(manager.footer_text().contains("at least two running"));
+}
+
+#[test]
 fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     let mut state = state_with_sessions();
     state.orchestration_groups.push(group(&state));
@@ -163,7 +184,7 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     assert_eq!(edit.screen(), ObserverManagerScreen::EditWorkers);
     assert_eq!(
         edit.item_labels(),
-        vec!["[ ] test / checks / shell", "[x] build / atlas / dev (2)",]
+        vec!["[x] build / atlas / dev (2)", "[ ] test / checks / shell",]
     );
     edit.handle(ObserverManagerEvent::Toggle);
     edit.handle(ObserverManagerEvent::Next);
@@ -194,6 +215,92 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
         delete.handle(ObserverManagerEvent::ConfirmDelete),
         ObserverManagerOutcome::Action(ObserverManagerAction::Delete { group_id })
     );
+}
+
+#[test]
+fn edit_without_changes_preserves_and_displays_non_running_existing_members() {
+    let mut state = state_with_sessions();
+    let mut existing = group(&state);
+    existing.workers[0].title = None;
+    state.orchestration_groups.push(existing);
+    state.sessions[1].status = SessionStatus::Ended;
+    state.sessions[1].closed_at = Some(state.sessions[1].last_used_at);
+    let expected_worker = state.sessions[1].id;
+
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Confirm);
+
+    assert_eq!(manager.screen(), ObserverManagerScreen::EditWorkers);
+    let labels = manager.item_labels();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Unavailable worker 1")),
+        "{labels:?}"
+    );
+    let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers { workers, .. }) =
+        manager.handle(ObserverManagerEvent::Confirm)
+    else {
+        panic!("an unchanged edit must preserve existing membership");
+    };
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].session_id, expected_worker);
+    assert_eq!(workers[0].title, None);
+}
+#[test]
+fn edit_without_changes_preserves_existing_worker_order() {
+    let mut state = state_with_sessions();
+    let mut existing = group(&state);
+    existing.workers.push(OrchestrationMember {
+        session_id: state.sessions[2].id,
+        membership_id: OrchestrationMembershipId::new(),
+        title: Some("test / checks / shell".parse().unwrap()),
+        capabilities: OrchestrationCapabilities {
+            observe_output: true,
+            open_interactive: true,
+        },
+    });
+    let expected = existing
+        .workers
+        .iter()
+        .map(|worker| worker.session_id)
+        .collect::<Vec<_>>();
+    state.orchestration_groups.push(existing);
+
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Confirm);
+    let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers { workers, .. }) =
+        manager.handle(ObserverManagerEvent::Confirm)
+    else {
+        panic!("an unchanged edit must preserve worker order");
+    };
+
+    assert_eq!(
+        workers
+            .iter()
+            .map(|worker| worker.session_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn delete_confirmation_leads_with_metadata_only_safety_text() {
+    let mut state = state_with_sessions();
+    let mut existing = group(&state);
+    existing.title = format!("Observer {}", "x".repeat(100)).parse().unwrap();
+    state.orchestration_groups.push(existing);
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Delete);
+
+    assert!(manager.item_labels()[0].starts_with("Metadata only; workloads keep running."));
+    let rendered = render_to_text(40, 10, &manager).unwrap();
+    assert!(rendered.contains("Metadata only"));
 }
 
 #[test]

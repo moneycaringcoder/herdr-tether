@@ -217,7 +217,7 @@ impl ObserverManagerState {
                 "Delete group".to_owned(),
             ],
             ObserverManagerScreen::ConfirmDelete => vec![format!(
-                "Delete {}? Metadata only; workloads keep running.",
+                "Metadata only; workloads keep running. Delete {}?",
                 self.selected_group_title()
             )],
         }
@@ -350,53 +350,64 @@ impl ObserverManagerState {
     }
 
     fn begin_create(&mut self) {
+        self.notice = match self.eligible.len() {
+            0 => Some("No running exact-owned workloads are available".to_owned()),
+            1 => Some("Observer needs at least two running exact-owned workloads".to_owned()),
+            _ => None,
+        };
+        if self.notice.is_some() {
+            self.screen = ObserverManagerScreen::Groups;
+            self.selected_index = self.groups.len();
+            return;
+        }
         self.screen = ObserverManagerScreen::CreateOrchestrator;
         self.screen_candidates.clone_from(&self.eligible);
         self.selected_index = 0;
         self.selected_group = None;
         self.selected_orchestrator = None;
         self.selected_workers.clear();
-        self.notice = None;
     }
 
     fn begin_edit(&mut self) {
         let group = self.selected_group().clone();
-        let mut candidates = self
-            .eligible
-            .iter()
-            .filter(|candidate| candidate.session_id != group.orchestrator_session_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let known = candidates
-            .iter()
-            .map(|candidate| candidate.session_id)
-            .collect::<HashSet<_>>();
+        let mut candidates = Vec::with_capacity(self.eligible.len() + group.workers.len());
+        let mut known = HashSet::with_capacity(group.workers.len());
         for (index, member) in group.workers.iter().enumerate() {
-            if known.contains(&member.session_id) {
-                if let Some(candidate) = candidates
-                    .iter_mut()
-                    .find(|candidate| candidate.session_id == member.session_id)
-                {
-                    candidate.existing = Some(member.clone());
-                }
-                continue;
-            }
-            let label = member
-                .title
-                .as_ref()
-                .map(|title| title.as_str().to_owned())
-                .unwrap_or_else(|| format!("Unavailable worker {}", index + 1));
-            candidates.push(Candidate {
-                session_id: member.session_id,
-                label: safe_component(&label, 72),
-                host: "unavailable".to_owned(),
-                repository: format!("worker-{}", index + 1),
-                title: safe_component(&label, 96)
-                    .parse()
-                    .expect("safe member title"),
-                existing: Some(member.clone()),
-            });
+            let mut candidate = self
+                .eligible
+                .iter()
+                .find(|candidate| candidate.session_id == member.session_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let label = member
+                        .title
+                        .as_ref()
+                        .map(|title| title.as_str().to_owned())
+                        .unwrap_or_else(|| format!("Unavailable worker {}", index + 1));
+                    Candidate {
+                        session_id: member.session_id,
+                        label: safe_component(&label, 72),
+                        host: "unavailable".to_owned(),
+                        repository: format!("worker-{}", index + 1),
+                        title: safe_component(&label, 96)
+                            .parse()
+                            .expect("safe member title"),
+                        existing: None,
+                    }
+                });
+            candidate.existing = Some(member.clone());
+            known.insert(member.session_id);
+            candidates.push(candidate);
         }
+        candidates.extend(
+            self.eligible
+                .iter()
+                .filter(|candidate| {
+                    candidate.session_id != group.orchestrator_session_id
+                        && !known.contains(&candidate.session_id)
+                })
+                .cloned(),
+        );
         self.selected_workers = group
             .workers
             .iter()
@@ -460,10 +471,7 @@ impl ObserverManagerState {
                     },
                     |existing| OrchestrationWorkerSpec {
                         session_id: existing.session_id,
-                        title: existing
-                            .title
-                            .clone()
-                            .or_else(|| Some(candidate.title.clone())),
+                        title: existing.title.clone(),
                         capabilities: existing.capabilities,
                     },
                 )

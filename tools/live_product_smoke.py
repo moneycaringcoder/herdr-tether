@@ -1211,7 +1211,7 @@ class Smoke:
         }
 
         self.interact(
-            [str(self.tether), "open"],
+            [str(self.tether), "open", "--placement", "new-tab"],
             picker_env,
             [
                 ("Hosts", b"o"),
@@ -1231,6 +1231,7 @@ class Smoke:
                 "UI-first Observer launch did not create exactly one outer pane: "
                 f"before={sorted(before_panes)}, after={sorted(panes)}"
             )
+        self.verify_placement("new-tab", invoking_pane, observer_pane)
         if self.tmux_sessions() != before_tmux:
             fail("Observer metadata/create launch changed workload lifecycle")
 
