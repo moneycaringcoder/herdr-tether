@@ -1,5 +1,14 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
+use chrono::{TimeZone, Utc};
+use herdr_tether::{
+    backend::ProcessBinaries,
+    config::Config,
+    model::SessionId,
+    snapshot::{Completion, collect},
+    state::{SessionRecord, SessionStatus, State},
+    status::MAX_STATUS_WORKLOADS,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -479,4 +488,53 @@ closed_days = 30
             "snapshot returned before SSH process {pid} was reaped"
         );
     }
+}
+
+#[test]
+fn snapshot_surfaces_status_workload_limit_as_typed_partial_data() {
+    let sandbox = Sandbox::new();
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let record = SessionRecord {
+        id: "tether-0197f198000070008000000000000001"
+            .parse::<SessionId>()
+            .unwrap(),
+        host: "local".into(),
+        target: "local".into(),
+        directory: "/work".into(),
+        preset: None,
+        command: None,
+        tmux_session_id: None,
+        ownership_proof: None,
+        status: SessionStatus::Running,
+        created_at: now,
+        last_used_at: now,
+        closed_at: None,
+        exit_status: None,
+    };
+    let mut config = Config::default();
+    config.discovery.local_roots.clear();
+    let state = State {
+        version: State::CURRENT_VERSION,
+        sessions: vec![record; MAX_STATUS_WORKLOADS + 1],
+        orchestration_groups: Vec::new(),
+    };
+
+    let snapshot = collect(
+        &config,
+        &state,
+        &[],
+        sandbox.path("home").to_str().unwrap(),
+        ProcessBinaries::new("/bin/true", "/bin/true"),
+    );
+
+    assert_eq!(snapshot.completion, Completion::Partial);
+    assert_eq!(snapshot.hosts.len(), 1);
+    assert_eq!(snapshot.hosts[0].reachability.status, "error");
+    assert_eq!(snapshot.hosts[0].external_catalog.status, "error");
+    assert!(
+        snapshot.hosts[0]
+            .owned_sessions
+            .iter()
+            .all(|session| session.workload_status == "error")
+    );
 }

@@ -185,7 +185,7 @@ pub fn collect(
             workers: discovery_workers,
         },
     );
-    let status_run = status_service.start(StatusRequest {
+    let status_run = status_service.try_start(StatusRequest {
         generation,
         hosts: status_hosts,
     });
@@ -204,24 +204,37 @@ pub fn collect(
         .iter()
         .map(|host| (host.name.clone(), HostResults::default()))
         .collect();
-    let mut status_finished = false;
+    let mut status_finished = status_run.is_err();
     let mut discovery_finished = false;
     let mut status_closed = false;
     let mut discovery_closed = false;
     let mut broken_stream = false;
+    if status_run.is_err() {
+        for result in results.values_mut() {
+            result.reachability = Some(HostReachability::Error);
+            result.catalog = Some((ExternalCatalogStatus::Error, Vec::new(), 0, 0));
+        }
+        for (id, host) in &workload_hosts {
+            if let Some(result) = results.get_mut(host) {
+                result.workloads.insert(*id, WorkloadStatus::Error);
+            }
+        }
+    }
 
     while !((status_finished || status_closed) && (discovery_finished || discovery_closed))
         && Instant::now() < deadline
     {
-        let progressed = drain_status(
-            generation,
-            &status_run,
-            &workload_hosts,
-            &mut results,
-            &mut status_finished,
-            &mut status_closed,
-            &mut broken_stream,
-        ) | drain_discovery(
+        let progressed = status_run.as_ref().is_ok_and(|status_run| {
+            drain_status(
+                generation,
+                status_run,
+                &workload_hosts,
+                &mut results,
+                &mut status_finished,
+                &mut status_closed,
+                &mut broken_stream,
+            )
+        }) | drain_discovery(
             generation,
             &discovery_run,
             &mut results,
@@ -236,21 +249,25 @@ pub fn collect(
 
     let cancelled = !(status_finished && discovery_finished);
     if cancelled {
-        status_run.cancel();
+        if let Ok(status_run) = &status_run {
+            status_run.cancel();
+        }
         discovery_run.cancel();
         let shutdown_deadline = Instant::now() + SHUTDOWN_MARGIN;
         while !((status_finished || status_closed) && (discovery_finished || discovery_closed))
             && Instant::now() < shutdown_deadline
         {
-            let progressed = drain_status(
-                generation,
-                &status_run,
-                &workload_hosts,
-                &mut results,
-                &mut status_finished,
-                &mut status_closed,
-                &mut broken_stream,
-            ) | drain_discovery(
+            let progressed = status_run.as_ref().is_ok_and(|status_run| {
+                drain_status(
+                    generation,
+                    status_run,
+                    &workload_hosts,
+                    &mut results,
+                    &mut status_finished,
+                    &mut status_closed,
+                    &mut broken_stream,
+                )
+            }) | drain_discovery(
                 generation,
                 &discovery_run,
                 &mut results,

@@ -2,7 +2,7 @@ use std::{fs, io::Write, path::Path, sync::Mutex, time::SystemTime};
 
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
-    backend::CommandSpec,
+    backend::{CommandSpec, ProcessBinaries},
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
@@ -10,7 +10,8 @@ use herdr_tether::{
     model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, StatusMessage, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS,
+        StatusMessage, StatusRequestError, StatusService, WorkloadStatus,
     },
     tui::{
         PickerCloseAction, PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin,
@@ -892,6 +893,33 @@ fn long_host_picker(count: usize) -> PickerState {
         })
         .collect();
     PickerState::new(options).unwrap()
+}
+
+#[test]
+fn picker_status_refresh_surfaces_workload_limit_rejection_as_error_state() {
+    let (config, state) = picker_fixture();
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let workload = options.hosts[0].workloads[0].clone();
+    options.hosts[0].workloads = vec![workload; MAX_STATUS_WORKLOADS + 1];
+    let mut picker = PickerState::new(options).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new("/bin/true", "/bin/true"),
+        std::time::Duration::from_secs(1),
+        1,
+    );
+
+    let error = picker.start_status_refresh(&service, 17).unwrap_err();
+
+    assert_eq!(
+        error,
+        StatusRequestError::TooManyWorkloads {
+            actual: MAX_STATUS_WORKLOADS + 1,
+            maximum: MAX_STATUS_WORKLOADS,
+        }
+    );
+    let rendered = render_picker_to_text(100, 20, &picker).unwrap();
+    assert!(rendered.contains("error"));
+    assert!(!error.to_string().contains("builder@example.test"));
 }
 
 #[test]

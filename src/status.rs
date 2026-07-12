@@ -19,6 +19,7 @@ use crate::{
     model::{ExternalSessionName, SessionId},
     tmux::TmuxBackend,
 };
+use thiserror::Error;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
@@ -73,9 +74,11 @@ pub struct StatusRequest {
     pub hosts: Vec<StatusHost>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StatusRequestError {
+    #[error("status host count {actual} exceeds limit {maximum}")]
     TooManyHosts { actual: usize, maximum: usize },
+    #[error("status workload count {actual} exceeds limit {maximum}")]
     TooManyWorkloads { actual: usize, maximum: usize },
 }
 
@@ -133,12 +136,6 @@ impl StatusService {
             timeout,
             workers: workers.clamp(1, MAX_STATUS_WORKERS),
         }
-    }
-
-    pub fn start(&self, request: StatusRequest) -> StatusRun {
-        let generation = request.generation;
-        self.try_start(request)
-            .unwrap_or_else(|_| finished_run(generation))
     }
 
     pub fn try_start(&self, mut request: StatusRequest) -> Result<StatusRun, StatusRequestError> {
@@ -235,15 +232,6 @@ fn normalize_status_hosts(hosts: Vec<StatusHost>) -> Vec<StatusHost> {
         }
     }
     normalized
-}
-
-fn finished_run(generation: u64) -> StatusRun {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _ = sender.send(StatusMessage::Finished { generation });
-    StatusRun {
-        receiver,
-        cancelled: Arc::new(AtomicBool::new(false)),
-    }
 }
 
 #[derive(Debug)]

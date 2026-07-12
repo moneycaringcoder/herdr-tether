@@ -50,21 +50,23 @@ fn fast_host_publishes_before_slow_host_times_out() {
         2,
     );
     let started = Instant::now();
-    let run = service.start(StatusRequest {
-        generation: 7,
-        hosts: vec![
-            StatusHost {
-                name: "slow".into(),
-                target: Some("slow".into()),
-                workloads: vec![slow_id],
-            },
-            StatusHost {
-                name: "fast".into(),
-                target: Some("fast".into()),
-                workloads: vec![fast_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 7,
+            hosts: vec![
+                StatusHost {
+                    name: "slow".into(),
+                    target: Some("slow".into()),
+                    workloads: vec![slow_id],
+                },
+                StatusHost {
+                    name: "fast".into(),
+                    target: Some("fast".into()),
+                    workloads: vec![fast_id],
+                },
+            ],
+        })
+        .unwrap();
 
     let mut messages = Vec::new();
     loop {
@@ -129,14 +131,16 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
         Duration::from_secs(10),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 8,
-        hosts: vec![StatusHost {
-            name: "dev".into(),
-            target: Some("dev".into()),
-            workloads: vec![owned],
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 8,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![owned],
+            }],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -205,21 +209,23 @@ esac
         Duration::from_secs(10),
         2,
     );
-    let run = service.start(StatusRequest {
-        generation: 10,
-        hosts: vec![
-            StatusHost {
-                name: "duplicate".into(),
-                target: Some("duplicate".into()),
-                workloads: vec![duplicate_id],
-            },
-            StatusHost {
-                name: "unsafe".into(),
-                target: Some("unsafe".into()),
-                workloads: vec![unsafe_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 10,
+            hosts: vec![
+                StatusHost {
+                    name: "duplicate".into(),
+                    target: Some("duplicate".into()),
+                    workloads: vec![duplicate_id],
+                },
+                StatusHost {
+                    name: "unsafe".into(),
+                    target: Some("unsafe".into()),
+                    workloads: vec![unsafe_id],
+                },
+            ],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -282,14 +288,16 @@ fn cancelled_generation_does_not_publish_late_results() {
         Duration::from_secs(3),
         2,
     );
-    let run = service.start(StatusRequest {
-        generation: 1,
-        hosts: vec![StatusHost {
-            name: "slow".into(),
-            target: Some("slow".into()),
-            workloads: vec![workload],
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 1,
+            hosts: vec![StatusHost {
+                name: "slow".into(),
+                target: Some("slow".into()),
+                workloads: vec![workload],
+            }],
+        })
+        .unwrap();
 
     run.cancel();
     let started = Instant::now();
@@ -331,26 +339,28 @@ esac
         Duration::from_secs(10),
         3,
     );
-    let run = service.start(StatusRequest {
-        generation: 9,
-        hosts: vec![
-            StatusHost {
-                name: "offline".into(),
-                target: Some("offline".into()),
-                workloads: vec![offline_id],
-            },
-            StatusHost {
-                name: "empty".into(),
-                target: Some("empty".into()),
-                workloads: vec![empty_id],
-            },
-            StatusHost {
-                name: "malformed".into(),
-                target: Some("malformed".into()),
-                workloads: vec![malformed_id],
-            },
-        ],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 9,
+            hosts: vec![
+                StatusHost {
+                    name: "offline".into(),
+                    target: Some("offline".into()),
+                    workloads: vec![offline_id],
+                },
+                StatusHost {
+                    name: "empty".into(),
+                    target: Some("empty".into()),
+                    workloads: vec![empty_id],
+                },
+                StatusHost {
+                    name: "malformed".into(),
+                    target: Some("malformed".into()),
+                    workloads: vec![malformed_id],
+                },
+            ],
+        })
+        .unwrap();
     let mut messages = Vec::new();
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -423,14 +433,16 @@ fn local_spawn_error_includes_actionable_tool_locations() {
         Duration::from_millis(100),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 9,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 9,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let message = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
     let StatusMessage::Host {
@@ -458,14 +470,16 @@ fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
         Duration::MAX,
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 10,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 10,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let first = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(matches!(
@@ -506,14 +520,16 @@ fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
         Duration::from_secs(1),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 11,
-        hosts: vec![StatusHost {
-            name: "private-alias".into(),
-            target: Some("private.example".into()),
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 11,
+            hosts: vec![StatusHost {
+                name: "private-alias".into(),
+                target: Some("private.example".into()),
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     let StatusMessage::Host {
         status: HostReachability::Unreachable,
@@ -551,14 +567,16 @@ fn successful_probe_does_not_leave_background_descendants_running() {
         Duration::from_secs(1),
         1,
     );
-    let run = service.start(StatusRequest {
-        generation: 12,
-        hosts: vec![StatusHost {
-            name: "local".into(),
-            target: None,
-            workloads: Vec::new(),
-        }],
-    });
+    let run = service
+        .try_start(StatusRequest {
+            generation: 12,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: Vec::new(),
+            }],
+        })
+        .unwrap();
 
     while !matches!(
         run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -621,6 +639,29 @@ fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
         }
     );
     assert!(!marker.exists(), "an invalid request reached the probe");
+
+    let run = service
+        .try_start(StatusRequest {
+            generation: 21,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: vec![workload; MAX_STATUS_WORKLOADS],
+            }],
+        })
+        .expect("the exact workload boundary must remain valid");
+    loop {
+        if matches!(
+            run.receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            StatusMessage::Finished { generation: 21 }
+        ) {
+            break;
+        }
+    }
+    assert!(
+        marker.exists(),
+        "a boundary-valid request did not reach the probe"
+    );
 }
 
 #[test]
