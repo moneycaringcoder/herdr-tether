@@ -190,13 +190,14 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     edit.handle(ObserverManagerEvent::Next);
     edit.handle(ObserverManagerEvent::Toggle);
     let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
-        group_id: edited_group,
+        expected_group,
         workers,
     }) = edit.handle(ObserverManagerEvent::Confirm)
     else {
         panic!("edit confirmation must request one metadata replacement");
     };
-    assert_eq!(edited_group, group_id);
+    assert_eq!(expected_group.id, group_id);
+    assert_eq!(expected_group, state.orchestration_groups[0]);
     assert_eq!(workers.len(), 1);
     assert_eq!(workers[0].session_id, state.sessions[2].id);
 
@@ -213,7 +214,9 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     delete.handle(ObserverManagerEvent::Delete);
     assert_eq!(
         delete.handle(ObserverManagerEvent::ConfirmDelete),
-        ObserverManagerOutcome::Action(ObserverManagerAction::Delete { group_id })
+        ObserverManagerOutcome::Action(ObserverManagerAction::Delete {
+            expected_group: state.orchestration_groups[0].clone()
+        })
     );
 }
 

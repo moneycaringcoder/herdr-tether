@@ -14,6 +14,9 @@
 - Debounced queued or repeated `Enter` events inside Observer so one open gesture places one interactive view, reports progress, and does not change ordinary intentional multi-attach behavior.
 - Replaced collapsed tile borders at tiny pane sizes with a bounded resize message and made Observer chrome use terminal-default foreground and background colors while retaining sanitized capture text.
 - Kept companion creation from running in or closing its source launcher pane, including when configured placement requests replacement.
+- Revalidated UI-selected orchestrators and newly added workers as running exact-owned workloads inside the locked state transaction, while preserving already-retained unavailable members.
+- Rejected manager edit or delete requests when the displayed group snapshot changed before commit, preventing stale screens from overwriting or deleting concurrent metadata updates.
+- Required native Observer-manager placement to use `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` and fail closed instead of falling back to a managed overlay pane ID.
 
 ### Limitations
 

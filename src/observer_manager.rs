@@ -70,11 +70,11 @@ pub enum ObserverManagerAction {
         workers: Vec<OrchestrationWorkerSpec>,
     },
     ReplaceWorkers {
-        group_id: OrchestrationGroupId,
+        expected_group: OrchestrationGroup,
         workers: Vec<OrchestrationWorkerSpec>,
     },
     Delete {
-        group_id: OrchestrationGroupId,
+        expected_group: OrchestrationGroup,
     },
     Launch {
         group_id: OrchestrationGroupId,
@@ -447,14 +447,14 @@ impl ObserverManagerState {
             return ObserverManagerOutcome::Continue;
         }
         ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers {
-            group_id: self.selected_group_id(),
+            expected_group: self.selected_group().clone(),
             workers: self.selected_worker_specs(),
         })
     }
 
     fn delete_action(&self) -> ObserverManagerOutcome {
         ObserverManagerOutcome::Action(ObserverManagerAction::Delete {
-            group_id: self.selected_group_id(),
+            expected_group: self.selected_group().clone(),
         })
     }
 

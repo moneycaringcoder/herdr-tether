@@ -33,19 +33,56 @@ impl HerdrContext {
     /// Loads the subset of Herdr's plugin environment needed to place panes.
     pub fn from_env() -> Result<Self> {
         let pane_id = required_string_env("HERDR_PANE_ID", Some("PANE_ID"))?;
-        let plugin_context = match env::var("HERDR_PLUGIN_CONTEXT_JSON") {
-            Ok(value) => Some(value),
-            Err(env::VarError::NotPresent) => None,
-            Err(env::VarError::NotUnicode(_)) => {
-                bail!("Herdr provided a non-UTF-8 HERDR_PLUGIN_CONTEXT_JSON")
-            }
-        };
+        let plugin_context = plugin_context_env()?;
         Ok(Self {
             binary: required_os_env("HERDR_BIN_PATH")?.into(),
             pane_id: placement_pane_id(pane_id, plugin_context.as_deref())?,
             workspace_id: required_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
         })
     }
+
+    /// Loads authoritative placement context for a managed plugin UI action.
+    ///
+    /// Unlike [`Self::from_env`], this never falls back to the managed pane ID.
+    pub fn from_plugin_env() -> Result<Self> {
+        let plugin_context = plugin_context_env()?;
+        Self::from_plugin_values(
+            required_os_env("HERDR_BIN_PATH")?.into(),
+            required_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
+            plugin_context.as_deref(),
+        )
+    }
+
+    fn from_plugin_values(
+        binary: PathBuf,
+        workspace_id: String,
+        plugin_context: Option<&str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            binary,
+            pane_id: plugin_placement_pane_id(plugin_context)?,
+            workspace_id,
+        })
+    }
+}
+
+fn plugin_context_env() -> Result<Option<String>> {
+    match env::var("HERDR_PLUGIN_CONTEXT_JSON") {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("Herdr provided a non-UTF-8 HERDR_PLUGIN_CONTEXT_JSON")
+        }
+    }
+}
+
+fn plugin_placement_pane_id(plugin_context: Option<&str>) -> Result<String> {
+    let plugin_context = plugin_context.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Herdr did not provide HERDR_PLUGIN_CONTEXT_JSON for authoritative plugin placement"
+        )
+    })?;
+    placement_pane_id(String::new(), Some(plugin_context))
 }
 
 fn placement_pane_id(pane_id: String, plugin_context: Option<&str>) -> Result<String> {
@@ -904,6 +941,42 @@ mod tests {
         assert_eq!(
             placement_pane_id("w1:p2".to_owned(), None).unwrap(),
             "w1:p2"
+        );
+    }
+
+    #[test]
+    fn strict_plugin_context_never_falls_back_to_the_managed_pane() {
+        let placements = std::cell::Cell::new(0);
+        let result =
+            HerdrContext::from_plugin_values(PathBuf::from("/bin/herdr"), "w1".to_owned(), None)
+                .inspect(|_| {
+                    placements.set(placements.get() + 1);
+                });
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("HERDR_PLUGIN_CONTEXT_JSON"), "{error}");
+        assert_eq!(
+            placements.get(),
+            0,
+            "missing plugin JSON must place no pane"
+        );
+        assert_eq!(
+            HerdrContext::from_plugin_values(
+                PathBuf::from("/bin/herdr"),
+                "w1".to_owned(),
+                Some(r#"{"focused_pane_id":"w1:p1"}"#),
+            )
+            .unwrap()
+            .pane_id,
+            "w1:p1"
+        );
+        assert!(
+            HerdrContext::from_plugin_values(
+                PathBuf::from("/bin/herdr"),
+                "w1".to_owned(),
+                Some(r#"{"pane_id":"w1:pF"}"#),
+            )
+            .is_err()
         );
     }
 

@@ -139,6 +139,34 @@ def terminal_screen_text(data: bytes, rows: int = 40, columns: int = 140) -> str
     return "\n".join("".join(line).rstrip() for line in screen)
 
 
+def process_fingerprint(
+    payload: object,
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    processes: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            if "pid" in value:
+                argv = value.get("argv")
+                processes.append(
+                    (
+                        str(value.get("pid")),
+                        str(value.get("name", "")),
+                        tuple(str(item) for item in argv)
+                        if isinstance(argv, list)
+                        else (),
+                    )
+                )
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return tuple(sorted(set(processes)))
+
+
 class Smoke:
     def __init__(
         self,
@@ -170,6 +198,9 @@ class Smoke:
         self._reader: threading.Thread | None = None
         self._cleaned = False
         self.owned_ids: set[str] = set()
+        self.plugin_config: Path | None = None
+        self.plugin_state: Path | None = None
+
         inherited_path = os.environ.get("PATH", "")
         resolved_tmux = shutil.which("tmux", path=inherited_path)
         self.tmux = Path(resolved_tmux).resolve() if resolved_tmux else Path("tmux")
@@ -544,6 +575,98 @@ class Smoke:
             except OSError:
                 pass
 
+    def pane_visible_text(self, pane_id: str) -> str:
+        result = self.herdr_run(
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            "visible",
+            "--format",
+            "text",
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return result.stdout
+        values = (
+            self.collect_strings(payload, "text")
+            + self.collect_strings(payload, "content")
+            + self.collect_strings(payload, "output")
+        )
+        return "\n".join(values) if values else result.stdout
+
+    def interact_managed_pane(
+        self,
+        pane_id: str,
+        steps: list[tuple[str, tuple[str, ...]]],
+    ) -> None:
+        for marker, keys in steps:
+            def visible() -> bool:
+                if pane_id not in self.pane_ids():
+                    fail(
+                        f"managed plugin pane {pane_id} closed before marker {marker!r}"
+                    )
+                return marker in self.pane_visible_text(pane_id)
+
+            self.wait_until(f"managed plugin picker marker {marker!r}", visible)
+            if keys:
+                self.herdr_run("pane", "send-keys", pane_id, *keys)
+
+    def pane_process_fingerprint(self, pane_id: str) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+        payload = self.result_object(
+            self.decode_json(
+                self.herdr_run("pane", "process-info", "--pane", pane_id),
+                f"pane {pane_id} process info",
+            ),
+            f"pane {pane_id} process info",
+        )
+        return process_fingerprint(payload)
+
+    def invoke_plugin_picker(self) -> tuple[str, str, str]:
+        workspace_id, _ = self.workspace_and_pane()
+        invoking_pane = self.focused_pane()
+        before = self.pane_ids()
+        response = self.result_object(
+            self.decode_json(
+                self.herdr_run(
+                    "plugin", "action", "invoke", "open", "--plugin", PLUGIN_ID
+                ),
+                "invoke open action",
+            ),
+            "invoke open action",
+        )
+        if "started" not in json.dumps(response, sort_keys=True).lower():
+            fail(f"open action did not report a started command: {response}")
+        def picker_ready() -> str | bool:
+            matches = [
+                pane_id
+                for pane_id in self.pane_ids() - before
+                if "Hosts" in self.pane_visible_text(pane_id)
+            ]
+            if len(matches) > 1:
+                fail(f"open action created multiple ready picker panes: {sorted(matches)}")
+            return matches[0] if matches else False
+
+        picker_pane = self.wait_until(
+            "open action managed picker pane readiness", picker_ready
+        )
+        logs = self.result_object(
+            self.decode_json(
+                self.herdr_run(
+                    "plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "20"
+                ),
+                "open action log",
+            ),
+            "open action log",
+        )
+        if "open" not in json.dumps(logs, sort_keys=True):
+            fail(f"Herdr plugin logs did not record the open action: {logs}")
+        return workspace_id, invoking_pane, picker_pane
+
     def picker_event_contract(self, workspace_id: str, invoking_pane: str) -> None:
         picker_env = self.tether_env(workspace_id, invoking_pane)
         before_panes = self.pane_ids()
@@ -881,88 +1004,83 @@ class Smoke:
 
         config_before = self.file_fingerprint(self.herdr_config)
         workspace_id, invoking_pane = self.workspace_and_pane()
-        for action in ("open", "setup"):
-            before = self.pane_ids()
-            response = self.result_object(
-                self.decode_json(
-                    self.herdr_run(
-                        "plugin", "action", "invoke", action, "--plugin", PLUGIN_ID
-                    ),
-                    f"invoke {action} action",
+        before = self.pane_ids()
+        response = self.result_object(
+            self.decode_json(
+                self.herdr_run(
+                    "plugin", "action", "invoke", "setup", "--plugin", PLUGIN_ID
                 ),
-                f"invoke {action} action",
+                "invoke setup action",
+            ),
+            "invoke setup action",
+        )
+        if "started" not in json.dumps(response, sort_keys=True).lower():
+            fail(f"setup action did not report a started command: {response}")
+        self.wait_new_pane(before, "setup action managed pane")
+        plugin_config = (
+            self.root
+            / "config"
+            / "herdr"
+            / "plugins"
+            / "config"
+            / PLUGIN_ID
+            / "config.toml"
+        )
+        plugin_state = (
+            self.root
+            / "state"
+            / "herdr"
+            / "plugins"
+            / PLUGIN_ID
+            / "state.json"
+        )
+        self.wait_until(
+            "setup action plugin files",
+            lambda: plugin_config.is_file() and plugin_state.is_file(),
+        )
+        try:
+            json.loads(plugin_state.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            fail(f"setup action state is unreadable or invalid JSON: {error}")
+        plugin_env = self.tether_env(workspace_id, invoking_pane)
+        plugin_env.update(
+            {
+                "HERDR_PLUGIN_CONFIG_DIR": str(plugin_config.parent),
+                "HERDR_PLUGIN_STATE_DIR": str(plugin_state.parent),
+            }
+        )
+        doctor = self.run([str(self.tether), "doctor"], env=plugin_env, check=False)
+        if doctor.returncode == 0:
+            fail("restricted-path plugin doctor unexpectedly found Cargo")
+        for executable in ("tmux", "ssh"):
+            if f"{executable}: ok" not in doctor.stdout:
+                fail(
+                    f"plugin doctor did not resolve {executable} under the restricted GUI PATH: "
+                    f"{doctor.stdout}"
+                )
+        if "cargo: missing (install it or add it to PATH)" not in doctor.stdout:
+            fail(
+                "plugin doctor did not expose actionable missing-Cargo guidance: "
+                f"{doctor.stdout}"
             )
-            if "started" not in json.dumps(response, sort_keys=True).lower():
-                fail(f"{action} action did not report a started command: {response}")
-            if action == "open":
-                pane_id = self.wait_new_pane(before, "open action managed pane")
-                self.close_pane(pane_id)
-            else:
-                self.wait_new_pane(before, "setup action managed pane")
-                plugin_config = (
-                    self.root
-                    / "config"
-                    / "herdr"
-                    / "plugins"
-                    / "config"
-                    / PLUGIN_ID
-                    / "config.toml"
-                )
-                plugin_state = (
-                    self.root
-                    / "state"
-                    / "herdr"
-                    / "plugins"
-                    / PLUGIN_ID
-                    / "state.json"
-                )
-                self.wait_until(
-                    "setup action plugin files",
-                    lambda: plugin_config.is_file() and plugin_state.is_file(),
-                )
-                try:
-                    json.loads(plugin_state.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as error:
-                    fail(f"setup action state is unreadable or invalid JSON: {error}")
-                plugin_env = self.tether_env(workspace_id, invoking_pane)
-                plugin_env.update(
-                    {
-                        "HERDR_PLUGIN_CONFIG_DIR": str(plugin_config.parent),
-                        "HERDR_PLUGIN_STATE_DIR": str(plugin_state.parent),
-                    }
-                )
-                doctor = self.run(
-                    [str(self.tether), "doctor"], env=plugin_env, check=False
-                )
-                if doctor.returncode == 0:
-                    fail("restricted-path plugin doctor unexpectedly found Cargo")
-                for executable in ("tmux", "ssh"):
-                    if f"{executable}: ok" not in doctor.stdout:
-                        fail(
-                            f"plugin doctor did not resolve {executable} under the restricted GUI PATH: "
-                            f"{doctor.stdout}"
-                        )
-                if "cargo: missing (install it or add it to PATH)" not in doctor.stdout:
-                    fail(
-                        "plugin doctor did not expose actionable missing-Cargo guidance: "
-                        f"{doctor.stdout}"
-                    )
-                if self.herdr_master is None:
-                    fail("Herdr PTY is unavailable while dismissing setup result")
-                os.write(self.herdr_master, b"\r")
-                self.wait_until(
-                    "setup action managed pane exit",
-                    lambda: not (self.pane_ids() - before),
-                )
-            logs = self.result_object(
-                self.decode_json(
-                    self.herdr_run("plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "20"),
-                    f"{action} action log",
+        if self.herdr_master is None:
+            fail("Herdr PTY is unavailable while dismissing setup result")
+        os.write(self.herdr_master, b"\r")
+        self.wait_until(
+            "setup action managed pane exit",
+            lambda: not (self.pane_ids() - before),
+        )
+        logs = self.result_object(
+            self.decode_json(
+                self.herdr_run(
+                    "plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "20"
                 ),
-                f"{action} action log",
-            )
-            if action not in json.dumps(logs, sort_keys=True):
-                fail(f"Herdr plugin logs did not record the {action} action: {logs}")
+                "setup action log",
+            ),
+            "setup action log",
+        )
+        if "setup" not in json.dumps(logs, sort_keys=True):
+            fail(f"Herdr plugin logs did not record the setup action: {logs}")
 
         config_after = self.herdr_config.read_bytes()
         if b'key = "prefix+t"' not in config_after or PLUGIN_ID.encode() not in config_after:
@@ -972,6 +1090,17 @@ class Smoke:
         )
         if not backup.exists() or self.file_fingerprint(backup) != config_before:
             fail("explicit Tether launcher setup action did not preserve the exact config backup")
+
+        plugin_config_text = plugin_config.read_text(encoding="utf-8")
+        configured = 'placement = "split-right"'
+        if configured not in plugin_config_text:
+            fail(f"plugin config omitted default placement: {plugin_config_text}")
+        plugin_config.write_text(
+            plugin_config_text.replace(configured, 'placement = "new-tab"', 1),
+            encoding="utf-8",
+        )
+        self.plugin_config = plugin_config
+        self.plugin_state = plugin_state
 
     @staticmethod
     def file_fingerprint(path: Path) -> tuple[bool, str]:
@@ -1195,94 +1324,132 @@ class Smoke:
         self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
 
-    def observer_manager_contract(
-        self,
-        workspace_id: str,
-        invoking_pane: str,
-        owned_ids: set[str],
-    ) -> None:
-        picker_env = self.tether_env(workspace_id, invoking_pane)
-        before_panes = self.pane_ids()
-        before_tmux = self.tmux_sessions()
-        before_status = {
-            str(record.get("id")): str(record.get("status"))
-            for record in self.state_records()
-            if record.get("id") in owned_ids
-        }
+    def observer_manager_contract(self, owned_ids: set[str]) -> None:
+        if self.plugin_state is None:
+            fail("plugin state path is unavailable before Observer smoke")
+        product_state = self.root / "state" / "herdr-tether" / "state.json"
+        self.plugin_state.write_bytes(product_state.read_bytes())
+        self.plugin_state.chmod(0o600)
 
-        self.interact(
-            [str(self.tether), "open", "--placement", "new-tab"],
-            picker_env,
+        def plugin_payload() -> dict[str, Any]:
+            try:
+                payload = json.loads(self.plugin_state.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                fail(f"could not read plugin-owned Tether state: {error}")
+            if not isinstance(payload, dict):
+                fail(f"plugin-owned Tether state has an unexpected shape: {payload}")
+            return payload
+
+        def owned_status(payload: dict[str, Any]) -> dict[str, str]:
+            sessions = payload.get("sessions")
+            if not isinstance(sessions, list):
+                fail(f"plugin-owned Tether state omitted sessions: {payload}")
+            return {
+                str(record.get("id")): str(record.get("status"))
+                for record in sessions
+                if isinstance(record, dict) and record.get("id") in owned_ids
+            }
+
+        before_tmux = self.tmux_sessions()
+        before_status = owned_status(plugin_payload())
+        _, invoking_pane, picker_pane = self.invoke_plugin_picker()
+        self.interact_managed_pane(
+            picker_pane,
             [
-                ("Hosts", b"o"),
-                ("Tether \u00b7 Observers", b"n"),
-                ("Choose orchestrator", b"\r"),
-                ("Choose workers", b" \r"),
-                ("Created Observer", b"\r"),
-                ("Observer actions", b"\r"),
+                ("Hosts", ("o",)),
+                ("Tether \u00b7 Observers", ("n",)),
+                ("Choose orchestrator", ("Enter",)),
+                ("Choose workers", ("Space", "Enter")),
+                ("Created Observer", ("Enter",)),
+                ("Observer actions", ()),
             ],
         )
-        observer_pane = self.wait_new_pane(before_panes, "UI-first Observer companion")
+        before_launch_panes = self.pane_ids()
+        source_process = self.pane_process_fingerprint(invoking_pane)
+        self.herdr_run("pane", "send-keys", picker_pane, "Enter")
+        observer_pane = self.wait_new_pane(
+            before_launch_panes, "real plugin-picker Observer companion"
+        )
         panes = self.pane_ids()
         if invoking_pane not in panes:
-            fail("UI-first Observer launch closed its source launcher pane")
-        if panes - before_panes != {observer_pane}:
+            fail("real plugin-picker Observer launch closed its authoritative source pane")
+        if panes - before_launch_panes != {observer_pane}:
             fail(
-                "UI-first Observer launch did not create exactly one outer pane: "
-                f"before={sorted(before_panes)}, after={sorted(panes)}"
+                "real plugin-picker Observer launch did not create exactly one companion: "
+                f"before={sorted(before_launch_panes)}, after={sorted(panes)}"
             )
+        if self.pane_process_fingerprint(invoking_pane) != source_process:
+            fail("real plugin-picker Observer launch ran a command in its source pane")
         self.verify_placement("new-tab", invoking_pane, observer_pane)
+
+        def observer_started() -> bool:
+            fingerprint = self.pane_process_fingerprint(observer_pane)
+            rendered = repr(fingerprint)
+            return "observer-runtime" in rendered and observer_pane in rendered
+
+        self.wait_until("Observer runtime in exact returned destination", observer_started)
+        runtime_panes = [
+            pane_id
+            for pane_id in self.pane_ids()
+            if "observer-runtime" in repr(self.pane_process_fingerprint(pane_id))
+        ]
+        if runtime_panes != [observer_pane]:
+            fail(f"Observer runtime did not run exactly once in its destination: {runtime_panes}")
         if self.tmux_sessions() != before_tmux:
             fail("Observer metadata/create launch changed workload lifecycle")
 
-        payload = self.state_payload()
-        groups = payload.get("orchestration_groups") if isinstance(payload, dict) else None
+        payload = plugin_payload()
+        groups = payload.get("orchestration_groups")
         if not isinstance(groups, list) or len(groups) != 1:
-            fail(f"UI-first Observer did not persist one group: {payload}")
+            fail(f"real plugin-picker Observer did not persist one group: {payload}")
         group = groups[0]
         workers = group.get("workers") if isinstance(group, dict) else None
         if not isinstance(workers, list) or len(workers) != 1:
-            fail(f"UI-first Observer did not persist one selected worker: {group}")
+            fail(f"real plugin-picker Observer did not persist one selected worker: {group}")
         capabilities = workers[0].get("capabilities")
         if capabilities != {"observe_output": True, "open_interactive": True}:
-            fail(f"UI-first Observer used unexpected capability defaults: {capabilities}")
+            fail(f"real plugin-picker Observer used unexpected defaults: {capabilities}")
         if group.get("orchestrator_session_id") == workers[0].get("session_id"):
-            fail("UI-first Observer persisted its orchestrator as a worker")
-        after_status = {
-            str(record.get("id")): str(record.get("status"))
-            for record in self.state_records()
-            if record.get("id") in owned_ids
-        }
+            fail("real plugin-picker Observer persisted its orchestrator as a worker")
+        after_status = owned_status(payload)
         if after_status != before_status:
             fail(
-                "UI-first Observer create/open changed workload state: "
+                "real plugin-picker Observer create/open changed workload state: "
                 f"before={before_status}, after={after_status}"
             )
 
         self.close_pane(observer_pane)
-        self.interact(
-            [str(self.tether), "open"],
-            picker_env,
+        if self.focused_pane() != invoking_pane:
+            fail("closing Observer did not return focus to its authoritative source pane")
+        _, delete_source, delete_picker = self.invoke_plugin_picker()
+        if delete_source != invoking_pane:
+            fail(
+                "second plugin picker did not retain the authoritative source pane: "
+                f"expected {invoking_pane}, got {delete_source}"
+            )
+        self.interact_managed_pane(
+            delete_picker,
             [
-                ("Hosts", b"o"),
-                ("Tether \u00b7 Observers", b"\r"),
-                ("Observer actions", b"d"),
-                ("Confirm delete", b"y"),
-                ("Deleted Observer", b"\x1b"),
-                ("Hosts", b"\x1b"),
+                ("Hosts", ("o",)),
+                ("Tether \u00b7 Observers", ("Enter",)),
+                ("Observer actions", ("d",)),
+                ("Confirm delete", ("y",)),
+                ("Deleted Observer", ("Esc",)),
+                ("Hosts", ("Esc",)),
             ],
         )
-        payload = self.state_payload()
-        groups = payload.get("orchestration_groups")
+        self.wait_until(
+            "delete picker managed pane exit",
+            lambda: delete_picker not in self.pane_ids(),
+        )
+        groups = plugin_payload().get("orchestration_groups")
         if groups != []:
-            fail(f"UI-first Observer deletion left group metadata: {groups}")
-        final_status = {
-            str(record.get("id")): str(record.get("status"))
-            for record in self.state_records()
-            if record.get("id") in owned_ids
-        }
+            fail(f"real plugin-picker Observer deletion left group metadata: {groups}")
+        final_status = owned_status(plugin_payload())
         if final_status != before_status or self.tmux_sessions() != before_tmux:
-            fail("UI-first Observer deletion touched workload lifecycle")
+            fail("real plugin-picker Observer deletion touched workload lifecycle")
+        if self.pane_process_fingerprint(invoking_pane) != source_process:
+            fail("real plugin-picker Observer workflow changed its source process")
 
     def product_lifecycle(self) -> None:
         setup = self.run([str(self.tether), "setup", "--yes"])
@@ -1408,8 +1575,6 @@ class Smoke:
         )
 
         self.observer_manager_contract(
-            workspace_id,
-            initial_pane,
             {first_id, second_id, third_id, symlink_id},
         )
 
@@ -1435,6 +1600,28 @@ class Smoke:
             fail("--remote-directory must be an absolute disposable POSIX path")
         if not (self.repo_root / "herdr-plugin.toml").is_file():
             fail(f"repository root has no herdr-plugin.toml: {self.repo_root}")
+        plugin_binary = (self.repo_root / "target" / "release" / "herdr-tether").resolve()
+        try:
+            same_plugin_binary = self.tether.samefile(plugin_binary)
+        except OSError:
+            same_plugin_binary = False
+        if not same_plugin_binary:
+            fail(
+                "live plugin smoke requires --tether target/release/herdr-tether; "
+                f"got {self.tether}"
+            )
+        source_paths = [
+            self.repo_root / "Cargo.toml",
+            self.repo_root / "Cargo.lock",
+            self.repo_root / "herdr-plugin.toml",
+            *sorted((self.repo_root / "src").rglob("*.rs")),
+        ]
+        newest_source = max(path.stat().st_mtime_ns for path in source_paths)
+        if plugin_binary.stat().st_mtime_ns < newest_source:
+            fail(
+                "target/release/herdr-tether predates product sources; "
+                "run cargo build --release --locked before live plugin smoke"
+            )
         if not self.tmux.is_file() or not os.access(self.tmux, os.X_OK):
             fail(
                 "required executable tmux could not be resolved before entering "

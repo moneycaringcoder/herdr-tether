@@ -9,7 +9,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from live_product_smoke import Smoke, terminal_screen_text, validate_remote_target
+from live_product_smoke import (
+    Smoke,
+    process_fingerprint,
+    terminal_screen_text,
+    validate_remote_target,
+)
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
@@ -237,6 +242,31 @@ class SmokeEnvironmentTests(unittest.TestCase):
 
 
 
+
+    def test_process_fingerprint_extracts_nested_identity_deterministically(self) -> None:
+        payload = {
+            "result": {
+                "children": [
+                    {"pid": 42, "name": "sh", "argv": ["sh", "-c", "exec worker"]},
+                    {
+                        "nested": {
+                            "pid": 43,
+                            "name": "herdr-tether",
+                            "argv": ["herdr-tether", "observer-runtime"],
+                        }
+                    },
+                    {"pid": 42, "name": "sh", "argv": ["sh", "-c", "exec worker"]},
+                ]
+            }
+        }
+
+        self.assertEqual(
+            process_fingerprint(payload),
+            (
+                ("42", "sh", ("sh", "-c", "exec worker")),
+                ("43", "herdr-tether", ("herdr-tether", "observer-runtime")),
+            ),
+        )
 
     def test_terminal_screen_tracks_ratatui_cursor_updates(self) -> None:
         output = (

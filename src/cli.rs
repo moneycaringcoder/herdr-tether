@@ -28,7 +28,7 @@ use crate::{
         SessionId,
     },
     observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
-    orchestration::{OrchestrationService, companion_placement},
+    orchestration::{MANAGER_STALE_GROUP_ERROR, OrchestrationService, companion_placement},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::discover_aliases,
@@ -671,36 +671,38 @@ fn run_observer_manager_flow(
                     }
                 }
             }
-            ObserverManagerAction::ReplaceWorkers { group_id, workers } => {
-                match service.replace_workers(&group_id, workers) {
-                    Ok(group) => {
-                        notice = Some(format!(
-                            "Updated {}; workload lifecycle unchanged",
-                            group.title.as_str()
-                        ));
-                    }
-                    Err(_) => {
-                        notice =
-                            Some("Could not update Observer; metadata was unchanged".to_owned());
-                    }
-                }
-            }
-            ObserverManagerAction::Delete { group_id } => match service.delete_group(&group_id) {
+            ObserverManagerAction::ReplaceWorkers {
+                expected_group,
+                workers,
+            } => match service.replace_workers(&expected_group, workers) {
                 Ok(group) => {
                     notice = Some(format!(
-                        "Deleted {} metadata; workloads keep running",
+                        "Updated {}; workload lifecycle unchanged",
                         group.title.as_str()
                     ));
                 }
-                Err(_) => {
-                    notice = Some("Could not delete Observer; metadata was unchanged".to_owned());
+                Err(error) => {
+                    notice = Some(observer_metadata_failure_notice("update", &error));
                 }
             },
+            ObserverManagerAction::Delete { expected_group } => {
+                match service.delete_group_if_unchanged(&expected_group) {
+                    Ok(group) => {
+                        notice = Some(format!(
+                            "Deleted {} metadata; workloads keep running",
+                            group.title.as_str()
+                        ));
+                    }
+                    Err(error) => {
+                        notice = Some(observer_metadata_failure_notice("delete", &error));
+                    }
+                }
+            }
             ObserverManagerAction::Launch { group_id } => {
                 let launch = (|| {
                     let group = service.group(&group_id)?;
                     let context =
-                        HerdrContext::from_env().context(OBSERVER_PLUGIN_CONTEXT_ERROR)?;
+                        HerdrContext::from_plugin_env().context(OBSERVER_PLUGIN_CONTEXT_ERROR)?;
                     let executable =
                         env::current_exe().context("locate the bundled Tether executable")?;
                     place_observer_in_herdr(context, executable, &group, placement)
@@ -712,6 +714,18 @@ fn run_observer_manager_flow(
             }
         }
     }
+}
+
+fn observer_metadata_failure_notice(operation: &str, error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == MANAGER_STALE_GROUP_ERROR)
+    {
+        return "Observer changed while this screen was open; refreshed current metadata; \
+                review and retry"
+            .to_owned();
+    }
+    format!("Could not {operation} Observer; metadata was unchanged")
 }
 
 fn observer_launch_failure_notice(error: &anyhow::Error) -> String {
@@ -1801,5 +1815,17 @@ mod tests {
         assert!(notice.contains("Herdr pane"));
         assert!(notice.contains("source pane was preserved"));
         assert!(!notice.contains("HERDR_PANE_ID"));
+    }
+
+    #[test]
+    fn stale_manager_snapshot_notice_reports_refresh_without_identifiers() {
+        let error = anyhow::anyhow!(MANAGER_STALE_GROUP_ERROR);
+
+        let notice = observer_metadata_failure_notice("delete", &error);
+
+        assert!(notice.contains("changed while this screen was open"));
+        assert!(notice.contains("refreshed current metadata"));
+        assert!(notice.contains("review and retry"));
+        assert!(!notice.contains("observer-"));
     }
 }
