@@ -4,7 +4,7 @@ use herdr_tether::observer_manager::{
     ObserverManagerState, render_to_text,
 };
 use herdr_tether::{
-    model::OrchestrationMembershipId,
+    model::{OrchestrationMembershipId, SessionId},
     state::{
         OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
         SessionStatus, State,
@@ -532,6 +532,22 @@ fn reassignment_review_renders_only_the_proposed_orchestrator_topology() {
 }
 
 #[test]
+fn ambiguous_orchestrator_labels_keep_the_candidate_reference_token() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+
+    let manager = ObserverManagerState::from_state(&state, None).unwrap();
+    let row = &manager.item_labels()[0];
+    let reference = state.sessions[0]
+        .id
+        .reference_token(SessionId::MAX_REFERENCE_WIDTH);
+
+    assert!(row.contains(&format!("ORCHESTRATOR build / atlas / dev [{reference}]")));
+    assert_eq!(row.matches('[').count(), 1);
+    assert_eq!(row.matches(']').count(), 1);
+}
+
+#[test]
 fn group_rows_report_topology_health_without_raw_session_ids() {
     let mut state = state_with_sessions();
     let mut existing = group(&state);
@@ -546,10 +562,13 @@ fn group_rows_report_topology_health_without_raw_session_ids() {
     });
     state.sessions[1].status = SessionStatus::Ended;
     state.sessions[1].closed_at = Some(state.sessions[1].last_used_at);
+    existing.orchestrator_session_id = state.sessions[2].id;
     state.orchestration_groups.push(existing);
     let manager = ObserverManagerState::from_state(&state, None).unwrap();
     let row = &manager.item_labels()[0];
-    assert!(row.contains("ORCHESTRATOR"));
+    assert!(row.contains("ORCHESTRATOR test / checks / shell"));
+    assert!(!row.contains('['));
+    assert!(!row.contains(']'));
     assert!(row.contains("2 workers"));
     assert!(row.contains("2 unavailable"));
     for record in &state.sessions {

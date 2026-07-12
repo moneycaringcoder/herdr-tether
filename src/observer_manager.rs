@@ -723,9 +723,6 @@ impl ObserverManagerState {
             .get(&group.orchestrator_session_id)
             .map(String::as_str)
             .unwrap_or("unavailable");
-        let orchestrator_ref = group
-            .orchestrator_session_id
-            .reference_token(SessionId::SHORT_REFERENCE_WIDTH);
         let orchestrator_health = if self
             .running_sessions
             .contains(&group.orchestrator_session_id)
@@ -740,10 +737,9 @@ impl ObserverManagerState {
             .filter(|worker| !self.running_sessions.contains(&worker.session_id))
             .count();
         format!(
-            "{} · ORCHESTRATOR {} [{}]{} · {} workers · {} unavailable",
+            "{} · ORCHESTRATOR {}{} · {} workers · {} unavailable",
             group.title.as_str(),
             orchestrator_label,
-            orchestrator_ref,
             orchestrator_health,
             group.workers.len(),
             unavailable
