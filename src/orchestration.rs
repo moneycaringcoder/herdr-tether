@@ -995,7 +995,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use crate::observer::ObserverAction;
+    use crate::observer::{ObserverAction, action_for_input};
 
     fn worker(id: &str, lifecycle: ObserverLifecycle, capture: Option<&str>) -> ObserverWorker {
         ObserverWorker {
