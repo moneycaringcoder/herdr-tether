@@ -17,7 +17,7 @@
 - Stop, Restart, Remove, and migration transitions now preserve recoverable identity and state across persistence, transport, placement, and concurrent-operation failures.
 - Public installation, lifecycle, security, and limitations guidance now uses a concise first-visit path and evergreen support wording.
 - Normal picker, snapshot, and session-list views now hide Removed tombstones, group active/transitional workloads ahead of ended workloads, and retain recent-first deterministic ordering within each group.
-- Public installation guidance now distinguishes the future stable tag, development `main`, and immutable exact-SHA installs; Herdr marketplace metadata now describes the durable-workload benefit directly.
+- Public installation guidance now distinguishes stable v0.3.0, development `main`, and immutable exact-SHA installs; Herdr marketplace metadata now describes the durable-workload benefit directly.
 
 ### Fixed
 

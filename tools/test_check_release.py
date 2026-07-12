@@ -5,36 +5,39 @@ from check_release import (
     PUBLIC_RELEASE_FILES,
     ReleaseIdentityError,
     validate_readme_install,
+    validate_hermes_install,
     validate_release_context,
 )
 
 
 class ReadmeInstallIdentityTests(unittest.TestCase):
-    def test_candidate_rejects_nonexistent_version_tag_commands(self) -> None:
-        truthful = """\
-herdr plugin install moneycaringcoder/herdr-tether --ref main --yes
+    def test_candidate_accepts_main_only_or_complete_stable_install_paths(self) -> None:
+        main_only = """\
+herdr plugin install moneycaringcoder/herdr-tether --ref main
 Use a full commit SHA for a reproducible candidate checkout.
 """
-        validate_readme_install(truthful, "v0.3.0", release=False)
-        for command in (
-            "herdr plugin install owner/repo --ref v0.3.0 --yes",
-            "cargo install --git https://example.invalid/repo --tag v0.3.0 --locked",
-        ):
-            with self.subTest(command=command):
-                with self.assertRaises(ReleaseIdentityError):
-                    validate_readme_install(truthful + command, "v0.3.0", release=False)
-
-    def test_candidate_accepts_explicitly_future_stable_commands(self) -> None:
-        truthful = """\
-Stable v0.3.0 (use only after `v0.3.0` is published):
+        complete = """\
+Stable v0.3.0:
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
-cargo install --git https://github.com/moneycaringcoder/herdr-tether \\
+cargo install --git https://github.com/moneycaringcoder/herdr-tether \
   --tag v0.3.0 --locked herdr-tether
-
-Development:
-herdr plugin install moneycaringcoder/herdr-tether --ref main
 """
-        validate_readme_install(truthful, "v0.3.0", release=False)
+        validate_readme_install(main_only, "v0.3.0", release=False)
+        validate_readme_install(complete, "v0.3.0", release=False)
+
+    def test_candidate_rejects_partial_stable_or_unpublished_copy(self) -> None:
+        for text in (
+            "herdr plugin install owner/repo --ref v0.3.0",
+            "cargo install --git https://example.invalid/repo --tag v0.3.0 --locked",
+            """\
+Stable v0.3.0 (once published). After `v0.3.0` is published:
+herdr plugin install owner/repo --ref v0.3.0
+cargo install --git https://example.invalid/repo --tag v0.3.0 --locked
+""",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ReleaseIdentityError):
+                    validate_readme_install(text, "v0.3.0", release=False)
 
     def test_quickstart_is_a_checked_public_release_surface(self) -> None:
         self.assertIn("docs/quickstart.md", {str(path) for path in PUBLIC_RELEASE_FILES})
@@ -44,6 +47,32 @@ herdr plugin install moneycaringcoder/herdr-tether --ref main
             "integrations/hermes/SKILL.md",
             {str(path) for path in PUBLIC_RELEASE_FILES},
         )
+
+    def test_hermes_install_requires_stable_main_and_exact_sha_paths(self) -> None:
+        base = "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether"
+        complete = f"""\
+Stable:
+{base}/v0.3.0/integrations/hermes/SKILL.md
+Development:
+{base}/main/integrations/hermes/SKILL.md
+Immutable:
+TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED
+{base}/${{TETHER_SKILL_REF}}/integrations/hermes/SKILL.md
+"""
+        validate_hermes_install(complete, "v0.3.0", surface="test")
+        for required in (
+            f"{base}/v0.3.0/integrations/hermes/SKILL.md",
+            f"{base}/main/integrations/hermes/SKILL.md",
+            "TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED",
+            f"{base}/${{TETHER_SKILL_REF}}/integrations/hermes/SKILL.md",
+        ):
+            with self.subTest(required=required):
+                with self.assertRaises(ReleaseIdentityError):
+                    validate_hermes_install(
+                        complete.replace(required, ""),
+                        "v0.3.0",
+                        surface="test",
+                    )
 
     def test_release_requires_both_tagged_install_paths(self) -> None:
         complete = """\

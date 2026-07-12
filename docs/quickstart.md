@@ -18,8 +18,7 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 Choose one source:
 
-**Stable v0.3.0 (once published).** `v0.3.0` is not published yet. After
-`v0.3.0` is published, install the release tag:
+**Stable v0.3.0.** Install the release tag:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
@@ -92,7 +91,7 @@ Closing the view leaves the workload running. Open Tether again and press `Enter
 ## 5. Add a remote host (optional)
 
 Install the standalone CLI when you want administration commands in your shell.
-After `v0.3.0` is published, install the stable release:
+The stable release is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \

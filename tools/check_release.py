@@ -112,11 +112,9 @@ def validate_readme_install(
         rf"after\s+`?{re.escape(tag)}`?\s+is\s+published)",
         re.IGNORECASE,
     )
-    if release:
-        if future_copy.search(readme):
-            raise ReleaseIdentityError(
-                f"{surface} still describes {tag} as unpublished"
-            )
+    if future_copy.search(readme):
+        raise ReleaseIdentityError(f"{surface} still describes {tag} as unpublished")
+    if release or herdr_tag in readme or cargo_tag:
         if herdr_tag not in readme:
             raise ReleaseIdentityError(
                 f"{surface} does not pin the primary install to {herdr_tag}"
@@ -125,25 +123,25 @@ def validate_readme_install(
             raise ReleaseIdentityError(
                 f"{surface} does not pin the primary Cargo install to --tag {tag}"
             )
-    elif herdr_tag in readme or cargo_tag:
-        tag_references = [
-            match.start()
-            for match in re.finditer(
-                rf"(?:--ref|--tag)\s+{re.escape(tag)}(?:\s|$)",
-                readme,
-            )
-        ]
-        future_label = re.compile(
-            rf"after\s+`?{re.escape(tag)}`?\s+is\s+published",
-            re.IGNORECASE,
-        )
-        if any(
-            not future_label.search(readme[max(0, position - 400) : position])
-            for position in tag_references
-        ):
+
+def validate_hermes_install(text: str, tag: str, *, surface: str) -> None:
+    skill_path = "integrations/hermes/SKILL.md"
+    base = "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether"
+    required = {
+        "stable tag": f"{base}/{tag}/{skill_path}",
+        "development main": f"{base}/main/{skill_path}",
+        "immutable exact SHA variable": "TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED",
+        "immutable exact SHA URL": f"{base}/${{TETHER_SKILL_REF}}/{skill_path}",
+    }
+    for label, value in required.items():
+        if value not in text:
             raise ReleaseIdentityError(
-                f"{surface} advertises nonexistent candidate tag {tag}; "
-                f"label tagged commands for use after {tag} is published"
+                f"{surface} does not provide the Hermes {label} install path"
+            )
+    for label in ("Stable", "Development", "Immutable"):
+        if label not in text:
+            raise ReleaseIdentityError(
+                f"{surface} does not clearly label the Hermes {label.lower()} install"
             )
 
 
@@ -204,11 +202,14 @@ def main() -> None:
         if actual != version:
             fail(f"{surface} version {actual!r} != {version!r}")
     documentation = cargo_package.get("documentation", "")
-    expected_documentation_ref = args.tag if args.release else "main"
-    if f"/blob/{expected_documentation_ref}/" not in documentation:
+    valid_documentation_refs = (args.tag,) if args.release else ("main", args.tag)
+    if not any(
+        f"/blob/{reference}/" in documentation for reference in valid_documentation_refs
+    ):
+        expected = " or ".join(valid_documentation_refs)
         fail(
             f"Cargo.toml documentation URL {documentation!r} is not pinned to "
-            f"{expected_documentation_ref}"
+            f"{expected}"
         )
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -229,6 +230,16 @@ def main() -> None:
         )
     except ReleaseIdentityError as error:
         fail(str(error))
+    hermes_path = Path("integrations/hermes/SKILL.md")
+    for relative_path in (Path("README.md"), hermes_path):
+        try:
+            validate_hermes_install(
+                (ROOT / relative_path).read_text(encoding="utf-8"),
+                args.tag,
+                surface=str(relative_path),
+            )
+        except ReleaseIdentityError as error:
+            fail(str(error))
 
     for relative_path in PUBLIC_RELEASE_FILES:
         text = (ROOT / relative_path).read_text(encoding="utf-8")

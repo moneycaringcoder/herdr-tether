@@ -40,8 +40,7 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 Choose the source that matches your stability and reproducibility needs. Herdr
 shows the source and build commands for review before you confirm.
 
-**Stable v0.3.0 (once published).** `v0.3.0` is not published yet. After
-`v0.3.0` is published, install the release tag:
+**Stable v0.3.0.** Install the release tag:
 
 ```sh
 herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
@@ -70,8 +69,7 @@ herdr plugin action invoke moneycaringcoder.tether.setup
 
 The setup action safely adds the `prefix+t` launcher and reloads Herdr's configuration. It refuses a conflicting binding and keeps an exact backup for rollback. After setup, press your Herdr prefix followed by `t`.
 
-Want the standalone administration commands too? After `v0.3.0` is published,
-the stable install is:
+Want the standalone administration commands too? The stable install is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
@@ -100,10 +98,25 @@ See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollb
 ### Optional Hermes skill
 
 Hermes users can install Tether's first-party, runtime-independent orchestration
-guide directly from this repository:
+guide directly from this repository.
+
+**Stable v0.3.0:**
+
+```sh
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.3.0/integrations/hermes/SKILL.md
+```
+
+**Development (`main`):**
 
 ```sh
 hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/main/integrations/hermes/SKILL.md
+```
+
+**Immutable reviewed commit:**
+
+```sh
+TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED
+hermes skills install "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/${TETHER_SKILL_REF}/integrations/hermes/SKILL.md"
 ```
 
 The [skill source](integrations/hermes/SKILL.md) uses Tether's public snapshot

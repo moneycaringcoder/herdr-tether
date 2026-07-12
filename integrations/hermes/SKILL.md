@@ -16,10 +16,25 @@ Use Tether as the visibility and lifecycle boundary for durable development work
 
 ## Install
 
-Install this single-file skill from its canonical raw URL:
+Choose the source that matches the Tether installation:
+
+**Stable v0.3.0:**
+
+```sh
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.3.0/integrations/hermes/SKILL.md
+```
+
+**Development (`main`):**
 
 ```sh
 hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/main/integrations/hermes/SKILL.md
+```
+
+**Immutable reviewed commit:**
+
+```sh
+TETHER_SKILL_REF=FULL_COMMIT_SHA_YOU_REVIEWED
+hermes skills install "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/${TETHER_SKILL_REF}/integrations/hermes/SKILL.md"
 ```
 
 The skill is available in new Hermes sessions after installation.
