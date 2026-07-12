@@ -1,6 +1,10 @@
 #[path = "../src/observer.rs"]
 mod observer;
 
+#[allow(dead_code)]
+#[path = "../src/model.rs"]
+mod model;
+
 use observer::{
     MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
     ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_key,
@@ -25,6 +29,14 @@ fn worker(id: &str) -> ObserverWorker {
 
 fn state(count: usize) -> ObserverState {
     ObserverState::new((0..count).map(|index| worker(&index.to_string())).collect())
+}
+
+fn session_worker(id: &str, title: &str) -> ObserverWorker {
+    ObserverWorker {
+        title: Some(title.to_owned()),
+        capture: Some("output".to_owned()),
+        ..worker(id)
+    }
 }
 
 #[test]
@@ -240,6 +252,66 @@ fn outcomes_are_read_only_and_open_requires_all_eligibility() {
             observer.apply(ObserverAction::OpenSelected),
             ObserverOutcome::OpenUnavailable { worker_id: id }
         );
+    }
+}
+
+#[test]
+fn duplicate_worker_titles_get_stable_expandable_references_without_changing_identity() {
+    let first = "tether-01890f1e7a0070008000000000000001";
+    let second = "tether-01890f1e7a0070008000000000000002";
+    let distinct = "tether-11890f1e7a0070008000000000000003";
+    let workers = vec![
+        session_worker(first, "Builder"),
+        session_worker(second, "Builder"),
+        session_worker(distinct, "Reviewer"),
+    ];
+    let mut observer = ObserverState::new(workers.clone());
+
+    let rendered = render_to_text(160, 14, &observer).unwrap();
+    assert!(rendered.contains("Builder · 01890f1e7a0070008000000000000001"));
+    assert!(rendered.contains("Builder · 01890f1e7a0070008000000000000002"));
+    assert!(rendered.contains("Reviewer · RUNNING"));
+    assert!(!rendered.contains("Reviewer · 11890f1e"));
+    assert!(!rendered.contains(first));
+    assert!(!rendered.contains(second));
+
+    observer.apply(ObserverAction::NextWorker);
+    assert_eq!(observer.selected_id(), Some(second));
+    observer.update_workers(vec![
+        workers[1].clone(),
+        workers[0].clone(),
+        workers[2].clone(),
+    ]);
+    assert_eq!(observer.selected_id(), Some(second));
+    assert_eq!(
+        observer.apply(ObserverAction::OpenSelected),
+        ObserverOutcome::OpenSelected {
+            worker_id: second.to_owned(),
+        }
+    );
+
+    let reordered = render_to_text(160, 14, &observer).unwrap();
+    assert!(reordered.contains("Builder · 01890f1e7a0070008000000000000001"));
+    assert!(reordered.contains("Builder · 01890f1e7a0070008000000000000002"));
+}
+
+#[test]
+fn session_reference_tokens_are_deterministic_ascii_and_bounded() {
+    use std::str::FromStr;
+
+    let id = model::SessionId::from_str("tether-01890f1e7a0070008000000000000001").unwrap();
+    assert_eq!(id.reference_token(0), "01890f1e");
+    assert_eq!(id.reference_token(8), "01890f1e");
+    assert_eq!(id.reference_token(12), "01890f1e7a00");
+    assert_eq!(
+        id.reference_token(usize::MAX),
+        "01890f1e7a0070008000000000000001"
+    );
+    for width in 0..=64 {
+        let token = id.reference_token(width);
+        assert!(token.is_ascii());
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!((8..=32).contains(&token.len()));
     }
 }
 

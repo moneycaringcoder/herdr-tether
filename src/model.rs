@@ -22,12 +22,27 @@ pub enum Placement {
 pub struct SessionId(Uuid);
 
 impl SessionId {
+    /// Width of the concise reference used when a human label needs disambiguation.
+    pub const SHORT_REFERENCE_WIDTH: usize = 8;
+    /// Maximum width of a reference token.
+    pub const MAX_REFERENCE_WIDTH: usize = 32;
+
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
 
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
+    }
+
+    /// Returns a stable, terminal-safe prefix of this session's UUID.
+    ///
+    /// `width` is clamped to the useful range from [`Self::SHORT_REFERENCE_WIDTH`]
+    /// through [`Self::MAX_REFERENCE_WIDTH`]. Callers can increase the width until
+    /// otherwise-colliding concise references become unique.
+    pub fn reference_token(&self, width: usize) -> String {
+        let width = width.clamp(Self::SHORT_REFERENCE_WIDTH, Self::MAX_REFERENCE_WIDTH);
+        self.0.simple().to_string()[..width].to_owned()
     }
 }
 

@@ -685,6 +685,18 @@ fn run_observer_manager_flow(
                     notice = Some(observer_metadata_failure_notice("update", &error));
                 }
             },
+            ObserverManagerAction::ReassignOrchestrator {
+                expected_group,
+                orchestrator_session_id,
+            } => {
+                notice = Some(dispatch_reassign_orchestrator(
+                    expected_group,
+                    orchestrator_session_id,
+                    |expected_group, orchestrator_session_id| {
+                        service.reassign_orchestrator(expected_group, orchestrator_session_id)
+                    },
+                ));
+            }
             ObserverManagerAction::Delete { expected_group } => {
                 match service.delete_group_if_unchanged(&expected_group) {
                     Ok(group) => {
@@ -713,6 +725,32 @@ fn run_observer_manager_flow(
                 }
             }
         }
+    }
+}
+
+fn dispatch_reassign_orchestrator<F>(
+    expected_group: OrchestrationGroup,
+    orchestrator_session_id: SessionId,
+    reassign: F,
+) -> String
+where
+    F: FnOnce(&OrchestrationGroup, SessionId) -> Result<OrchestrationGroup>,
+{
+    match reassign(&expected_group, orchestrator_session_id) {
+        Ok(group) => format!(
+            "Updated {} metadata; workload lifecycle and placement unchanged",
+            group.title.as_str()
+        ),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.to_string() == MANAGER_STALE_GROUP_ERROR) =>
+        {
+            observer_metadata_failure_notice("reassign", &error)
+        }
+        Err(_) => "Could not reassign Observer; metadata was unchanged; \
+                   workload lifecycle and placement unchanged"
+            .to_owned(),
     }
 }
 
@@ -1827,5 +1865,73 @@ mod tests {
         assert!(notice.contains("refreshed current metadata"));
         assert!(notice.contains("review and retry"));
         assert!(!notice.contains("observer-"));
+    }
+    fn manager_group(orchestrator_session_id: SessionId) -> OrchestrationGroup {
+        OrchestrationGroup {
+            id: "observer-build-atlas".parse().unwrap(),
+            title: "Observer build atlas".parse().unwrap(),
+            orchestrator_session_id,
+            workers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reassign_dispatch_forwards_exact_snapshot_and_replacement_once() {
+        let original = SessionId::new();
+        let replacement = SessionId::new();
+        let expected = manager_group(original);
+        let returned = manager_group(replacement);
+        let mut calls = 0;
+
+        let notice = dispatch_reassign_orchestrator(
+            expected.clone(),
+            replacement,
+            |actual_expected, actual_replacement| {
+                calls += 1;
+                assert_eq!(actual_expected, &expected);
+                assert_eq!(actual_replacement, replacement);
+                Ok(returned.clone())
+            },
+        );
+
+        assert_eq!(calls, 1);
+        assert!(notice.contains("Updated Observer build atlas metadata"));
+        assert!(notice.contains("workload lifecycle and placement unchanged"));
+        assert!(!notice.contains(&replacement.to_string()));
+    }
+
+    #[test]
+    fn stale_reassign_dispatch_notice_is_actionable_and_identifier_free() {
+        let replacement = SessionId::new();
+        let expected = manager_group(SessionId::new());
+
+        let notice = dispatch_reassign_orchestrator(expected, replacement, |_, _| {
+            Err(anyhow::anyhow!(MANAGER_STALE_GROUP_ERROR))
+        });
+
+        assert!(notice.contains("changed while this screen was open"));
+        assert!(notice.contains("refreshed current metadata"));
+        assert!(notice.contains("review and retry"));
+        assert!(!notice.contains(&replacement.to_string()));
+        assert!(!notice.contains("observer-"));
+    }
+
+    #[test]
+    fn failed_reassign_dispatch_reports_metadata_unchanged_without_identifiers() {
+        let replacement = SessionId::new();
+        let expected = manager_group(SessionId::new());
+        let mut calls = 0;
+
+        let notice = dispatch_reassign_orchestrator(expected, replacement, |_, _| {
+            calls += 1;
+            Err(anyhow::anyhow!("replacement became ineligible"))
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(
+            notice,
+            "Could not reassign Observer; metadata was unchanged; workload lifecycle and placement unchanged"
+        );
+        assert!(!notice.contains(&replacement.to_string()));
     }
 }

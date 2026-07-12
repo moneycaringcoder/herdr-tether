@@ -141,10 +141,10 @@ described above.
 From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
 1. Press `n` for **Create Observer**.
-2. Choose one running workload as orchestrator.
-3. Select one or more running workers with `Space`, then press `Enter`.
-4. Select the new group and press `Enter` for its actions.
-5. Choose **Open Observer**.
+2. Choose one running workload as `ORCHESTRATOR`.
+3. Select one or more `WORKER` workloads with `Space`, then press `Enter`.
+4. Review the topology and press `Enter` again to create it.
+5. Select the new group and choose **Open Observer**.
 
 Tether derives bounded labels from safe workload metadata. New workers receive
 the safe default capabilities: bounded read-only output observation and
@@ -159,9 +159,11 @@ use `r` to refresh and `Enter` to open an authorized running worker as a normal
 Tether view. Press `q`, `Esc`, or `Ctrl+C` to leave Observer. Membership and
 lifecycle labels refresh while it runs; worker input is never forwarded.
 
-To change a group, choose **Edit workers**, toggle running workloads with
-`Space`, and press `Enter`. To remove a group, press `d` and confirm. Both
-operations change only group metadata and leave every workload and pane alone.
+To change a group, choose **Edit workers** or **Change orchestrator**, make the
+selection, review the resulting topology, and confirm. Promoting a worker to
+orchestrator removes it from the worker list. To remove a group, press `d` and
+confirm. All operations change only group metadata and leave every workload and
+pane alone.
 
 The standalone `herdr-tether orchestration` commands remain available as an
 optional machine/adapter API. Native picker users do not need exact IDs, shell

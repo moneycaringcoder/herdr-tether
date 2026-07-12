@@ -1360,6 +1360,9 @@ class Smoke:
                 ("Tether \u00b7 Observers", ("n",)),
                 ("Choose orchestrator", ("Enter",)),
                 ("Choose workers", ("Space", "Enter")),
+                ("Review topology", ()),
+                ("ORCHESTRATOR", ()),
+                ("WORKER", ("Enter",)),
                 ("Created Observer", ("Enter",)),
                 ("Observer actions", ()),
             ],
@@ -1411,6 +1414,16 @@ class Smoke:
             fail(f"real plugin-picker Observer used unexpected defaults: {capabilities}")
         if group.get("orchestrator_session_id") == workers[0].get("session_id"):
             fail("real plugin-picker Observer persisted its orchestrator as a worker")
+        worker_title = workers[0].get("title")
+        if not isinstance(worker_title, str) or not worker_title:
+            fail(f"real plugin-picker Observer persisted no safe worker title: {workers[0]}")
+        self.wait_until(
+            "persisted worker identity rendered in Observer tile",
+            lambda: worker_title in self.pane_visible_text(observer_pane),
+        )
+        observer_text = self.pane_visible_text(observer_pane)
+        if "ORCHESTRATOR" in observer_text:
+            fail("Observer worker tiles rendered the orchestrator role token")
         after_status = owned_status(payload)
         if after_status != before_status:
             fail(

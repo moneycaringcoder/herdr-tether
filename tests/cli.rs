@@ -62,26 +62,44 @@ impl Sandbox {
 const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
 
 fn active_state(id: &str) -> String {
-    format!(
-        r#"{{
-  "version": 4,
-  "sessions": [{{
-    "id": "{id}",
-    "host": "local",
-    "target": "local",
-    "directory": "/tmp",
-    "preset": null,
-    "command": "exec true",
-    "tmux_session_id": 7,
-    "ownership_proof": "0197f198000070008000000000000099",
-    "status": "running",
-    "created_at": "2026-01-01T00:00:00Z",
-    "last_used_at": "2026-01-01T00:00:00Z",
-    "closed_at": null
-  }}],
-  "orchestration_groups": []
-}}"#
-    )
+    active_state_many(&[id.to_owned()])
+}
+
+fn active_state_many(ids: &[String]) -> String {
+    let sessions = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            serde_json::json!({
+                "id": id,
+                "host": "local",
+                "target": "local",
+                "directory": "/tmp",
+                "preset": null,
+                "command": "exec true",
+                "tmux_session_id": index + 7,
+                "ownership_proof": format!(
+                    "0197f1980000700080000000000000{:02x}",
+                    0x99 + index
+                ),
+                "status": "running",
+                "created_at": "2026-01-01T00:00:00Z",
+                "last_used_at": "2026-01-01T00:00:00Z",
+                "closed_at": null
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "version": 4,
+        "sessions": sessions,
+        "orchestration_groups": []
+    }))
+    .unwrap()
+}
+
+fn seed_active_state(sandbox: &Sandbox, ids: &[String]) {
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    fs::write(sandbox.state_file(), active_state_many(ids)).unwrap();
 }
 
 fn install_tmux_script(sandbox: &Sandbox, body: &str) -> (std::ffi::OsString, std::path::PathBuf) {
@@ -143,6 +161,7 @@ fn every_scriptable_surface_has_help() {
 fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
     let sandbox = Sandbox::new();
     let worker = "tether-0197f198000070008000000000000002";
+    seed_active_state(&sandbox, &[SESSION_ID.to_owned(), worker.to_owned()]);
 
     sandbox
         .command()
@@ -226,6 +245,13 @@ fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
 #[test]
 fn orchestration_group_and_worker_limits_are_enforced_without_pane_side_effects() {
     let sandbox = Sandbox::new();
+    let workers = (0..65)
+        .map(|_| GeneratedSessionId::new().to_string())
+        .collect::<Vec<_>>();
+    let sessions = std::iter::once(SESSION_ID.to_owned())
+        .chain(workers.iter().cloned())
+        .collect::<Vec<_>>();
+    seed_active_state(&sandbox, &sessions);
     for index in 0..32 {
         sandbox
             .command()
@@ -258,14 +284,14 @@ fn orchestration_group_and_worker_limits_are_enforced_without_pane_side_effects(
             "orchestration group limit of 32 has been reached",
         ));
 
-    for worker in (0..64).map(|_| GeneratedSessionId::new().to_string()) {
+    for worker in workers.iter().take(64) {
         sandbox
             .command()
             .args([
                 "orchestration",
                 "add-worker",
                 "group-0",
-                &worker,
+                worker,
                 "--observe-output",
             ])
             .assert()
@@ -277,7 +303,7 @@ fn orchestration_group_and_worker_limits_are_enforced_without_pane_side_effects(
             "orchestration",
             "add-worker",
             "group-0",
-            &GeneratedSessionId::new().to_string(),
+            &workers[64],
             "--observe-output",
         ])
         .assert()
