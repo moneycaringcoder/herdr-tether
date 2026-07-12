@@ -915,6 +915,7 @@ fn picker_uses_one_resize_fallback_until_the_minimum_geometry() {
     assert!(rendered.contains("Esc close"));
 }
 
+
 #[test]
 fn picker_viewport_reports_position_and_both_directions_without_changing_selection() {
     let mut picker = long_host_picker(20);

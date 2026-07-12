@@ -24,6 +24,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::{
     config::Config,
     discovery::{
@@ -2855,8 +2857,8 @@ fn bounded_label(text: &str, max_width: usize) -> String {
     }
     let content_width = max_width.saturating_sub(1);
     let mut end = 0;
-    for (index, character) in text.char_indices() {
-        let next = index + character.len_utf8();
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let next = index + grapheme.len();
         if Line::from(&text[..next]).width() > content_width {
             break;
         }
@@ -2937,6 +2939,29 @@ fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rec
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn picker_label_truncation_preserves_extended_graphemes() {
+        let cases = [
+            ("adjacent flags", "🇺🇸", "🇨🇦xxxx"),
+            ("keycap", "1\u{fe0f}\u{20e3}", "xxxx"),
+            ("combining mark", "e\u{301}", "xxxx"),
+            ("text variation selector", "❤\u{fe0e}", "xxxx"),
+            ("emoji variation selector", "❤\u{fe0f}", "xxxx"),
+            ("emoji ZWJ sequence", "👩\u{200d}💻", "xxxx"),
+        ];
+
+        for (name, cluster, tail) in cases {
+            let prefix = "aaaaaaaa";
+            let boundary = format!("{prefix}{cluster}");
+            let max_width = Line::from(boundary.as_str()).width() + 1;
+            assert_eq!(
+                bounded_label(&format!("{boundary}{tail}"), max_width),
+                format!("{boundary}…"),
+                "{name}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
