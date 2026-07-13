@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::{Duration, SystemTime},
@@ -218,6 +218,57 @@ impl PickerOptions {
         Self {
             hosts,
             default_placement: config.ui.placement,
+        }
+    }
+
+    /// Stably prioritizes entries already authorized by picker configuration or state.
+    ///
+    /// The invocation directory is only a preference: it cannot add a host,
+    /// directory, workload, command, or selection.
+    pub fn prefer_invocation_location(
+        &mut self,
+        location: Option<&crate::herdr::InvocationLocation>,
+        state: &State,
+    ) {
+        let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
+            return;
+        };
+        let mut matching_hosts = self.hosts.iter().enumerate().filter(|(_, host)| {
+            host.directories
+                .iter()
+                .any(|candidate| Path::new(candidate) == directory)
+                || host.workloads.iter().any(|workload| {
+                    state.sessions.iter().any(|session| {
+                        session.id == workload.id && Path::new(&session.directory) == directory
+                    })
+                })
+        });
+        let Some((host_index, _)) = matching_hosts.next() else {
+            return;
+        };
+        if matching_hosts.next().is_some() {
+            return;
+        }
+
+        self.hosts[..=host_index].rotate_right(1);
+        let host = &mut self.hosts[0];
+        stable_prefer(&mut host.directories, |candidate| {
+            Path::new(candidate) == directory
+        });
+        stable_prefer(&mut host.workloads, |workload| {
+            state.sessions.iter().any(|session| {
+                session.id == workload.id && Path::new(&session.directory) == directory
+            })
+        });
+    }
+}
+
+fn stable_prefer<T>(values: &mut [T], mut preferred: impl FnMut(&T) -> bool) {
+    let mut destination = 0;
+    for index in 0..values.len() {
+        if preferred(&values[index]) {
+            values[destination..=index].rotate_right(1);
+            destination += 1;
         }
     }
 }

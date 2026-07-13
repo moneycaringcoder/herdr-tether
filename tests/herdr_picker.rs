@@ -5,7 +5,7 @@ use herdr_tether::{
     backend::{CommandSpec, ProcessBinaries},
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
-    herdr::{HerdrClient, HerdrContext, PaneTitle},
+    herdr::{HerdrClient, HerdrContext, InvocationLocation, PaneTitle},
     lifecycle::{CloseOwnedError, PrunePreview, PruneService},
     model::{ExternalSessionName, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -876,6 +876,127 @@ fn picker_fixture() -> (Config, State) {
         orchestration_groups: Vec::new(),
     };
     (config, state)
+}
+
+#[test]
+fn plugin_invocation_location_uses_only_documented_absolute_cwds() {
+    let global = r#"{"invocation_source":"command_palette","correlation_id":"global-1"}"#;
+    let workspace =
+        r#"{"workspace_id":"w1","workspace_cwd":"/home/user/code","invocation_source":"action"}"#;
+    let pane = r#"{"workspace_cwd":"/home/user/code","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#;
+
+    assert_eq!(
+        InvocationLocation::from_plugin_context_json(Some(global)),
+        None
+    );
+    assert_eq!(
+        InvocationLocation::from_plugin_context_json(Some(workspace))
+            .unwrap()
+            .directory(),
+        Path::new("/home/user/code")
+    );
+    assert_eq!(
+        InvocationLocation::from_plugin_context_json(Some(pane))
+            .unwrap()
+            .directory(),
+        Path::new("/srv/shared")
+    );
+}
+
+#[test]
+fn plugin_invocation_location_rejects_hostile_unknown_and_missing_context() {
+    let oversized = format!(r#"{{"focused_pane_cwd":"/{}"}}"#, "a".repeat(4096));
+    let cases = [
+        None,
+        Some(""),
+        Some("{"),
+        Some("[]"),
+        Some(r#"{"focused_pane_cwd":17,"workspace_cwd":"/safe"}"#),
+        Some(r#"{"focused_pane_cwd":"","workspace_cwd":"/safe"}"#),
+        Some(r#"{"focused_pane_cwd":"relative","workspace_cwd":"/safe"}"#),
+        Some("{\"focused_pane_cwd\":\"/safe\\u0000hostile\"}"),
+        Some("{\"focused_pane_cwd\":\"/safe\\u001fhostile\"}"),
+        Some(r#"{"workspace_cwd":false}"#),
+        Some(r#"{"workspace_cwd":"relative"}"#),
+        Some(r#"{"clicked_url":"file:///srv/shared","host":"build-box"}"#),
+        Some(oversized.as_str()),
+    ];
+
+    for context in cases {
+        assert_eq!(
+            InvocationLocation::from_plugin_context_json(context),
+            None,
+            "unexpected preference for {context:?}"
+        );
+    }
+}
+
+#[test]
+fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
+    let (mut config, state) = picker_fixture();
+    config.hosts.push(HostConfig {
+        name: "other-box".into(),
+        target: "other@example.test".into(),
+        roots: vec!["/other/root".into()],
+        presets: Vec::new(),
+    });
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let before = options.clone();
+    let preference = InvocationLocation::from_plugin_context_json(Some(
+        r#"{"workspace_cwd":"/home/user/code","focused_pane_cwd":"/srv/shared"}"#,
+    ));
+
+    options.prefer_invocation_location(preference.as_ref(), &state);
+
+    assert_eq!(
+        options
+            .hosts
+            .iter()
+            .map(|host| host.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build-box", "local", "other-box"]
+    );
+    assert_eq!(
+        options.hosts[0]
+            .directories
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["/srv/shared", "/srv/recent", "/srv/configured"]
+    );
+    assert_eq!(
+        options.hosts[0]
+            .workloads
+            .iter()
+            .map(|workload| workload.id)
+            .collect::<Vec<_>>(),
+        [state.sessions[0].id, state.sessions[1].id]
+    );
+    assert_eq!(options.hosts[1], before.hosts[0]);
+    assert_eq!(options.hosts[2], before.hosts[2]);
+
+    let unchanged = options.clone();
+    let unknown = InvocationLocation::from_plugin_context_json(Some(
+        r#"{"focused_pane_cwd":"/untrusted/not-configured"}"#,
+    ));
+    options.prefer_invocation_location(unknown.as_ref(), &state);
+    assert_eq!(options, unchanged);
+    options.prefer_invocation_location(None, &state);
+    assert_eq!(options, unchanged);
+}
+
+#[test]
+fn invocation_location_does_not_choose_between_ambiguous_hosts() {
+    let (mut config, state) = picker_fixture();
+    config.discovery.local_roots.push("/srv/shared".into());
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let before = options.clone();
+    let preference =
+        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
+
+    options.prefer_invocation_location(preference.as_ref(), &state);
+
+    assert_eq!(options, before);
 }
 
 fn long_host_picker(count: usize) -> PickerState {

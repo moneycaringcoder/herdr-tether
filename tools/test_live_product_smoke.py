@@ -47,7 +47,7 @@ class SmokeJsonReportTests(unittest.TestCase):
         self.assertEqual(report["failure_category"], "command")
         self.assertEqual(
             [phase["status"] for phase in report["phases"]],
-            ["passed", "passed", "failed", "not_run", "not_run"],
+            ["passed", "passed", "failed", "not_run", "not_run", "not_run"],
         )
         self.assertEqual(report["exercised"], {"actions": [], "placements": []})
         self.assertEqual(report["cleanup"], {"attempts": 4, "result": "failed"})
@@ -69,6 +69,7 @@ class SmokeJsonReportTests(unittest.TestCase):
                 "start_herdr",
                 "keybinding_contract",
                 "plugin_contract",
+                "keyboard_picker_matrix",
                 "product_lifecycle",
             ],
             active_phase=None,
@@ -354,6 +355,133 @@ class SmokeEnvironmentTests(unittest.TestCase):
         self.assertNotIn("Tether - Hosts", screen)
         self.assertIn("Create new Tether workload", screen)
         self.assertIn("Split right", screen)
+
+    def test_herdr_resize_uses_explicit_rows_and_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+            smoke.herdr_master = 17
+            try:
+                with mock.patch.object(smoke_module.fcntl, "ioctl") as ioctl:
+                    smoke.resize_herdr(rows=14, columns=48)
+                descriptor, operation, dimensions = ioctl.call_args.args
+                self.assertEqual(descriptor, 17)
+                self.assertEqual(operation, smoke_module.termios.TIOCSWINSZ)
+                self.assertEqual(
+                    smoke_module.struct.unpack("HHHH", dimensions),
+                    (14, 48, 0, 0),
+                )
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
+    def test_keyboard_picker_matrix_orchestrates_semantic_stages_without_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+            panes = iter(["picker-wide", "picker-narrow"])
+            try:
+                with (
+                    mock.patch.object(smoke, "resize_herdr") as resize,
+                    mock.patch.object(
+                        smoke,
+                        "invoke_plugin_picker_via_keyboard",
+                        side_effect=lambda: next(panes),
+                    ) as invoke,
+                    mock.patch.object(
+                        smoke, "interact_managed_pane_via_herdr"
+                    ) as interact,
+                    mock.patch.object(
+                        smoke, "wait_until", return_value=True
+                    ) as wait_until,
+                    mock.patch.object(smoke_module.time, "sleep") as sleep,
+                ):
+                    smoke.keyboard_picker_matrix()
+
+                self.assertEqual(
+                    resize.call_args_list,
+                    [
+                        mock.call(rows=24, columns=80),
+                        mock.call(rows=40, columns=140),
+                        mock.call(rows=14, columns=48),
+                        mock.call(rows=40, columns=140),
+                    ],
+                )
+                self.assertEqual(invoke.call_count, 2)
+                expected_steps = [
+                    ("Hosts", b"\x1b[B\x1b[A\r"),
+                    ("Resources", b"\x1b"),
+                    ("Hosts", b"\x1b"),
+                ]
+                self.assertEqual(
+                    interact.call_args_list,
+                    [
+                        mock.call("picker-wide", expected_steps),
+                        mock.call("picker-narrow", expected_steps),
+                    ],
+                )
+                self.assertEqual(wait_until.call_count, 2)
+                sleep.assert_not_called()
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
+    def test_semantic_picker_steps_send_only_raw_herdr_pty_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+            try:
+                stages = iter(["Hosts", "Resources", "Hosts"])
+
+                def wait_without_sleep(_description, predicate, timeout=mock.ANY):
+                    self.assertTrue(predicate())
+                    return True
+
+                with (
+                    mock.patch.object(smoke, "pane_ids", return_value={"picker"}),
+                    mock.patch.object(
+                        smoke,
+                        "pane_visible_text",
+                        side_effect=lambda _pane: next(stages),
+                    ),
+                    mock.patch.object(
+                        smoke, "wait_until", side_effect=wait_without_sleep
+                    ),
+                    mock.patch.object(smoke, "send_herdr_bytes") as send,
+                    mock.patch.object(smoke, "herdr_run") as herdr_run,
+                    mock.patch.object(smoke_module.time, "sleep") as sleep,
+                ):
+                    smoke.interact_managed_pane_via_herdr(
+                        "picker",
+                        [
+                            ("Hosts", b"\x1b[B\x1b[A\r"),
+                            ("Resources", b"\x1b"),
+                            ("Hosts", b"\x1b"),
+                        ],
+                    )
+
+                self.assertEqual(
+                    send.call_args_list,
+                    [
+                        mock.call(b"\x1b[B\x1b[A\r"),
+                        mock.call(b"\x1b"),
+                        mock.call(b"\x1b"),
+                    ],
+                )
+                herdr_run.assert_not_called()
+                sleep.assert_not_called()
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
 
     def test_cleanup_nonzero_commands_fail_but_all_attempts_continue(self) -> None:
         with tempfile.TemporaryDirectory() as repository:

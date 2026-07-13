@@ -13,6 +13,7 @@ id = "open"
 title = "Tether: Open workloads"
 description = "Create, open, or restart local and remote workloads. Run Tether: Set up first."
 command = ["target/release/herdr-tether", "plugin", "open"]
+contexts = ["global", "workspace", "pane"]
 
 [[actions]]
 id = "setup"

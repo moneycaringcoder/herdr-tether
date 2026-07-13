@@ -15,6 +15,9 @@
 - Added finite persisted-state, configuration, discovery-request, and status-request budgets with deterministic boundary rejection, global discovery completion reasons, and exact-target status deduplication.
 - Added versioned, bounded, redacted JSON output for doctor diagnostics and live product-smoke evidence.
 - Added deterministic public documentation, canonical default/version, package-derived hygiene, installed-artifact runtime, archive-budget, and documented CLI contract checks.
+- Added read-only setup preflight for required runtime tools before any Tether or Herdr file mutation.
+- Added optional documented Herdr pane/workspace context prioritization that reorders only known, unambiguous picker entries.
+- Added correlation-safe redaction for plugin action and entrypoint failures, plus official-Herdr keyboard-only picker checks at 80×24 and 48×14.
 
 ### Fixed
 

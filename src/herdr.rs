@@ -20,6 +20,52 @@ use crate::{
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.tether";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_INVOCATION_DIRECTORY_BYTES: usize = 4096;
+
+/// A validated invocation directory supplied by Herdr's documented plugin context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationLocation {
+    directory: PathBuf,
+}
+
+impl InvocationLocation {
+    /// Reads an optional picker preference from Herdr's plugin action context.
+    ///
+    /// Invalid or unavailable context is deliberately ignored. Placement context
+    /// is parsed separately and retains its stricter error behavior.
+    pub fn from_plugin_env() -> Option<Self> {
+        let context = env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+        Self::from_plugin_context_json(Some(&context))
+    }
+
+    /// Parses only Herdr's documented invocation CWD fields.
+    ///
+    /// Pane context takes precedence over workspace context. If the pane field is
+    /// present but unusable, the workspace field is not used as a fallback.
+    pub fn from_plugin_context_json(plugin_context: Option<&str>) -> Option<Self> {
+        let context: Value = serde_json::from_str(plugin_context?).ok()?;
+        let context = context.as_object()?;
+        let directory = match context.get("focused_pane_cwd") {
+            Some(value) => value.as_str()?,
+            None => context.get("workspace_cwd")?.as_str()?,
+        };
+        if directory.is_empty()
+            || directory.len() > MAX_INVOCATION_DIRECTORY_BYTES
+            || directory.chars().any(char::is_control)
+        {
+            return None;
+        }
+        let directory = PathBuf::from(directory);
+        if !directory.is_absolute() {
+            return None;
+        }
+        Some(Self { directory })
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
 
 /// Herdr process and placement context supplied to a plugin action.
 #[derive(Clone, Debug, Eq, PartialEq)]
