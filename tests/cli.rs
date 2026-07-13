@@ -1531,6 +1531,59 @@ fn doctor_classifies_invalid_config_nonzero_and_permission_failures_without_shor
 }
 
 #[test]
+fn doctor_json_uses_supported_version_flags_for_each_binary() {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.path("doctor-bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    for (executable, expected_flag) in [
+        ("tmux", "-V"),
+        ("ssh", "-V"),
+        ("cargo", "--version"),
+        ("herdr", "--version"),
+    ] {
+        let path = bin.join(executable);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = {expected_flag:?} ] || exit 64\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let output = sandbox
+        .command()
+        .env("PATH", &bin)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing config and state must still fail"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.len() < 2_048, "doctor JSON exceeded bound");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["truncated"], false);
+    for name in ["tmux", "ssh", "cargo", "herdr"] {
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap();
+        assert_eq!(check["status"], "ok", "wrong version argv for {name}");
+        assert_eq!(check["diagnostic"], serde_json::Value::Null);
+        assert_eq!(check["truncated"], false);
+    }
+}
+
+#[test]
 fn doctor_json_is_stable_bounded_and_redacts_adversarial_probe_data() {
     let sandbox = Sandbox::new();
     let bin = sandbox.path("private-home/repository/doctor-bin");

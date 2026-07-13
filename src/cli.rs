@@ -1543,14 +1543,14 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     checks.push(doctor_check("state", state_status, true));
 
     let binaries = ProcessBinaries::new("ssh", "tmux");
-    checks.push(probe_binary("tmux", binaries.tmux().to_owned()));
-    checks.push(probe_binary("ssh", binaries.ssh().to_owned()));
-    checks.push(probe_binary("cargo", PathBuf::from("cargo")));
+    checks.push(probe_binary("tmux", binaries.tmux().to_owned(), "-V"));
+    checks.push(probe_binary("ssh", binaries.ssh().to_owned(), "-V"));
+    checks.push(probe_binary("cargo", PathBuf::from("cargo"), "--version"));
 
     let herdr = env::var_os("HERDR_BIN_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("herdr"));
-    checks.push(probe_binary("herdr", herdr));
+    checks.push(probe_binary("herdr", herdr, "--version"));
     let herdr_binary_provided = env::var_os("HERDR_BIN_PATH")
         .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
     let plugin_context_signaled = herdr_binary_provided
@@ -1626,8 +1626,8 @@ fn doctor_status_passes(status: DoctorStatus) -> bool {
     matches!(status, DoctorStatus::Ok | DoctorStatus::Standalone)
 }
 
-fn probe_binary(name: &'static str, program: PathBuf) -> DoctorCheck {
-    let spec = CommandSpec::new(program, vec!["--version".to_owned()]);
+fn probe_binary(name: &'static str, program: PathBuf, version_flag: &str) -> DoctorCheck {
+    let spec = CommandSpec::new(program, vec![version_flag.to_owned()]);
     let cancelled = AtomicBool::new(false);
     let status = match run_bounded(&spec, StdDuration::from_secs(3), &cancelled) {
         BoundedOutput::Completed { status, .. } if status.success() => DoctorStatus::Ok,
