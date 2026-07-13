@@ -437,6 +437,8 @@ def verify_installed_runtime(cargo: str, archive: Path, root_prefix: str) -> Non
             _write_probe(probes / name, output)
         runtime_environment = build_environment | {
             "HERDR_BIN_PATH": str(probes / "herdr"),
+            "HERDR_PANE_ID": "package-smoke-pane",
+            "HERDR_WORKSPACE_ID": "package-smoke-workspace",
             "PATH": str(probes),
             "XDG_CONFIG_HOME": str(xdg_config),
             "XDG_STATE_HOME": str(xdg_state),
@@ -454,7 +456,9 @@ def verify_installed_runtime(cargo: str, archive: Path, root_prefix: str) -> Non
         )
         expected_files = {
             xdg_config / "herdr-tether" / "config.toml",
+            xdg_config / "herdr-tether" / ".config.toml.lock",
             xdg_state / "herdr-tether" / "state.json",
+            xdg_state / "herdr-tether" / ".state.json.lock",
         }
         actual_files = {
             path for root in (xdg_config, xdg_state) for path in root.rglob("*") if path.is_file()
