@@ -404,7 +404,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 1, "", "no server running")
                 if argv[1:] == ["session", "list", "--json"]:
                     return subprocess.CompletedProcess(argv, 0, "[]", "")
-                return subprocess.CompletedProcess(argv, 1, "", "session does not exist")
+                return subprocess.CompletedProcess(argv, 1, "", "session is already closed")
 
             with mock.patch.object(smoke, "run", side_effect=run):
                 smoke.cleanup()

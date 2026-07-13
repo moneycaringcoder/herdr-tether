@@ -1756,6 +1756,7 @@ class Smoke:
                 "no server running",
                 "can't find session",
                 "no such session",
+                "is already closed",
             )
         )
 
