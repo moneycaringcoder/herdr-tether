@@ -595,6 +595,7 @@ fn local_host_check_resolves_tmux_outside_restricted_gui_path() {
 #[test]
 fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     let plugin_config = sandbox.path("plugin-config");
     let plugin_state = sandbox.path("plugin-state");
     let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
@@ -605,6 +606,8 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .command()
         .env("HERDR_PLUGIN_CONFIG_DIR", &plugin_config)
         .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -617,6 +620,8 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .command()
         .env("HERDR_PLUGIN_CONFIG_DIR", &plugin_config)
         .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -1471,6 +1476,7 @@ fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
 #[test]
 fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutating_herdr() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
     fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
     fs::write(&herdr_config, "# unchanged\n").unwrap();
@@ -1498,6 +1504,8 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
 
     sandbox
         .command()
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -1531,8 +1539,11 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
 #[test]
 fn prune_uses_configured_retention_unless_the_flag_explicitly_overrides_it() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     sandbox
         .command()
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success();

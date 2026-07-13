@@ -254,10 +254,11 @@ Release-candidate validation is package-derived rather than based on a hand-main
 
 `HerdrClient` adapts Herdr's pane and tab commands. It captures the invoking pane, creates and focuses the selected split or tab, then runs an exact Tether attach command there. Tether uses its resolved executable and forwards Herdr's authoritative plugin config/state directories instead of relying on a pane-local `PATH`.
 
-Setup probes Herdr, `tmux`, and OpenSSH through fixed version arguments before
-creating or rewriting Tether state, configuration, keybindings, or backups.
-Cargo remains an installation/build prerequisite rather than a runtime setup
-dependency.
+The main setup command probes Herdr, `tmux`, and OpenSSH through fixed version
+arguments before creating or rewriting Tether state or configuration. The
+separate keybinding command verifies Herdr before touching Herdr configuration
+or backups. Cargo remains an installation/build prerequisite rather than a
+runtime setup dependency.
 
 The picker consumes only Herdr's documented optional `focused_pane_cwd` and
 `workspace_cwd` context fields, with pane context taking precedence. A match

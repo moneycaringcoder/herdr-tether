@@ -841,6 +841,37 @@ class Smoke:
             picker_ready,
         )
 
+    def assert_managed_picker_viewport(
+        self,
+        pane_id: str,
+        *,
+        rows: int,
+        columns: int,
+    ) -> None:
+        response = self.result_object(
+            self.decode_json(
+                self.herdr_run("pane", "layout", "--pane", pane_id),
+                "keyboard picker layout",
+            ),
+            "keyboard picker layout",
+        )
+        layout = response.get("layout")
+        area = layout.get("area") if isinstance(layout, dict) else None
+        width = area.get("width") if isinstance(area, dict) else None
+        height = area.get("height") if isinstance(area, dict) else None
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+            or not 1 <= width <= columns
+            or not max(1, rows - 4) <= height <= rows
+        ):
+            fail(
+                "Herdr picker layout did not reflect the requested "
+                f"{columns}x{rows} viewport; observed {width!r}x{height!r}"
+            )
+
     def keyboard_picker_matrix(self) -> None:
         steps = [
             ("Hosts", b"\x1b[B\x1b[A\r"),
@@ -852,6 +883,11 @@ class Smoke:
             try:
                 self.resize_herdr(rows=rows, columns=columns)
                 picker_pane = self.invoke_plugin_picker_via_keyboard()
+                self.assert_managed_picker_viewport(
+                    picker_pane,
+                    rows=rows,
+                    columns=columns,
+                )
                 self.interact_managed_pane_via_herdr(picker_pane, steps)
                 self.wait_until(
                     f"{columns}x{rows} keyboard-only picker pane exit",

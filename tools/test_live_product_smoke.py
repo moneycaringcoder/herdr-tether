@@ -396,6 +396,9 @@ class SmokeEnvironmentTests(unittest.TestCase):
                         side_effect=lambda: next(panes),
                     ) as invoke,
                     mock.patch.object(
+                        smoke, "assert_managed_picker_viewport"
+                    ) as viewport,
+                    mock.patch.object(
                         smoke, "interact_managed_pane_via_herdr"
                     ) as interact,
                     mock.patch.object(
@@ -415,6 +418,13 @@ class SmokeEnvironmentTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(invoke.call_count, 2)
+                self.assertEqual(
+                    viewport.call_args_list,
+                    [
+                        mock.call("picker-wide", rows=24, columns=80),
+                        mock.call("picker-narrow", rows=14, columns=48),
+                    ],
+                )
                 expected_steps = [
                     ("Hosts", b"\x1b[B\x1b[A\r"),
                     ("Resources", b"\x1b"),
@@ -429,6 +439,51 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 )
                 self.assertEqual(wait_until.call_count, 2)
                 sleep.assert_not_called()
+            finally:
+                shutil.rmtree(smoke.root, ignore_errors=True)
+
+    def test_managed_picker_viewport_requires_observed_narrow_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=False,
+            )
+
+            def layout(width: int, height: int) -> subprocess.CompletedProcess[str]:
+                payload = {
+                    "id": "layout",
+                    "result": {
+                        "type": "pane_layout",
+                        "layout": {
+                            "area": {
+                                "x": 0,
+                                "y": 0,
+                                "width": width,
+                                "height": height,
+                            }
+                        },
+                    },
+                }
+                return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+
+            try:
+                with mock.patch.object(smoke, "herdr_run", return_value=layout(48, 12)):
+                    smoke.assert_managed_picker_viewport(
+                        "picker",
+                        rows=14,
+                        columns=48,
+                    )
+                with (
+                    mock.patch.object(smoke, "herdr_run", return_value=layout(140, 38)),
+                    self.assertRaises(smoke_module.SmokeFailure),
+                ):
+                    smoke.assert_managed_picker_viewport(
+                        "picker",
+                        rows=14,
+                        columns=48,
+                    )
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)
 
