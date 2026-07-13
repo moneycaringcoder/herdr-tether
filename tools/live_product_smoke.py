@@ -33,6 +33,10 @@ HERDR_VERSION = "0.7.3"
 COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
+HERDR_DEFAULT_ROWS = 40
+HERDR_DEFAULT_COLUMNS = 140
+HERDR_PICKER_VIEWPORTS = ((24, 80), (14, 48))
+HERDR_OPEN_KEYS = b"\x02t"
 OWNED_SESSION_RE = re.compile(r"^tether-[0-9a-f]{32}$")
 SSH_TARGET_RE = re.compile(
     r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
@@ -45,6 +49,7 @@ PHASE_NAMES = (
     "start_herdr",
     "keybinding_contract",
     "plugin_contract",
+    "keyboard_picker_matrix",
     "product_lifecycle",
 )
 EXERCISED_ACTIONS = (
@@ -570,7 +575,11 @@ class Smoke:
 
     def start_herdr(self) -> None:
         master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
+        fcntl.ioctl(
+            slave,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", HERDR_DEFAULT_ROWS, HERDR_DEFAULT_COLUMNS, 0, 0),
+        )
         try:
             self.herdr_client = subprocess.Popen(
                 [str(self.herdr), "--session", self.session],
@@ -638,6 +647,35 @@ class Smoke:
             except OSError as log_error:
                 diagnostics = f"<unavailable: {log_error}>"
             fail(f"{error}\nHerdr server log ({server_log}):\n{diagnostics}")
+
+    def resize_herdr(self, *, rows: int, columns: int) -> None:
+        if self.herdr_master is None:
+            fail("Herdr PTY is unavailable for resize")
+        if not 1 <= rows <= 1_000 or not 1 <= columns <= 1_000:
+            fail("Herdr PTY dimensions must be between 1 and 1000")
+        try:
+            fcntl.ioctl(
+                self.herdr_master,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", rows, columns, 0, 0),
+            )
+        except OSError as error:
+            fail(f"could not resize Herdr PTY: {error}")
+
+    def send_herdr_bytes(self, keys: bytes) -> None:
+        if self.herdr_master is None:
+            fail("Herdr PTY is unavailable for keyboard input")
+        if not keys:
+            return
+        pending = memoryview(keys)
+        try:
+            while pending:
+                written = os.write(self.herdr_master, pending)
+                if written <= 0:
+                    fail("Herdr PTY accepted no keyboard input")
+                pending = pending[written:]
+        except OSError as error:
+            fail(f"could not write keyboard input to Herdr PTY: {error}")
 
     def interact(
         self,
@@ -759,6 +797,107 @@ class Smoke:
             self.wait_until(f"managed plugin picker marker {marker!r}", visible)
             if keys:
                 self.herdr_run("pane", "send-keys", pane_id, *keys)
+
+    def interact_managed_pane_via_herdr(
+        self,
+        pane_id: str,
+        steps: list[tuple[str, bytes]],
+    ) -> None:
+        """Verify picker stages and deliver every action through Herdr's PTY."""
+        for marker, keys in steps:
+            def visible() -> bool:
+                if pane_id not in self.pane_ids():
+                    fail(
+                        f"managed plugin pane {pane_id} closed before marker {marker!r}"
+                    )
+                return marker in self.pane_visible_text(pane_id)
+
+            self.wait_until(
+                f"keyboard-only managed picker marker {marker!r}",
+                visible,
+            )
+            self.send_herdr_bytes(keys)
+
+    def invoke_plugin_picker_via_keyboard(self) -> str:
+        """Invoke the installed prefix+t action through the real Herdr client."""
+        before = self.pane_ids()
+        self.send_herdr_bytes(HERDR_OPEN_KEYS)
+
+        def picker_ready() -> str | bool:
+            matches = [
+                pane_id
+                for pane_id in self.pane_ids() - before
+                if "Hosts" in self.pane_visible_text(pane_id)
+            ]
+            if len(matches) > 1:
+                fail(
+                    "prefix+t created multiple ready picker panes: "
+                    f"{sorted(matches)}"
+                )
+            return matches[0] if matches else False
+
+        return self.wait_until(
+            "prefix+t managed picker pane readiness",
+            picker_ready,
+        )
+
+    def assert_managed_picker_viewport(
+        self,
+        pane_id: str,
+        *,
+        rows: int,
+        columns: int,
+    ) -> None:
+        response = self.result_object(
+            self.decode_json(
+                self.herdr_run("pane", "layout", "--pane", pane_id),
+                "keyboard picker layout",
+            ),
+            "keyboard picker layout",
+        )
+        layout = response.get("layout")
+        area = layout.get("area") if isinstance(layout, dict) else None
+        width = area.get("width") if isinstance(area, dict) else None
+        height = area.get("height") if isinstance(area, dict) else None
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+            or not 1 <= width <= columns
+            or not max(1, rows - 4) <= height <= rows
+        ):
+            fail(
+                "Herdr picker layout did not reflect the requested "
+                f"{columns}x{rows} viewport; observed {width!r}x{height!r}"
+            )
+
+    def keyboard_picker_matrix(self) -> None:
+        steps = [
+            ("Hosts", b"\x1b[B\x1b[A\r"),
+            ("Resources", b"\x1b"),
+            ("Hosts", b"\x1b"),
+        ]
+        for rows, columns in HERDR_PICKER_VIEWPORTS:
+            picker_pane: str | None = None
+            try:
+                self.resize_herdr(rows=rows, columns=columns)
+                picker_pane = self.invoke_plugin_picker_via_keyboard()
+                self.assert_managed_picker_viewport(
+                    picker_pane,
+                    rows=rows,
+                    columns=columns,
+                )
+                self.interact_managed_pane_via_herdr(picker_pane, steps)
+                self.wait_until(
+                    f"{columns}x{rows} keyboard-only picker pane exit",
+                    lambda: picker_pane not in self.pane_ids(),
+                )
+            finally:
+                self.resize_herdr(
+                    rows=HERDR_DEFAULT_ROWS,
+                    columns=HERDR_DEFAULT_COLUMNS,
+                )
 
     def pane_process_fingerprint(self, pane_id: str) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
         payload = self.result_object(
@@ -1609,7 +1748,9 @@ class Smoke:
             fail("real plugin-picker Observer workflow changed its source process")
 
     def product_lifecycle(self) -> None:
-        setup = self.run([str(self.tether), "setup", "--yes"])
+        setup_env = self.env.copy()
+        setup_env["HERDR_BIN_PATH"] = str(self.herdr_wrapper)
+        setup = self.run([str(self.tether), "setup", "--yes"], env=setup_env)
         if "Tether configuration:" not in setup.stdout or "Tether state:" not in setup.stdout:
             fail(f"Tether setup did not report its configuration and state paths: {setup.stdout}")
         doctor_env = self.env.copy()
@@ -1909,6 +2050,7 @@ class Smoke:
             ("start_herdr", self.start_herdr),
             ("keybinding_contract", self.keybinding_contract),
             ("plugin_contract", self.plugin_contract),
+            ("keyboard_picker_matrix", self.keyboard_picker_matrix),
             ("product_lifecycle", self.product_lifecycle),
         )
         for name, operation in phases:

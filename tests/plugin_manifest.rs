@@ -63,6 +63,12 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
 
     let actions = value["actions"].as_array().unwrap();
     assert_eq!(actions.len(), 3);
+    assert!(
+        actions[0].as_table().unwrap().keys().all(|field| {
+            ["id", "title", "description", "command", "contexts"].contains(&field.as_str())
+        }),
+        "open action contains a field outside Herdr's documented schema"
+    );
     assert_eq!(actions[0]["id"].as_str(), Some("open"));
     assert_eq!(actions[0]["title"].as_str(), Some("Tether: Open workloads"));
     assert_eq!(
@@ -75,6 +81,14 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
             toml::Value::String("target/release/herdr-tether".into()),
             toml::Value::String("plugin".into()),
             toml::Value::String("open".into()),
+        ]
+    );
+    assert_eq!(
+        actions[0]["contexts"].as_array().unwrap(),
+        &[
+            toml::Value::String("global".into()),
+            toml::Value::String("workspace".into()),
+            toml::Value::String("pane".into()),
         ]
     );
     assert_eq!(actions[1]["id"].as_str(), Some("setup"));

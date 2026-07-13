@@ -307,9 +307,48 @@ enum PluginCommand {
 }
 
 pub fn run() -> Result<()> {
+    let plugin_managed = env::var_os("HERDR_PLUGIN_ACTION_ID").is_some()
+        || env::var_os("HERDR_PLUGIN_ENTRYPOINT_ID").is_some();
+    let result = run_inner();
+    if plugin_managed {
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let correlation = plugin_correlation_reference();
+                Err(anyhow::anyhow!(
+                    "plugin command failed; correlation {correlation}"
+                ))
+            }
+        }
+    } else {
+        result
+    }
+}
+
+fn run_inner() -> Result<()> {
     let cli = Cli::parse();
     let paths = AppPaths::from_env()?;
     dispatch(cli.command, &paths)
+}
+
+fn plugin_correlation_reference() -> String {
+    env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .and_then(|context| serde_json::from_str::<serde_json::Value>(&context).ok())
+        .and_then(|context| {
+            context
+                .get("correlation_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|correlation| {
+            !correlation.is_empty()
+                && correlation.len() <= 64
+                && correlation.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'-' | b'_')
+                })
+        })
+        .unwrap_or_else(|| "unavailable".to_owned())
 }
 
 fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
@@ -355,6 +394,7 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
         bail!("setup requires --yes when standard input is not a terminal");
     }
 
+    preflight_setup_runtime()?;
     let config_store = ConfigStore::new(paths.config_file.clone());
     let state_store = StateStore::new(paths.state_file.clone());
     config_store.update(|_| Ok(()))?;
@@ -382,7 +422,7 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
         placement_name(config.ui.placement)
     );
     println!("Configured targets: {}", config.hosts.len());
-    println!("Prerequisites: Herdr, tmux, SSH, and Cargo must be installed and executable.");
+    println!("Prerequisites: Herdr, tmux, and SSH must be installed and executable.");
     println!("Herdr keybindings are changed only by the explicit keybinding command.");
     println!("Binding to install: plugin_action moneycaringcoder.tether.open");
     println!(
@@ -392,6 +432,7 @@ fn setup(paths: &AppPaths, args: SetupArgs) -> Result<()> {
 }
 
 fn setup_keybinding(args: KeybindingArgs) -> Result<()> {
+    preflight_runtime_tool("Herdr", herdr_executable(), "--version")?;
     let path = HerdrKeybindingStore::path_from_env()?;
     let store = HerdrKeybindingStore::new(path.clone());
     if args.rollback {
@@ -416,8 +457,33 @@ fn setup_keybinding(args: KeybindingArgs) -> Result<()> {
     Ok(())
 }
 
+fn preflight_setup_runtime() -> Result<()> {
+    let binaries = ProcessBinaries::new("ssh", "tmux");
+    preflight_runtime_tool("Herdr", herdr_executable(), "--version")?;
+    preflight_runtime_tool("tmux", binaries.tmux().to_owned(), "-V")?;
+    preflight_runtime_tool("SSH", binaries.ssh().to_owned(), "-V")
+}
+
+fn herdr_executable() -> PathBuf {
+    env::var_os("HERDR_BIN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("herdr"))
+}
+
+fn preflight_runtime_tool(
+    name: &'static str,
+    executable: PathBuf,
+    version_flag: &str,
+) -> Result<()> {
+    let check = probe_binary(name, executable, version_flag);
+    if !matches!(check.status, DoctorStatus::Ok) {
+        bail!("setup prerequisite unavailable: {name}; install {name} and retry");
+    }
+    Ok(())
+}
+
 fn reload_herdr_config(config: &Path, backup: Option<PathBuf>) -> Result<()> {
-    let executable = env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = herdr_executable();
     let status = Command::new(&executable)
         .args(["server", "reload-config"])
         .status()
@@ -842,6 +908,10 @@ fn selection_from_picker(
     }
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
+    options.prefer_invocation_location(
+        crate::herdr::InvocationLocation::from_plugin_env().as_ref(),
+        state,
+    );
     retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
         options

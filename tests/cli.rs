@@ -40,6 +40,9 @@ impl Sandbox {
             .env("XDG_STATE_HOME", self.path("xdg-state"))
             .env_remove("HERDR_PLUGIN_CONFIG_DIR")
             .env_remove("HERDR_PLUGIN_STATE_DIR")
+            .env_remove("HERDR_PLUGIN_ACTION_ID")
+            .env_remove("HERDR_PLUGIN_ENTRYPOINT_ID")
+            .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
             .env_remove("HERDR_BIN_PATH")
             .env_remove("HERDR_CONFIG_PATH")
             .env_remove("HERDR_PANE_ID")
@@ -114,6 +117,167 @@ fn install_tmux_script(sandbox: &Sandbox, body: &str) -> (std::ffi::OsString, st
         std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
             .unwrap();
     (path, tmux)
+}
+
+fn install_setup_runtime_scripts(
+    sandbox: &Sandbox,
+    failing_tool: Option<&str>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = sandbox.path("setup-bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (tool, expected_arg) in [("herdr", "--version"), ("tmux", "-V"), ("ssh", "-V")] {
+        let executable = bin.join(tool);
+        let exit = if failing_tool == Some(tool) { 19 } else { 0 };
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\n[ \"$1\" = \"{expected_arg}\" ] || exit 31\nexit {exit}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (bin.clone(), bin.join("herdr"))
+}
+
+#[test]
+fn setup_preflight_checks_each_runtime_without_mutating_absent_or_existing_stores() {
+    for (tool, display_name) in [("herdr", "Herdr"), ("tmux", "tmux"), ("ssh", "SSH")] {
+        for existing in [false, true] {
+            let sandbox = Sandbox::new();
+            let (bin, herdr) = install_setup_runtime_scripts(&sandbox, Some(tool));
+            let config_dir = sandbox.path("preflight-config");
+            let state_dir = sandbox.path("preflight-state");
+
+            if existing {
+                fs::create_dir_all(&config_dir).unwrap();
+                fs::create_dir_all(&state_dir).unwrap();
+                fs::write(config_dir.join("config.toml"), b"exact config bytes\r\n").unwrap();
+                fs::write(state_dir.join("state.json"), b"exact state bytes\r\n").unwrap();
+            }
+
+            sandbox
+                .command()
+                .env("PATH", &bin)
+                .env("HERDR_BIN_PATH", &herdr)
+                .env("HERDR_PLUGIN_CONFIG_DIR", &config_dir)
+                .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+                .args(["setup", "--yes"])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(format!(
+                    "setup prerequisite unavailable: {display_name}"
+                )))
+                .stderr(predicate::str::contains("exit").not())
+                .stderr(predicate::str::contains("setup-bin").not());
+
+            if existing {
+                assert_eq!(
+                    fs::read(config_dir.join("config.toml")).unwrap(),
+                    b"exact config bytes\r\n"
+                );
+                assert_eq!(
+                    fs::read(state_dir.join("state.json")).unwrap(),
+                    b"exact state bytes\r\n"
+                );
+            } else {
+                assert!(!config_dir.exists());
+                assert!(!state_dir.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn setup_preflight_success_creates_stores_without_requiring_cargo() {
+    let sandbox = Sandbox::new();
+    let (bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
+
+    sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_BIN_PATH", herdr)
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Herdr, tmux, and SSH"))
+        .stdout(predicate::str::contains("Cargo").not());
+
+    assert!(sandbox.config_file().exists());
+    assert!(sandbox.state_file().exists());
+}
+
+#[test]
+fn keybinding_preflight_failure_preserves_exact_herdr_config() {
+    let sandbox = Sandbox::new();
+    let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
+    fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+    let original = b"# exact private bytes\r\nonboarding = false\r\n";
+    fs::write(&herdr_config, original).unwrap();
+    let (bin, herdr) = install_setup_runtime_scripts(&sandbox, Some("herdr"));
+
+    sandbox
+        .command()
+        .env("PATH", bin)
+        .env("HERDR_BIN_PATH", herdr)
+        .args(["setup", "keybinding"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "setup prerequisite unavailable: Herdr",
+        ));
+
+    assert_eq!(fs::read(&herdr_config).unwrap(), original);
+    assert!(!HerdrKeybindingStore::backup_path_for(&herdr_config).exists());
+}
+
+#[test]
+fn plugin_error_boundary_redacts_details_and_validates_correlation_reference() {
+    let sandbox = Sandbox::new();
+    let secret_dir = sandbox.path("SECRET-target-path-backend");
+    fs::create_dir_all(&secret_dir).unwrap();
+    fs::write(secret_dir.join("config.toml"), "SECRET_BACKEND = [").unwrap();
+
+    sandbox
+        .command()
+        .env("HERDR_PLUGIN_CONFIG_DIR", &secret_dir)
+        .env("HERDR_PLUGIN_ACTION_ID", "SECRET_ACTION")
+        .env(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"correlation_id":"safe.Ref:42-test_ok"}"#,
+        )
+        .args(["host", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "plugin command failed; correlation safe.Ref:42-test_ok",
+        ))
+        .stderr(predicate::str::contains("SECRET").not())
+        .stderr(predicate::str::contains(secret_dir.display().to_string()).not());
+
+    sandbox
+        .command()
+        .env("HERDR_PLUGIN_CONFIG_DIR", &secret_dir)
+        .env("HERDR_PLUGIN_ENTRYPOINT_ID", "SECRET_ENTRYPOINT")
+        .env(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"correlation_id":"hostile/path\nSECRET"}"#,
+        )
+        .args(["host", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "plugin command failed; correlation unavailable",
+        ))
+        .stderr(predicate::str::contains("SECRET").not());
+
+    sandbox
+        .command()
+        .env("HERDR_PLUGIN_CONFIG_DIR", &secret_dir)
+        .args(["host", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(secret_dir.display().to_string()))
+        .stderr(predicate::str::contains("SECRET_BACKEND"));
 }
 
 #[test]
@@ -431,6 +595,7 @@ fn local_host_check_resolves_tmux_outside_restricted_gui_path() {
 #[test]
 fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     let plugin_config = sandbox.path("plugin-config");
     let plugin_state = sandbox.path("plugin-state");
     let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
@@ -441,6 +606,8 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .command()
         .env("HERDR_PLUGIN_CONFIG_DIR", &plugin_config)
         .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -453,6 +620,8 @@ fn plugin_directories_override_xdg_and_setup_never_edits_herdr_config() {
         .command()
         .env("HERDR_PLUGIN_CONFIG_DIR", &plugin_config)
         .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -488,7 +657,7 @@ fn keybinding_setup_and_rollback_are_explicit_and_reload_after_writes() {
     fs::write(
         &herdr,
         format!(
-            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> '{}'\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$1\" \"$2\" >> '{}'\nexit 0\n",
             log.display()
         ),
     )
@@ -547,7 +716,11 @@ fn keybinding_reload_failure_reports_written_state_and_rollback_without_leaking_
     )
     .unwrap();
     let herdr = sandbox.path("herdr-fails");
-    fs::write(&herdr, "#!/bin/sh\nexit 23\n").unwrap();
+    fs::write(
+        &herdr,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nexit 23\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -1303,6 +1476,7 @@ fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
 #[test]
 fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutating_herdr() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     let herdr_config = sandbox.path("xdg-config/herdr/config.toml");
     fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
     fs::write(&herdr_config, "# unchanged\n").unwrap();
@@ -1330,6 +1504,8 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
 
     sandbox
         .command()
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success()
@@ -1351,7 +1527,7 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
         .stdout(predicate::str::contains("Configured targets: 1"))
         .stdout(predicate::str::contains("tmux"))
         .stdout(predicate::str::contains("SSH"))
-        .stdout(predicate::str::contains("Cargo"))
+        .stdout(predicate::str::contains("Cargo").not())
         .stdout(predicate::str::contains("Herdr"))
         .stdout(predicate::str::contains("plugin_action"))
         .stdout(predicate::str::contains("herdr-tether setup keybinding"))
@@ -1363,8 +1539,11 @@ fn setup_reports_effective_defaults_prerequisites_and_next_action_without_mutati
 #[test]
 fn prune_uses_configured_retention_unless_the_flag_explicitly_overrides_it() {
     let sandbox = Sandbox::new();
+    let (runtime_bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
     sandbox
         .command()
+        .env("PATH", &runtime_bin)
+        .env("HERDR_BIN_PATH", &herdr)
         .args(["setup", "--yes"])
         .assert()
         .success();

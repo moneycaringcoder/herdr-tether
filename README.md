@@ -67,7 +67,11 @@ Whichever source you choose, run the setup action once:
 herdr plugin action invoke moneycaringcoder.tether.setup
 ```
 
-The setup action safely adds the `prefix+t` launcher and reloads Herdr's configuration. It refuses a conflicting binding and keeps an exact backup for rollback. After setup, press your Herdr prefix followed by `t`.
+The setup action safely adds the `prefix+t` launcher and reloads Herdr's
+configuration. Development `main` first checks the required runtime
+tools—Herdr, `tmux`, and OpenSSH—before writing Tether or Herdr files. Setup
+refuses a conflicting binding and keeps an exact backup for rollback. After
+setup, press your Herdr prefix followed by `t`.
 
 Want the standalone administration commands too? The stable install is:
 
@@ -138,6 +142,12 @@ reference adapter, not a Tether runtime dependency.
 3. Open a running workload, restart an ended one, attach to an external session, or choose **Create new Tether workload**.
 4. For a new workload, choose a repository, command, and placement.
 5. Close the Herdr view whenever you want. The workload remains available.
+
+On development `main`, when Herdr supplies an optional pane or workspace
+working directory, Tether brings an already-known matching workload and host to
+the front. The context is only a preference: malformed, unknown, or ambiguous
+paths change nothing, and Tether never creates a host, path, command, or
+selection from it.
 
 The picker keeps actions contextual:
 
