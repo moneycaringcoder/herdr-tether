@@ -14,6 +14,7 @@ import html
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import sys
 import tomllib
 from urllib.parse import unquote, urlsplit
@@ -50,11 +51,19 @@ def public_name(path: Path, root: Path) -> str:
 def read_public(path: Path, root: Path, findings: Findings) -> str | None:
     name = public_name(path, root)
     try:
-        size = path.stat().st_size
-        if size > MAX_DOCUMENT_BYTES:
+        with path.open("rb") as document:
+            metadata = os.fstat(document.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                findings.add("document-read", name, "cannot read as bounded UTF-8 text")
+                return None
+            if metadata.st_size > MAX_DOCUMENT_BYTES:
+                findings.add("document-size", name, f"exceeds {MAX_DOCUMENT_BYTES} bytes")
+                return None
+            content = document.read(MAX_DOCUMENT_BYTES + 1)
+        if len(content) > MAX_DOCUMENT_BYTES:
             findings.add("document-size", name, f"exceeds {MAX_DOCUMENT_BYTES} bytes")
             return None
-        return path.read_text(encoding="utf-8")
+        return content.decode("utf-8", errors="strict")
     except (OSError, UnicodeError):
         findings.add("document-read", name, "cannot read as bounded UTF-8 text")
         return None

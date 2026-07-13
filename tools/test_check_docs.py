@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 CHECKER = Path(__file__).with_name("check_docs.py")
+SPEC = importlib.util.spec_from_file_location("check_docs", CHECKER)
+assert SPEC is not None and SPEC.loader is not None
+check_docs = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(check_docs)
 
 
 class DocsCheckerTests(unittest.TestCase):
@@ -135,6 +141,56 @@ class DocsCheckerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("config-default docs/configuration.md: documented workers must be 4", result.stdout)
         self.assertIn("capability-default docs/architecture.md:", result.stdout)
+
+    def test_read_public_uses_opened_inode_when_path_is_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "README.md"
+            path.write_text("# original\n", encoding="utf-8")
+            replacement = root / "replacement.md"
+            replacement.write_text("# replacement\n", encoding="utf-8")
+            opened_inode: list[int] = []
+            opened_binary: list[bool] = []
+            original_open = Path.open
+
+            def replace_after_open(candidate, *args, **kwargs):
+                handle = original_open(candidate, *args, **kwargs)
+                opened_inode.append(os.fstat(handle.fileno()).st_ino)
+                opened_binary.append(isinstance(handle.read(0), bytes))
+                os.replace(replacement, path)
+                self.assertNotEqual(opened_inode[-1], path.stat().st_ino)
+                return handle
+
+            findings = check_docs.Findings()
+            with mock.patch.object(Path, "open", replace_after_open):
+                text = check_docs.read_public(path, root, findings)
+
+        self.assertEqual(text, "# original\n")
+        self.assertEqual(opened_binary, [True])
+        self.assertEqual(findings.output(), [])
+
+    def test_read_public_rejects_file_grown_past_limit_after_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "README.md"
+            path.write_bytes(b"small")
+            original_open = Path.open
+
+            def grow_after_open(candidate, *args, **kwargs):
+                handle = original_open(candidate, *args, **kwargs)
+                with open(path, "ab") as writer:
+                    writer.write(b"x" * check_docs.MAX_DOCUMENT_BYTES)
+                return handle
+
+            findings = check_docs.Findings()
+            with mock.patch.object(Path, "open", grow_after_open):
+                text = check_docs.read_public(path, root, findings)
+
+        self.assertIsNone(text)
+        self.assertEqual(
+            findings.output(),
+            [f"document-size README.md: exceeds {check_docs.MAX_DOCUMENT_BYTES} bytes"],
+        )
 
     def test_diagnostics_are_bounded(self):
         links = " ".join(f"[x{i}](missing-{i}.md)" for i in range(300))
