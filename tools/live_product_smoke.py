@@ -106,14 +106,14 @@ def smoke_report(
         "result": result,
         "cleanup": {
             "attempts": smoke.cleanup_attempts if smoke is not None else 0,
+            "result": smoke.cleanup_result if smoke is not None else "not_run",
+        },
+        "versions": {
             "platform": safe_version(sys.platform),
             "python": safe_version(platform.python_version()),
             "herdr": HERDR_VERSION,
             "tmux": safe_version(smoke.tmux_version) if smoke is not None else "unknown",
             "tether": safe_version(smoke.tether_version) if smoke is not None else "unknown",
-            "herdr": HERDR_VERSION,
-            "tmux": smoke.tmux_version if smoke is not None else "unknown",
-            "tether": smoke.tether_version if smoke is not None else "unknown",
         },
         "failure_category": category,
         "truncated": False,
