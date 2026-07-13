@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from check_package import (
     PackageError,
@@ -13,10 +14,34 @@ from check_package import (
     ArchiveLimits,
     EXPECTED_PACKAGE_FILES,
     inspect_archive,
+    isolated_build_environment,
     validate_entries,
     validate_lock_packages,
     validate_source_paths,
 )
+
+
+class IsolatedRuntimeEnvironmentTests(unittest.TestCase):
+    def test_preserves_default_rustup_home_before_isolating_home(self) -> None:
+        with tempfile.TemporaryDirectory() as original, tempfile.TemporaryDirectory() as sandbox:
+            rustup_home = Path(original) / ".rustup"
+            rustup_home.mkdir()
+            with mock.patch.dict(os.environ, {"HOME": original}, clear=False):
+                os.environ.pop("RUSTUP_HOME", None)
+                environment = isolated_build_environment(
+                    Path(sandbox) / "cargo", Path(sandbox) / "home"
+                )
+            self.assertEqual(environment["RUSTUP_HOME"], str(rustup_home))
+            self.assertEqual(environment["HOME"], str(Path(sandbox) / "home"))
+
+    def test_preserves_explicit_rustup_home(self) -> None:
+        with tempfile.TemporaryDirectory() as sandbox:
+            explicit = str(Path(sandbox) / "custom-rustup")
+            with mock.patch.dict(os.environ, {"RUSTUP_HOME": explicit}, clear=False):
+                environment = isolated_build_environment(
+                    Path(sandbox) / "cargo", Path(sandbox) / "home"
+                )
+            self.assertEqual(environment["RUSTUP_HOME"], explicit)
 
 
 class PackageContentsTests(unittest.TestCase):

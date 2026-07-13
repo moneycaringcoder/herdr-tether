@@ -375,6 +375,23 @@ def _write_probe(path: Path, output: str) -> None:
     path.chmod(0o700)
 
 
+def isolated_build_environment(cargo_home: Path, home: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    if not environment.get("RUSTUP_HOME"):
+        original_home = Path(environment.get("HOME", str(Path.home())))
+        default_rustup_home = original_home / ".rustup"
+        if default_rustup_home.is_dir():
+            environment["RUSTUP_HOME"] = str(default_rustup_home)
+    environment.update(
+        {
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_NET_OFFLINE": "true",
+            "HOME": str(home),
+        }
+    )
+    return environment
+
+
 def verify_installed_runtime(cargo: str, archive: Path, root_prefix: str) -> None:
     cargo_path = shutil.which(cargo)
     if cargo_path is None:
@@ -399,14 +416,7 @@ def verify_installed_runtime(cargo: str, archive: Path, root_prefix: str) -> Non
         if registry.is_dir():
             (cargo_home / "registry").symlink_to(registry, target_is_directory=True)
 
-        build_environment = os.environ.copy()
-        build_environment.update(
-            {
-                "CARGO_HOME": str(cargo_home),
-                "CARGO_NET_OFFLINE": "true",
-                "HOME": str(home),
-            }
-        )
+        build_environment = isolated_build_environment(cargo_home, home)
         install = _run_runtime_command(
             [
                 cargo_path,
