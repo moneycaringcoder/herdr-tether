@@ -291,12 +291,12 @@ def validate_destination(
     except (OSError, ValueError):
         findings.add("link-traversal", source_name, "relative target escapes documentation root")
         return
+    mismatch = exact_case_path(root, normalized)
+    if mismatch:
+        findings.add("link-case", source_name, f"target case does not match '{mismatch}'")
+        return
     if not target.exists():
-        mismatch = exact_case_path(root, normalized)
-        if mismatch:
-            findings.add("link-case", source_name, f"target case does not match '{mismatch}'")
-        else:
-            findings.add("link-file", source_name, f"missing relative target '{normalized.as_posix()}'")
+        findings.add("link-file", source_name, f"missing relative target '{normalized.as_posix()}'")
         return
     if target.is_dir():
         findings.add("link-file", source_name, f"relative target is not a file '{normalized.as_posix()}'")
