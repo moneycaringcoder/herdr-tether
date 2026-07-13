@@ -47,6 +47,20 @@ class PackageDerivedPublicScanTests(unittest.TestCase):
                 inspect_archive(archive)
             self.assertNotIn("ghp_", str(caught.exception))
 
+
+    def test_scans_cargo_original_manifest_generated_by_cargo_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "package.crate"
+            make_archive(
+                archive,
+                {"Cargo.toml.orig": b"[package]\nmetadata = \"api_token=SECRET_VALUE\"\n"},
+            )
+            with self.assertRaisesRegex(
+                ContractError, r"Cargo\.toml\.orig: credential-token"
+            ) as caught:
+                inspect_archive(archive)
+            self.assertNotIn("SECRET_VALUE", str(caught.exception))
+
     def test_detects_seeded_private_and_residue_patterns_without_echoing_them(self) -> None:
         seeds = {
             "private-path": "/home/secret-user/project",
@@ -114,7 +128,13 @@ class ArchiveSafetyTests(unittest.TestCase):
     def test_rejects_unsafe_paths_and_special_types(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for index, name in enumerate((f"{PREFIX}/../escape.md", f"{PREFIX}/docs\\evil.md")):
+            for index, name in enumerate(
+                (
+                    f"{PREFIX}/../escape.md",
+                    f"{PREFIX}/docs\\evil.md",
+                    f"{PREFIX}/docs/unsafe\u202ename.md",
+                )
+            ):
                 archive = root / f"path-{index}.crate"
                 with tarfile.open(archive, "w:gz") as output:
                     member = tarfile.TarInfo(name)
@@ -221,6 +241,7 @@ cargo install --git https://github.com/moneycaringcoder/herdr-tether --rev 01234
             "herdr-tether doctor $(id)",
             "TOKEN=value herdr-tether doctor",
             "herdr-tether doctor; echo bad",
+            "herdr-tether doctor &",
         )
         for command in unsafe:
             with self.subTest(command=command):

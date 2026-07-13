@@ -85,6 +85,7 @@ def smoke_report(
     smoke: "Smoke | None",
     result: str,
     category: str | None = None,
+    cleanup_result: str | None = None,
 ) -> dict[str, object]:
     completed = set(smoke.completed_phases if smoke is not None else ())
     report: dict[str, object] = {
@@ -106,7 +107,11 @@ def smoke_report(
         "result": result,
         "cleanup": {
             "attempts": smoke.cleanup_attempts if smoke is not None else 0,
-            "result": smoke.cleanup_result if smoke is not None else "not_run",
+            "result": cleanup_result
+            if cleanup_result is not None
+            else smoke.cleanup_result
+            if smoke is not None
+            else "not_run",
         },
         "versions": {
             "platform": safe_version(sys.platform),
@@ -134,6 +139,17 @@ def validate_remote_target(target: str) -> str:
 
 class SmokeFailure(RuntimeError):
     pass
+
+class SmokeConstructionFailure(SmokeFailure):
+    def __init__(self, cause: Exception, cleanup_result: str) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.cleanup_result = cleanup_result
+
+class SmokeInterrupted(RuntimeError):
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
 
 
 def fail(message: str) -> "NoReturn":
@@ -253,6 +269,43 @@ def process_fingerprint(
 
 
 class Smoke:
+    @classmethod
+    def create(
+        cls,
+        herdr: Path,
+        tether: Path,
+        repo_root: Path,
+        keep: bool,
+        remote_target: str | None = None,
+        remote_directory: str | None = None,
+        remote_known_hosts: Path | None = None,
+    ) -> "Smoke":
+        """Construct a smoke environment without leaking a partial temp root."""
+        smoke = cls.__new__(cls)
+        try:
+            smoke.__init__(
+                herdr,
+                tether,
+                repo_root,
+                keep,
+                remote_target,
+                remote_directory,
+                remote_known_hosts,
+            )
+        except Exception as error:
+            cleanup_result = "not_run"
+            root = getattr(smoke, "root", None)
+            if isinstance(root, Path):
+                try:
+                    shutil.rmtree(root)
+                    cleanup_result = "passed" if not root.exists() else "failed"
+                except OSError:
+                    cleanup_result = "failed"
+            if isinstance(error, SmokeInterrupted):
+                raise
+            raise SmokeConstructionFailure(error, cleanup_result) from error
+        return smoke
+
     def __init__(
         self,
         herdr: Path,
@@ -1926,38 +1979,50 @@ def main() -> int:
             print(f"live product smoke FAILED: {validation_error}", file=sys.stderr)
         return 2
 
-    smoke = Smoke(
-        args.herdr,
-        args.tether,
-        args.repo_root,
-        args.keep,
-        args.remote_target,
-        args.remote_directory,
-        args.remote_known_hosts,
-    )
-    atexit.register(smoke.cleanup)
+    smoke: Smoke | None = None
 
     def interrupted(signum: int, _frame: Any) -> None:
-        fail(f"received signal {signum}")
+        raise SmokeInterrupted(signum)
 
     signal.signal(signal.SIGHUP, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
     result = "passed"
     category: str | None = None
     exit_code = 0
+    construction_cleanup_result: str | None = None
     try:
+        smoke = Smoke.create(
+            args.herdr,
+            args.tether,
+            args.repo_root,
+            args.keep,
+            args.remote_target,
+            args.remote_directory,
+            args.remote_known_hosts,
+        )
+        atexit.register(smoke.cleanup)
         smoke.execute()
+    except SmokeInterrupted as error:
+        result = "interrupted"
+        category = "interrupted"
+        exit_code = 128 + error.signum
+        if not args.json:
+            print("live product smoke interrupted", file=sys.stderr)
     except SmokeFailure as error:
+        if isinstance(error, SmokeConstructionFailure):
+            construction_cleanup_result = error.cleanup_result
+            error = error.cause
         result = "failed"
         category = failure_category(error)
         exit_code = 1
         if not args.json:
             print(f"live product smoke FAILED: {error}", file=sys.stderr)
-            output = smoke.herdr_output.decode("utf-8", "replace").strip()
-            if output:
-                print(f"Herdr PTY tail:\n{output[-8000:]}", file=sys.stderr)
-            if args.keep:
-                print(f"disposable root retained at {smoke.root}", file=sys.stderr)
+            if smoke is not None:
+                output = smoke.herdr_output.decode("utf-8", "replace").strip()
+                if output:
+                    print(f"Herdr PTY tail:\n{output[-8000:]}", file=sys.stderr)
+                if args.keep:
+                    print(f"disposable root retained at {smoke.root}", file=sys.stderr)
     except KeyboardInterrupt as error:
         result = "interrupted"
         category = failure_category(error)
@@ -1965,14 +2030,26 @@ def main() -> int:
         if not args.json:
             print("live product smoke interrupted", file=sys.stderr)
     finally:
-        smoke.cleanup()
+        if smoke is not None:
+            smoke.cleanup()
+    cleanup_result = (
+        smoke.cleanup_result if smoke is not None else construction_cleanup_result or "not_run"
+    )
     result, category, exit_code = finalize_cleanup_verdict(
-        result, category, exit_code, smoke.cleanup_result
+        result,
+        category,
+        exit_code,
+        cleanup_result,
     )
     if not args.json and category == "cleanup":
         print("live product smoke FAILED: cleanup did not complete", file=sys.stderr)
     if args.json:
-        print(json.dumps(smoke_report(smoke, result, category), separators=(",", ":")))
+        print(
+            json.dumps(
+                smoke_report(smoke, result, category, cleanup_result),
+                separators=(",", ":"),
+            )
+        )
     elif result == "passed":
         print("live product smoke passed: actions, continuity, exact close, and all placements")
     return exit_code

@@ -551,11 +551,32 @@ def public_assets(root: Path) -> set[str]:
     return result
 
 
+def populate_dependency_cache(cargo: str) -> None:
+    """Fetch locked sources before the isolated offline install proof."""
+    try:
+        result = subprocess.run(
+            [cargo, "fetch", "--locked"],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PackageError(f"could not fetch locked Cargo dependencies: {error}") from error
+    if result.returncode != 0:
+        raise PackageError(
+            f"cargo fetch failed ({result.returncode}):\n{result.stderr[:1000]}"
+        )
+
+
 def package_entries(cargo: str, allow_dirty: bool) -> set[str]:
     package = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]
     root_prefix = f"{package['name']}-{package['version']}"
     archive = ROOT / "target" / "package" / f"{root_prefix}.crate"
     archive.unlink(missing_ok=True)
+    populate_dependency_cache(cargo)
     command = [cargo, "package", "--locked", "--no-verify"]
     if allow_dirty:
         command.append("--allow-dirty")

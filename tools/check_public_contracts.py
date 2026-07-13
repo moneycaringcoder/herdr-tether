@@ -35,7 +35,7 @@ TEXT_PATTERNS = (
     ("orchestration-residue", re.compile(r"\b(?:mission ledger|internal ledger|agent transcript|internal mission|conversation transcript)\b", re.I)),
     ("unsafe-release-wording", re.compile(r"\b(?:curl|wget)\b[^\n]{0,240}\|\s*(?:ba)?sh\b|\bsudo\s+(?:cargo\s+install|herdr\s+plugin\s+install)\b", re.I)),
 )
-SHELL_OPERATOR_RE = re.compile(r"(?:\|\||&&|[|;<>`]|\$\(|\$\{|\n)")
+SHELL_OPERATOR_RE = re.compile(r"(?:\|\||&&|[|&;<>`]|\$\(|\$\{|\n)")
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -80,6 +80,8 @@ class CliExample:
 
 def _safe_member_name(name: str) -> PurePosixPath:
     path = PurePosixPath(name)
+    if any(unicodedata.category(character).startswith("C") for character in name):
+        raise ContractError("package archive contains an unsafe member path")
     if (
         not name
         or "\\" in name
@@ -137,7 +139,7 @@ def _is_public_text_surface(path: str) -> bool:
         return parsed.suffix.lower() not in BINARY_ASSET_SUFFIXES
     return len(parsed.parts) == 1 and (
         parsed.suffix.lower() in {".md", ".txt", ".toml", ".json"}
-        or parsed.name in {"LICENSE", "Cargo.lock"}
+        or parsed.name in {"LICENSE", "Cargo.lock", "Cargo.toml.orig"}
     )
 
 

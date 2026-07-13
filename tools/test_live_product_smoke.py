@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import signal
 import tempfile
 import unittest
 from unittest import mock
@@ -13,6 +14,7 @@ from unittest import mock
 import live_product_smoke as smoke_module
 from live_product_smoke import (
     Smoke,
+    SmokeInterrupted,
     REPORT_MAX_BYTES,
     failure_category,
     finalize_cleanup_verdict,
@@ -489,7 +491,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
         smoke.cleanup.side_effect = cleanup
         with (
             mock.patch.object(smoke_module, "parse_args", return_value=args),
-            mock.patch.object(smoke_module, "Smoke", return_value=smoke),
+            mock.patch.object(smoke_module.Smoke, "create", return_value=smoke),
             mock.patch.object(smoke_module, "smoke_report", return_value={"result": "failed"}) as report,
             mock.patch.object(smoke_module.atexit, "register"),
             mock.patch.object(smoke_module.signal, "signal"),
@@ -498,8 +500,73 @@ class SmokeEnvironmentTests(unittest.TestCase):
             exit_code = smoke_module.main()
 
         self.assertEqual(exit_code, 1)
-        report.assert_called_once_with(smoke, "failed", "cleanup")
+        report.assert_called_once_with(smoke, "failed", "cleanup", "failed")
         self.assertEqual(json.loads(stdout.getvalue()), {"result": "failed"})
+
+    def test_constructor_failure_emits_json_and_removes_partial_root(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            partial_root = Path(repository) / "tether-smoke-partial"
+            partial_root.mkdir()
+            args = mock.Mock(
+                herdr=Path("/bin/true"),
+                tether=Path("/bin/true"),
+                repo_root=Path(repository),
+                keep=False,
+                remote_target="host.example",
+                remote_directory="/srv/work",
+                remote_known_hosts=Path(repository) / "missing-known-hosts",
+                json=True,
+            )
+            with (
+                mock.patch.object(smoke_module, "parse_args", return_value=args),
+                mock.patch.object(smoke_module.tempfile, "mkdtemp", return_value=str(partial_root)),
+                mock.patch.object(smoke_module.signal, "signal"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                exit_code = smoke_module.main()
+
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(report["completion"], "failed")
+            self.assertIsNotNone(report["failure_category"])
+            self.assertEqual(report["cleanup"], {"attempts": 0, "result": "passed"})
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertFalse(partial_root.exists())
+
+    def test_signal_interruption_has_distinct_json_category_and_exit_code(self) -> None:
+        args = mock.Mock(
+            herdr=Path("/bin/true"),
+            tether=Path("/bin/true"),
+            repo_root=Path("/tmp"),
+            keep=False,
+            remote_target=None,
+            remote_directory=None,
+            remote_known_hosts=None,
+            json=True,
+        )
+        smoke = mock.Mock(
+            cleanup_result="passed",
+            cleanup_attempts=0,
+            completed_phases=[],
+            active_phase=None,
+            tmux_version="unknown",
+            tether_version="unknown",
+        )
+        smoke.execute.side_effect = SmokeInterrupted(signal.SIGTERM)
+        with (
+            mock.patch.object(smoke_module, "parse_args", return_value=args),
+            mock.patch.object(smoke_module.Smoke, "create", return_value=smoke),
+            mock.patch.object(smoke_module.atexit, "register"),
+            mock.patch.object(smoke_module.signal, "signal"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            exit_code = smoke_module.main()
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        self.assertEqual(report["result"], "interrupted")
+        self.assertEqual(report["failure_category"], "interrupted")
 
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:

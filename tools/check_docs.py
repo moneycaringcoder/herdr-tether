@@ -17,6 +17,7 @@ import re
 import stat
 import sys
 import tomllib
+import unicodedata
 from urllib.parse import unquote, urlsplit
 
 MAX_DOCUMENTS = 512
@@ -27,6 +28,10 @@ SKIPPED_SCHEMES = {"http", "https", "mailto", "ftp", "data"}
 
 class BoundedTextTooLarge(Exception):
     """Raised when a text input exceeds the checker byte limit."""
+
+
+def contains_forbidden_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
 
 
 class Findings:
@@ -196,6 +201,13 @@ def anchors_for(text: str, name: str, findings: Findings) -> set[str]:
     for line in unfenced_lines(text):
         for match in re.finditer(r"<a\s+[^>]*?\b(?:id|name)\s*=\s*(['\"])(.*?)\1[^>]*>", line, re.I):
             anchor = html.unescape(match.group(2))
+            if contains_forbidden_control(anchor):
+                findings.add(
+                    "anchor-invalid",
+                    name,
+                    "explicit anchor contains a forbidden character",
+                )
+                continue
             if anchor in explicit:
                 findings.add("anchor-duplicate", name, f"duplicate explicit anchor '{anchor}'")
             explicit.add(anchor)
@@ -244,7 +256,7 @@ def validate_destination(
     except (UnicodeError, ValueError):
         findings.add("link-invalid", source_name, "relative target has invalid URL encoding")
         return
-    if "\x00" in decoded_path or "\x00" in fragment:
+    if contains_forbidden_control(decoded_path) or contains_forbidden_control(fragment):
         findings.add("link-invalid", source_name, "relative target contains a forbidden character")
         return
     relative = PurePosixPath(decoded_path) if decoded_path else PurePosixPath(source_name)

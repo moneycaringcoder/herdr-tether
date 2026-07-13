@@ -83,6 +83,22 @@ class DocsCheckerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("anchor-duplicate README.md: duplicate explicit anchor 'same'", result.stdout)
 
+    def test_control_characters_in_fragments_and_explicit_anchors_are_redacted(self):
+        control = "\u202e"
+        result = self.run_check(
+            {
+                "README.md": (
+                    f"[fragment](guide.md#unsafe{control}value)\n"
+                    f"<a id='unsafe{control}value'></a>\n"
+                ),
+                "guide.md": "# Safe\n",
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("anchor-invalid README.md:", result.stdout)
+        self.assertIn("link-invalid README.md:", result.stdout)
+        self.assertNotIn(control, result.stdout)
+
     def test_traversal_and_encoded_traversal_fail_closed(self):
         result = self.run_check({"README.md": "[plain](../secret) [encoded](%2e%2e/secret)\n"})
         self.assertEqual(result.returncode, 1)

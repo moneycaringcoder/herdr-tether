@@ -16,6 +16,7 @@ from check_package import (
     extract_validated_archive,
     inspect_archive,
     isolated_build_environment,
+    populate_dependency_cache,
     validate_entries,
     validate_lock_packages,
     validate_source_paths,
@@ -43,6 +44,31 @@ class IsolatedRuntimeEnvironmentTests(unittest.TestCase):
                     Path(sandbox) / "cargo", Path(sandbox) / "home"
                 )
             self.assertEqual(environment["RUSTUP_HOME"], explicit)
+
+
+class DependencyCacheTests(unittest.TestCase):
+    def test_fetches_locked_dependencies_in_repository_environment(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch("check_package.subprocess.run", return_value=completed) as run:
+            populate_dependency_cache("/toolchain/bin/cargo")
+
+        run.assert_called_once_with(
+            ["/toolchain/bin/cargo", "fetch", "--locked"],
+            cwd=mock.ANY,
+            check=False,
+            text=True,
+            stdout=mock.ANY,
+            stderr=mock.ANY,
+            timeout=180,
+        )
+
+    def test_fetch_failure_is_an_actionable_package_error(self) -> None:
+        completed = SimpleNamespace(returncode=101, stdout="", stderr="missing crate")
+        with (
+            mock.patch("check_package.subprocess.run", return_value=completed),
+            self.assertRaisesRegex(PackageError, "cargo fetch failed"),
+        ):
+            populate_dependency_cache("cargo")
 
 
 class PackageContentsTests(unittest.TestCase):
