@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -264,8 +265,11 @@ class _BoundedReader:
 
 def _read_validated_members(
     package_archive: tarfile.TarFile,
+    package_root: Path | None = None,
 ) -> Iterable[tarfile.TarInfo]:
     for member in package_archive:
+        # The consumer validates the header before asking this generator to
+        # consume or materialize its payload.
         yield member
         if not member.isfile():
             continue
@@ -273,11 +277,68 @@ def _read_validated_members(
         if extracted is None:
             raise PackageError(f"could not read package member {member.name!r}")
         remaining = member.size
-        while remaining:
-            chunk = extracted.read(min(64 * 1024, remaining))
-            if not chunk:
-                raise PackageError(f"package member {member.name!r} is truncated")
-            remaining -= len(chunk)
+        output = None
+        relative = None
+        try:
+            if package_root is not None:
+                relative = PurePosixPath(member.name).relative_to(package_root.name)
+                target = package_root.joinpath(*relative.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                output = target.open("xb")
+            while remaining:
+                chunk = extracted.read(min(64 * 1024, remaining))
+                if not chunk:
+                    raise PackageError(f"package member {member.name!r} is truncated")
+                if output is not None:
+                    output.write(chunk)
+                remaining -= len(chunk)
+        except FileExistsError as error:
+            assert relative is not None
+            raise PackageError(
+                f"package extraction repeats destination {relative.as_posix()!r}"
+            ) from error
+        finally:
+            if output is not None:
+                output.close()
+
+
+def _consume_archive(
+    archive: Path,
+    root_prefix: str,
+    limits: ArchiveLimits,
+    destination: Path | None = None,
+) -> set[str]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(archive, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PackageError(f"Cargo package archive is not a regular file: {archive}")
+        if metadata.st_size > limits.max_archive_bytes:
+            raise PackageError(
+                f"package archive exceeds {limits.max_archive_bytes} compressed bytes"
+            )
+        package_root = destination / root_prefix if destination is not None else None
+        with os.fdopen(descriptor, "rb") as raw_archive:
+            descriptor = -1
+            with gzip.GzipFile(fileobj=raw_archive, mode="rb") as decompressed:
+                bounded = _BoundedReader(
+                    decompressed, limits.max_decompressed_stream_bytes
+                )
+                with tarfile.open(fileobj=bounded, mode="r|") as package_archive:
+                    return validate_archive_members(
+                        _read_validated_members(package_archive, package_root),
+                        root_prefix,
+                        limits,
+                    )
+    except PackageError:
+        raise
+    except (OSError, EOFError, tarfile.TarError) as error:
+        raise PackageError(f"could not inspect Cargo package archive: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def inspect_archive(
@@ -285,61 +346,15 @@ def inspect_archive(
     root_prefix: str,
     limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
 ) -> set[str]:
-    try:
-        if archive.is_symlink() or not archive.is_file():
-            raise PackageError(f"Cargo package archive is not a regular file: {archive}")
-        archive_bytes = archive.stat().st_size
-        if archive_bytes > limits.max_archive_bytes:
-            raise PackageError(
-                f"package archive exceeds {limits.max_archive_bytes} compressed bytes"
-            )
-        with archive.open("rb") as raw_archive:
-            with gzip.GzipFile(fileobj=raw_archive, mode="rb") as decompressed:
-                bounded = _BoundedReader(
-                    decompressed, limits.max_decompressed_stream_bytes
-                )
-                with tarfile.open(fileobj=bounded, mode="r|") as package_archive:
-                    return validate_archive_members(
-                        _read_validated_members(package_archive), root_prefix, limits
-                    )
-    except PackageError:
-        raise
-    except (OSError, EOFError, tarfile.TarError) as error:
-        raise PackageError(f"could not inspect Cargo package archive: {error}") from error
+    return _consume_archive(archive, root_prefix, limits)
 
 
 def extract_validated_archive(
     archive: Path, root_prefix: str, destination: Path
 ) -> Path:
-    """Materialize only already-validated regular files, ignoring archive modes."""
-    inspect_archive(archive, root_prefix)
-    package_root = destination / root_prefix
-    with tarfile.open(archive, mode="r:gz") as package_archive:
-        for member in package_archive:
-            if not member.isfile():
-                continue
-            relative = PurePosixPath(member.name).relative_to(root_prefix)
-            target = package_root.joinpath(*relative.parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = package_archive.extractfile(member)
-            if source is None:
-                raise PackageError(f"could not read package member {member.name!r}")
-            remaining = member.size
-            try:
-                with target.open("xb") as output:
-                    while remaining:
-                        chunk = source.read(min(64 * 1024, remaining))
-                        if not chunk:
-                            raise PackageError(
-                                f"package member {member.name!r} is truncated"
-                            )
-                        output.write(chunk)
-                        remaining -= len(chunk)
-            except FileExistsError as error:
-                raise PackageError(
-                    f"package extraction repeats destination {relative.as_posix()!r}"
-                ) from error
-    return package_root
+    """Validate and materialize regular files from one securely opened inode."""
+    _consume_archive(archive, root_prefix, DEFAULT_ARCHIVE_LIMITS, destination)
+    return destination / root_prefix
 
 
 def _run_runtime_command(

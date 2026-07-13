@@ -13,6 +13,7 @@ from check_package import (
     validate_archive_members,
     ArchiveLimits,
     EXPECTED_PACKAGE_FILES,
+    extract_validated_archive,
     inspect_archive,
     isolated_build_environment,
     validate_entries,
@@ -226,6 +227,33 @@ class PackageContentsTests(unittest.TestCase):
                 package.addfile(member)
             with self.assertRaises(PackageError):
                 inspect_archive(link, prefix)
+
+    def test_extraction_consumes_validated_inode_when_archive_path_is_replaced(self) -> None:
+        prefix = "herdr-tether-0.3.0"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "package.crate"
+            replacement = root / "replacement.crate"
+            member = f"{prefix}/src/main.rs"
+            self._write_archive(archive, [(member, b"validated inode")])
+            self._write_archive(replacement, [(member, b"replacement inode")])
+            real_validate = validate_archive_members
+
+            def replace_after_validation(members, root_prefix, limits=ArchiveLimits()):
+                entries = real_validate(members, root_prefix, limits)
+                os.replace(replacement, archive)
+                return entries
+
+            with mock.patch(
+                "check_package.validate_archive_members",
+                side_effect=replace_after_validation,
+            ):
+                extracted = extract_validated_archive(archive, prefix, root / "output")
+
+            self.assertEqual(
+                (extracted / "src" / "main.rs").read_bytes(),
+                b"validated inode",
+            )
 
     def test_archive_rejects_declared_bomb_before_reading_payload(self) -> None:
         prefix = "herdr-tether-0.3.0"
