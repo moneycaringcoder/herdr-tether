@@ -13,6 +13,8 @@
 - Added distinct Observer capture states for loading, ready-but-empty output, and unavailable output; empty groups now expose only refresh and back actions.
 - Added bounded picker and Observer-manager viewport position and overflow guidance, plus explicit resize fallbacks for panes too small to show actionable content.
 - Added finite persisted-state, configuration, discovery-request, and status-request budgets with deterministic boundary rejection, global discovery completion reasons, and exact-target status deduplication.
+- Added versioned, bounded, redacted JSON output for doctor diagnostics and live product-smoke evidence.
+- Added deterministic public documentation, canonical default/version, package-derived hygiene, installed-artifact runtime, archive-budget, and documented CLI contract checks.
 
 ### Fixed
 

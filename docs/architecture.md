@@ -246,6 +246,10 @@ lifecycle state.
 
 The scriptable snapshot joins effective hosts, bounded repository discovery, complete owned metadata, live owned status, and safe external catalogs. Expected degradation is represented as typed partial data instead of a fabricated empty result. Snapshot has no lifecycle or persistence-mutation capability and excludes preset command bodies, child output, raw backend errors, and private storage paths.
 
+## Public quality gates
+
+Release-candidate validation is package-derived rather than based on a hand-maintained file list. The package checker enforces archive member, compressed, and uncompressed size budgets before extracting into an isolated directory, installs that exact source package, and exercises non-mutating help plus setup, doctor, and snapshot contracts in isolated user paths. Documentation links, anchors, traversal safety, canonical defaults, and version references are checked deterministically. Packaged public text and curated non-mutating CLI examples are scanned and executed with bounded, redacted diagnostics. The live product smoke can emit a versioned bounded JSON record of phases, exercised actions and placements, cleanup, and tool versions.
+
 ## Herdr placement boundary
 
 `HerdrClient` adapts Herdr's pane and tab commands. It captures the invoking pane, creates and focuses the selected split or tab, then runs an exact Tether attach command there. Tether uses its resolved executable and forwards Herdr's authoritative plugin config/state directories instead of relying on a pane-local `PATH`.
