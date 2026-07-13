@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import gzip
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
-from typing import Iterable, Mapping
+from typing import BinaryIO, Iterable, Mapping
 import unicodedata
 
 
@@ -43,6 +45,32 @@ class ContractError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ArchiveLimits:
+    max_members: int = 128
+    max_member_bytes: int = 2 * 1024 * 1024
+    max_total_bytes: int = 8 * 1024 * 1024
+    max_archive_bytes: int = 2 * 1024 * 1024
+    max_decompressed_bytes: int = 16 * 1024 * 1024
+
+
+DEFAULT_ARCHIVE_LIMITS = ArchiveLimits()
+
+
+class _BoundedReader:
+    def __init__(self, source: BinaryIO, limit: int) -> None:
+        self.source = source
+        self.remaining = limit
+
+    def read(self, size: int = -1) -> bytes:
+        requested = self.remaining + 1 if size < 0 else min(size, self.remaining + 1)
+        data = self.source.read(requested)
+        if len(data) > self.remaining:
+            raise ContractError("package archive decompression exceeds safety limit")
+        self.remaining -= len(data)
+        return data
+
+
+@dataclass(frozen=True)
 class CliExample:
     surface: str
     line: int
@@ -64,14 +92,13 @@ def _safe_member_name(name: str) -> PurePosixPath:
     return path
 
 
-def _decode_public_text(contents: bytes) -> str | None:
+def _decode_public_text(contents: bytes) -> str:
     if b"\0" in contents:
-        return None
+        raise ContractError("malformed-public-text")
     try:
-        text = contents.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    return text
+        return contents.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ContractError("malformed-public-text") from error
 
 
 def _scan_text(text: str) -> set[str]:
@@ -99,59 +126,94 @@ def _format_violations(violations: list[tuple[str, str]], maximum: int) -> str:
     return message[:MAX_DIAGNOSTIC_CHARS]
 
 
+BINARY_ASSET_SUFFIXES = {".bin", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".webp", ".woff", ".woff2"}
+
+
 def _is_public_text_surface(path: str) -> bool:
     parsed = PurePosixPath(path)
     if parsed.parts[0] in {"docs", "integrations"}:
         return True
     if parsed.parts[0] == "assets":
-        return True
+        return parsed.suffix.lower() not in BINARY_ASSET_SUFFIXES
     return len(parsed.parts) == 1 and (
         parsed.suffix.lower() in {".md", ".txt", ".toml", ".json"}
         or parsed.name in {"LICENSE", "Cargo.lock"}
     )
 
 
-def inspect_archive(archive_path: Path, *, max_diagnostics: int = MAX_DIAGNOSTICS) -> list[CliExample]:
-    """Inspect actual regular files in a Cargo package; return curated CLI examples."""
+def inspect_archive(
+    archive_path: Path,
+    *,
+    max_diagnostics: int = MAX_DIAGNOSTICS,
+    limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
+) -> list[CliExample]:
+    """Inspect bounded regular files in a Cargo package; return curated CLI examples."""
     if max_diagnostics < 1:
         raise ValueError("max_diagnostics must be positive")
     violations: list[tuple[str, str]] = []
     examples: list[CliExample] = []
     seen: set[str] = set()
     package_root: str | None = None
+    total_bytes = 0
     try:
-        with tarfile.open(archive_path, mode="r:gz") as archive:
-            for member in archive:
-                path = _safe_member_name(member.name)
-                if package_root is None:
-                    package_root = path.parts[0]
-                if not path.parts or path.parts[0] != package_root:
-                    raise ContractError("package archive member escapes its package root")
-                if member.name in seen:
-                    raise ContractError("package archive repeats a member")
-                seen.add(member.name)
-                if member.isdir():
-                    continue
-                if not member.isfile() or len(path.parts) == 1:
-                    raise ContractError("package archive contains a non-regular public member")
-                relative = PurePosixPath(*path.parts[1:]).as_posix()
-                if not _is_public_text_surface(relative):
-                    continue
-                handle = archive.extractfile(member)
-                if handle is None:
-                    raise ContractError("package archive member could not be inspected")
-                text = _decode_public_text(handle.read())
-                if text is None:
-                    continue
-                violations.extend((relative, category) for category in _scan_text(text))
-                if relative.lower().endswith((".md", ".markdown")):
-                    try:
-                        examples.extend(extract_cli_examples(text, relative))
-                    except ContractError as error:
-                        violations.append((relative, "unsafe-cli-example"))
+        if archive_path.is_symlink():
+            raise ContractError("package archive is not a regular file")
+        with archive_path.open("rb") as raw_archive:
+            opened = os.fstat(raw_archive.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ContractError("package archive is not a regular file")
+            if opened.st_size > limits.max_archive_bytes:
+                raise ContractError("package archive exceeds compressed-byte safety limit")
+            with gzip.GzipFile(fileobj=raw_archive, mode="rb") as decompressed:
+                bounded = _BoundedReader(decompressed, limits.max_decompressed_bytes)
+                with tarfile.open(fileobj=bounded, mode="r|") as archive:
+                    for count, member in enumerate(archive, start=1):
+                        if count > limits.max_members:
+                            raise ContractError("package archive exceeds member-count safety limit")
+                        path = _safe_member_name(member.name.rstrip("/") if member.isdir() else member.name)
+                        if package_root is None:
+                            package_root = path.parts[0]
+                        if not path.parts or path.parts[0] != package_root:
+                            raise ContractError("package archive member escapes its package root")
+                        if path.as_posix() in seen:
+                            raise ContractError("package archive repeats a member")
+                        seen.add(path.as_posix())
+                        if len(path.parts) == 1:
+                            if not member.isdir():
+                                raise ContractError("package archive root is not a directory")
+                            continue
+                        if not member.isfile() and not member.isdir():
+                            raise ContractError("package archive contains a non-regular public member")
+                        if member.isdir():
+                            continue
+                        if member.size < 0 or member.size > limits.max_member_bytes:
+                            raise ContractError("package archive member exceeds per-member safety limit")
+                        total_bytes += member.size
+                        if total_bytes > limits.max_total_bytes:
+                            raise ContractError("package archive exceeds total-byte safety limit")
+                        relative = PurePosixPath(*path.parts[1:]).as_posix()
+                        if not _is_public_text_surface(relative):
+                            continue
+                        handle = archive.extractfile(member)
+                        if handle is None:
+                            raise ContractError("package archive member could not be inspected")
+                        contents = handle.read(member.size + 1)
+                        if len(contents) != member.size:
+                            raise ContractError("package archive member is truncated or oversized")
+                        try:
+                            text = _decode_public_text(contents)
+                        except ContractError:
+                            violations.append((relative, "malformed-public-text"))
+                            continue
+                        violations.extend((relative, category) for category in _scan_text(text))
+                        if relative.lower().endswith((".md", ".markdown")):
+                            try:
+                                examples.extend(extract_cli_examples(text, relative))
+                            except ContractError:
+                                violations.append((relative, "unsafe-cli-example"))
     except ContractError:
         raise
-    except (OSError, tarfile.TarError) as error:
+    except (OSError, EOFError, tarfile.TarError) as error:
         raise ContractError("package archive could not be inspected") from error
     if violations:
         raise ContractError(_format_violations(violations, max_diagnostics))

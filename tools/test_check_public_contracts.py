@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import io
+import os
 from pathlib import Path
 import stat
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 from check_public_contracts import (
+    ArchiveLimits,
     ContractError,
     extract_cli_examples,
     inspect_archive,
@@ -79,6 +82,95 @@ class PackageDerivedPublicScanTests(unittest.TestCase):
             self.assertLessEqual(message.count("credential-token"), 8)
             paths = [part.split(": ", 1)[0] for part in message.split("; ") if part.startswith("docs/")]
             self.assertEqual(paths, sorted(paths))
+
+
+class ArchiveSafetyTests(unittest.TestCase):
+    def test_rejects_each_archive_budget_at_n_plus_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("members", {"README.md": b"a", "docs/a.md": b"b"}, ArchiveLimits(max_members=2)),
+                ("member", {"README.md": b"abc"}, ArchiveLimits(max_member_bytes=2)),
+                ("total", {"README.md": b"ab", "docs/a.md": b"cd"}, ArchiveLimits(max_total_bytes=3)),
+            )
+            for name, files, limits in cases:
+                with self.subTest(name=name):
+                    archive = root / f"{name}.crate"
+                    make_archive(archive, files)
+                    with self.assertRaises(ContractError):
+                        inspect_archive(archive, limits=limits)
+
+    def test_rejects_compressed_and_decompressed_bombs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "bomb.crate"
+            make_archive(archive, {"README.md": b"x" * 4096})
+            compressed_size = archive.stat().st_size
+            with self.assertRaises(ContractError):
+                inspect_archive(archive, limits=ArchiveLimits(max_archive_bytes=compressed_size - 1))
+            with self.assertRaises(ContractError):
+                inspect_archive(archive, limits=ArchiveLimits(max_member_bytes=8192, max_total_bytes=8192, max_decompressed_bytes=512))
+
+    def test_rejects_unsafe_paths_and_special_types(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, name in enumerate((f"{PREFIX}/../escape.md", f"{PREFIX}/docs\\evil.md")):
+                archive = root / f"path-{index}.crate"
+                with tarfile.open(archive, "w:gz") as output:
+                    member = tarfile.TarInfo(name)
+                    member.size = 1
+                    output.addfile(member, io.BytesIO(b"x"))
+                with self.assertRaises(ContractError):
+                    inspect_archive(archive)
+            special = root / "special.crate"
+            with tarfile.open(special, "w:gz") as output:
+                root_member = tarfile.TarInfo(PREFIX)
+                root_member.type = tarfile.DIRTYPE
+                output.addfile(root_member)
+                link = tarfile.TarInfo(f"{PREFIX}/docs/link.md")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "README.md"
+                output.addfile(link)
+            with self.assertRaises(ContractError):
+                inspect_archive(special)
+
+    def test_consumes_the_same_inode_that_was_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "package.crate"
+            replacement = root / "replacement.crate"
+            make_archive(archive, {"README.md": b"safe\n"})
+            make_archive(replacement, {"README.md": b"api_token = SECRET_VALUE\n"})
+            real_open = Path.open
+            swapped = False
+            def replacing_open(path: Path, *args: object, **kwargs: object):
+                nonlocal swapped
+                handle = real_open(path, *args, **kwargs)
+                if path == archive and not swapped:
+                    swapped = True
+                    os.replace(replacement, archive)
+                return handle
+            with mock.patch.object(Path, "open", replacing_open):
+                self.assertEqual(inspect_archive(archive), [])
+
+
+class MalformedPublicTextTests(unittest.TestCase):
+    def test_docs_and_config_text_fail_closed_on_nul_or_invalid_utf8(self) -> None:
+        malformed = (b"safe\x00hidden", b"safe\xffhidden")
+        surfaces = ("docs/public.md", "README.md", "herdr-plugin.toml", "config.json")
+        for surface in surfaces:
+            for contents in malformed:
+                with self.subTest(surface=surface, contents=contents), tempfile.TemporaryDirectory() as directory:
+                    archive = Path(directory) / "package.crate"
+                    make_archive(archive, {surface: contents})
+                    with self.assertRaisesRegex(ContractError, "malformed-public-text"):
+                        inspect_archive(archive)
+
+    def test_known_binary_asset_may_be_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "package.crate"
+            make_archive(archive, {"assets/image.png": b"\x89PNG\r\n\x1a\n\x00\xff"})
+            self.assertEqual(inspect_archive(archive), [])
 
 
 class CuratedCliExampleTests(unittest.TestCase):
