@@ -1825,7 +1825,8 @@ class Smoke:
         except (SmokeFailure, json.JSONDecodeError):
             cleanup_failed = True
         try:
-            if self.external_session in self.tmux_sessions():
+            live_tmux_sessions = self.tmux_sessions()
+            if self.external_session in live_tmux_sessions or owned_ids.intersection(live_tmux_sessions):
                 cleanup_failed = True
         except SmokeFailure:
             cleanup_failed = True
@@ -1893,6 +1894,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def finalize_cleanup_verdict(
+    result: str, category: str | None, exit_code: int, cleanup_result: str
+) -> tuple[str, str | None, int]:
+    if cleanup_result != "passed" and exit_code == 0:
+        return "failed", "cleanup", 1
+    return result, category, exit_code
+
+
 def main() -> int:
     args = parse_args()
     remote_values = (
@@ -1957,6 +1966,11 @@ def main() -> int:
             print("live product smoke interrupted", file=sys.stderr)
     finally:
         smoke.cleanup()
+    result, category, exit_code = finalize_cleanup_verdict(
+        result, category, exit_code, smoke.cleanup_result
+    )
+    if not args.json and category == "cleanup":
+        print("live product smoke FAILED: cleanup did not complete", file=sys.stderr)
     if args.json:
         print(json.dumps(smoke_report(smoke, result, category), separators=(",", ":")))
     elif result == "passed":

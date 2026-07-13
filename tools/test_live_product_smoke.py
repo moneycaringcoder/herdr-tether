@@ -14,6 +14,7 @@ from live_product_smoke import (
     Smoke,
     REPORT_MAX_BYTES,
     failure_category,
+    finalize_cleanup_verdict,
     smoke_report,
     process_fingerprint,
     terminal_screen_text,
@@ -435,6 +436,37 @@ class SmokeEnvironmentTests(unittest.TestCase):
                     smoke.cleanup()
 
             self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_rejects_ended_metadata_when_owned_tmux_is_still_live(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(Path("/bin/true"), Path("/bin/true"), Path(repository), keep=True)
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 0, owned + "\n", "")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps([{"id": owned, "status": "ended"}]), ""
+                    )
+                return subprocess.CompletedProcess(argv, 1, "", "session is already closed")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_failure_changes_successful_process_verdict(self) -> None:
+        self.assertEqual(
+            finalize_cleanup_verdict("passed", None, 0, "failed"),
+            ("failed", "cleanup", 1),
+        )
+        self.assertEqual(
+            finalize_cleanup_verdict("failed", "product_lifecycle", 1, "failed"),
+            ("failed", "product_lifecycle", 1),
+        )
 
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:
