@@ -403,7 +403,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 if argv[1:3] == ["list-sessions", "-F"]:
                     return subprocess.CompletedProcess(argv, 1, "", "no server running")
                 if argv[1:] == ["session", "list", "--json"]:
-                    return subprocess.CompletedProcess(argv, 0, "[]", "")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{"id": owned, "status": "ended"}]), "")
                 return subprocess.CompletedProcess(argv, 1, "", "session is already closed")
 
             with mock.patch.object(smoke, "run", side_effect=run):

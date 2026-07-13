@@ -1816,7 +1816,9 @@ class Smoke:
             else:
                 payload = json.loads(tether_result.stdout)
                 if not isinstance(payload, list) or any(
-                    isinstance(item, dict) and item.get("id") in owned_ids
+                    isinstance(item, dict)
+                    and item.get("id") in owned_ids
+                    and item.get("status") not in {"ended", "removed"}
                     for item in payload
                 ):
                     cleanup_failed = True
