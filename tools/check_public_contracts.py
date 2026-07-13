@@ -156,9 +156,17 @@ def inspect_archive(
     package_root: str | None = None
     total_bytes = 0
     try:
-        if archive_path.is_symlink():
-            raise ContractError("package archive is not a regular file")
-        with archive_path.open("rb") as raw_archive:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise ContractError("package archive no-follow open is unavailable")
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(archive_path, flags)
+        try:
+            raw_archive = os.fdopen(descriptor, "rb")
+        except Exception:
+            os.close(descriptor)
+            raise
+        with raw_archive:
             opened = os.fstat(raw_archive.fileno())
             if not stat.S_ISREG(opened.st_mode):
                 raise ContractError("package archive is not a regular file")

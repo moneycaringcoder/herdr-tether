@@ -134,24 +134,52 @@ class ArchiveSafetyTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 inspect_archive(special)
 
-    def test_consumes_the_same_inode_that_was_validated(self) -> None:
+    def test_rejects_symlink_replacement_at_atomic_open(self) -> None:
+        if not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("platform does not expose O_NOFOLLOW")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "package.crate"
+            target = root / "target.crate"
+            make_archive(archive, {"README.md": b"safe\n"})
+            make_archive(target, {"README.md": b"api_token = SECRET_VALUE\n"})
+            real_open = os.open
+            swapped = False
+
+            def replacing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal swapped
+                if Path(path) == archive and not swapped:
+                    swapped = True
+                    archive.unlink()
+                    archive.symlink_to(target)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", replacing_open):
+                with self.assertRaisesRegex(ContractError, "could not be inspected"):
+                    inspect_archive(archive)
+            self.assertTrue(swapped)
+
+    def test_consumes_the_same_descriptor_that_was_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "package.crate"
             replacement = root / "replacement.crate"
             make_archive(archive, {"README.md": b"safe\n"})
             make_archive(replacement, {"README.md": b"api_token = SECRET_VALUE\n"})
-            real_open = Path.open
+            real_open = os.open
             swapped = False
-            def replacing_open(path: Path, *args: object, **kwargs: object):
+
+            def replacing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
                 nonlocal swapped
-                handle = real_open(path, *args, **kwargs)
-                if path == archive and not swapped:
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if Path(path) == archive and not swapped:
                     swapped = True
                     os.replace(replacement, archive)
-                return handle
-            with mock.patch.object(Path, "open", replacing_open):
+                return descriptor
+
+            with mock.patch.object(os, "open", replacing_open):
                 self.assertEqual(inspect_archive(archive), [])
+            self.assertTrue(swapped)
 
 
 class MalformedPublicTextTests(unittest.TestCase):
