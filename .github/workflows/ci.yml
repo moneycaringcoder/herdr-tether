@@ -71,6 +71,9 @@ jobs:
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py
           python3 tools/check_release.py --tag v0.3.0
+          python3 tools/test_check_docs.py
+          python3 tools/test_check_public_contracts.py
+          python3 tools/check_docs.py
 
       - name: Build the installed release artifact
         run: cargo build --release --locked
@@ -161,6 +164,9 @@ jobs:
             --locked \
             --root "$RUNNER_TEMP/package-install"
           "$RUNNER_TEMP/package-install/bin/herdr-tether" --version
+          python3 tools/check_public_contracts.py \
+            --archive "${package_crates[0]}" \
+            --binary "$RUNNER_TEMP/package-install/bin/herdr-tether"
 
       - name: Install from the exact checked-out commit
         shell: bash

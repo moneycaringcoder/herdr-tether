@@ -1529,3 +1529,134 @@ fn doctor_classifies_invalid_config_nonzero_and_permission_failures_without_shor
         .stdout(predicate::str::contains("permission denied"))
         .stderr(predicate::str::contains("doctor found"));
 }
+
+#[test]
+fn doctor_json_uses_supported_version_flags_for_each_binary() {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.path("doctor-bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    for (executable, expected_flag) in [
+        ("tmux", "-V"),
+        ("ssh", "-V"),
+        ("cargo", "--version"),
+        ("herdr", "--version"),
+    ] {
+        let path = bin.join(executable);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = {expected_flag:?} ] || exit 64\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let output = sandbox
+        .command()
+        .env("PATH", &bin)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "missing config and state must still fail"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.len() < 2_048, "doctor JSON exceeded bound");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["truncated"], false);
+    for name in ["tmux", "ssh", "cargo", "herdr"] {
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap();
+        assert_eq!(check["status"], "ok", "wrong version argv for {name}");
+        assert_eq!(check["diagnostic"], serde_json::Value::Null);
+        assert_eq!(check["truncated"], false);
+    }
+}
+
+#[test]
+fn doctor_json_is_stable_bounded_and_redacts_adversarial_probe_data() {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.path("private-home/repository/doctor-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let secret = "credential-token-DO-NOT-LEAK";
+    for executable in ["tmux", "ssh", "cargo", "herdr"] {
+        let path = bin.join(executable);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '\\033]0;owned\\a%s /private/home/repository host.internal %020000d' '{secret}' 1 >&2\nexit 7\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let output = sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HOME", sandbox.path("private-home"))
+        .env("API_TOKEN", secret)
+        .env("HERDR_BIN_PATH", bin.join("herdr"))
+        .env("HERDR_PANE_ID", "secret-session-id")
+        .env("HERDR_WORKSPACE_ID", "secret-workspace-id")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.len() < 2_048, "doctor JSON exceeded bound");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for forbidden in [
+        secret,
+        "private-home",
+        "repository",
+        "host.internal",
+        "secret-session-id",
+        "secret-workspace-id",
+        "\u{1b}",
+        "printf",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "leaked {forbidden:?}: {stdout}"
+        );
+    }
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["completion"], "failed");
+    assert_eq!(report["truncated"], false);
+    assert_eq!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "config",
+            "state",
+            "tmux",
+            "ssh",
+            "cargo",
+            "herdr",
+            "herdr_context"
+        ]
+    );
+    for check in report["checks"].as_array().unwrap() {
+        assert!(check["status"].is_string());
+        assert!(check["required"].is_boolean());
+        assert!(check["truncated"].is_boolean());
+        assert!(check.get("diagnostic").is_some());
+    }
+}

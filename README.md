@@ -91,7 +91,15 @@ cargo install --git https://github.com/moneycaringcoder/herdr-tether \
   --rev "$TETHER_REV" --locked herdr-tether
 ```
 
-Then run `herdr-tether doctor`.
+Then run `herdr-tether doctor`. For automation and support bundles, `herdr-tether doctor --json` emits a versioned, bounded report with typed check statuses and redacted diagnostics.
+
+Maintainers can validate the packaged public surface with:
+
+```sh
+python3 tools/check_docs.py
+python3 tools/check_package.py
+python3 tools/check_public_contracts.py --archive target/package/herdr-tether-VERSION.crate --binary target/release/herdr-tether
+```
 
 See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollback, updates, and uninstalling.
 

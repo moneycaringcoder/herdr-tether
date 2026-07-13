@@ -1,20 +1,93 @@
 #!/usr/bin/env python3
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import signal
 import tempfile
 import unittest
 from unittest import mock
 
+import live_product_smoke as smoke_module
 from live_product_smoke import (
     Smoke,
+    SmokeInterrupted,
+    REPORT_MAX_BYTES,
+    failure_category,
+    finalize_cleanup_verdict,
+    smoke_report,
     process_fingerprint,
     terminal_screen_text,
     validate_remote_target,
 )
+
+
+class SmokeJsonReportTests(unittest.TestCase):
+    def test_report_is_exact_bounded_and_redacts_adversarial_failures(self) -> None:
+        error = RuntimeError(
+            "command failed credential-token /private/home/repository "
+            "host.internal session-id \x1b]0;owned\x07 " + "x" * 100_000
+        )
+        smoke = mock.Mock(
+            completed_phases=["validate_inputs", "start_herdr"],
+            active_phase="keybinding_contract",
+            cleanup_attempts=4,
+            cleanup_result="failed",
+            tmux_version="tmux 3.4",
+            tether_version="herdr-tether 0.1.0",
+        )
+        report = smoke_report(smoke, "failed", failure_category(error))
+        encoded = json.dumps(report, separators=(",", ":"))
+        self.assertLessEqual(len(encoded.encode()), REPORT_MAX_BYTES)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["completion"], "failed")
+        self.assertEqual(report["failure_category"], "command")
+        self.assertEqual(
+            [phase["status"] for phase in report["phases"]],
+            ["passed", "passed", "failed", "not_run", "not_run"],
+        )
+        self.assertEqual(report["exercised"], {"actions": [], "placements": []})
+        self.assertEqual(report["cleanup"], {"attempts": 4, "result": "failed"})
+        self.assertFalse(report["truncated"])
+        for forbidden in (
+            "credential-token",
+            "/private/home",
+            "host.internal",
+            "session-id",
+            "\x1b",
+            "x" * 100,
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_success_report_has_stable_actions_placements_and_versions(self) -> None:
+        smoke = mock.Mock(
+            completed_phases=[
+                "validate_inputs",
+                "start_herdr",
+                "keybinding_contract",
+                "plugin_contract",
+                "product_lifecycle",
+            ],
+            active_phase=None,
+            cleanup_attempts=3,
+            cleanup_result="passed",
+            tmux_version="tmux 3.4",
+            tether_version="herdr-tether 0.1.0",
+        )
+        report = smoke_report(smoke, "passed")
+        self.assertEqual(report["completion"], "complete")
+        self.assertEqual(
+            report["exercised"]["placements"],
+            ["split-right", "split-down", "new-tab"],
+        )
+        self.assertEqual(
+            report["exercised"]["actions"],
+            ["setup", "doctor", "open", "resume", "stop", "replace", "observe"],
+        )
+        self.assertIsNone(report["failure_category"])
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
@@ -281,6 +354,219 @@ class SmokeEnvironmentTests(unittest.TestCase):
         self.assertNotIn("Tether - Hosts", screen)
         self.assertIn("Create new Tether workload", screen)
         self.assertIn("Split right", screen)
+
+    def test_cleanup_nonzero_commands_fail_but_all_attempts_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+            failed = subprocess.CompletedProcess([], 7, "sensitive stdout", "sensitive stderr")
+            absent_tmux = subprocess.CompletedProcess([], 1, "", "no server running")
+            empty_tether = subprocess.CompletedProcess([], 0, "[]", "")
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return absent_tmux
+                if argv[1:] == ["session", "list", "--json"]:
+                    return empty_tether
+                return failed
+
+            with mock.patch.object(smoke, "run", side_effect=run) as mocked_run:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    smoke.cleanup()
+
+            warning = stderr.getvalue()
+            self.assertLess(len(warning), 1024)
+            self.assertNotIn("sensitive stdout", warning)
+            self.assertNotIn("sensitive stderr", warning)
+            attempted = [call.args[0] for call in mocked_run.call_args_list]
+            self.assertTrue(any(command[1:3] == ["session", "stop"] for command in attempted))
+            self.assertTrue(any(command[1:] == ["session", "stop", smoke.session, "--json"] for command in attempted))
+            self.assertTrue(any(command[1:] == ["session", "delete", smoke.session, "--json"] for command in attempted))
+            self.assertEqual(smoke.cleanup_attempts, 4)
+            self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_accepts_explicit_nonexistent_results_and_verifies_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "no server running")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{"id": owned, "status": "ended"}]), "")
+                return subprocess.CompletedProcess(argv, 1, "", "session is already closed")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_attempts, 4)
+            self.assertEqual(smoke.cleanup_result, "passed")
+
+    def test_cleanup_fails_when_owned_resource_remains_after_successful_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 0, smoke.external_session + "\n", "")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{"id": owned}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_rejects_ended_metadata_when_owned_tmux_is_still_live(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(Path("/bin/true"), Path("/bin/true"), Path(repository), keep=True)
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 0, owned + "\n", "")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps([{"id": owned, "status": "ended"}]), ""
+                    )
+                return subprocess.CompletedProcess(argv, 1, "", "session is already closed")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_failure_changes_successful_process_verdict(self) -> None:
+        self.assertEqual(
+            finalize_cleanup_verdict("passed", None, 0, "failed"),
+            ("failed", "cleanup", 1),
+        )
+        self.assertEqual(
+            finalize_cleanup_verdict("failed", "product_lifecycle", 1, "failed"),
+            ("failed", "product_lifecycle", 1),
+        )
+
+    def test_main_returns_nonzero_and_failed_json_when_cleanup_fails(self) -> None:
+        args = mock.Mock(
+            herdr=Path("/bin/true"),
+            tether=Path("/bin/true"),
+            repo_root=Path("/tmp"),
+            keep=True,
+            remote_target=None,
+            remote_directory=None,
+            remote_known_hosts=None,
+            json=True,
+        )
+        smoke = mock.Mock(cleanup_result="pending")
+        smoke.execute.return_value = None
+
+        def cleanup() -> None:
+            smoke.cleanup_result = "failed"
+
+        smoke.cleanup.side_effect = cleanup
+        with (
+            mock.patch.object(smoke_module, "parse_args", return_value=args),
+            mock.patch.object(smoke_module.Smoke, "create", return_value=smoke),
+            mock.patch.object(smoke_module, "smoke_report", return_value={"result": "failed"}) as report,
+            mock.patch.object(smoke_module.atexit, "register"),
+            mock.patch.object(smoke_module.signal, "signal"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            exit_code = smoke_module.main()
+
+        self.assertEqual(exit_code, 1)
+        report.assert_called_once_with(smoke, "failed", "cleanup", "failed")
+        self.assertEqual(json.loads(stdout.getvalue()), {"result": "failed"})
+
+    def test_constructor_failure_emits_json_and_removes_partial_root(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            partial_root = Path(repository) / "tether-smoke-partial"
+            partial_root.mkdir()
+            args = mock.Mock(
+                herdr=Path("/bin/true"),
+                tether=Path("/bin/true"),
+                repo_root=Path(repository),
+                keep=False,
+                remote_target="host.example",
+                remote_directory="/srv/work",
+                remote_known_hosts=Path(repository) / "missing-known-hosts",
+                json=True,
+            )
+            with (
+                mock.patch.object(smoke_module, "parse_args", return_value=args),
+                mock.patch.object(smoke_module.tempfile, "mkdtemp", return_value=str(partial_root)),
+                mock.patch.object(smoke_module.signal, "signal"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                exit_code = smoke_module.main()
+
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(report["completion"], "failed")
+            self.assertIsNotNone(report["failure_category"])
+            self.assertEqual(report["cleanup"], {"attempts": 0, "result": "passed"})
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertFalse(partial_root.exists())
+
+    def test_signal_interruption_has_distinct_json_category_and_exit_code(self) -> None:
+        args = mock.Mock(
+            herdr=Path("/bin/true"),
+            tether=Path("/bin/true"),
+            repo_root=Path("/tmp"),
+            keep=False,
+            remote_target=None,
+            remote_directory=None,
+            remote_known_hosts=None,
+            json=True,
+        )
+        smoke = mock.Mock(
+            cleanup_result="passed",
+            cleanup_attempts=0,
+            completed_phases=[],
+            active_phase=None,
+            tmux_version="unknown",
+            tether_version="unknown",
+        )
+        smoke.execute.side_effect = SmokeInterrupted(signal.SIGTERM)
+        with (
+            mock.patch.object(smoke_module, "parse_args", return_value=args),
+            mock.patch.object(smoke_module.Smoke, "create", return_value=smoke),
+            mock.patch.object(smoke_module.atexit, "register"),
+            mock.patch.object(smoke_module.signal, "signal"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            exit_code = smoke_module.main()
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        self.assertEqual(report["result"], "interrupted")
+        self.assertEqual(report["failure_category"], "interrupted")
 
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:

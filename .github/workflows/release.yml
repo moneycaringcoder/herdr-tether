@@ -81,6 +81,9 @@ jobs:
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py
           python3 tools/check_package.py
+          python3 tools/test_check_docs.py
+          python3 tools/test_check_public_contracts.py
+          python3 tools/check_docs.py
 
       - name: Build installed release artifact
         run: cargo build --release --locked
@@ -103,6 +106,9 @@ jobs:
           rm "${package_crates[0]}"
           cargo package --locked
           cmp "$RUNNER_TEMP/first.crate" "${package_crates[0]}"
+          python3 tools/check_public_contracts.py \
+            --archive "${package_crates[0]}" \
+            --binary target/release/herdr-tether
           cargo test --locked --manifest-path "${package_manifests[0]}" -- --test-threads=1
           cargo install \
             --path "$(dirname "${package_manifests[0]}")" \
