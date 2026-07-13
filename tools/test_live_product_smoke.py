@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import live_product_smoke as smoke_module
 from live_product_smoke import (
     Smoke,
     REPORT_MAX_BYTES,
@@ -467,6 +468,38 @@ class SmokeEnvironmentTests(unittest.TestCase):
             finalize_cleanup_verdict("failed", "product_lifecycle", 1, "failed"),
             ("failed", "product_lifecycle", 1),
         )
+
+    def test_main_returns_nonzero_and_failed_json_when_cleanup_fails(self) -> None:
+        args = mock.Mock(
+            herdr=Path("/bin/true"),
+            tether=Path("/bin/true"),
+            repo_root=Path("/tmp"),
+            keep=True,
+            remote_target=None,
+            remote_directory=None,
+            remote_known_hosts=None,
+            json=True,
+        )
+        smoke = mock.Mock(cleanup_result="pending")
+        smoke.execute.return_value = None
+
+        def cleanup() -> None:
+            smoke.cleanup_result = "failed"
+
+        smoke.cleanup.side_effect = cleanup
+        with (
+            mock.patch.object(smoke_module, "parse_args", return_value=args),
+            mock.patch.object(smoke_module, "Smoke", return_value=smoke),
+            mock.patch.object(smoke_module, "smoke_report", return_value={"result": "failed"}) as report,
+            mock.patch.object(smoke_module.atexit, "register"),
+            mock.patch.object(smoke_module.signal, "signal"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            exit_code = smoke_module.main()
+
+        self.assertEqual(exit_code, 1)
+        report.assert_called_once_with(smoke, "failed", "cleanup")
+        self.assertEqual(json.loads(stdout.getvalue()), {"result": "failed"})
 
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:
