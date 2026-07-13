@@ -25,6 +25,10 @@ MAX_DIAGNOSTICS = 100
 SKIPPED_SCHEMES = {"http", "https", "mailto", "ftp", "data"}
 
 
+class BoundedTextTooLarge(Exception):
+    """Raised when a text input exceeds the checker byte limit."""
+
+
 class Findings:
     def __init__(self) -> None:
         self.items: set[str] = set()
@@ -48,22 +52,27 @@ def public_name(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def read_bounded_utf8(path: Path) -> str:
+    """Read strict UTF-8 from one regular-file descriptor, bounded at MAX + 1."""
+    with path.open("rb") as document:
+        metadata = os.fstat(document.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("not a regular file")
+        if metadata.st_size > MAX_DOCUMENT_BYTES:
+            raise BoundedTextTooLarge
+        content = document.read(MAX_DOCUMENT_BYTES + 1)
+    if len(content) > MAX_DOCUMENT_BYTES:
+        raise BoundedTextTooLarge
+    return content.decode("utf-8", errors="strict")
+
+
 def read_public(path: Path, root: Path, findings: Findings) -> str | None:
     name = public_name(path, root)
     try:
-        with path.open("rb") as document:
-            metadata = os.fstat(document.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                findings.add("document-read", name, "cannot read as bounded UTF-8 text")
-                return None
-            if metadata.st_size > MAX_DOCUMENT_BYTES:
-                findings.add("document-size", name, f"exceeds {MAX_DOCUMENT_BYTES} bytes")
-                return None
-            content = document.read(MAX_DOCUMENT_BYTES + 1)
-        if len(content) > MAX_DOCUMENT_BYTES:
-            findings.add("document-size", name, f"exceeds {MAX_DOCUMENT_BYTES} bytes")
-            return None
-        return content.decode("utf-8", errors="strict")
+        return read_bounded_utf8(path)
+    except BoundedTextTooLarge:
+        findings.add("document-size", name, f"exceeds {MAX_DOCUMENT_BYTES} bytes")
+        return None
     except (OSError, UnicodeError):
         findings.add("document-read", name, "cannot read as bounded UTF-8 text")
         return None
@@ -302,10 +311,10 @@ def check_canonical(root: Path, findings: Findings) -> None:
     if not (cargo_path.is_file() and plugin_path.is_file()):
         return
     try:
-        cargo = tomllib.loads(cargo_path.read_text(encoding="utf-8"))["package"]
-        plugin = tomllib.loads(plugin_path.read_text(encoding="utf-8"))
+        cargo = tomllib.loads(read_bounded_utf8(cargo_path))["package"]
+        plugin = tomllib.loads(read_bounded_utf8(plugin_path))
         version, rust, herdr = str(cargo["version"]), str(cargo["rust-version"]), str(plugin["min_herdr_version"])
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
+    except (OSError, UnicodeError, BoundedTextTooLarge, tomllib.TOMLDecodeError, KeyError, TypeError):
         findings.add("canonical-source", "Cargo.toml", "cannot read package documentation contract")
         return
     if str(plugin.get("version", "")) != version:
@@ -338,9 +347,9 @@ def check_config_contract(root: Path, findings: Findings) -> None:
     if not (source_path.is_file() and doc_path.is_file()):
         return
     try:
-        source = source_path.read_text(encoding="utf-8")
-        document = doc_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        source = read_bounded_utf8(source_path)
+        document = read_bounded_utf8(doc_path)
+    except (OSError, UnicodeError, BoundedTextTooLarge):
         findings.add("config-default", "docs/configuration.md", "cannot compare public configuration defaults")
         return
     patterns = {
@@ -366,8 +375,8 @@ def check_capability_contract(root: Path, findings: Findings) -> None:
     if not (source_path.is_file() and doc_path.is_file()):
         return
     try:
-        source, document = source_path.read_text(encoding="utf-8"), doc_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        source, document = read_bounded_utf8(source_path), read_bounded_utf8(doc_path)
+    except (OSError, UnicodeError, BoundedTextTooLarge):
         findings.add("capability-default", "docs/architecture.md", "cannot compare capability defaults")
         return
     source_default = bool(re.search(r"observe_output:\s*true\s*,\s*open_interactive:\s*true", source, re.S))

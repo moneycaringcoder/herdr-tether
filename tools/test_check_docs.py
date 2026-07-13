@@ -169,6 +169,68 @@ class DocsCheckerTests(unittest.TestCase):
         self.assertEqual(opened_binary, [True])
         self.assertEqual(findings.output(), [])
 
+    def test_canonical_reads_use_opened_inode_when_path_is_replaced(self):
+        canonical = (
+            "Cargo.toml", "herdr-plugin.toml", "src/config.rs",
+            "docs/configuration.md", "src/orchestration.rs", "docs/architecture.md",
+        )
+        for relative in canonical:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("original", encoding="utf-8")
+                replacement = root / "replacement"
+                replacement.write_text("replacement", encoding="utf-8")
+                original_open = Path.open
+
+                def replace_after_open(candidate, *args, **kwargs):
+                    handle = original_open(candidate, *args, **kwargs)
+                    os.replace(replacement, path)
+                    self.assertNotEqual(os.fstat(handle.fileno()).st_ino, path.stat().st_ino)
+                    return handle
+
+                with mock.patch.object(Path, "open", replace_after_open):
+                    self.assertEqual(check_docs.read_bounded_utf8(path), "original")
+
+    def test_canonical_reads_reject_exactly_limit_plus_one(self):
+        canonical = (
+            "Cargo.toml", "herdr-plugin.toml", "src/config.rs",
+            "docs/configuration.md", "src/orchestration.rs", "docs/architecture.md",
+        )
+        for relative in canonical:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * (check_docs.MAX_DOCUMENT_BYTES + 1))
+                with self.assertRaises(check_docs.BoundedTextTooLarge):
+                    check_docs.read_bounded_utf8(path)
+
+    def test_canonical_reads_reject_growth_past_limit_after_open(self):
+        canonical = (
+            "Cargo.toml", "herdr-plugin.toml", "src/config.rs",
+            "docs/configuration.md", "src/orchestration.rs", "docs/architecture.md",
+        )
+        for relative in canonical:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"small")
+                original_open = Path.open
+
+                def grow_after_open(candidate, *args, **kwargs):
+                    handle = original_open(candidate, *args, **kwargs)
+                    with original_open(path, "ab") as writer:
+                        writer.write(b"x" * check_docs.MAX_DOCUMENT_BYTES)
+                    return handle
+
+                with mock.patch.object(Path, "open", grow_after_open):
+                    with self.assertRaises(check_docs.BoundedTextTooLarge):
+                        check_docs.read_bounded_utf8(path)
+
+    def test_production_checker_has_no_direct_path_read_text(self):
+        self.assertNotIn(".read_text(", CHECKER.read_text(encoding="utf-8"))
+
     def test_read_public_rejects_file_grown_past_limit_after_open(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
