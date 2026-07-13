@@ -236,7 +236,9 @@ class PackageContentsTests(unittest.TestCase):
             replacement = root / "replacement.crate"
             member = f"{prefix}/src/main.rs"
             self._write_archive(archive, [(member, b"validated inode")])
-            self._write_archive(replacement, [(member, b"replacement inode")])
+            self._write_archive(
+                replacement, [(f"{prefix}/../escaped", b"replacement inode")]
+            )
             real_validate = validate_archive_members
 
             def replace_after_validation(members, root_prefix, limits=ArchiveLimits()):
@@ -254,6 +256,7 @@ class PackageContentsTests(unittest.TestCase):
                 (extracted / "src" / "main.rs").read_bytes(),
                 b"validated inode",
             )
+            self.assertFalse((root / "output" / "escaped").exists())
 
     def test_archive_rejects_declared_bomb_before_reading_payload(self) -> None:
         prefix = "herdr-tether-0.3.0"
