@@ -351,6 +351,91 @@ class SmokeEnvironmentTests(unittest.TestCase):
         self.assertIn("Create new Tether workload", screen)
         self.assertIn("Split right", screen)
 
+    def test_cleanup_nonzero_commands_fail_but_all_attempts_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+            failed = subprocess.CompletedProcess([], 7, "sensitive stdout", "sensitive stderr")
+            absent_tmux = subprocess.CompletedProcess([], 1, "", "no server running")
+            empty_tether = subprocess.CompletedProcess([], 0, "[]", "")
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return absent_tmux
+                if argv[1:] == ["session", "list", "--json"]:
+                    return empty_tether
+                return failed
+
+            with mock.patch.object(smoke, "run", side_effect=run) as mocked_run:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    smoke.cleanup()
+
+            warning = stderr.getvalue()
+            self.assertLess(len(warning), 1024)
+            self.assertNotIn("sensitive stdout", warning)
+            self.assertNotIn("sensitive stderr", warning)
+            attempted = [call.args[0] for call in mocked_run.call_args_list]
+            self.assertTrue(any(command[1:3] == ["session", "stop"] for command in attempted))
+            self.assertTrue(any(command[1:] == ["session", "stop", smoke.session, "--json"] for command in attempted))
+            self.assertTrue(any(command[1:] == ["session", "delete", smoke.session, "--json"] for command in attempted))
+            self.assertEqual(smoke.cleanup_attempts, 4)
+            self.assertEqual(smoke.cleanup_result, "failed")
+
+    def test_cleanup_accepts_explicit_nonexistent_results_and_verifies_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "no server running")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(argv, 0, "[]", "")
+                return subprocess.CompletedProcess(argv, 1, "", "session does not exist")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_attempts, 4)
+            self.assertEqual(smoke.cleanup_result, "passed")
+
+    def test_cleanup_fails_when_owned_resource_remains_after_successful_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as repository:
+            smoke = Smoke(
+                Path("/bin/true"),
+                Path("/bin/true"),
+                Path(repository),
+                keep=True,
+            )
+            owned = "tether-0123456789abcdef0123456789abcdef"
+            smoke.owned_ids.add(owned)
+
+            def run(argv, **kwargs):
+                if argv[1:3] == ["list-sessions", "-F"]:
+                    return subprocess.CompletedProcess(argv, 0, smoke.external_session + "\n", "")
+                if argv[1:] == ["session", "list", "--json"]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{"id": owned}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    smoke.cleanup()
+
+            self.assertEqual(smoke.cleanup_result, "failed")
+
     def test_cleanup_reaches_root_removal_after_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as repository:
             smoke = Smoke(

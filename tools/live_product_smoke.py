@@ -1742,40 +1742,90 @@ class Smoke:
             )
         self.tether_version = self.run([str(self.tether), "--version"]).stdout.strip()[:64]
 
+    @staticmethod
+    def _cleanup_absent(result: subprocess.CompletedProcess[str]) -> bool:
+        """Recognize only explicit, bounded missing-resource cleanup outcomes."""
+        if result.returncode == 0:
+            return True
+        message = f"{result.stdout}\n{result.stderr}".lower()
+        return any(
+            marker in message
+            for marker in (
+                "does not exist",
+                "not found",
+                "no server running",
+                "can't find session",
+                "no such session",
+            )
+        )
+
     def cleanup(self) -> None:
         if self._cleaned:
             return
         self._cleaned = True
         cleanup_failed = False
+
+        def attempt(command: list[str], timeout: float) -> None:
+            nonlocal cleanup_failed
+            self.cleanup_attempts += 1
+            try:
+                result = self.run(command, check=False, timeout=timeout)
+                if not self._cleanup_absent(result):
+                    print(
+                        "live product smoke cleanup warning: command returned nonzero",
+                        file=sys.stderr,
+                    )
+                    cleanup_failed = True
+            except SmokeFailure:
+                print(
+                    "live product smoke cleanup warning: command could not complete",
+                    file=sys.stderr,
+                )
+                cleanup_failed = True
+
         # Close exact Tether-owned workloads first. The deliberately external
         # session is cleaned separately and is never passed to Tether close.
-        for session_id in sorted(
+        owned_ids = {
             session_id
             for session_id in self.owned_ids
             if OWNED_SESSION_RE.fullmatch(session_id)
-        ):
-            self.cleanup_attempts += 1
-            try:
-                self.run(
-                    [str(self.tether), "session", "stop", session_id],
-                    check=False,
-                    timeout=5.0,
-                )
-            except SmokeFailure as error:
-                print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
-                cleanup_failed = True
+        }
+        for session_id in sorted(owned_ids):
+            attempt([str(self.tether), "session", "stop", session_id], 5.0)
         cleanup_commands = (
             ([str(self.tmux), "kill-session", "-t", f"={self.external_session}"], 5.0),
             ([str(self.herdr), "session", "stop", self.session, "--json"], 10.0),
             ([str(self.herdr), "session", "delete", self.session, "--json"], 10.0),
         )
         for command, timeout in cleanup_commands:
-            self.cleanup_attempts += 1
-            try:
-                self.run(command, check=False, timeout=timeout)
-            except SmokeFailure as error:
-                print(f"live product smoke cleanup warning: {error}", file=sys.stderr)
+            attempt(command, timeout)
+
+        # A successful command is not proof that cleanup happened. Query the
+        # independently observable Tether and tmux inventories before reporting
+        # success, while treating their documented empty/nonexistent outcomes
+        # as absence.
+        try:
+            tether_result = self.run(
+                [str(self.tether), "session", "list", "--json"],
+                check=False,
+                timeout=5.0,
+            )
+            if tether_result.returncode != 0:
                 cleanup_failed = True
+            else:
+                payload = json.loads(tether_result.stdout)
+                if not isinstance(payload, list) or any(
+                    isinstance(item, dict) and item.get("id") in owned_ids
+                    for item in payload
+                ):
+                    cleanup_failed = True
+        except (SmokeFailure, json.JSONDecodeError):
+            cleanup_failed = True
+        try:
+            if self.external_session in self.tmux_sessions():
+                cleanup_failed = True
+        except SmokeFailure:
+            cleanup_failed = True
         if self.herdr_client and self.herdr_client.poll() is None:
             try:
                 os.killpg(self.herdr_client.pid, signal.SIGTERM)
