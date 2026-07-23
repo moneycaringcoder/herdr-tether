@@ -84,9 +84,27 @@ When foreground processes are present, replacement requires interactive confirma
 
 GUI applications may provide a reduced `PATH`. Tether checks common system and Homebrew locations for `ssh` and `tmux`, but `herdr-tether doctor` should still be used to verify the actual environment.
 
-## The workload is absent from Herdr's Agents sidebar
+## A workload is absent from Herdr's Agents sidebar
 
-Herdr 0.7.3 has no general API for registering arbitrary nested workloads as sidebar agents. A tool running behind SSH and `tmux` may therefore be absent even while its Tether workload is healthy. Use Tether's pane/session title and picker state. Tether does not fabricate native agent state.
+Start with `herdr --version`.
+
+- On Herdr 0.7.3 and 0.7.4, arbitrary workloads hidden behind SSH and `tmux`
+  cannot be registered as sidebar agents. Use Tether's pane/session title and
+  picker state.
+- On Herdr 0.7.5 and newer, the workload must run a Herdr-supported agent and
+  must have been created with an explicit `herdr_agent` preset value or
+  `--herdr-agent KIND`. Tether never guesses a kind from the command. Changing
+  a preset later does not rewrite an existing durable workload record.
+
+If **Show group in Agents sidebar** is active, the filter intentionally hides
+unrelated agents. Open an applicable member from Tether or Observer after
+activating the view so Tether can label that pane for the selected group. Use
+**Restore default Agents sidebar** to remove Tether's filter.
+
+If applying or clearing the view fails, the prior preference is preserved.
+Confirm the plugin is still enabled on Herdr 0.7.5 or newer, then retry from the
+group action screen. Tether's Agent view is presentation-only and never changes
+workload lifecycle or ownership.
 
 ## The picker is difficult to read or use with assistive technology
 

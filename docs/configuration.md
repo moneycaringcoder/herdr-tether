@@ -12,6 +12,7 @@ Outside plugin context, defaults are:
 | --- | --- |
 | Configuration | `${XDG_CONFIG_HOME:-$HOME/.config}/herdr-tether/config.toml` |
 | State | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tether/state.json` |
+| Agent sidebar preference | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tether/agent-view.json` |
 
 Run `herdr-tether setup --yes` to create missing stores, or `herdr-tether doctor` to report which context and dependencies are active.
 
@@ -98,6 +99,21 @@ the durable workload lifecycle. Ad hoc creation supports the equivalent
 `herdr-tether open --command COMMAND --herdr-agent KIND` option. Agent kinds
 must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
+### Agent sidebar preference
+
+On Herdr 0.7.5 and newer, **Show group in Agents sidebar** stores one optional
+orchestration-group ID in `agent-view.json` beside `state.json`. Herdr plugin
+actions use the same authoritative `HERDR_PLUGIN_STATE_DIR`; standalone
+defaults use the path shown above. The file is created lazily with the same
+private permissions, advisory locking, and atomic replacement as other Tether
+state.
+
+The preference is presentation-only. It contains no command, terminal output,
+agent state, credential, host, or path. Tether restores its source-owned view
+after Herdr startup or live handoff, and **Restore default Agents sidebar**
+clears only Tether's view. Do not hand-edit this file; use those group actions
+so persisted preference and Herdr's current view change transactionally.
+
 ### Placement
 
 `ui.placement` accepts:
@@ -121,8 +137,8 @@ Discovery is bounded by depth, visited entries, results, time, and worker count.
 
 ## State is not configuration
 
-State records Tether-owned identity, resolved host target, directory, launch information, lifecycle status, and timestamps. It does not store SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
+State records Tether-owned identity, resolved host target, directory, launch information, optional explicit agent hint, lifecycle status, timestamps, and orchestration groups. It does not store SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
 
-Do not hand-edit `state.json`. Lifecycle transitions are lock-protected and validated so an interrupted Stop or Restart can be reconciled safely. Supported older schemas migrate atomically; a corrupt or future schema fails closed.
+Do not hand-edit `state.json` or `agent-view.json`. Lifecycle transitions and Agent view preference changes are lock-protected and validated so interrupted work can be reconciled safely. Supported older schemas migrate atomically; a corrupt or future schema fails closed.
 
 For the meaning of each state, see [Lifecycle](lifecycle.md). For storage and trust boundaries, see [Architecture and security](architecture.md).

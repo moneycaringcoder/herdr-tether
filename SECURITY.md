@@ -45,8 +45,9 @@ Within that boundary, Tether:
 - bounds status and repository discovery with deadlines, output caps, cancellation, and child-process cleanup;
 - records lifecycle transitions so interrupted Stop and Restart operations remain recoverable;
 - keeps metadata cleanup separate from SSH, `tmux`, probing, and Stop capabilities;
-- migrates and writes configuration/state with advisory locks, private Unix permissions, and atomic replacement;
-- excludes command bodies, child output, raw backend errors, and private storage paths from scriptable snapshots; and
+- migrates and writes configuration, lifecycle/orchestration state, and Agent view preferences with advisory locks, private Unix permissions, and atomic replacement;
+- excludes command bodies, child output, raw backend errors, and private storage paths from scriptable snapshots;
+- treats explicit agent hints, Agent view filters, and pane metadata tokens as presentation data that cannot authorize capture, input, or lifecycle mutation; and
 - stores no SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
 
 Detailed component, lifecycle, persistence, and trust boundaries are documented in [Architecture and security](docs/architecture.md).

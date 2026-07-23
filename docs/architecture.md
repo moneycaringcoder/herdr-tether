@@ -10,15 +10,23 @@ The public mental model is documented in [Lifecycle](lifecycle.md). This documen
 flowchart LR
     UI[Herdr picker or CLI] --> Intent{Create, Open, Stop, Restart, Remove}
     UI --> Observe[Status and discovery]
+    UI --> Groups[Orchestration metadata]
     Intent --> Life[Lifecycle service]
     Life --> State[Private atomic state]
     Life --> Backend[Durable backend]
     Observe --> Backend
+    Groups --> State
+    Groups --> Observer[Observer projection]
+    Observer --> Backend
     Backend --> Local[Local tmux]
     Backend --> SSH[BatchMode OpenSSH]
     SSH --> Remote[Remote tmux]
-    Intent --> Place[Herdr pane placement]
-    Place --> Attach[Exact attach command]
+    UI --> Place[Herdr placement]
+    Place --> Herdr[Herdr panes, popups, and APIs]
+    Herdr --> Attach[Exact attach command plus optional agent hint]
+    Attach --> Backend
+    Groups --> AgentView[Source-owned Agent view]
+    AgentView --> Herdr
 ```
 
 The boundaries are intentionally one-way:
@@ -27,6 +35,7 @@ The boundaries are intentionally one-way:
 - Herdr placement may display or attach, but cannot change workload ownership;
 - external session discovery produces an attach-only type with no lifecycle methods;
 - metadata cleanup has no SSH, `tmux`, probe, or Stop capability.
+- Agent view filters, labels, and tokens are presentation metadata; they cannot authorize capture, input, or lifecycle work.
 
 ## Core invariants
 
@@ -41,11 +50,11 @@ The boundaries are intentionally one-way:
 
 ## Opt-in orchestration groups
 
-Development state schema version 4 stores an `orchestration_groups` collection
-and a unique membership epoch for every worker entry. Stable schema versions
-migrate with an empty collection, so no session is grouped implicitly.
-Development schema version 3 groups migrate by assigning and persisting fresh
-membership epochs. Each group stores a bounded, harness-neutral ID and title,
+State schema version 4 stores an `orchestration_groups` collection and a unique
+membership epoch for every worker entry. Schemas 0 through 2 migrate with an
+empty collection, so no session is grouped implicitly. Schema version 3 groups
+migrate by assigning and persisting fresh membership epochs. Each group stores
+a bounded, harness-neutral ID and title,
 one exact orchestrator session reference, and an ordered worker-membership
 list. Each worker stores its opaque epoch, an exact session reference, an
 optional display title, and two independent capabilities:
@@ -78,6 +87,29 @@ its title, orchestrator, membership order, membership epoch, capabilities, or
 worker titles changed before commit. Promoting a worker to orchestrator removes
 that worker role while preserving every unaffected membership.
 
+## Native Agent views
+
+Herdr 0.7.5 and newer can project one orchestration group into the native
+Agents sidebar. The user must select **Show group in Agents sidebar**; Tether
+never installs a view implicitly. `AgentViewService` persists only the selected
+group ID in bounded `agent-view.json` beside `state.json`, then installs one
+transient view owned by source `plugin:moneycaringcoder.tether`. The filter
+matches the bounded `tether_group` token and applies only to Herdr-recognized
+agent panes.
+
+When Tether opens an owned session that belongs to the selected group, it
+reports that group token on the newly placed pane. The token and view are
+display-only: group membership remains in `state.json`, and lifecycle,
+observation, and interactive-open authority continue to require the ordinary
+exact-owned state and capability checks.
+
+Set and clear operations hold the preference lock, persist the desired value,
+and roll it back if Herdr rejects the corresponding socket request. Deleting
+the selected group first clears the view; a rejected group deletion attempts
+to restore it. A startup hook restores a valid preference after Herdr startup
+or live handoff and drops a preference whose group no longer exists. Herdr
+0.7.3 and 0.7.4 ignore the newer startup hook and retain the titled-pane
+fallback; Tether skips their unavailable metadata-token API.
 
 ## Observer projection
 
@@ -135,7 +167,7 @@ destination pane; it does not run a command in or close the source launcher
 pane.
 Native manager launch also requires a valid
 `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id`; it fails before placement rather
-than treating the managed picker overlay as the source. The optional standalone
+than treating the managed plugin surface as the source. The optional standalone
 adapter path retains its generic Herdr environment compatibility.
 Observer terminal teardown independently attempts to restore cursor visibility,
 leave the alternate screen, and disable raw mode on every guarded exit path;
@@ -209,12 +241,13 @@ When a cleanup operation works from a preview, it revalidates the exact unchange
 
 ## Persistence
 
-`ConfigStore` owns validated TOML. `StateStore` owns lifecycle records. Both
-apply finite input, cardinality, collection, and field-size budgets before
-serialization or follow-on work; boundary values are accepted and the next
-value is rejected without truncation. Their parent directories, persistent lock
-files, data, and temporary files use private Unix permissions. Mutations hold a
-per-file advisory lock across load, validation, migration, mutation, and save.
+`ConfigStore` owns validated TOML. `StateStore` owns lifecycle and orchestration
+records. `AgentViewService` owns one bounded JSON presentation preference.
+All three apply finite input and field-size budgets before serialization or
+follow-on work. Their parent directories, persistent lock files, data, and
+temporary files use private Unix permissions. Mutations hold a per-file
+advisory lock across load, validation, migration or preference checks,
+mutation, and save.
 
 The atomic writer:
 
@@ -230,7 +263,11 @@ unknown fields where strict schemas apply, and future versions fail closed.
 State is metadata, not a process registry; destructive safety comes from fresh
 exact backend evidence, not the presence or absence of a JSON record.
 
-Stored data may include host targets, directories, trusted preset commands, owned identifiers, launch information, lifecycle status, exit context, and timestamps. Tether does not store SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
+Stored data may include host targets, directories, trusted preset commands,
+explicit agent kinds, owned identifiers, launch information, lifecycle status,
+orchestration metadata, one selected Agent view group ID, exit context, and
+timestamps. Tether does not store SSH passwords, private keys, access tokens,
+terminal contents, or telemetry identifiers.
 
 ## Discovery and snapshots
 
@@ -252,7 +289,13 @@ Release-candidate validation is package-derived rather than based on a hand-main
 
 ## Herdr placement boundary
 
-`HerdrClient` adapts Herdr's pane and tab commands. It captures the invoking pane, creates and focuses the selected split or tab, then runs an exact Tether attach command there. Tether uses its resolved executable and forwards Herdr's authoritative plugin config/state directories instead of relying on a pane-local `PATH`.
+`HerdrClient` adapts Herdr's pane, tab, plugin-surface, and metadata commands.
+Herdr 0.7.4 and newer open managed picker/setup surfaces as session-modal
+popups; the compatible 0.7.3 path retains overlays. Tether captures the
+invoking pane, creates and focuses the selected split or tab, then runs an
+exact Tether attach command there. It uses its resolved executable and forwards
+Herdr's authoritative plugin config/state directories instead of relying on a
+pane-local `PATH`.
 
 The main setup command probes Herdr, `tmux`, and OpenSSH through fixed version
 arguments before creating or rewriting Tether state or configuration. The
@@ -283,7 +326,12 @@ Replace current pane follows destination-first ordering:
 
 Cancellation, dispatch failure, or readiness failure preserves the source. A final source-close failure preserves the verified destination and reports both pane identities.
 
-Herdr 0.7.3 has no general nested-workload registration API. Tether cannot infer the native agent identity or lifecycle of an arbitrary process behind SSH and `tmux`, so it uses clear pane/session titles instead of fabricating sidebar agents.
+Herdr 0.7.3 and 0.7.4 have no general nested-workload registration API, so
+Tether uses clear pane/session titles there. On Herdr 0.7.5 and newer, an
+explicit validated agent hint can expose a supported agent hidden behind SSH
+or `tmux`, and an opt-in source-owned view can filter recognized group panes.
+Tether still never infers an arbitrary agent identity or lifecycle from a
+command or process title.
 
 ## Threat model and trust boundary
 
