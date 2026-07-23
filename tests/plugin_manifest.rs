@@ -1,13 +1,13 @@
 use std::{fs, process::Command};
 
 #[test]
-fn manifest_declares_build_actions_and_managed_overlay_panes() {
+fn manifest_declares_build_startup_actions_and_managed_overlay_panes() {
     let manifest = fs::read_to_string("herdr-plugin.toml").expect("herdr-plugin.toml is present");
     let value: toml::Value = toml::from_str(&manifest).expect("manifest is valid TOML");
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
-    assert_eq!(value["version"].as_str(), Some("0.3.0"));
+    assert_eq!(value["version"].as_str(), Some("0.4.0"));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
     assert_eq!(
         value["description"].as_str(),
@@ -21,6 +21,7 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
         "description",
         "platforms",
         "build",
+        "startup",
         "actions",
         "events",
         "panes",
@@ -58,6 +59,17 @@ fn manifest_declares_build_actions_and_managed_overlay_panes() {
             toml::Value::String("build".into()),
             toml::Value::String("--release".into()),
             toml::Value::String("--locked".into()),
+        ]
+    );
+
+    let startup = value["startup"].as_array().unwrap();
+    assert_eq!(startup.len(), 1);
+    assert_eq!(
+        startup[0]["command"].as_array().unwrap(),
+        &[
+            toml::Value::String("target/release/herdr-tether".into()),
+            toml::Value::String("plugin".into()),
+            toml::Value::String("restore-agent-view".into()),
         ]
     );
 

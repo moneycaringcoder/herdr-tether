@@ -40,10 +40,10 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 Choose the source that matches your stability and reproducibility needs. Herdr
 shows the source and build commands for review before you confirm.
 
-**Stable v0.3.0.** Install the release tag:
+**Stable v0.4.0.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.4.0
 ```
 
 **Development (`main`).** This follows the public development line, not a
@@ -68,8 +68,8 @@ herdr plugin action invoke moneycaringcoder.tether.setup
 ```
 
 The setup action safely adds the `prefix+t` launcher and reloads Herdr's
-configuration. Development `main` first checks the required runtime
-tools—Herdr, `tmux`, and OpenSSH—before writing Tether or Herdr files. Setup
+configuration. Setup first checks the required runtime tools—Herdr, `tmux`, and
+OpenSSH—before writing Tether or Herdr files. Setup
 refuses a conflicting binding and keeps an exact backup for rollback. After
 setup, press your Herdr prefix followed by `t`.
 
@@ -77,7 +77,7 @@ Want the standalone administration commands too? The stable install is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.3.0 --locked herdr-tether
+  --tag v0.4.0 --locked herdr-tether
 ```
 
 For development `main`:
@@ -112,10 +112,10 @@ See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollb
 Hermes users can install Tether's optional, runtime-independent reference guide
 directly from this repository.
 
-**Stable v0.3.0:**
+**Stable v0.4.0:**
 
 ```sh
-hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.3.0/integrations/hermes/SKILL.md
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.4.0/integrations/hermes/SKILL.md
 ```
 
 **Development (`main`):**
@@ -160,12 +160,17 @@ The picker keeps actions contextual:
 
 `Esc` backs out or closes Tether. See [Lifecycle](docs/lifecycle.md) for interrupted operations, cleanup, and ownership details.
 
-## Development orchestration and Observer
+When a workload command runs a Herdr-supported agent behind Tether's `tmux` or
+SSH boundary, configure an explicit agent hint rather than relying on process
+guessing. Presets accept `herdr_agent = "codex"` in `config.toml`; ad hoc CLI
+creation accepts `--herdr-agent codex`. On Herdr 0.7.5 and newer, the resulting
+view is recognized as that agent while retaining Tether's durable lifecycle.
 
-The opt-in orchestration-group and Observer workflow is currently available on
-development `main` and immutable reviewed commits, not in stable v0.3.0. It
-organizes existing Tether-owned workloads for observation; it does not launch,
-adopt, stop, restart, or remove them.
+## Orchestration and Observer
+
+The opt-in orchestration-group and Observer workflow organizes existing
+Tether-owned workloads for observation; it does not launch, adopt, stop,
+restart, or remove them.
 
 Use the native workflow from the ordinary `prefix+t` picker:
 
@@ -182,6 +187,14 @@ same screen. Every role change has a topology review; metadata edits are
 reversible, and confirmed deletion does not touch workloads or panes. Ordinary
 users never need session IDs,
 shell commands, a standalone Tether installation, or environment setup.
+
+On Herdr 0.7.5 and newer, a group can also become an opt-in native Agents
+sidebar view. Select **Show group in Agents sidebar** from its action screen;
+Tether filters the sidebar to recognized agents in that group and restores the
+selection after Herdr startup or live handoff. Opening a group member labels
+that pane for the view. **Restore default Agents sidebar** removes only
+Tether's filter. This feature never launches, adopts, or sends input to a
+workload, and Herdr 0.7.3/0.7.4 remain supported without it.
 
 The CLI remains an optional machine/adapter API:
 

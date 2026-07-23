@@ -15,6 +15,68 @@ pub enum Placement {
     ReplaceCurrentPane,
 }
 
+/// An explicit Herdr screen-manifest hint for an agent hidden behind tmux or SSH.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HerdrAgentKind(String);
+
+impl HerdrAgentKind {
+    pub const MAX_BYTES: usize = 32;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HerdrAgentKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid Herdr agent kind: expected [a-z][a-z0-9_-]{{0,31}}")]
+pub struct HerdrAgentKindError;
+
+impl FromStr for HerdrAgentKind {
+    type Err = HerdrAgentKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut bytes = value.bytes();
+        let Some(first) = bytes.next() else {
+            return Err(HerdrAgentKindError);
+        };
+        if !first.is_ascii_lowercase()
+            || value.len() > Self::MAX_BYTES
+            || !bytes.all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+        {
+            return Err(HerdrAgentKindError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl Serialize for HerdrAgentKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for HerdrAgentKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
 /// A stable, Tether-owned identifier for a durable session.
 ///
 /// Its textual representation is also safe to use as a tmux session name.
@@ -423,5 +485,25 @@ impl<'de> Deserialize<'de> for SessionId {
     {
         let value = String::deserialize(deserializer)?;
         value.parse().map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn herdr_agent_kind_is_bounded_and_shell_safe() {
+        for valid in ["codex", "claude-code", "omp_2", &"a".repeat(32)] {
+            let kind = valid.parse::<HerdrAgentKind>().unwrap();
+            assert_eq!(kind.as_str(), valid);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{valid}\"")
+            );
+        }
+        for invalid in ["", "Codex", "a.b", "a=b", " agent", &"a".repeat(33)] {
+            assert!(invalid.parse::<HerdrAgentKind>().is_err(), "{invalid}");
+        }
     }
 }

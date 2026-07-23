@@ -16,6 +16,7 @@ fn session(suffix: u8, host: &str, directory: &str, preset: Option<&str>) -> Ses
         .unwrap()
         .with_timezone(&Utc);
     SessionRecord {
+        herdr_agent: None,
         id: format!("tether-0197f1980000700080000000000000{suffix:02}")
             .parse()
             .unwrap(),
@@ -253,6 +254,8 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
             "Open Observer",
             "Edit workers",
             "Change orchestrator",
+            "Show group in Agents sidebar",
+            "Restore default Agents sidebar",
             "Delete group"
         ]
     );
@@ -261,6 +264,23 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
         ObserverManagerOutcome::Action(ObserverManagerAction::Launch {
             group_id: group_id.clone()
         })
+    );
+
+    let mut views = ObserverManagerState::from_state(&state, None).unwrap();
+    views.handle(ObserverManagerEvent::Confirm);
+    for _ in 0..3 {
+        views.handle(ObserverManagerEvent::Next);
+    }
+    assert_eq!(
+        views.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
+            group_id: group_id.clone()
+        })
+    );
+    views.handle(ObserverManagerEvent::Next);
+    assert_eq!(
+        views.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::ClearAgentView)
     );
 
     let mut edit = ObserverManagerState::from_state(&state, None).unwrap();

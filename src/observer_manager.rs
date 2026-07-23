@@ -84,6 +84,10 @@ pub enum ObserverManagerAction {
         expected_group: OrchestrationGroup,
         orchestrator_session_id: SessionId,
     },
+    SetAgentView {
+        group_id: OrchestrationGroupId,
+    },
+    ClearAgentView,
     Delete {
         expected_group: OrchestrationGroup,
     },
@@ -241,6 +245,8 @@ impl ObserverManagerState {
                 "Open Observer".to_owned(),
                 "Edit workers".to_owned(),
                 "Change orchestrator".to_owned(),
+                "Show group in Agents sidebar".to_owned(),
+                "Restore default Agents sidebar".to_owned(),
                 "Delete group".to_owned(),
             ],
             ObserverManagerScreen::ReviewTopology => self.review_labels(),
@@ -290,7 +296,7 @@ impl ObserverManagerState {
                 "Space select workers · Enter review · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::GroupActions => {
-                "Enter choose · e Edit · d Delete · ↑/↓ navigate · Esc/Backspace back"
+                "Enter choose · e Edit · d Delete · Agents view is opt-in · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::EditWorkers => {
                 "Space add/remove · Enter review · ↑/↓ navigate · Esc/Backspace back"
@@ -319,7 +325,7 @@ impl ObserverManagerState {
                 ObserverManagerEvent::ConfirmDelete => self.delete_action(),
                 ObserverManagerEvent::DismissDelete | ObserverManagerEvent::Back => {
                     self.screen = ObserverManagerScreen::GroupActions;
-                    self.selected_index = 3;
+                    self.selected_index = 5;
                     ObserverManagerOutcome::Continue
                 }
                 _ => ObserverManagerOutcome::Continue,
@@ -400,7 +406,11 @@ impl ObserverManagerState {
                     self.begin_reassign();
                     ObserverManagerOutcome::Continue
                 }
-                3 => {
+                3 => ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
+                    group_id: self.selected_group_id(),
+                }),
+                4 => ObserverManagerOutcome::Action(ObserverManagerAction::ClearAgentView),
+                5 => {
                     self.screen = ObserverManagerScreen::ConfirmDelete;
                     self.selected_index = 0;
                     ObserverManagerOutcome::Continue

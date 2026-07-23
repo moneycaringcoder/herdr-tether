@@ -1049,6 +1049,7 @@ mod tests {
             .save(&State {
                 version: State::CURRENT_VERSION,
                 sessions: vec![SessionRecord {
+                    herdr_agent: None,
                     id: test_id(),
                     host: "local".into(),
                     target: "local".into(),

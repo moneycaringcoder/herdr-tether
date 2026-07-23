@@ -12,8 +12,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::{
+    agent_view::{AGENT_VIEW_SOURCE, GROUP_TOKEN},
     backend::CommandSpec,
-    model::Placement,
+    model::{OrchestrationGroupId, Placement},
     quote::posix_quote,
     status::{BoundedOutput, run_bounded},
 };
@@ -78,12 +79,32 @@ pub struct HerdrContext {
 impl HerdrContext {
     /// Loads the subset of Herdr's plugin environment needed to place panes.
     pub fn from_env() -> Result<Self> {
-        let pane_id = required_string_env("HERDR_PANE_ID", Some("PANE_ID"))?;
         let plugin_context = plugin_context_env()?;
+        Self::from_runtime_values(
+            required_os_env("HERDR_BIN_PATH")?.into(),
+            optional_string_env("HERDR_PANE_ID", Some("PANE_ID"))?,
+            optional_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
+            plugin_context.as_deref(),
+        )
+    }
+
+    fn from_runtime_values(
+        binary: PathBuf,
+        pane_id: Option<String>,
+        workspace_id: Option<String>,
+        plugin_context: Option<&str>,
+    ) -> Result<Self> {
+        let pane_id = match plugin_context {
+            Some(context) => placement_pane_id(String::new(), Some(context))?,
+            None => {
+                pane_id.ok_or_else(|| anyhow::anyhow!("Herdr did not provide HERDR_PANE_ID"))?
+            }
+        };
+        let workspace_id = placement_workspace_id(workspace_id, plugin_context)?;
         Ok(Self {
-            binary: required_os_env("HERDR_BIN_PATH")?.into(),
-            pane_id: placement_pane_id(pane_id, plugin_context.as_deref())?,
-            workspace_id: required_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
+            binary,
+            pane_id,
+            workspace_id,
         })
     }
 
@@ -94,20 +115,20 @@ impl HerdrContext {
         let plugin_context = plugin_context_env()?;
         Self::from_plugin_values(
             required_os_env("HERDR_BIN_PATH")?.into(),
-            required_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
+            optional_string_env("HERDR_WORKSPACE_ID", Some("WORKSPACE_ID"))?,
             plugin_context.as_deref(),
         )
     }
 
     fn from_plugin_values(
         binary: PathBuf,
-        workspace_id: String,
+        workspace_id: Option<String>,
         plugin_context: Option<&str>,
     ) -> Result<Self> {
         Ok(Self {
             binary,
             pane_id: plugin_placement_pane_id(plugin_context)?,
-            workspace_id,
+            workspace_id: placement_workspace_id(workspace_id, plugin_context)?,
         })
     }
 }
@@ -120,6 +141,23 @@ fn plugin_context_env() -> Result<Option<String>> {
             bail!("Herdr provided a non-UTF-8 HERDR_PLUGIN_CONTEXT_JSON")
         }
     }
+}
+
+fn placement_workspace_id(
+    workspace_id: Option<String>,
+    plugin_context: Option<&str>,
+) -> Result<String> {
+    if let Some(plugin_context) = plugin_context {
+        let context: Value =
+            serde_json::from_str(plugin_context).context("decode HERDR_PLUGIN_CONTEXT_JSON")?;
+        if let Some(context_workspace_id) = context.get("workspace_id").and_then(Value::as_str) {
+            return require_nonempty_env(
+                "HERDR_PLUGIN_CONTEXT_JSON workspace_id",
+                context_workspace_id.to_owned(),
+            );
+        }
+    }
+    workspace_id.ok_or_else(|| anyhow::anyhow!("Herdr did not provide HERDR_WORKSPACE_ID"))
 }
 
 fn plugin_placement_pane_id(plugin_context: Option<&str>) -> Result<String> {
@@ -154,22 +192,26 @@ fn required_os_env(name: &str) -> Result<OsString> {
     Ok(value)
 }
 
-fn required_string_env(name: &str, fallback: Option<&str>) -> Result<String> {
+fn optional_string_env(name: &str, fallback: Option<&str>) -> Result<Option<String>> {
     match env::var(name) {
-        Ok(value) => require_nonempty_env(name, value),
+        Ok(value) => require_nonempty_env(name, value).map(Some),
         Err(env::VarError::NotPresent) => {
-            let fallback =
-                fallback.ok_or_else(|| anyhow::anyhow!("Herdr did not provide {name}"))?;
-            let value = env::var(fallback)
-                .with_context(|| format!("Herdr did not provide a valid UTF-8 {name}"))?;
-            require_nonempty_env(fallback, value)
+            let Some(fallback) = fallback else {
+                return Ok(None);
+            };
+            match env::var(fallback) {
+                Ok(value) => require_nonempty_env(fallback, value).map(Some),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => {
+                    bail!("Herdr did not provide a valid UTF-8 {name}")
+                }
+            }
         }
         Err(env::VarError::NotUnicode(_)) => {
             bail!("Herdr did not provide a valid UTF-8 {name}")
         }
     }
 }
-
 fn require_nonempty_env(name: &str, value: String) -> Result<String> {
     if value.trim().is_empty() {
         bail!("Herdr provided an empty {name}");
@@ -514,26 +556,74 @@ impl HerdrClient {
         })
     }
 
-    /// Opens one of this plugin's manifest-declared managed overlay panes.
+    /// Opens one of this plugin's manifest-declared managed panes.
+    ///
+    /// Herdr 0.7.4 and newer use a session-modal popup. Older compatible
+    /// releases retain the overlay behavior.
     pub fn open_plugin_pane(&self, entrypoint: &str) -> Result<()> {
         if entrypoint.trim().is_empty() {
             bail!("plugin pane entrypoint must not be empty");
         }
+        let popup = self.supports_popup_plugin_panes()?;
+        let placement = if popup { "popup" } else { "overlay" };
+        let mut arguments = vec![
+            "plugin".to_owned(),
+            "pane".to_owned(),
+            "open".to_owned(),
+            "--plugin".to_owned(),
+            PLUGIN_ID.to_owned(),
+            "--entrypoint".to_owned(),
+            entrypoint.to_owned(),
+            "--placement".to_owned(),
+            placement.to_owned(),
+        ];
+        if popup {
+            arguments.extend([
+                "--width".to_owned(),
+                "80%".to_owned(),
+                "--height".to_owned(),
+                "80%".to_owned(),
+            ]);
+        }
+        let response = self.invoke("open plugin pane", &arguments)?;
+        if popup {
+            require_result_type_in(&response, &["ok", "plugin_pane_opened"])
+        } else {
+            require_result_type(&response, "plugin_pane_opened")
+        }
+    }
+
+    /// Labels a pane for an opted-in Tether orchestration view.
+    ///
+    /// Herdr releases before 0.7.5 have no metadata-token API; keeping this a
+    /// no-op preserves Tether's 0.7.3 compatibility outside the optional view.
+    pub fn report_agent_view_group(
+        &self,
+        pane_id: &str,
+        group_id: &OrchestrationGroupId,
+    ) -> Result<()> {
+        let output = self.execute("read version", &["--version".to_owned()])?;
+        if parse_herdr_version(&output.stdout)? < (0, 7, 5) {
+            return Ok(());
+        }
         let response = self.invoke(
-            "open plugin pane",
+            "label pane for Agent view",
             &[
-                "plugin".to_owned(),
                 "pane".to_owned(),
-                "open".to_owned(),
-                "--plugin".to_owned(),
-                PLUGIN_ID.to_owned(),
-                "--entrypoint".to_owned(),
-                entrypoint.to_owned(),
-                "--placement".to_owned(),
-                "overlay".to_owned(),
+                "report-metadata".to_owned(),
+                pane_id.to_owned(),
+                "--source".to_owned(),
+                AGENT_VIEW_SOURCE.to_owned(),
+                "--token".to_owned(),
+                format!("{GROUP_TOKEN}={group_id}"),
             ],
         )?;
-        require_result_type(&response, "plugin_pane_opened")
+        require_result_type(&response, "ok")
+    }
+
+    fn supports_popup_plugin_panes(&self) -> Result<bool> {
+        let output = self.execute("read version", &["--version".to_owned()])?;
+        parse_herdr_version(&output.stdout).map(|version| version >= (0, 7, 4))
     }
 
     fn split(&self, direction: &str) -> Result<String> {
@@ -622,12 +712,25 @@ impl HerdrClient {
         else {
             return false;
         };
-        let expected_program = expected.program.file_name();
-        if Some(program) == expected_program && process.argv[1..] == expected.args {
+        let (expected_program, expected_args) = if expected.program.file_name()
+            == Some(std::ffi::OsStr::new("env"))
+            && expected
+                .args
+                .first()
+                .is_some_and(|argument| argument.starts_with("HERDR_AGENT="))
+        {
+            let Some(wrapped_program) = expected.args.get(1) else {
+                return false;
+            };
+            (Path::new(wrapped_program).file_name(), &expected.args[2..])
+        } else {
+            (expected.program.file_name(), expected.args.as_slice())
+        };
+        if Some(program) == expected_program && process.argv[1..] == *expected_args {
             return true;
         }
 
-        let target = match expected.args.as_slice() {
+        let target = match expected_args {
             [session, attach, target_flag, _, separator, name]
                 if session == "session"
                     && attach == "attach-external"
@@ -918,14 +1021,52 @@ fn placed_command_with_paths(
     Ok(CommandSpec::new("env", arguments))
 }
 
+fn parse_herdr_version(stdout: &[u8]) -> Result<(u64, u64, u64)> {
+    let text = std::str::from_utf8(stdout).context("Herdr version output was not UTF-8")?;
+    let version = text
+        .trim()
+        .strip_prefix("herdr ")
+        .ok_or_else(|| anyhow::anyhow!("Herdr version output did not start with `herdr `"))?;
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut components = core.split('.');
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Herdr version output did not contain a numeric major version")
+        })?;
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Herdr version output did not contain a numeric minor version")
+        })?;
+    let patch = components
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Herdr version output did not contain a numeric patch version")
+        })?;
+    if components.next().is_some() {
+        bail!("Herdr version output contained too many numeric components");
+    }
+    Ok((major, minor, patch))
+}
 fn require_result_type(envelope: &Value, expected: &str) -> Result<()> {
+    require_result_type_in(envelope, &[expected])
+}
+
+fn require_result_type_in(envelope: &Value, expected: &[&str]) -> Result<()> {
     let actual = envelope
         .get("result")
         .and_then(|result| result.get("type"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Herdr response result did not contain a type"))?;
-    if actual != expected {
-        bail!("unexpected Herdr response type `{actual}`; expected `{expected}`");
+    if !expected.contains(&actual) {
+        bail!(
+            "unexpected Herdr response type `{actual}`; expected one of {}",
+            expected.join(", ")
+        );
     }
     Ok(())
 }
@@ -993,11 +1134,14 @@ mod tests {
     #[test]
     fn strict_plugin_context_never_falls_back_to_the_managed_pane() {
         let placements = std::cell::Cell::new(0);
-        let result =
-            HerdrContext::from_plugin_values(PathBuf::from("/bin/herdr"), "w1".to_owned(), None)
-                .inspect(|_| {
-                    placements.set(placements.get() + 1);
-                });
+        let result = HerdrContext::from_plugin_values(
+            PathBuf::from("/bin/herdr"),
+            Some("w1".to_owned()),
+            None,
+        )
+        .inspect(|_| {
+            placements.set(placements.get() + 1);
+        });
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("HERDR_PLUGIN_CONTEXT_JSON"), "{error}");
@@ -1009,7 +1153,7 @@ mod tests {
         assert_eq!(
             HerdrContext::from_plugin_values(
                 PathBuf::from("/bin/herdr"),
-                "w1".to_owned(),
+                Some("w1".to_owned()),
                 Some(r#"{"focused_pane_id":"w1:p1"}"#),
             )
             .unwrap()
@@ -1019,11 +1163,62 @@ mod tests {
         assert!(
             HerdrContext::from_plugin_values(
                 PathBuf::from("/bin/herdr"),
-                "w1".to_owned(),
+                Some("w1".to_owned()),
                 Some(r#"{"pane_id":"w1:pF"}"#),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn popup_context_uses_invoking_pane_without_managed_pane_env() {
+        let context = HerdrContext::from_runtime_values(
+            PathBuf::from("/bin/herdr"),
+            None,
+            None,
+            Some(r#"{"workspace_id":"w1","focused_pane_id":"w1:p1"}"#),
+        )
+        .unwrap();
+
+        assert_eq!(context.pane_id, "w1:p1");
+        assert_eq!(context.workspace_id, "w1");
+    }
+
+    #[test]
+    fn parses_popup_capable_herdr_versions() {
+        assert_eq!(parse_herdr_version(b"herdr 0.7.3\n").unwrap(), (0, 7, 3));
+        assert_eq!(parse_herdr_version(b"herdr 0.7.4\n").unwrap(), (0, 7, 4));
+        assert_eq!(
+            parse_herdr_version(b"herdr 1.0.0-preview\n").unwrap(),
+            (1, 0, 0)
+        );
+        assert!(parse_herdr_version(b"unknown\n").is_err());
+    }
+
+    #[test]
+    fn attach_verification_unwraps_explicit_agent_hint() {
+        let expected = CommandSpec::new(
+            "env",
+            vec![
+                "HERDR_AGENT=codex".into(),
+                "/usr/bin/tmux".into(),
+                "attach-session".into(),
+                "-t".into(),
+                "=tether-session".into(),
+            ],
+        );
+        let process = ForegroundProcess {
+            pid: 42,
+            name: "tmux".into(),
+            argv: vec![
+                "/usr/bin/tmux".into(),
+                "attach-session".into(),
+                "-t".into(),
+                "=tether-session".into(),
+            ],
+        };
+
+        assert!(HerdrClient::is_attach_process(&process, &expected));
     }
 
     #[test]

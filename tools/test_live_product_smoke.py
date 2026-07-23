@@ -36,6 +36,7 @@ class SmokeJsonReportTests(unittest.TestCase):
             active_phase="keybinding_contract",
             cleanup_attempts=4,
             cleanup_result="failed",
+            herdr_version="0.7.5",
             tmux_version="tmux 3.4",
             tether_version="herdr-tether 0.1.0",
         )
@@ -75,6 +76,7 @@ class SmokeJsonReportTests(unittest.TestCase):
             active_phase=None,
             cleanup_attempts=3,
             cleanup_result="passed",
+            herdr_version="0.7.5",
             tmux_version="tmux 3.4",
             tether_version="herdr-tether 0.1.0",
         )
@@ -88,6 +90,7 @@ class SmokeJsonReportTests(unittest.TestCase):
             report["exercised"]["actions"],
             ["setup", "doctor", "open", "resume", "stop", "replace", "observe"],
         )
+        self.assertEqual(report["versions"]["herdr"], "0.7.5")
         self.assertIsNone(report["failure_category"])
 
 
@@ -657,6 +660,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
     def test_main_returns_nonzero_and_failed_json_when_cleanup_fails(self) -> None:
         args = mock.Mock(
             herdr=Path("/bin/true"),
+            herdr_version="0.7.5",
             tether=Path("/bin/true"),
             repo_root=Path("/tmp"),
             keep=True,
@@ -692,6 +696,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
             partial_root.mkdir()
             args = mock.Mock(
                 herdr=Path("/bin/true"),
+                herdr_version="0.7.5",
                 tether=Path("/bin/true"),
                 repo_root=Path(repository),
                 keep=False,
@@ -720,6 +725,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
     def test_signal_interruption_has_distinct_json_category_and_exit_code(self) -> None:
         args = mock.Mock(
             herdr=Path("/bin/true"),
+            herdr_version="0.7.5",
             tether=Path("/bin/true"),
             repo_root=Path("/tmp"),
             keep=False,
@@ -733,6 +739,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
             cleanup_attempts=0,
             completed_phases=[],
             active_phase=None,
+            herdr_version="0.7.5",
             tmux_version="unknown",
             tether_version="unknown",
         )

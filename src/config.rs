@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::Placement,
+    model::{HerdrAgentKind, Placement},
     storage::{
         atomic_write, atomic_write_preserving_parent, with_advisory_lock,
         with_advisory_lock_preserving_parent,
@@ -235,6 +235,8 @@ fn value_contains_tether_key(value: &toml::Value) -> bool {
 pub struct CommandPreset {
     pub name: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_agent: Option<HerdrAgentKind>,
 }
 
 impl CommandPreset {
@@ -320,7 +322,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const CURRENT_VERSION: u32 = 3;
     pub const MAX_HOSTS: usize = 256;
     pub const MAX_STRING_BYTES: usize = 16 * 1024;
     pub fn add_host(&mut self, host: HostConfig) -> Result<()> {
@@ -537,11 +539,17 @@ impl ConfigStore {
             })?;
 
         let (config, migrated) = match version {
-            2 => {
+            3 => {
                 let config: Config = toml::from_str(&source).with_context(|| {
-                    format!("decode config version 2 from `{}`", self.path.display())
+                    format!("decode config version 3 from `{}`", self.path.display())
                 })?;
                 (config, false)
+            }
+            2 => {
+                let legacy: ConfigV2 = toml::from_str(&source).with_context(|| {
+                    format!("decode config version 2 from `{}`", self.path.display())
+                })?;
+                (legacy.migrate(), true)
             }
             1 => {
                 let legacy: ConfigV1 = toml::from_str(&source).with_context(|| {
@@ -644,6 +652,30 @@ fn require_positive_u64(value: u64, field: &str) -> Result<()> {
         bail!("{field} exceeds the maximum TOML integer");
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigV2 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    hosts: Vec<HostConfig>,
+    ui: UiDefaults,
+    discovery: DiscoveryDefaults,
+    retention: RetentionDefaults,
+}
+
+impl ConfigV2 {
+    fn migrate(self) -> Config {
+        Config {
+            version: Config::CURRENT_VERSION,
+            hosts: self.hosts,
+            ui: self.ui,
+            discovery: self.discovery,
+            retention: self.retention,
+        }
+    }
 }
 
 #[derive(Deserialize)]

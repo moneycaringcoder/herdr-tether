@@ -29,7 +29,7 @@ import time
 from typing import Any, Callable, Iterable
 
 PLUGIN_ID = "moneycaringcoder.tether"
-HERDR_VERSION = "0.7.3"
+DEFAULT_HERDR_VERSION = "0.7.3"
 COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
@@ -37,10 +37,16 @@ HERDR_DEFAULT_ROWS = 40
 HERDR_DEFAULT_COLUMNS = 140
 HERDR_PICKER_VIEWPORTS = ((24, 80), (14, 48))
 HERDR_OPEN_KEYS = b"\x02t"
+PICKER_RESIZE_MARKER = "Resize terminal to at least 40x8"
 OWNED_SESSION_RE = re.compile(r"^tether-[0-9a-f]{32}$")
 SSH_TARGET_RE = re.compile(
     r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
 )
+MANAGED_KEY_BYTES = {
+    "Enter": b"\r",
+    "Space": b" ",
+    "Esc": b"\x1b",
+}
 
 REPORT_SCHEMA_VERSION = 1
 REPORT_MAX_BYTES = 4096
@@ -121,7 +127,7 @@ def smoke_report(
         "versions": {
             "platform": safe_version(sys.platform),
             "python": safe_version(platform.python_version()),
-            "herdr": HERDR_VERSION,
+            "herdr": safe_version(smoke.herdr_version) if smoke is not None else "unknown",
             "tmux": safe_version(smoke.tmux_version) if smoke is not None else "unknown",
             "tether": safe_version(smoke.tether_version) if smoke is not None else "unknown",
         },
@@ -284,6 +290,7 @@ class Smoke:
         remote_target: str | None = None,
         remote_directory: str | None = None,
         remote_known_hosts: Path | None = None,
+        herdr_version: str = DEFAULT_HERDR_VERSION,
     ) -> "Smoke":
         """Construct a smoke environment without leaking a partial temp root."""
         smoke = cls.__new__(cls)
@@ -296,6 +303,7 @@ class Smoke:
                 remote_target,
                 remote_directory,
                 remote_known_hosts,
+                herdr_version,
             )
         except Exception as error:
             cleanup_result = "not_run"
@@ -320,11 +328,17 @@ class Smoke:
         remote_target: str | None = None,
         remote_directory: str | None = None,
         remote_known_hosts: Path | None = None,
+        herdr_version: str = DEFAULT_HERDR_VERSION,
     ) -> None:
         self.herdr = herdr.resolve()
         self.tether = tether.resolve()
         self.repo_root = repo_root.resolve()
         self.keep = keep
+        self.herdr_version = safe_version(herdr_version)
+        version_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", self.herdr_version)
+        if version_match is None:
+            raise ValueError("expected Herdr version must be numeric major.minor.patch")
+        self.popup_plugin_panes = tuple(map(int, version_match.groups())) >= (0, 7, 4)
         self.remote_target = (
             validate_remote_target(remote_target) if remote_target is not None else None
         )
@@ -717,9 +731,15 @@ class Smoke:
         reader = threading.Thread(target=drain, name="tether-picker-reader", daemon=True)
         reader.start()
         try:
+            previous_screen: str | None = None
             for marker, keys in steps:
+                observed_screen = ""
                 def visible() -> bool:
+                    nonlocal observed_screen
                     rendered = terminal_screen_text(bytes(output))
+                    observed_screen = rendered
+                    if previous_screen is not None and rendered == previous_screen:
+                        return False
                     if process.poll() is not None and marker not in rendered:
                         fail(
                             f"interactive command exited ({process.returncode}) before marker "
@@ -734,7 +754,9 @@ class Smoke:
                     fail(
                         f"{error}; process={process.poll()}\n"
                         f"interactive screen:\n{rendered}"
+                        f"\nprevious interactive screen:\n{previous_screen or '<none>'}"
                     )
+                previous_screen = observed_screen if keys else None
                 os.write(master, keys)
             try:
                 returncode = process.wait(timeout=STATE_TIMEOUT)
@@ -781,49 +803,90 @@ class Smoke:
         )
         return "\n".join(values) if values else result.stdout
 
+    def managed_surface_text(self, pane_id: str | None) -> str:
+        if pane_id is None:
+            return terminal_screen_text(bytes(self.herdr_output))
+        return self.pane_visible_text(pane_id)
+
+    def managed_surface_closed(self, pane_id: str | None) -> bool:
+        if pane_id is not None:
+            return pane_id not in self.pane_ids()
+        rendered = self.managed_surface_text(None)
+        return (
+            "Tether ·" not in rendered
+            and "Tether: Open workloads" not in rendered
+            and "Tether: Set up" not in rendered
+            and PICKER_RESIZE_MARKER not in rendered
+        )
+
+    def send_managed_keys(self, pane_id: str | None, *keys: str) -> None:
+        if pane_id is not None:
+            self.herdr_run("pane", "send-keys", pane_id, *keys)
+            return
+        encoded = bytearray()
+        for key in keys:
+            encoded.extend(MANAGED_KEY_BYTES.get(key, key.encode("utf-8")))
+        self.send_herdr_bytes(bytes(encoded))
+
     def interact_managed_pane(
         self,
-        pane_id: str,
+        pane_id: str | None,
         steps: list[tuple[str, tuple[str, ...]]],
     ) -> None:
+        previous_screen: str | None = None
         for marker, keys in steps:
+            observed_screen = ""
             def visible() -> bool:
-                if pane_id not in self.pane_ids():
+                nonlocal observed_screen
+                rendered = self.managed_surface_text(pane_id)
+                observed_screen = rendered
+                if previous_screen is not None and rendered == previous_screen:
+                    return False
+                if self.managed_surface_closed(pane_id):
                     fail(
-                        f"managed plugin pane {pane_id} closed before marker {marker!r}"
+                        f"managed plugin surface closed before marker {marker!r}"
                     )
-                return marker in self.pane_visible_text(pane_id)
+                return marker in rendered
 
             self.wait_until(f"managed plugin picker marker {marker!r}", visible)
+            previous_screen = observed_screen if keys else None
             if keys:
-                self.herdr_run("pane", "send-keys", pane_id, *keys)
+                self.send_managed_keys(pane_id, *keys)
 
     def interact_managed_pane_via_herdr(
         self,
-        pane_id: str,
+        pane_id: str | None,
         steps: list[tuple[str, bytes]],
     ) -> None:
         """Verify picker stages and deliver every action through Herdr's PTY."""
+        previous_screen: str | None = None
         for marker, keys in steps:
+            observed_screen = ""
             def visible() -> bool:
-                if pane_id not in self.pane_ids():
+                nonlocal observed_screen
+                rendered = self.managed_surface_text(pane_id)
+                observed_screen = rendered
+                if previous_screen is not None and rendered == previous_screen:
+                    return False
+                if self.managed_surface_closed(pane_id):
                     fail(
-                        f"managed plugin pane {pane_id} closed before marker {marker!r}"
+                        f"managed plugin surface closed before marker {marker!r}"
                     )
-                return marker in self.pane_visible_text(pane_id)
+                return marker in rendered
 
             self.wait_until(
                 f"keyboard-only managed picker marker {marker!r}",
                 visible,
             )
+            previous_screen = observed_screen if keys else None
             self.send_herdr_bytes(keys)
 
-    def invoke_plugin_picker_via_keyboard(self) -> str:
+    def invoke_plugin_picker_via_keyboard(self) -> str | None:
         """Invoke the installed prefix+t action through the real Herdr client."""
         before = self.pane_ids()
         self.send_herdr_bytes(HERDR_OPEN_KEYS)
 
-        def picker_ready() -> str | bool:
+        def picker_ready() -> str | bool | None:
             matches = [
                 pane_id
                 for pane_id in self.pane_ids() - before
@@ -834,20 +897,48 @@ class Smoke:
                     "prefix+t created multiple ready picker panes: "
                     f"{sorted(matches)}"
                 )
-            return matches[0] if matches else False
+            if matches:
+                return matches[0]
+            if self.popup_plugin_panes:
+                if self.pane_ids() != before:
+                    fail("popup picker unexpectedly changed tiled pane topology")
+                rendered = self.managed_surface_text(None)
+                if "Hosts" in rendered or PICKER_RESIZE_MARKER in rendered:
+                    return "popup"
+            return False
 
-        return self.wait_until(
-            "prefix+t managed picker pane readiness",
-            picker_ready,
-        )
+        try:
+            result = self.wait_until(
+                "prefix+t managed picker readiness",
+                picker_ready,
+            )
+        except SmokeFailure as error:
+            logs = self.herdr_run(
+                "plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "20",
+                check=False,
+            )
+            fail(
+                f"{error}; plugin log response: "
+                f"{(logs.stdout + logs.stderr)[-4000:]}"
+            )
+        return None if self.popup_plugin_panes else result
 
     def assert_managed_picker_viewport(
         self,
-        pane_id: str,
+        pane_id: str | None,
         *,
         rows: int,
         columns: int,
     ) -> None:
+        if pane_id is None:
+            rendered = self.managed_surface_text(None)
+            expected = PICKER_RESIZE_MARKER if (rows, columns) == (14, 48) else "Hosts"
+            if expected not in rendered:
+                fail(
+                    f"Herdr popup did not render {expected!r} in the requested "
+                    f"{columns}x{rows} viewport"
+                )
+            return
         response = self.result_object(
             self.decode_json(
                 self.herdr_run("pane", "layout", "--pane", pane_id),
@@ -888,10 +979,15 @@ class Smoke:
                     rows=rows,
                     columns=columns,
                 )
-                self.interact_managed_pane_via_herdr(picker_pane, steps)
+                viewport_steps = (
+                    [(PICKER_RESIZE_MARKER, b"\x1b")]
+                    if picker_pane is None and (rows, columns) == (14, 48)
+                    else steps
+                )
+                self.interact_managed_pane_via_herdr(picker_pane, viewport_steps)
                 self.wait_until(
-                    f"{columns}x{rows} keyboard-only picker pane exit",
-                    lambda: picker_pane not in self.pane_ids(),
+                    f"{columns}x{rows} keyboard-only picker exit",
+                    lambda: self.managed_surface_closed(picker_pane),
                 )
             finally:
                 self.resize_herdr(
@@ -909,7 +1005,7 @@ class Smoke:
         )
         return process_fingerprint(payload)
 
-    def invoke_plugin_picker(self) -> tuple[str, str, str]:
+    def invoke_plugin_picker(self) -> tuple[str, str, str | None]:
         workspace_id, _ = self.workspace_and_pane()
         invoking_pane = self.focused_pane()
         before = self.pane_ids()
@@ -924,6 +1020,7 @@ class Smoke:
         )
         if "started" not in json.dumps(response, sort_keys=True).lower():
             fail(f"open action did not report a started command: {response}")
+
         def picker_ready() -> str | bool:
             matches = [
                 pane_id
@@ -932,10 +1029,17 @@ class Smoke:
             ]
             if len(matches) > 1:
                 fail(f"open action created multiple ready picker panes: {sorted(matches)}")
-            return matches[0] if matches else False
+            if matches:
+                return matches[0]
+            if self.popup_plugin_panes:
+                if self.pane_ids() != before:
+                    fail("popup picker unexpectedly changed tiled pane topology")
+                if "Hosts" in self.managed_surface_text(None):
+                    return "popup"
+            return False
 
-        picker_pane = self.wait_until(
-            "open action managed picker pane readiness", picker_ready
+        picker = self.wait_until(
+            "open action managed picker readiness", picker_ready
         )
         logs = self.result_object(
             self.decode_json(
@@ -948,37 +1052,10 @@ class Smoke:
         )
         if "open" not in json.dumps(logs, sort_keys=True):
             fail(f"Herdr plugin logs did not record the open action: {logs}")
-        return workspace_id, invoking_pane, picker_pane
+        return workspace_id, invoking_pane, None if picker == "popup" else picker
 
     def picker_event_contract(self, workspace_id: str, invoking_pane: str) -> None:
         picker_env = self.tether_env(workspace_id, invoking_pane)
-        before_panes = self.pane_ids()
-        before_tmux = self.tmux_sessions()
-        missing = self.root / "work" / "missing-create-directory"
-        self.interact(
-            [
-                str(self.tether),
-                "open",
-                "--directory",
-                str(missing),
-                "--command",
-                "true",
-            ],
-            picker_env,
-            [
-                ("Hosts", b"\r"),
-                ("Create new Tether workload", b"\r"),
-                (str(self.root / "home"), b"\r"),
-                ("Shell", b"\r"),
-                ("Split right", b"\x1b[B\x1b[B\r"),
-                ("Operation failed", b""),
-                ("Enter retry", b"\x1b"),
-                ("Hosts", b"\x1b"),
-            ],
-        )
-        if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
-            fail("failed local new-tab create leaked a pane or tmux session")
-
         self.tmux_run(
             "new-session",
             "-d",
@@ -1006,7 +1083,7 @@ class Smoke:
             picker_env,
             [
                 ("Hosts", b"\r"),
-                (self.external_session, b"\x1b[B\r"),
+                (self.external_session, b"\r"),
                 ("Split right", b"\x1b[B\x1b[B\r"),
             ],
         )
@@ -1020,6 +1097,33 @@ class Smoke:
         self.close_pane(external_pane)
         if self.external_session not in self.tmux_sessions():
             fail("closing an external Tether view killed the external tmux session")
+
+        before_panes = self.pane_ids()
+        before_tmux = self.tmux_sessions()
+        missing = self.root / "work" / "missing-create-directory"
+        self.interact(
+            [
+                str(self.tether),
+                "open",
+                "--directory",
+                str(missing),
+                "--command",
+                "true",
+            ],
+            picker_env,
+            [
+                ("Hosts", b"\r"),
+                ("Create new Tether workload", b"\r"),
+                (str(self.root / "home"), b"\r"),
+                ("Shell", b"\r"),
+                ("Split right", b"\x1b[B\x1b[B\r"),
+                ("Operation failed", b""),
+                ("Enter retry", b"\x1b"),
+                ("Hosts", b"\x1b"),
+            ],
+        )
+        if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
+            fail("failed local new-tab create leaked a pane or tmux session")
 
     def replacement_contract(self, workspace_id: str, invoking_pane: str) -> None:
         split = self.result_object(
@@ -1299,7 +1403,15 @@ class Smoke:
         )
         if "started" not in json.dumps(response, sort_keys=True).lower():
             fail(f"setup action did not report a started command: {response}")
-        self.wait_new_pane(before, "setup action managed pane")
+        if self.popup_plugin_panes:
+            self.wait_until(
+                "setup action popup readiness",
+                lambda: "Tether: Set up" in self.managed_surface_text(None),
+            )
+            if self.pane_ids() != before:
+                fail("setup popup unexpectedly changed tiled pane topology")
+        else:
+            self.wait_new_pane(before, "setup action managed pane")
         plugin_config = (
             self.root
             / "config"
@@ -1350,8 +1462,10 @@ class Smoke:
             fail("Herdr PTY is unavailable while dismissing setup result")
         os.write(self.herdr_master, b"\r")
         self.wait_until(
-            "setup action managed pane exit",
-            lambda: not (self.pane_ids() - before),
+            "setup action managed surface exit",
+            lambda: self.managed_surface_closed(None)
+            if self.popup_plugin_panes
+            else not (self.pane_ids() - before),
         )
         logs = self.result_object(
             self.decode_json(
@@ -1652,7 +1766,7 @@ class Smoke:
         )
         before_launch_panes = self.pane_ids()
         source_process = self.pane_process_fingerprint(invoking_pane)
-        self.herdr_run("pane", "send-keys", picker_pane, "Enter")
+        self.send_managed_keys(picker_pane, "Enter")
         observer_pane = self.wait_new_pane(
             before_launch_panes, "real plugin-picker Observer companion"
         )
@@ -1735,8 +1849,8 @@ class Smoke:
             ],
         )
         self.wait_until(
-            "delete picker managed pane exit",
-            lambda: delete_picker not in self.pane_ids(),
+            "delete picker managed surface exit",
+            lambda: self.managed_surface_closed(delete_picker),
         )
         groups = plugin_payload().get("orchestration_groups")
         if groups != []:
@@ -1930,9 +2044,10 @@ class Smoke:
         if not match or tuple(map(int, match.groups())) < (3, 3):
             fail(f"live smoke requires tmux 3.3 or newer; got {self.tmux_version!r}")
         version = self.run([str(self.herdr), "--version"])
-        if version.stdout.strip() != f"herdr {HERDR_VERSION}":
+        if version.stdout.strip() != f"herdr {self.herdr_version}":
             fail(
-                f"live smoke requires official Herdr {HERDR_VERSION}; got {version.stdout.strip()!r}"
+                f"live smoke requires official Herdr {self.herdr_version}; "
+                f"got {version.stdout.strip()!r}"
             )
         self.tether_version = self.run([str(self.tether), "--version"]).stdout.strip()[:64]
 
@@ -2062,9 +2177,14 @@ class Smoke:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Tether against live Herdr 0.7.3 and an isolated tmux server."
+        description="Run Tether against an official Herdr release and an isolated tmux server."
     )
-    parser.add_argument("--herdr", required=True, type=Path, help="official Herdr 0.7.3 binary")
+    parser.add_argument("--herdr", required=True, type=Path, help="official Herdr binary")
+    parser.add_argument(
+        "--herdr-version",
+        default=DEFAULT_HERDR_VERSION,
+        help="expected official Herdr version",
+    )
     parser.add_argument("--tether", required=True, type=Path, help="built herdr-tether binary")
     parser.add_argument(
         "--repo-root", type=Path, default=Path.cwd(), help="checkout containing herdr-plugin.toml"
@@ -2141,6 +2261,7 @@ def main() -> int:
             args.remote_target,
             args.remote_directory,
             args.remote_known_hosts,
+            herdr_version=args.herdr_version,
         )
         atexit.register(smoke.cleanup)
         smoke.execute()

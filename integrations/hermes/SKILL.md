@@ -18,10 +18,10 @@ Use Tether as the visibility and lifecycle boundary for durable development work
 
 Choose the source that matches the Tether installation:
 
-**Stable v0.3.0:**
+**Stable v0.4.0:**
 
 ```sh
-hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.3.0/integrations/hermes/SKILL.md
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.4.0/integrations/hermes/SKILL.md
 ```
 
 **Development (`main`):**
@@ -127,24 +127,18 @@ herdr-tether session remove ID
 
 Read a new snapshot after a requested lifecycle action and verify the expected observable metadata/workload status. If the result is partial, report the action result separately from any status that could not be collected.
 
-## Configure an Orchestration Group (development only)
+## Configure an Orchestration Group
 
-Use this procedure only with Tether development `main` or an immutable reviewed
-commit containing orchestration commands. Stable v0.3.0 users should continue
-using the snapshot and lifecycle procedures above.
-
-Before running any command in this development-only section, perform the
-side-effect-free capability probe:
+First perform the side-effect-free capability probe:
 
 ```sh
 herdr-tether orchestration --help
 ```
 
 Require a successful exit and help that lists the orchestration subcommands.
-`herdr-tether --version` is not sufficient because stable and development
-builds may report the same package version. If the probe fails or the command is
-absent, stop and report that this Tether installation does not provide the
-preview orchestration capability; do not attempt any orchestration mutation.
+If the probe fails or the command is absent, stop and report that this Tether
+installation does not provide orchestration; do not attempt any orchestration
+mutation.
 
 The user or calling adapter must provide all orchestration values externally:
 

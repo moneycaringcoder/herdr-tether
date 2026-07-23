@@ -48,6 +48,9 @@ impl AppPaths {
             ssh_config_file,
         })
     }
+    pub fn agent_view_file(&self) -> PathBuf {
+        self.state_file.with_file_name("agent-view.json")
+    }
 }
 
 fn home_path(value: Option<OsString>) -> Option<PathBuf> {

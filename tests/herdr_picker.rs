@@ -7,7 +7,7 @@ use herdr_tether::{
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext, InvocationLocation, PaneTitle},
     lifecycle::{CloseOwnedError, PrunePreview, PruneService},
-    model::{ExternalSessionName, Placement, SessionId},
+    model::{ExternalSessionName, OrchestrationGroupId, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS,
@@ -33,6 +33,10 @@ fn write_fake_herdr(path: &Path, log: &Path, pane_run: &str) {
 printf 'CALL' >> '{log}'
 for arg do printf '\t%s' "$arg" >> '{log}'; done
 printf '\n' >> '{log}'
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'herdr 0.7.5'
+  exit 0
+fi
 if [ "$1 $2" = "pane split" ]; then
   printf '%s' '{{"id":"cli-1","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9","workspace_id":"w1","tab_id":"w1:t1"}}}}}}'
 elif [ "$1 $2" = "tab create" ]; then
@@ -41,8 +45,10 @@ elif [ "$1 $2" = "pane rename" ]; then
   printf '%s' '{{"id":"rename","result":{{"type":"pane_info","pane":{{"pane_id":"w1:p9"}}}}}}'
 elif [ "$1 $2" = "pane run" ]; then
   {pane_run}
+elif [ "$1 $2" = "pane report-metadata" ]; then
+  printf '%s' '{{"id":"metadata","result":{{"type":"ok"}}}}'
 elif [ "$1 $2 $3" = "plugin pane open" ]; then
-  printf '%s' '{{"id":"cli-4","result":{{"type":"plugin_pane_opened","plugin_pane":{{"pane":{{"pane_id":"w1:p11"}}}}}}}}'
+  printf '%s' '{{"id":"cli-4","result":{{"type":"ok"}}}}'
 else
   printf '%s' '{{"id":"bad","error":{{"message":"unexpected fake invocation"}}}}'
   exit 2
@@ -768,7 +774,7 @@ fn replacement_preserves_reused_source_pane_id() {
 }
 
 #[test]
-fn plugin_action_opens_the_declared_overlay_entrypoint() {
+fn plugin_action_uses_popup_on_current_herdr() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -781,8 +787,81 @@ fn plugin_action_opens_the_declared_overlay_entrypoint() {
     client.open_plugin_pane("picker").unwrap();
 
     assert!(fs::read_to_string(log).unwrap().contains(
+        "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\tpopup"
+    ));
+}
+
+#[test]
+fn plugin_action_keeps_overlay_on_minimum_herdr() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    let script = format!(
+        "#!/bin/sh\nprintf 'CALL' >> '{log}'\nfor arg do printf '\\t%s' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.3'; else printf '%s' '{{\"id\":\"cli\",\"result\":{{\"type\":\"plugin_pane_opened\"}}}}'; fi\n",
+        log = log.display(),
+    );
+    fs::write(&binary, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+    HerdrClient::new(context(&binary))
+        .open_plugin_pane("picker")
+        .unwrap();
+
+    assert!(fs::read_to_string(log).unwrap().contains(
         "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\toverlay"
     ));
+}
+
+#[test]
+fn current_herdr_receives_source_owned_agent_view_group_token() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    write_fake_herdr(&binary, &log, ":");
+    let group_id = "build-group".parse::<OrchestrationGroupId>().unwrap();
+
+    HerdrClient::new(context(&binary))
+        .report_agent_view_group("w1:p9", &group_id)
+        .unwrap();
+
+    assert!(fs::read_to_string(log).unwrap().contains(
+        "CALL\tpane\treport-metadata\tw1:p9\t--source\tplugin:moneycaringcoder.tether\t--token\ttether_group=build-group"
+    ));
+}
+
+#[test]
+fn minimum_herdr_skips_unavailable_agent_view_metadata_api() {
+    let _guard = FAKE_HERDR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let binary = temp.path().join("herdr");
+    let log = temp.path().join("herdr.log");
+    let script = format!(
+        "#!/bin/sh\nprintf 'CALL' >> '{log}'\nfor arg do printf '\\t%s' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nprintf '%s\\n' 'herdr 0.7.3'\n",
+        log = log.display(),
+    );
+    fs::write(&binary, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+    HerdrClient::new(context(&binary))
+        .report_agent_view_group(
+            "w1:p9",
+            &"build-group".parse::<OrchestrationGroupId>().unwrap(),
+        )
+        .unwrap();
+
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains("CALL\t--version"));
+    assert!(!transcript.contains("report-metadata"));
 }
 
 #[test]
@@ -794,7 +873,7 @@ fn plugin_action_surfaces_real_stderr_error_envelope() {
     let binary = temp.path().join("herdr");
     fs::write(
         &binary,
-        "#!/bin/sh\nprintf '%s' '{\"error\":{\"message\":\"invoking pane vanished\"}}' >&2\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.5'; exit 0; fi\nprintf '%s' '{\"error\":{\"message\":\"invoking pane vanished\"}}' >&2\nexit 1\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -818,6 +897,7 @@ fn picker_fixture() -> (Config, State) {
             target: "builder@example.test".into(),
             roots: vec!["/srv/configured".into(), "/srv/shared".into()],
             presets: vec![CommandPreset {
+                herdr_agent: None,
                 name: "agent".into(),
                 command: "exec codex".into(),
             }],
@@ -839,6 +919,7 @@ fn picker_fixture() -> (Config, State) {
         version: State::CURRENT_VERSION,
         sessions: vec![
             SessionRecord {
+                herdr_agent: None,
                 id: "tether-0197f198000070008000000000000001"
                     .parse::<SessionId>()
                     .unwrap(),
@@ -856,6 +937,7 @@ fn picker_fixture() -> (Config, State) {
                 exit_status: None,
             },
             SessionRecord {
+                herdr_agent: None,
                 id: "tether-0197f198000070008000000000000002"
                     .parse::<SessionId>()
                     .unwrap(),
@@ -1369,6 +1451,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
     config.hosts[0].target = "new-builder@example.test".into();
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     state.sessions.push(SessionRecord {
+        herdr_agent: None,
         id: "tether-0197f198000070008000000000000003".parse().unwrap(),
         host: "removed-box".into(),
         target: "removed@example.test".into(),
@@ -2408,6 +2491,7 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
     let now = Utc::now();
     let sessions = (0..count)
         .map(|index| SessionRecord {
+            herdr_agent: None,
             id: format!("tether-0197f198000070008000000000000{:03}", index + 100)
                 .parse()
                 .unwrap(),
@@ -2441,6 +2525,7 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
     let now = Utc::now();
     let records = (0..3)
         .map(|index| SessionRecord {
+            herdr_agent: None,
             id: format!("tether-0197f198000070008000000000000{:03}", index + 100)
                 .parse()
                 .unwrap(),
@@ -2504,6 +2589,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
         (202, SessionStatus::Stopping, 42),
     ] {
         records.push(SessionRecord {
+            herdr_agent: None,
             id: format!("tether-0197f198000070008000000000000{suffix:03}")
                 .parse()
                 .unwrap(),
