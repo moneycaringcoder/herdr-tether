@@ -1056,33 +1056,6 @@ class Smoke:
 
     def picker_event_contract(self, workspace_id: str, invoking_pane: str) -> None:
         picker_env = self.tether_env(workspace_id, invoking_pane)
-        before_panes = self.pane_ids()
-        before_tmux = self.tmux_sessions()
-        missing = self.root / "work" / "missing-create-directory"
-        self.interact(
-            [
-                str(self.tether),
-                "open",
-                "--directory",
-                str(missing),
-                "--command",
-                "true",
-            ],
-            picker_env,
-            [
-                ("Hosts", b"\r"),
-                ("Create new Tether workload", b"\r"),
-                (str(self.root / "home"), b"\r"),
-                ("Shell", b"\r"),
-                ("Split right", b"\x1b[B\x1b[B\r"),
-                ("Operation failed", b""),
-                ("Enter retry", b"\x1b"),
-                ("Hosts", b"\x1b"),
-            ],
-        )
-        if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
-            fail("failed local new-tab create leaked a pane or tmux session")
-
         self.tmux_run(
             "new-session",
             "-d",
@@ -1124,6 +1097,33 @@ class Smoke:
         self.close_pane(external_pane)
         if self.external_session not in self.tmux_sessions():
             fail("closing an external Tether view killed the external tmux session")
+
+        before_panes = self.pane_ids()
+        before_tmux = self.tmux_sessions()
+        missing = self.root / "work" / "missing-create-directory"
+        self.interact(
+            [
+                str(self.tether),
+                "open",
+                "--directory",
+                str(missing),
+                "--command",
+                "true",
+            ],
+            picker_env,
+            [
+                ("Hosts", b"\r"),
+                ("Create new Tether workload", b"\r"),
+                (str(self.root / "home"), b"\r"),
+                ("Shell", b"\r"),
+                ("Split right", b"\x1b[B\x1b[B\r"),
+                ("Operation failed", b""),
+                ("Enter retry", b"\x1b"),
+                ("Hosts", b"\x1b"),
+            ],
+        )
+        if self.pane_ids() != before_panes or self.tmux_sessions() != before_tmux:
+            fail("failed local new-tab create leaked a pane or tmux session")
 
     def replacement_contract(self, workspace_id: str, invoking_pane: str) -> None:
         split = self.result_object(
