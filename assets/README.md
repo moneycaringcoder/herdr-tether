@@ -18,6 +18,8 @@ and structural contrast, not the teal accent, carry the identity. Each SVG has
 a `<title>` and `<desc>` for contexts that expose embedded image semantics.
 
 No third-party logo, icon, typeface file, screenshot, or generated raster asset
-is included. A product screenshot is intentionally omitted until the integrated
-picker can be captured from a stable, sanitized fixture; a hand-composed mock
-would overstate the shipped UI.
+is included. Product UI is exercised through sanitized deterministic fixtures
+in the official Herdr live-product smoke at documented viewports. A static
+screenshot remains intentionally omitted because it would capture one Herdr
+version, terminal renderer, theme, and moment rather than the supported
+terminal-default presentation.

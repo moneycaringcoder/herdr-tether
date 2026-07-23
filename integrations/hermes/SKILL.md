@@ -47,8 +47,8 @@ Use this skill when a user wants to:
 - start a user-chosen command in a Tether-owned workload;
 - reopen, restart, stop, or remove a specific Tether-owned workload;
 - compare workload state across configured local and remote hosts; or
-- configure and view an opt-in orchestration group when using development
-  `main` or an immutable reviewed commit.
+- configure and view an opt-in orchestration group on stable v0.4.0,
+  development `main`, or an immutable reviewed commit.
 
 ## Preflight
 
@@ -90,8 +90,9 @@ Only start a workload after the user has requested it and the launch choices are
 1. **Host:** choose `local` or a currently effective configured/SSH host visible in the snapshot. Do not launch against a historical `state`-only target.
 2. **Directory:** use the user-selected repository/directory appropriate to that host. Paths are host-relative; never transplant a local machine path to a remote host.
 3. **Workload command:** use exactly one of a named Tether preset or an explicit command supplied/approved by the user. The command and its runtime are external configuration; this skill does not require a particular agent, scheduler, or tool.
-4. **Environment:** rely on the selected host's configured shell environment, environment manager, or secret manager. Never place credentials or tokens in CLI arguments or persisted command text.
-5. **Layout:** add a placement only when invoked from a compatible Herdr pane and the user chose one: `split-right`, `split-down`, `new-tab`, or `replace-current-pane`. Otherwise omit `--placement` and let Tether configuration decide.
+4. **Agent identity:** pass `--herdr-agent KIND` only when the user explicitly supplied a Herdr-supported kind for an agent hidden behind `tmux` or SSH. Never infer it from the command, repository, or process name.
+5. **Environment:** rely on the selected host's configured shell environment, environment manager, or secret manager. Never place credentials or tokens in CLI arguments or persisted command text.
+6. **Layout:** add a placement only when invoked from a compatible Herdr pane and the user chose one: `split-right`, `split-down`, `new-tab`, or `replace-current-pane`. Otherwise omit `--placement` and let Tether configuration decide.
 
 Preset form:
 
@@ -105,7 +106,7 @@ Explicit-command form:
 herdr-tether open --host HOST --directory DIRECTORY --command COMMAND
 ```
 
-Add `--placement PLACEMENT` only under the layout rule above. Pass every substituted value as one safely quoted argument; never construct a command by concatenating untrusted text. `open` intentionally enters the durable terminal, so run it only from an interactive surface that can hand control to Tether. Do not simulate a detached launch with raw tmux.
+Add `--herdr-agent KIND` and `--placement PLACEMENT` only under the rules above. Pass every substituted value as one safely quoted argument; never construct a command by concatenating untrusted text. `open` intentionally enters the durable terminal, so run it only from an interactive surface that can hand control to Tether. Do not simulate a detached launch with raw tmux.
 
 After control returns, request a fresh snapshot and identify the resulting owned workload from observable fields. Do not claim creation succeeded merely because the attach command started.
 
@@ -198,6 +199,12 @@ explicit command and approved values to a Herdr-pane context instead of
 attempting to reconstruct environment variables. Prefer `split-right`,
 `split-down`, or `new-tab`; Tether normalizes `replace-current-pane` to
 `split-right` so the invoking or Observer pane remains available.
+
+The native **Show group in Agents sidebar** and **Restore default Agents
+sidebar** actions are user-facing Herdr plugin surfaces, not public
+orchestration CLI commands. An adapter must not call Herdr's socket directly,
+edit `agent-view.json`, or claim that creating a group activated a sidebar
+filter.
 
 ## Safety Boundaries
 

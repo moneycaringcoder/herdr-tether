@@ -88,6 +88,11 @@ Herdr 0.7.3 does not expose a generic plugin-action menu, so this explicit one-t
 
 Closing the view leaves the workload running. Open Tether again and press `Enter` on that running workload to reconnect.
 
+If the command is a Herdr-supported agent hidden behind `tmux` or SSH, create
+the workload from a preset with an explicit `herdr_agent` or use the standalone
+`open --herdr-agent KIND` option. Tether never infers a kind from a command.
+See [Agent hints in Configuration](configuration.md#host-entries-and-presets).
+
 ## 5. Add a remote host (optional)
 
 Install the standalone CLI when you want administration commands in your shell.
@@ -164,11 +169,16 @@ confirm. All operations change only group metadata and leave every workload and
 pane alone.
 
 With Herdr 0.7.5 or newer, the same action screen offers **Show group in Agents
-sidebar**. This is explicit and reversible: it filters the native Agents
-sidebar to recognized group members, persists across Herdr startup or live
-handoff, and does not open or mutate workloads. Choose **Restore default Agents
-sidebar** to clear Tether's view. Herdr 0.7.3 and 0.7.4 continue to support the
-ordinary Tether and Observer workflows without this optional view.
+sidebar**. The view contains only panes Herdr recognizes as agents. After
+activating it, open each applicable group member from Tether or Observer;
+Tether labels that pane for the selected group. Agent commands hidden behind
+`tmux` or SSH need the explicit hint described above.
+
+The view is explicit and reversible: it persists across Herdr startup or live
+handoff and does not open or mutate workloads by itself. Choose **Restore
+default Agents sidebar** to clear Tether's filter. Herdr 0.7.3 and 0.7.4
+continue to support ordinary Tether and Observer workflows without this
+optional view.
 
 The standalone `herdr-tether orchestration` commands remain available as an
 optional machine/adapter API. Native picker users do not need exact IDs, shell

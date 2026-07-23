@@ -132,8 +132,8 @@ hermes skills install "https://raw.githubusercontent.com/moneycaringcoder/herdr-
 ```
 
 The [skill source](integrations/hermes/SKILL.md) describes Tether's public
-snapshot, lifecycle, and development orchestration commands. Hermes is a
-reference adapter, not a Tether runtime dependency.
+snapshot, lifecycle, and orchestration commands. Hermes is a reference adapter,
+not a Tether runtime dependency.
 
 ## The `prefix+t` workflow
 
@@ -143,11 +143,10 @@ reference adapter, not a Tether runtime dependency.
 4. For a new workload, choose a repository, command, and placement.
 5. Close the Herdr view whenever you want. The workload remains available.
 
-On development `main`, when Herdr supplies an optional pane or workspace
-working directory, Tether brings an already-known matching workload and host to
-the front. The context is only a preference: malformed, unknown, or ambiguous
-paths change nothing, and Tether never creates a host, path, command, or
-selection from it.
+When Herdr supplies an optional pane or workspace working directory, Tether
+brings an already-known matching workload and host to the front. The context is
+only a preference: malformed, unknown, or ambiguous paths change nothing, and
+Tether never creates a host, path, command, or selection from it.
 
 The picker keeps actions contextual:
 
@@ -286,7 +285,7 @@ The snapshot reports bounded host, repository, owned-workload, and safe external
 - **Commands and presets are trusted code.** They run through the selected machine's shell; Tether is not a sandbox.
 - **SSH policy remains yours.** Tether uses `BatchMode=yes` and never weakens host-key verification.
 - **Remote support is SSH + tmux.** Tether does not provide remote Herdr federation or pane streaming.
-- **Herdr 0.7.3 sidebar limitation:** Herdr has no general API for registering arbitrary nested workloads as sidebar agents. Tether uses clear pane/session titles and does not fabricate agent state.
+- **Agent integration is explicit and versioned.** Herdr 0.7.3 and 0.7.4 cannot register arbitrary workloads hidden behind `tmux` or SSH, so Tether falls back to clear pane/session titles. On Herdr 0.7.5 and newer, validated agent hints and opt-in group views expose recognized panes without Tether guessing agent identity or lifecycle.
 - Tether reads literal aliases from the primary `~/.ssh/config`; it does not traverse `Include` directives for discovery. Explicitly add an alias that is only present in an included file.
 
 Read the [architecture and security boundaries](docs/architecture.md) before deploying Tether in a sensitive environment. Vulnerabilities should be reported through the [security policy](SECURITY.md), not a public issue.
@@ -297,9 +296,9 @@ Read the [architecture and security boundaries](docs/architecture.md) before dep
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | installing, configuring the launcher, or creating the first workload |
 | [Lifecycle](docs/lifecycle.md) | deciding whether to leave, stop, restart, remove, or retry |
-| [Configuration](docs/configuration.md) | adding hosts, roots, presets, placement, or retention settings |
-| [Troubleshooting](docs/troubleshooting.md) | a host, workload, install, or pane action did not behave as expected |
-| [Architecture and security](docs/architecture.md) | reviewing trust boundaries, persistence, transport, or ownership |
+| [Configuration](docs/configuration.md) | adding hosts, roots, presets, agent hints, placement, or retention settings |
+| [Troubleshooting](docs/troubleshooting.md) | a host, workload, install, pane action, or Agents sidebar view did not behave as expected |
+| [Architecture and security](docs/architecture.md) | reviewing trust boundaries, persistence, transport, ownership, or Agent view metadata |
 | [Contributing](CONTRIBUTING.md) | developing or testing Tether |
 | [Security policy](SECURITY.md) | reporting a vulnerability |
 
