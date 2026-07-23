@@ -1061,6 +1061,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         SessionRecord {
+            herdr_agent: None,
             id,
             host: "local".to_owned(),
             target: "local".to_owned(),
@@ -1506,6 +1507,7 @@ mod tests {
             State {
                 version: State::CURRENT_VERSION,
                 sessions: vec![SessionRecord {
+                    herdr_agent: None,
                     id: worker_id,
                     host: "local".to_owned(),
                     target: "local".to_owned(),
@@ -2073,6 +2075,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let record = SessionRecord {
+            herdr_agent: None,
             id: worker_id,
             host: "local".to_owned(),
             target: "local".to_owned(),

@@ -34,6 +34,7 @@ fn sample_config() -> Config {
             target: "builder@example.test".into(),
             roots: vec!["/srv/code".into()],
             presets: vec![CommandPreset {
+                herdr_agent: None,
                 name: "shell".into(),
                 command: "exec ${SHELL:-/bin/sh} -l".into(),
             }],
@@ -54,6 +55,7 @@ fn config_at_serialized_limit() -> Config {
             roots: Vec::new(),
             presets: (0..33)
                 .map(|index| CommandPreset {
+                    herdr_agent: None,
                     name: format!("preset-{index}"),
                     command: "x".into(),
                 })
@@ -82,6 +84,7 @@ fn state_at_serialized_limit() -> State {
         version: State::CURRENT_VERSION,
         sessions: (0..33)
             .map(|index| SessionRecord {
+                herdr_agent: None,
                 id: format!("tether-0197f19800007000800000000000{index:04x}")
                     .parse()
                     .unwrap(),
@@ -146,7 +149,7 @@ fn config_round_trips_atomically_with_private_permissions() {
 }
 
 #[test]
-fn config_v0_is_migrated_and_rewritten_as_v2() {
+fn config_v0_is_migrated_and_rewritten_as_current() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
     fs::write(
@@ -167,7 +170,7 @@ roots = ["/work"]
     assert_eq!(
         migrated,
         Config {
-            version: 2,
+            version: Config::CURRENT_VERSION,
             hosts: vec![HostConfig {
                 name: "work".into(),
                 target: "work.example.test".into(),
@@ -179,11 +182,15 @@ roots = ["/work"]
             retention: RetentionDefaults::default(),
         }
     );
-    assert!(fs::read_to_string(path).unwrap().contains("version = 2"));
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains(&format!("version = {}", Config::CURRENT_VERSION))
+    );
 }
 
 #[test]
-fn config_v1_is_migrated_with_exact_v2_defaults() {
+fn config_v1_is_migrated_with_current_defaults() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
     fs::write(
@@ -204,7 +211,7 @@ placement = "split-down"
 
     let migrated = ConfigStore::new(path.clone()).load().unwrap();
 
-    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.version, Config::CURRENT_VERSION);
     assert_eq!(migrated.hosts[0].roots, ["/work"]);
     assert_eq!(migrated.hosts[0].presets[0].name, "shell");
     assert_eq!(migrated.ui.placement, Placement::SplitDown);
@@ -221,9 +228,51 @@ placement = "split-down"
     );
     assert_eq!(migrated.retention, RetentionDefaults { closed_days: 30 });
     let rewritten = fs::read_to_string(path).unwrap();
-    assert!(rewritten.contains("version = 2"));
+    assert!(rewritten.contains(&format!("version = {}", Config::CURRENT_VERSION)));
     assert!(rewritten.contains("[discovery]"));
     assert!(rewritten.contains("[retention]"));
+}
+
+#[test]
+fn config_v2_is_migrated_with_an_empty_agent_hint() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"version = 2
+
+[[hosts]]
+name = "work"
+target = "work.example.test"
+roots = ["/work"]
+presets = [{ name = "shell", command = "exec /bin/sh" }]
+
+[ui]
+placement = "split-right"
+
+[discovery]
+local_roots = []
+max_depth = 4
+max_entries = 4096
+max_results = 64
+timeout_seconds = 3
+workers = 4
+
+[retention]
+closed_days = 30
+"#,
+    )
+    .unwrap();
+
+    let migrated = ConfigStore::new(path.clone()).load().unwrap();
+
+    assert_eq!(migrated.version, Config::CURRENT_VERSION);
+    assert_eq!(migrated.hosts[0].presets[0].herdr_agent, None);
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains(&format!("version = {}", Config::CURRENT_VERSION))
+    );
 }
 
 #[test]
@@ -431,7 +480,11 @@ fn config_load_time_migration_holds_the_advisory_lock() {
         ConfigStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("version = 2"));
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains(&format!("version = {}", Config::CURRENT_VERSION))
+    );
 }
 
 #[test]
@@ -482,12 +535,14 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     let mut presets = sample_config();
     presets.hosts[0].presets = (0..HostConfig::MAX_PRESETS)
         .map(|index| CommandPreset {
+            herdr_agent: None,
             name: format!("preset-{index}"),
             command: "true".into(),
         })
         .collect();
     let mut presets_over = presets.clone();
     presets_over.hosts[0].presets.push(CommandPreset {
+        herdr_agent: None,
         name: "over".into(),
         command: "true".into(),
     });
@@ -629,6 +684,7 @@ fn state_round_trips_and_migrates_v0() {
     let state = State {
         version: State::CURRENT_VERSION,
         sessions: vec![SessionRecord {
+            herdr_agent: None,
             id: "tether-0197f198000070008000000000000001".parse().unwrap(),
             host: "build-box".into(),
             target: "builder@example.test".into(),
@@ -935,6 +991,7 @@ fn state_v4_orchestration_validation_fails_closed() {
 fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     let session = || SessionRecord {
+        herdr_agent: None,
         id: SessionId::new(),
         host: "host".into(),
         target: "example.test".into(),
@@ -1243,6 +1300,7 @@ fn concurrent_state_updates_preserve_both_records() {
                     thread::sleep(StdDuration::from_millis(50));
                     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
                     state.sessions.push(SessionRecord {
+                        herdr_agent: None,
                         id: format!("tether-0197f19800007000800000000000{suffix}")
                             .parse()
                             .unwrap(),

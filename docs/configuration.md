@@ -45,10 +45,10 @@ Tether discovers literal `Host` aliases in the primary `~/.ssh/config`. OpenSSH 
 
 ## Configuration schema
 
-A default version-2 configuration is:
+A default version-3 configuration is:
 
 ```toml
-version = 2
+version = 3
 hosts = []
 
 [ui]
@@ -81,6 +81,7 @@ roots = ["/srv/repos", "~/work"]
 [[hosts.presets]]
 name = "editor"
 command = "exec vi"
+herdr_agent = "codex"
 
 [[hosts.presets]]
 name = "tests"
@@ -88,6 +89,14 @@ command = "cargo test"
 ```
 
 Presets are trusted code. Tether starts a login `/bin/sh`, restores the selected directory, then runs the configured command through `/bin/sh -c`. It does not sandbox or escape a command into harmless data. Restrict write access to the configuration and review shared presets.
+
+`herdr_agent` is optional. Set it to a Herdr-supported agent kind such as
+`codex` when that preset runs an agent behind Tether's `tmux` or SSH boundary.
+Tether then attaches with an explicit `HERDR_AGENT=<kind>` screen-manifest
+hint, allowing Herdr 0.7.5 and newer to recognize the agent without changing
+the durable workload lifecycle. Ad hoc creation supports the equivalent
+`herdr-tether open --command COMMAND --herdr-agent KIND` option. Agent kinds
+must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
 ### Placement
 

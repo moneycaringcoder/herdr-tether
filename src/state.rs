@@ -13,8 +13,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     model::{
-        OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle, OwnershipProof,
-        SessionId, TmuxSessionId,
+        HerdrAgentKind, OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle,
+        OwnershipProof, SessionId, TmuxSessionId,
     },
     storage::{atomic_write, with_advisory_lock},
 };
@@ -64,6 +64,8 @@ pub struct SessionRecord {
     pub target: String,
     pub directory: String,
     pub preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_agent: Option<HerdrAgentKind>,
     /// Original shell command, retained privately for an explicit restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -601,6 +603,7 @@ impl From<SessionRecordV2> for SessionRecord {
             target: record.target,
             directory: record.directory,
             preset: record.preset,
+            herdr_agent: None,
             command: record.command,
             tmux_session_id: record.tmux_session_id,
             ownership_proof: record.ownership_proof,
@@ -673,6 +676,7 @@ impl StateV1 {
                         target: session.target,
                         directory: session.directory,
                         preset: session.preset,
+                        herdr_agent: None,
                         command: None,
                         tmux_session_id: None,
                         ownership_proof: None,
@@ -722,6 +726,7 @@ impl StateV0 {
                     target: session.target,
                     directory: session.directory,
                     preset: None,
+                    herdr_agent: None,
                     command: None,
                     tmux_session_id: None,
                     ownership_proof: None,

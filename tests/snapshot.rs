@@ -495,6 +495,7 @@ fn snapshot_surfaces_status_workload_limit_as_typed_partial_data() {
     let sandbox = Sandbox::new();
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     let record = SessionRecord {
+        herdr_agent: None,
         id: "tether-0197f198000070008000000000000001"
             .parse::<SessionId>()
             .unwrap(),

@@ -1,3 +1,4 @@
+pub mod agent_view;
 pub mod backend;
 pub mod cli;
 pub mod config;

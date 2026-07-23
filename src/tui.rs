@@ -33,7 +33,7 @@ use crate::{
         DiscoveryService,
     },
     lifecycle::{CloseOwnedError, LifecycleService, PrunePreview, PruneService},
-    model::{ExternalSessionName, Placement, SessionId},
+    model::{ExternalSessionName, HerdrAgentKind, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
@@ -51,7 +51,11 @@ const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerCommand {
     Shell,
-    Preset { name: String, command: String },
+    Preset {
+        name: String,
+        command: String,
+        herdr_agent: Option<HerdrAgentKind>,
+    },
 }
 
 impl PickerCommand {
@@ -62,10 +66,14 @@ impl PickerCommand {
         }
     }
 
-    fn selection_parts(&self) -> (Option<String>, String) {
+    fn selection_parts(&self) -> (Option<String>, String, Option<HerdrAgentKind>) {
         match self {
-            Self::Shell => (None, SHELL_COMMAND.to_owned()),
-            Self::Preset { name, command } => (Some(name.clone()), command.clone()),
+            Self::Shell => (None, SHELL_COMMAND.to_owned(), None),
+            Self::Preset {
+                name,
+                command,
+                herdr_agent,
+            } => (Some(name.clone()), command.clone(), herdr_agent.clone()),
         }
     }
 }
@@ -173,6 +181,7 @@ impl PickerOptions {
             commands.extend(host.presets.iter().map(|preset| PickerCommand::Preset {
                 name: preset.name.clone(),
                 command: preset.command.clone(),
+                herdr_agent: preset.herdr_agent.clone(),
             }));
             hosts.push(PickerHost {
                 name: host.name.clone(),
@@ -379,6 +388,7 @@ pub struct OpenSelection {
     pub host: String,
     pub directory: String,
     pub preset: Option<String>,
+    pub herdr_agent: Option<HerdrAgentKind>,
     pub command: String,
     pub placement: Placement,
 }
@@ -1952,7 +1962,7 @@ impl PickerState {
         }
 
         let host = &self.options.hosts[self.host_index];
-        let (preset, command) = host.commands[self.command_index].selection_parts();
+        let (preset, command, herdr_agent) = host.commands[self.command_index].selection_parts();
         PickerSelection::Create(OpenSelection {
             host: host.name.clone(),
             directory: self
@@ -1960,6 +1970,7 @@ impl PickerState {
                 .clone()
                 .expect("create selection has a directory"),
             preset,
+            herdr_agent,
             command,
             placement,
         })
@@ -3653,6 +3664,7 @@ mod close_render_tests {
             .save(&State {
                 version: State::CURRENT_VERSION,
                 sessions: vec![SessionRecord {
+                    herdr_agent: None,
                     id: "tether-0197f198000070008000000000000099".parse().unwrap(),
                     host: "old".to_owned(),
                     target: "old.example".to_owned(),

@@ -96,6 +96,7 @@ fn proof() -> OwnershipProof {
 fn owned_record(status: SessionStatus) -> SessionRecord {
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     SessionRecord {
+        herdr_agent: None,
         id: id(),
         host: "local".into(),
         target: "local".into(),
@@ -1306,6 +1307,7 @@ fn explicit_ssh_targets_reject_option_and_shell_injection() {
 fn cleanup_never_selects_active_unknown_or_recent_sessions() {
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     let mut record = SessionRecord {
+        herdr_agent: None,
         id: id(),
         host: "build-box".into(),
         target: "builder@example.test".into(),
@@ -1385,6 +1387,7 @@ fn prune_record(
 ) -> SessionRecord {
     let created_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
     SessionRecord {
+        herdr_agent: None,
         id: id.parse().unwrap(),
         host: "local".into(),
         target: "local".into(),

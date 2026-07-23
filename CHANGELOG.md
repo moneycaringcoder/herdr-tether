@@ -2,11 +2,13 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
 ### Added
 
 - Added opt-in orchestration groups in development state schema version 4, with harness-neutral orchestrator/worker references, persisted membership epochs, explicit output-observation and interactive-open capabilities, and metadata-only membership lifecycle commands. Development schema version 3 migrates forward with fresh epochs.
 - Added a read-only Observer companion that uses one outer Herdr pane, dynamically refreshes exact-owned worker status and authorized bounded captures, rejects stale asynchronous results against complete authorization fingerprints, restores terminal state defensively, renders deterministic four-worker pages, and can open an authorized running worker without replacing Observer.
-- Added development `main` and immutable exact-SHA operating guidance for groups and Observer while retaining stable v0.3.0 installation instructions.
+- Added stable v0.4.0, development `main`, and immutable exact-SHA operating guidance for groups and Observer.
 - Added a native `prefix+t` Observer manager that creates safe group metadata from running workloads, edits membership reversibly, confirms metadata-only deletion, and launches one companion pane from the current Herdr plugin context without exposing session IDs or requiring standalone CLI setup.
 - Added explicit topology review with visible `ORCHESTRATOR` and `WORKER` roles, group health summaries, and metadata-only orchestrator reassignment that preserves unaffected worker membership.
 - Added stable bounded reference tokens only when otherwise-safe workload or Observer tile labels are ambiguous, while retaining exact internal identity for every action.
@@ -18,6 +20,10 @@
 - Added read-only setup preflight for required runtime tools before any Tether or Herdr file mutation.
 - Added optional documented Herdr pane/workspace context prioritization that reorders only known, unambiguous picker entries.
 - Added correlation-safe redaction for plugin action and entrypoint failures, plus official-Herdr keyboard-only picker checks at 80×24 and 48×14.
+
+- Added explicit validated Herdr agent-kind hints for presets and ad hoc workload creation; hinted local and SSH-backed attachments expose `HERDR_AGENT=<kind>` so Herdr 0.7.5 can recognize agents hidden behind `tmux` without Tether guessing from commands.
+- Added opt-in, source-owned native Agent sidebar views for orchestration groups on Herdr 0.7.5, including persisted startup/live-handoff restoration, reversible default-view recovery, and group tokens on newly opened member panes.
+- Added Herdr 0.7.5 live-product coverage while retaining Herdr 0.7.3 compatibility, and switched managed picker/setup panes to Herdr's session-modal popup when the installed version supports it.
 
 ### Fixed
 

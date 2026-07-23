@@ -13,6 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::{
+    agent_view::AgentViewService,
     backend::{
         CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, create_outcome_is_uncertain,
     },
@@ -21,11 +22,11 @@ use crate::{
         HostConfig,
     },
     discovery::{DiscoveryLimits, DiscoveryService},
-    herdr::{HerdrClient, HerdrContext, PaneTitle},
+    herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
     lifecycle::{LifecycleService, PruneError, PruneService},
     model::{
-        ExternalSessionName, OrchestrationGroupId, OrchestrationTitle, OwnershipProof, Placement,
-        SessionId,
+        ExternalSessionName, HerdrAgentKind, OrchestrationGroupId, OrchestrationTitle,
+        OwnershipProof, Placement, SessionId,
     },
     observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
     orchestration::{MANAGER_STALE_GROUP_ERROR, OrchestrationService, companion_placement},
@@ -171,6 +172,9 @@ struct OpenArgs {
     /// Named command preset from the selected host.
     #[arg(long, conflicts_with = "command")]
     preset: Option<String>,
+    /// Explicit Herdr screen-manifest hint for an agent hidden behind tmux or SSH.
+    #[arg(long)]
+    herdr_agent: Option<HerdrAgentKind>,
     /// Placement used when invoked from a Herdr plugin pane.
     #[arg(long, value_enum)]
     placement: Option<PlacementArg>,
@@ -300,15 +304,18 @@ struct PruneArgs {
 
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
-    /// Open the managed Tether picker overlay.
+    /// Open the managed Tether picker.
     Open,
-    /// Open the managed Tether setup overlay.
+    /// Open the managed Tether setup.
     Setup,
+    /// Restore an opted-in Agent sidebar view after Herdr startup or handoff.
+    RestoreAgentView,
 }
 
 pub fn run() -> Result<()> {
     let plugin_managed = env::var_os("HERDR_PLUGIN_ACTION_ID").is_some()
-        || env::var_os("HERDR_PLUGIN_ENTRYPOINT_ID").is_some();
+        || env::var_os("HERDR_PLUGIN_ENTRYPOINT_ID").is_some()
+        || env::var_os("HERDR_PLUGIN_EVENT").is_some();
     let result = run_inner();
     if plugin_managed {
         match result {
@@ -361,9 +368,9 @@ fn dispatch(command: TopLevel, paths: &AppPaths) -> Result<()> {
         TopLevel::Open(args) => open(paths, args),
         TopLevel::Snapshot(args) => snapshot(paths, args),
         TopLevel::Session { command } => session_command(paths, command),
+        TopLevel::Plugin { command } => plugin_command(paths, command),
         TopLevel::Orchestration { command } => orchestration_command(paths, command),
         TopLevel::Doctor(args) => doctor(paths, args),
-        TopLevel::Plugin { command } => plugin_command(command),
     }
 }
 
@@ -534,6 +541,7 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
                     .presets
                     .into_iter()
                     .map(|preset| CommandPreset {
+                        herdr_agent: None,
                         name: preset.name,
                         command: preset.command,
                     })
@@ -693,7 +701,7 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
             return Ok(());
         };
         if selection == PickerSelection::ManageObservers {
-            match run_observer_manager_flow(observer_placement, &state_store)? {
+            match run_observer_manager_flow(observer_placement, paths, &state_store)? {
                 ObserverManagerFlow::BackToPicker => continue,
                 ObserverManagerFlow::Launched => return Ok(()),
             }
@@ -712,9 +720,9 @@ enum ObserverManagerFlow {
     BackToPicker,
     Launched,
 }
-
 fn run_observer_manager_flow(
     placement: Placement,
+    paths: &AppPaths,
     state_store: &StateStore,
 ) -> Result<ObserverManagerFlow> {
     let service = OrchestrationService::new(state_store.clone());
@@ -770,7 +778,48 @@ fn run_observer_manager_flow(
                     },
                 ));
             }
+            ObserverManagerAction::SetAgentView { group_id } => {
+                let title = state
+                    .orchestration_groups
+                    .iter()
+                    .find(|group| group.id == group_id)
+                    .map(|group| group.title.as_str().to_owned());
+                let result = AgentViewService::from_env(paths.agent_view_file())
+                    .and_then(|agent_views| agent_views.set_group(&state, &group_id));
+                notice = Some(match (result, title) {
+                    (Ok(()), Some(title)) => {
+                        format!("Agents sidebar now shows {title}; open members to add them")
+                    }
+                    (Ok(()), None) => "Agents sidebar view applied".to_owned(),
+                    (Err(_), _) => {
+                        "Could not apply Agents sidebar view; previous view was preserved"
+                            .to_owned()
+                    }
+                });
+            }
+            ObserverManagerAction::ClearAgentView => {
+                let result = AgentViewService::from_env(paths.agent_view_file())
+                    .and_then(|agent_views| agent_views.clear());
+                notice = Some(if result.is_ok() {
+                    "Restored default Agents sidebar".to_owned()
+                } else {
+                    "Could not restore default Agents sidebar; previous view was preserved"
+                        .to_owned()
+                });
+            }
             ObserverManagerAction::Delete { expected_group } => {
+                let active_view = AgentViewService::from_env(paths.agent_view_file())
+                    .and_then(|agent_views| agent_views.clear_group_if_active(&expected_group.id));
+                let active_view = match active_view {
+                    Ok(active_view) => active_view,
+                    Err(_) => {
+                        notice = Some(
+                            "Could not delete Observer; active Agents view was preserved"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
+                };
                 match service.delete_group_if_unchanged(&expected_group) {
                     Ok(group) => {
                         notice = Some(format!(
@@ -779,6 +828,11 @@ fn run_observer_manager_flow(
                         ));
                     }
                     Err(error) => {
+                        if active_view {
+                            let _ = AgentViewService::from_env(paths.agent_view_file()).and_then(
+                                |agent_views| agent_views.set_group(&state, &expected_group.id),
+                            );
+                        }
                         notice = Some(observer_metadata_failure_notice("delete", &error));
                     }
                 }
@@ -875,11 +929,12 @@ fn selection_from_args(
 ) -> Result<OpenSelection> {
     let host_name = args.host.context("--host is required")?;
     let host = resolve_host_from(config, aliases, &host_name)?;
-    let (preset, command) = resolve_command(&host, args.preset, args.command)?;
+    let (preset, command, preset_agent) = resolve_command(&host, args.preset, args.command)?;
     Ok(OpenSelection {
         host: host_name,
         directory: args.directory.context("--directory is required")?,
         preset,
+        herdr_agent: args.herdr_agent.or(preset_agent),
         command,
         placement: args
             .placement
@@ -964,9 +1019,14 @@ fn selection_from_picker(
             }
             if args.command.is_some() || args.preset.is_some() {
                 let host = resolve_host_from(config, aliases, &selection.host)?;
-                let (preset, command) = resolve_command(&host, args.preset, args.command)?;
+                let (preset, command, preset_agent) =
+                    resolve_command(&host, args.preset, args.command)?;
                 selection.preset = preset;
                 selection.command = command;
+                selection.herdr_agent = args.herdr_agent.clone().or(preset_agent);
+            }
+            if let Some(herdr_agent) = args.herdr_agent {
+                selection.herdr_agent = Some(herdr_agent);
             }
             if let Some(placement) = args.placement {
                 selection.placement = placement.into();
@@ -1027,12 +1087,14 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         selection.preset.as_deref(),
         Some(&selection.command),
     );
+    let herdr_agent = selection.herdr_agent.clone();
     let record = SessionRecord {
         id,
         host: selection.host,
         target: host.target,
         directory: selection.directory,
         preset: selection.preset,
+        herdr_agent: herdr_agent.clone(),
         command: Some(selection.command),
         tmux_session_id: None,
         ownership_proof: Some(ownership_proof),
@@ -1086,21 +1148,28 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
-        let attach = backend.attach_command(&id, &ownership_proof, identity)?;
-        place_in_herdr(
-            HerdrClient::new(context),
-            &attach,
-            &title,
-            selection.placement,
-        )
-        .with_context(|| {
-            format!("place newly created session `{id}`; it remains running and recorded for retry")
-        })?;
+        let attach = attach_with_agent_hint(
+            backend.attach_command(&id, &ownership_proof, identity)?,
+            herdr_agent.as_ref(),
+        )?;
+        let client = HerdrClient::new(context);
+        let placed =
+            place_in_herdr(&client, &attach, &title, selection.placement).with_context(|| {
+                format!(
+                    "place newly created session `{id}`; it remains running and recorded for retry"
+                )
+            })?;
+        if report_agent_view_group_for_session(paths, &client, &placed.pane_id, id).is_err() {
+            eprintln!("warning: could not label the pane for the active Agents sidebar view");
+        }
         println!("created {id}");
         Ok(())
     } else {
         println!("created {id}");
-        run_attach(backend.attach_command(&id, &ownership_proof, identity)?)
+        run_attach(attach_with_agent_hint(
+            backend.attach_command(&id, &ownership_proof, identity)?,
+            herdr_agent.as_ref(),
+        )?)
     }
 }
 fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
@@ -1143,8 +1212,12 @@ fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> R
             .owned_record(id)?
             .with_context(|| format!("unknown Tether session `{id}`"))?;
         let title = pane_title_for_record(&record);
-        let attach = service.open_owned(id)?;
-        place_in_herdr(HerdrClient::new(context), &attach, &title, placement)?;
+        let attach = attach_with_agent_hint(service.open_owned(id)?, record.herdr_agent.as_ref())?;
+        let client = HerdrClient::new(context);
+        let placed = place_in_herdr(&client, &attach, &title, placement)?;
+        if report_agent_view_group_for_session(paths, &client, &placed.pane_id, id).is_err() {
+            eprintln!("warning: could not label the pane for the active Agents sidebar view");
+        }
         Ok(())
     } else {
         session_command(paths, SessionCommand::Open { id })
@@ -1190,7 +1263,8 @@ fn attach_external(
         let context = HerdrContext::from_env()?;
         let executable = env::current_exe().context("locate the Tether executable")?;
         let attach = external_attach_command(executable, &target, &name);
-        place_in_herdr(HerdrClient::new(context), &attach, &title, placement)?;
+        let client = HerdrClient::new(context);
+        place_in_herdr(&client, &attach, &title, placement)?;
         Ok(())
     } else {
         let backend = backend_for(&target)?;
@@ -1199,19 +1273,33 @@ fn attach_external(
 }
 
 fn place_in_herdr(
-    client: HerdrClient,
+    client: &HerdrClient,
     command: &CommandSpec,
     title: &PaneTitle,
     placement: Placement,
-) -> Result<()> {
+) -> Result<PlacedPane> {
     if placement != Placement::ReplaceCurrentPane {
-        client.place(command, title, placement)?;
-        return Ok(());
+        return client.place(command, title, placement);
     }
 
-    confirm_replacement(&client)?;
-    if let Some(warning) = client.replace_current(command, title)?.warning {
+    confirm_replacement(client)?;
+    let placed = client.replace_current(command, title)?;
+    if let Some(warning) = &placed.warning {
         eprintln!("warning: {warning}");
+    }
+    Ok(placed)
+}
+
+fn report_agent_view_group_for_session(
+    paths: &AppPaths,
+    client: &HerdrClient,
+    pane_id: &str,
+    session_id: SessionId,
+) -> Result<()> {
+    let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
+    let agent_views = AgentViewService::from_env(paths.agent_view_file())?;
+    if let Some(group_id) = agent_views.group_for_session(&state, session_id)? {
+        client.report_agent_view_group(pane_id, &group_id)?;
     }
     Ok(())
 }
@@ -1367,7 +1455,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             }
             let attach = LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
                 .open_owned(id)?;
-            run_attach(attach)
+            run_attach(attach_with_agent_hint(attach, record.herdr_agent.as_ref())?)
         }
         SessionCommand::AttachExternal { target, name } => {
             let backend = backend_for(&target)?;
@@ -1536,7 +1624,6 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
         }
         return Ok(());
     }
-
     let result = service.apply(&preview)?;
     for id in result.removed_ids {
         println!("{id}");
@@ -1547,13 +1634,22 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
     Ok(())
 }
 
-fn plugin_command(command: PluginCommand) -> Result<()> {
-    let context = HerdrContext::from_env()?;
-    let entrypoint = match command {
-        PluginCommand::Open => "picker",
-        PluginCommand::Setup => "setup",
-    };
-    HerdrClient::new(context).open_plugin_pane(entrypoint)
+fn plugin_command(paths: &AppPaths, command: PluginCommand) -> Result<()> {
+    match command {
+        PluginCommand::Open | PluginCommand::Setup => {
+            let context = HerdrContext::from_env()?;
+            let entrypoint = match command {
+                PluginCommand::Open => "picker",
+                PluginCommand::Setup => "setup",
+                PluginCommand::RestoreAgentView => unreachable!(),
+            };
+            HerdrClient::new(context).open_plugin_pane(entrypoint)
+        }
+        PluginCommand::RestoreAgentView => {
+            let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
+            AgentViewService::from_env(paths.agent_view_file())?.restore(&state)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1937,19 +2033,21 @@ fn resolve_command(
     host: &HostConfig,
     preset: Option<String>,
     command: Option<String>,
-) -> Result<(Option<String>, String)> {
+) -> Result<(Option<String>, String, Option<HerdrAgentKind>)> {
     match (preset, command) {
         (Some(name), None) => {
-            let command = host
+            let preset = host
                 .presets
                 .iter()
                 .find(|preset| preset.name == name)
-                .with_context(|| format!("unknown preset `{name}` for host `{}`", host.name))?
-                .command
-                .clone();
-            Ok((Some(name), command))
+                .with_context(|| format!("unknown preset `{name}` for host `{}`", host.name))?;
+            Ok((
+                Some(name),
+                preset.command.clone(),
+                preset.herdr_agent.clone(),
+            ))
         }
-        (None, Some(command)) if !command.trim().is_empty() => Ok((None, command)),
+        (None, Some(command)) if !command.trim().is_empty() => Ok((None, command, None)),
         (None, Some(_)) => bail!("--command must not be empty"),
         _ => bail!("exactly one of --command or --preset is required"),
     }
@@ -1962,6 +2060,26 @@ fn backend_for(target: &str) -> Result<TmuxBackend> {
     } else {
         TmuxBackend::remote(target.to_owned(), binaries)
     }
+}
+
+fn attach_with_agent_hint(
+    spec: CommandSpec,
+    herdr_agent: Option<&HerdrAgentKind>,
+) -> Result<CommandSpec> {
+    let Some(herdr_agent) = herdr_agent else {
+        return Ok(spec);
+    };
+    let program = spec.program.to_str().with_context(|| {
+        format!(
+            "attach program path `{}` is not valid UTF-8",
+            spec.program.display()
+        )
+    })?;
+    let mut arguments = Vec::with_capacity(spec.args.len() + 2);
+    arguments.push(format!("HERDR_AGENT={herdr_agent}"));
+    arguments.push(program.to_owned());
+    arguments.extend(spec.args);
+    Ok(CommandSpec::new("env", arguments))
 }
 
 fn run_attach(spec: CommandSpec) -> Result<()> {
@@ -2013,9 +2131,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_agent_hint_wraps_the_host_visible_attach_process() {
+        let command = CommandSpec::new(
+            "/usr/bin/tmux",
+            vec![
+                "attach-session".into(),
+                "-t".into(),
+                "=tether-session".into(),
+            ],
+        );
+        let agent = "codex".parse::<HerdrAgentKind>().unwrap();
+
+        let hinted = attach_with_agent_hint(command, Some(&agent)).unwrap();
+
+        assert_eq!(hinted.program, PathBuf::from("env"));
+        assert_eq!(
+            hinted.args,
+            [
+                "HERDR_AGENT=codex",
+                "/usr/bin/tmux",
+                "attach-session",
+                "-t",
+                "=tether-session"
+            ]
+        );
+    }
+
+    #[test]
     fn reopening_uses_only_safe_stored_presentation_metadata() {
         let now = Utc::now();
         let record = SessionRecord {
+            herdr_agent: None,
             id: SessionId::new(),
             host: "build-box".into(),
             target: "builder@example.test".into(),

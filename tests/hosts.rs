@@ -12,6 +12,7 @@ fn host(name: &str, target: &str) -> HostConfig {
         target: target.into(),
         roots: vec!["/srv/code with spaces".into()],
         presets: vec![CommandPreset {
+            herdr_agent: None,
             name: "shell".into(),
             command: "exec ${SHELL:-/bin/sh} -l".into(),
         }],

@@ -1457,7 +1457,7 @@ fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
     let herdr = sandbox.path("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nprintf '%s' '{\"id\":\"cli-1\",\"result\":{\"type\":\"plugin_pane_opened\"}}'\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.3'; else printf '%s' '{\"id\":\"cli-1\",\"result\":{\"type\":\"plugin_pane_opened\"}}'; fi\n",
     )
     .unwrap();
     #[cfg(unix)]

@@ -18,10 +18,10 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 Choose one source:
 
-**Stable v0.3.0.** Install the release tag:
+**Stable v0.4.0.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.3.0
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.4.0
 ```
 
 **Development (`main`).** Use this to follow the public development line, not
@@ -95,7 +95,7 @@ The stable release is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.3.0 --locked herdr-tether
+  --tag v0.4.0 --locked herdr-tether
 ```
 
 For development `main`:
@@ -132,11 +132,9 @@ herdr-tether host check build
 
 Tether also discovers literal aliases in the primary `~/.ssh/config`. It does not traverse `Include` directives for alias discovery; add an included-only alias explicitly.
 
-## 6. Create an Observer group (development only)
+## 6. Create an Observer group
 
-Orchestration groups and Observer are available from development `main` or an
-immutable reviewed commit; stable v0.3.0 remains the durable-workload workflow
-described above.
+Orchestration groups and Observer are included in stable v0.4.0.
 
 From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
@@ -164,6 +162,13 @@ selection, review the resulting topology, and confirm. Promoting a worker to
 orchestrator removes it from the worker list. To remove a group, press `d` and
 confirm. All operations change only group metadata and leave every workload and
 pane alone.
+
+With Herdr 0.7.5 or newer, the same action screen offers **Show group in Agents
+sidebar**. This is explicit and reversible: it filters the native Agents
+sidebar to recognized group members, persists across Herdr startup or live
+handoff, and does not open or mutate workloads. Choose **Restore default Agents
+sidebar** to clear Tether's view. Herdr 0.7.3 and 0.7.4 continue to support the
+ordinary Tether and Observer workflows without this optional view.
 
 The standalone `herdr-tether orchestration` commands remain available as an
 optional machine/adapter API. Native picker users do not need exact IDs, shell
