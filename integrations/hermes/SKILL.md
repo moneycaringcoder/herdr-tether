@@ -1,6 +1,6 @@
 ---
 name: tether
-version: 1.1.0
+version: 1.1.1
 description: Observe and operate durable workloads and opt-in groups through Tether's public CLI without depending on tmux internals.
 author: Tether maintainers
 license: MIT
@@ -18,10 +18,10 @@ Use Tether as the visibility and lifecycle boundary for durable development work
 
 Choose the source that matches the Tether installation:
 
-**Stable v0.4.0:**
+**Stable v0.4.1:**
 
 ```sh
-hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.4.0/integrations/hermes/SKILL.md
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.4.1/integrations/hermes/SKILL.md
 ```
 
 **Development (`main`):**
@@ -47,7 +47,7 @@ Use this skill when a user wants to:
 - start a user-chosen command in a Tether-owned workload;
 - reopen, restart, stop, or remove a specific Tether-owned workload;
 - compare workload state across configured local and remote hosts; or
-- configure and view an opt-in orchestration group on stable v0.4.0,
+- configure and view an opt-in orchestration group on stable v0.4.1,
   development `main`, or an immutable reviewed commit.
 
 ## Preflight

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-23
+
+### Fixed
+
+- Corrected stable documentation that still described v0.4.0 orchestration, picker context, and Hermes workflows as development-only.
+- Documented versioned Herdr agent recognition, native Agents sidebar setup and recovery, the private `agent-view.json` preference, and the presentation-only Agent metadata security boundary.
+- Updated quickstart, troubleshooting, architecture, contributor, visual-asset, and Hermes guidance to match the released popup, agent-hint, group-view, package, and CI behavior.
+
 ## [0.4.0] - 2026-07-23
 
 ### Added

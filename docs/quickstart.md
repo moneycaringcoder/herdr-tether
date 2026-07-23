@@ -18,10 +18,10 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 Choose one source:
 
-**Stable v0.4.0.** Install the release tag:
+**Stable v0.4.1.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.4.0
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.4.1
 ```
 
 **Development (`main`).** Use this to follow the public development line, not
@@ -100,7 +100,7 @@ The stable release is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.4.0 --locked herdr-tether
+  --tag v0.4.1 --locked herdr-tether
 ```
 
 For development `main`:
@@ -139,7 +139,7 @@ Tether also discovers literal aliases in the primary `~/.ssh/config`. It does no
 
 ## 6. Create an Observer group
 
-Orchestration groups and Observer are included in stable v0.4.0.
+Orchestration groups and Observer are included in stable v0.4.1.
 
 From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
