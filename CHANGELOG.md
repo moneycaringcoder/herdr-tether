@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-24
+
 ### Added
 
 - Added Herdr 0.7.5+ Mission Control: event-driven agent states, exact metadata-bound group-member resolution, bounded multi-target reviewed prompt-and-wait delivery, focus/read/wait actions, reconnect resnapshots, and explicit stale-state recovery without recurring SSH capture for attached agents.
