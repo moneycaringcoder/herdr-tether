@@ -10,7 +10,7 @@ use crate::{
     },
     model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
     quote::posix_quote,
-    sshcfg::{OpenSshTarget, openssh_target},
+    sshcfg::{OpenSshTarget, openssh_connection_args, openssh_target},
     status::{BoundedOutput, run_bounded},
 };
 
@@ -109,26 +109,7 @@ impl TmuxBackend {
             Location::Local => Ok(CommandSpec::new(self.binaries.tmux(), arguments)),
             Location::Remote(target) => {
                 let remote_command = remote_tmux_command(&arguments)?;
-                let mut ssh_arguments = if interactive {
-                    vec![
-                        "-o".to_owned(),
-                        "BatchMode=yes".to_owned(),
-                        "-t".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveInterval=15".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveCountMax=3".to_owned(),
-                    ]
-                } else {
-                    vec![
-                        "-o".to_owned(),
-                        "BatchMode=yes".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveInterval=15".to_owned(),
-                        "-o".to_owned(),
-                        "ServerAliveCountMax=3".to_owned(),
-                    ]
-                };
+                let mut ssh_arguments = openssh_connection_args(interactive);
                 if let Some(port) = target.port {
                     ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
                 }
@@ -143,14 +124,7 @@ impl TmuxBackend {
             Location::Local => Ok(CommandSpec::new("/bin/sh", arguments)),
             Location::Remote(target) => {
                 let remote_command = remote_command("/bin/sh", &arguments)?;
-                let mut ssh_arguments = vec![
-                    "-o".to_owned(),
-                    "BatchMode=yes".to_owned(),
-                    "-o".to_owned(),
-                    "ServerAliveInterval=15".to_owned(),
-                    "-o".to_owned(),
-                    "ServerAliveCountMax=3".to_owned(),
-                ];
+                let mut ssh_arguments = openssh_connection_args(false);
                 if let Some(port) = target.port {
                     ssh_arguments.extend(["-p".to_owned(), port.to_string()]);
                 }

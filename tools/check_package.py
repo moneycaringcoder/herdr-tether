@@ -63,9 +63,11 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "src/config.rs",
         "src/discovery.rs",
         "src/herdr.rs",
+        "src/herdr_socket.rs",
         "src/lib.rs",
         "src/lifecycle.rs",
         "src/main.rs",
+        "src/mission_control.rs",
         "src/model.rs",
         "src/observer.rs",
         "src/observer_manager.rs",
@@ -153,7 +155,7 @@ def validate_entries(entries: set[str], required_assets: set[str]) -> None:
         if added:
             details.append(f"unexpected: {', '.join(added)}")
         raise PackageError(
-            "package surface differs from the explicit 51-file contract ("
+            f"package surface differs from the explicit {len(EXPECTED_PACKAGE_FILES)}-file contract ("
             + "; ".join(details)
             + ")"
         )

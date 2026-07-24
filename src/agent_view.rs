@@ -1,8 +1,7 @@
 use std::{
     env,
     fs::OpenOptions,
-    io::{self, BufRead, BufReader, Read, Write},
-    net::Shutdown,
+    io::{self, Read},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -11,9 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(unix)]
-use std::os::unix::{fs::OpenOptionsExt, net::UnixStream};
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
+    herdr_socket::HerdrSocketClient,
     model::{OrchestrationGroupId, SessionId},
     state::State,
     storage::{atomic_write, with_advisory_lock},
@@ -21,9 +21,33 @@ use crate::{
 
 pub const AGENT_VIEW_SOURCE: &str = "plugin:moneycaringcoder.tether";
 pub const GROUP_TOKEN: &str = "tether_group";
+pub const REMOTE_TOKEN: &str = "tether_remote";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentViewFilter {
+    #[default]
+    All,
+    NeedsAttention,
+    Remote,
+}
+
+impl AgentViewFilter {
+    const fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "group",
+            Self::NeedsAttention => "group agents needing attention",
+            Self::Remote => "remote group agents",
+        }
+    }
+}
+
 const PREFERENCE_SCHEMA_VERSION: u32 = 1;
 const MAX_PREFERENCE_BYTES: usize = 4096;
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -32,6 +56,8 @@ struct AgentViewPreference {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     group_id: Option<OrchestrationGroupId>,
+    #[serde(default, skip_serializing_if = "AgentViewFilter::is_all")]
+    filter: AgentViewFilter,
 }
 
 impl Default for AgentViewPreference {
@@ -39,6 +65,7 @@ impl Default for AgentViewPreference {
         Self {
             schema_version: PREFERENCE_SCHEMA_VERSION,
             group_id: None,
+            filter: AgentViewFilter::All,
         }
     }
 }
@@ -46,17 +73,18 @@ impl Default for AgentViewPreference {
 #[derive(Clone, Debug)]
 pub struct AgentViewService {
     preference_file: PathBuf,
-    socket_path: Option<PathBuf>,
+    client: Option<HerdrSocketClient>,
 }
 
 impl AgentViewService {
     pub fn from_env(preference_file: PathBuf) -> Result<Self> {
-        let socket_path = env::var_os("HERDR_SOCKET_PATH")
+        let client = env::var_os("HERDR_SOCKET_PATH")
             .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty());
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(HerdrSocketClient::new);
         Ok(Self {
             preference_file,
-            socket_path,
+            client,
         })
     }
 
@@ -64,11 +92,20 @@ impl AgentViewService {
     fn with_socket(preference_file: PathBuf, socket_path: PathBuf) -> Self {
         Self {
             preference_file,
-            socket_path: Some(socket_path),
+            client: Some(HerdrSocketClient::new(socket_path)),
         }
     }
 
     pub fn set_group(&self, state: &State, group_id: &OrchestrationGroupId) -> Result<()> {
+        self.set_group_filter(state, group_id, AgentViewFilter::All)
+    }
+
+    pub fn set_group_filter(
+        &self,
+        state: &State,
+        group_id: &OrchestrationGroupId,
+        filter: AgentViewFilter,
+    ) -> Result<()> {
         if !state
             .orchestration_groups
             .iter()
@@ -82,9 +119,10 @@ impl AgentViewService {
             let next = AgentViewPreference {
                 schema_version: PREFERENCE_SCHEMA_VERSION,
                 group_id: Some(group_id.clone()),
+                filter,
             };
             save_preference(&self.preference_file, &next)?;
-            if let Err(error) = self.apply_group(&group_id) {
+            if let Err(error) = self.apply_group(&group_id, filter) {
                 save_preference(&self.preference_file, &previous)
                     .context("restore prior Agent view preference after Herdr rejected the view")?;
                 return Err(error);
@@ -121,7 +159,7 @@ impl AgentViewService {
                 save_preference(&self.preference_file, &AgentViewPreference::default())?;
                 return Ok(());
             }
-            self.apply_group(&group_id)
+            self.apply_group(&group_id, preference.filter)
         })
     }
 
@@ -167,17 +205,43 @@ impl AgentViewService {
             .map(|group| group.id.clone()))
     }
 
-    fn apply_group(&self, group_id: &OrchestrationGroupId) -> Result<()> {
+    fn apply_group(&self, group_id: &OrchestrationGroupId, mode: AgentViewFilter) -> Result<()> {
+        let group = json!({
+            "op": "eq",
+            "field": {"token": GROUP_TOKEN},
+            "value": group_id.to_string(),
+        });
+        let filter = match mode {
+            AgentViewFilter::All => group,
+            AgentViewFilter::NeedsAttention => json!({
+                "op": "all",
+                "filters": [
+                    group,
+                    {
+                        "op": "in",
+                        "field": "status",
+                        "values": ["blocked", "done"],
+                    },
+                ],
+            }),
+            AgentViewFilter::Remote => json!({
+                "op": "all",
+                "filters": [
+                    group,
+                    {
+                        "op": "eq",
+                        "field": {"token": REMOTE_TOKEN},
+                        "value": "true",
+                    },
+                ],
+            }),
+        };
         let response = self.request(
             "agent.view.set",
             json!({
                 "source": AGENT_VIEW_SOURCE,
-                "label": "Tether group",
-                "filter": {
-                    "op": "eq",
-                    "field": {"token": GROUP_TOKEN},
-                    "value": group_id.to_string(),
-                },
+                "label": format!("Tether {}", mode.label()),
+                "filter": filter,
                 "sort": [
                     {"field": "attention", "order": "desc"},
                     {"field": "state_change_seq", "order": "desc"},
@@ -192,58 +256,15 @@ impl AgentViewService {
         require_agent_view_response(&response, false)
     }
 
-    #[cfg(unix)]
     fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let socket_path = self
-            .socket_path
+        self.client
             .as_ref()
-            .context("Herdr did not provide HERDR_SOCKET_PATH")?;
-        let mut stream = UnixStream::connect(socket_path)
-            .with_context(|| format!("connect to Herdr socket `{}`", socket_path.display()))?;
-        stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-        stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-        let mut encoded = serde_json::to_vec(&json!({
-            "id": "tether-agent-view",
-            "method": method,
-            "params": params,
-        }))?;
-        encoded.push(b'\n');
-        stream
-            .write_all(&encoded)
-            .context("write Herdr Agent view request")?;
-        stream.flush().context("flush Herdr Agent view request")?;
-
-        stream
-            .shutdown(Shutdown::Write)
-            .context("finish Herdr Agent view request")?;
-        let mut response = String::new();
-        BufReader::new(stream.take(MAX_RESPONSE_BYTES as u64 + 1))
-            .read_line(&mut response)
-            .context("read Herdr Agent view response")?;
-        if response.len() > MAX_RESPONSE_BYTES {
-            bail!("Herdr Agent view response exceeded {MAX_RESPONSE_BYTES} bytes");
-        }
-        if !response.ends_with('\n') {
-            bail!("Herdr Agent view response was not newline terminated");
-        }
-        let envelope: Value =
-            serde_json::from_str(&response).context("decode Herdr Agent view response")?;
-        if let Some(error) = envelope.get("error") {
-            bail!("Herdr rejected Agent view request: {error}");
-        }
-        Ok(envelope)
-    }
-
-    #[cfg(not(unix))]
-    fn request(&self, _method: &str, _params: Value) -> Result<Value> {
-        bail!("Tether Agent views require a Unix Herdr socket")
+            .context("Herdr did not provide HERDR_SOCKET_PATH")?
+            .request_value(method, params, SOCKET_TIMEOUT)
     }
 }
 
-fn require_agent_view_response(envelope: &Value, active: bool) -> Result<()> {
-    let result = envelope
-        .get("result")
-        .context("Herdr Agent view response did not contain a result")?;
+fn require_agent_view_response(result: &Value, active: bool) -> Result<()> {
     if result.get("type").and_then(Value::as_str) != Some("agent_view")
         || result.get("active").and_then(Value::as_bool) != Some(active)
     {
@@ -300,7 +321,7 @@ fn save_preference(path: &Path, preference: &AgentViewPreference) -> Result<()> 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::{os::unix::net::UnixListener, thread};
+    use std::{io::Write, os::unix::net::UnixListener, thread};
 
     use crate::state::{OrchestrationGroup, State};
 
@@ -331,9 +352,15 @@ mod tests {
             assert_eq!(request["params"]["source"], AGENT_VIEW_SOURCE);
             assert_eq!(request["params"]["filter"]["field"]["token"], GROUP_TOKEN);
             assert_eq!(request["params"]["filter"]["value"], "build-group");
-            stream
-                .write_all(b"{\"id\":\"tether-agent-view\",\"result\":{\"type\":\"agent_view\",\"active\":true}}\n")
-                .unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": request["id"],
+                    "result": {"type": "agent_view", "active": true}
+                })
+            )
+            .unwrap();
         });
         let preference = temp.path().join("agent-view.json");
         let service = AgentViewService::with_socket(preference.clone(), socket);
@@ -349,6 +376,55 @@ mod tests {
     }
 
     #[test]
+    fn filtered_views_combine_exact_group_with_status_or_remote_metadata() {
+        for (index, mode) in [AgentViewFilter::NeedsAttention, AgentViewFilter::Remote]
+            .into_iter()
+            .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join(format!("herdr-{index}.sock"));
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                let request: Value = serde_json::from_str(request.trim()).unwrap();
+                let filters = request["params"]["filter"]["filters"].as_array().unwrap();
+                assert_eq!(filters[0]["field"]["token"], GROUP_TOKEN);
+                assert_eq!(filters[0]["value"], "build-group");
+                match mode {
+                    AgentViewFilter::NeedsAttention => {
+                        assert_eq!(filters[1]["field"], "status");
+                        assert_eq!(filters[1]["values"], json!(["blocked", "done"]));
+                    }
+                    AgentViewFilter::Remote => {
+                        assert_eq!(filters[1]["field"]["token"], REMOTE_TOKEN);
+                        assert_eq!(filters[1]["value"], "true");
+                    }
+                    AgentViewFilter::All => unreachable!(),
+                }
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": request["id"],
+                        "result": {"type": "agent_view", "active": true}
+                    })
+                )
+                .unwrap();
+            });
+            let preference = temp.path().join("agent-view.json");
+            AgentViewService::with_socket(preference.clone(), socket)
+                .set_group_filter(&state("build-group"), &"build-group".parse().unwrap(), mode)
+                .unwrap();
+            server.join().unwrap();
+            let persisted: AgentViewPreference =
+                serde_json::from_slice(&std::fs::read(preference).unwrap()).unwrap();
+            assert_eq!(persisted.filter, mode);
+        }
+    }
+
+    #[test]
     fn startup_restore_reapplies_the_persisted_group_view() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("herdr.sock");
@@ -360,9 +436,15 @@ mod tests {
             let request: Value = serde_json::from_str(request.trim()).unwrap();
             assert_eq!(request["method"], "agent.view.set");
             assert_eq!(request["params"]["filter"]["value"], "build-group");
-            stream
-                .write_all(b"{\"id\":\"tether-agent-view\",\"result\":{\"type\":\"agent_view\",\"active\":true}}\n")
-                .unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": request["id"],
+                    "result": {"type": "agent_view", "active": true}
+                })
+            )
+            .unwrap();
         });
         let preference = temp.path().join("agent-view.json");
         save_preference(
@@ -370,6 +452,7 @@ mod tests {
             &AgentViewPreference {
                 schema_version: PREFERENCE_SCHEMA_VERSION,
                 group_id: Some("build-group".parse().unwrap()),
+                filter: AgentViewFilter::All,
             },
         )
         .unwrap();
@@ -388,11 +471,16 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = String::new();
             stream.read_to_string(&mut request).unwrap();
-            stream
-                .write_all(
-                    b"{\"id\":\"tether-agent-view\",\"error\":{\"message\":\"unsupported\"}}\n",
-                )
-                .unwrap();
+            let request: Value = serde_json::from_str(request.trim()).unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": request["id"],
+                    "error": {"code": "unsupported", "message": "unsupported"}
+                })
+            )
+            .unwrap();
         });
         let preference = temp.path().join("agent-view.json");
         let service = AgentViewService::with_socket(preference.clone(), socket);
@@ -412,7 +500,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = AgentViewService {
             preference_file: temp.path().join("agent-view.json"),
-            socket_path: None,
+            client: None,
         };
 
         assert!(
@@ -429,11 +517,12 @@ mod tests {
         let expected = AgentViewPreference {
             schema_version: PREFERENCE_SCHEMA_VERSION,
             group_id: Some("build-group".parse().unwrap()),
+            filter: AgentViewFilter::All,
         };
         save_preference(&preference, &expected).unwrap();
         let service = AgentViewService {
             preference_file: preference.clone(),
-            socket_path: None,
+            client: None,
         };
 
         assert!(
@@ -442,5 +531,25 @@ mod tests {
                 .is_err()
         );
         assert_eq!(load_preference(&preference).unwrap(), expected);
+    }
+
+    #[test]
+    fn legacy_group_preference_defaults_to_the_full_group_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let preference = temp.path().join("agent-view.json");
+        std::fs::write(
+            &preference,
+            br#"{"schema_version":1,"group_id":"build-group"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_preference(&preference).unwrap(),
+            AgentViewPreference {
+                schema_version: PREFERENCE_SCHEMA_VERSION,
+                group_id: Some("build-group".parse().unwrap()),
+                filter: AgentViewFilter::All,
+            }
+        );
     }
 }

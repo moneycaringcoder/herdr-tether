@@ -64,6 +64,40 @@ Match host *
 }
 
 #[test]
+fn discovers_bounded_includes_without_escaping_the_primary_ssh_directory() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join(".ssh");
+    let includes = ssh.join("config.d");
+    fs::create_dir_all(&includes).unwrap();
+    let outside = temp.path().join("outside.conf");
+    fs::write(&outside, "Host outside-must-not-appear\n").unwrap();
+    fs::write(
+        ssh.join("config"),
+        format!(
+            "Host root\nInclude config.d/*.conf ../outside.conf {}\n",
+            outside.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        includes.join("10-base.conf"),
+        "Host included-a *.pattern\nInclude nested.conf ../config\n",
+    )
+    .unwrap();
+    fs::write(ssh.join("nested.conf"), "Host nested\nInclude config\n").unwrap();
+    fs::write(
+        includes.join("20-extra.conf"),
+        "Host included-b included-a\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        discover_aliases(&ssh.join("config")).unwrap(),
+        ["root", "included-a", "nested", "included-b"]
+    );
+}
+
+#[test]
 fn a_missing_ssh_config_yields_an_empty_catalog() {
     let temp = tempdir().unwrap();
     assert!(

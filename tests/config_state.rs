@@ -817,6 +817,7 @@ fn state_v4_orchestration_groups_round_trip_arbitrary_references() {
                     capabilities: OrchestrationCapabilities {
                         observe_output: true,
                         open_interactive: false,
+                        prompt_agent: false,
                     },
                 },
                 OrchestrationMember {
@@ -826,6 +827,7 @@ fn state_v4_orchestration_groups_round_trip_arbitrary_references() {
                     capabilities: OrchestrationCapabilities {
                         observe_output: false,
                         open_interactive: true,
+                        prompt_agent: false,
                     },
                 },
                 OrchestrationMember {
@@ -835,6 +837,7 @@ fn state_v4_orchestration_groups_round_trip_arbitrary_references() {
                     capabilities: OrchestrationCapabilities {
                         observe_output: true,
                         open_interactive: true,
+                        prompt_agent: false,
                     },
                 },
             ],
@@ -907,6 +910,7 @@ fn state_v4_orchestration_validation_fails_closed() {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: false,
+                prompt_agent: false,
             },
         }],
     };
@@ -943,6 +947,7 @@ fn state_v4_orchestration_validation_fails_closed() {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: false,
+                prompt_agent: false,
             },
         })
         .collect();
@@ -1090,6 +1095,7 @@ fn orchestration_collection_boundaries_succeed_and_n_plus_one_preserves_file() {
         capabilities: OrchestrationCapabilities {
             observe_output: true,
             open_interactive: false,
+            prompt_agent: false,
         },
     };
     let group = |index: usize| OrchestrationGroup {
@@ -1648,4 +1654,22 @@ fn herdr_keybinding_detects_conflicts_in_builtin_action_fields() {
     assert!(error.contains("already bound"));
     assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!HerdrKeybindingStore::backup_path_for(&path).exists());
+}
+
+#[test]
+fn prompt_agent_capability_is_additive_and_defaults_closed() {
+    let legacy: OrchestrationCapabilities =
+        serde_json::from_str(r#"{"observe_output":true,"open_interactive":true}"#).unwrap();
+    assert!(!legacy.prompt_agent);
+
+    let granted = OrchestrationCapabilities {
+        observe_output: true,
+        open_interactive: true,
+        prompt_agent: true,
+    };
+    let granted_json = serde_json::to_value(granted).unwrap();
+    assert_eq!(granted_json["prompt_agent"], true);
+
+    let default_json = serde_json::to_value(legacy).unwrap();
+    assert!(default_json.get("prompt_agent").is_none());
 }

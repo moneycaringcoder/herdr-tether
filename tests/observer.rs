@@ -6,10 +6,11 @@ mod observer;
 mod model;
 
 use observer::{
-    MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, ObserverAction, ObserverCapabilities,
-    ObserverCapture, ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome,
-    ObserverState, ObserverWorker, action_for_input, action_for_key, observer_theme_style, render,
-    render_to_styles, render_to_text, sanitize_capture, worker_rects,
+    MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, MAX_PROMPT_TARGETS, ObserverAction,
+    ObserverAgentState, ObserverCapabilities, ObserverCapture, ObserverInputKind, ObserverKey,
+    ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_input,
+    action_for_key, observer_theme_style, render, render_to_styles, render_to_text,
+    sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -21,9 +22,14 @@ fn worker(id: &str) -> ObserverWorker {
         capabilities: ObserverCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         },
         lifecycle: ObserverLifecycle::Running,
+        agent_state: ObserverAgentState::Unknown,
+        live_agent: false,
         owned: true,
+        last_observed: None,
+        latency_ms: None,
         capture: Some(format!("output-{id}")),
     }
 }
@@ -305,6 +311,7 @@ fn outcomes_are_read_only_and_open_requires_all_eligibility() {
             capabilities: ObserverCapabilities {
                 observe_output: true,
                 open_interactive: false,
+                prompt_agent: false,
             },
             ..worker("observe-only")
         },
@@ -388,8 +395,10 @@ fn capture_lifecycle_renders_loading_ready_empty_and_unavailable_distinctly() {
     assert!(!loading.contains("No captured output"), "{loading}");
     assert!(!loading.contains("Output unavailable"), "{loading}");
     observer.merge_capture("capture", ObserverCapture::Ready(String::new()));
+    observer.set_connection_observation("capture", 12, None);
     let ready_empty = render_to_text(40, 8, &observer).unwrap();
     assert!(ready_empty.contains("No captured output"), "{ready_empty}");
+    assert!(ready_empty.contains("12ms"), "{ready_empty}");
     assert!(!ready_empty.contains("Loading output"), "{ready_empty}");
     assert!(!ready_empty.contains("Output unavailable"), "{ready_empty}");
     observer.merge_capture("capture", ObserverCapture::Unavailable);
@@ -702,6 +711,19 @@ fn press_repeat_boundary_and_busy_matrix_is_consistent() {
                 action_for_input(ObserverKey::Char('r'), kind, busy),
                 single_action.then_some(ObserverAction::Refresh)
             );
+            for (key, expected) in [
+                (ObserverKey::Char(' '), ObserverAction::TogglePromptTarget),
+                (ObserverKey::Char('p'), ObserverAction::ComposePrompt),
+                (ObserverKey::Char('f'), ObserverAction::FocusSelected),
+                (ObserverKey::Char('v'), ObserverAction::ReadSelected),
+                (ObserverKey::Char('w'), ObserverAction::WaitSelected),
+            ] {
+                assert_eq!(
+                    action_for_input(key, kind, busy),
+                    single_action.then_some(expected),
+                    "{key:?} {kind:?} busy={busy}"
+                );
+            }
             assert_eq!(
                 action_for_input(ObserverKey::Escape, kind, busy),
                 (kind == ObserverInputKind::Press).then_some(ObserverAction::Quit)
@@ -806,4 +828,136 @@ fn unicode_capture_renders_only_valid_bounded_buffer_cells() {
             .iter()
             .any(|cell| cell.symbol().contains("👩🏽\u{200d}⚕"))
     );
+}
+
+fn mission_worker(id: &str, agent_state: ObserverAgentState) -> ObserverWorker {
+    ObserverWorker {
+        capabilities: ObserverCapabilities {
+            observe_output: true,
+            open_interactive: true,
+            prompt_agent: true,
+        },
+        agent_state,
+        live_agent: true,
+        last_observed: Some("2026-07-24T12:00:00Z".to_owned()),
+        ..worker(id)
+    }
+}
+
+#[test]
+fn read_only_live_agent_uses_events_and_non_input_actions_without_prompt_grant() {
+    let mut read_only = mission_worker("read-only", ObserverAgentState::Working);
+    read_only.capabilities.prompt_agent = false;
+    let observer = ObserverState::new(vec![read_only]);
+
+    assert_eq!(observer.workers()[0].status_label(), "WORKING");
+    assert!(observer.workers()[0].uses_live_agent());
+    assert!(observer.workers()[0].can_focus());
+    assert!(observer.workers()[0].can_observe_agent());
+    assert!(!observer.workers()[0].can_prompt());
+    assert_eq!(observer.action_for_key(ObserverKey::Char('p')), None);
+    assert_eq!(
+        observer.action_for_key(ObserverKey::Char('f')),
+        Some(ObserverAction::FocusSelected)
+    );
+    assert_eq!(
+        observer.action_for_key(ObserverKey::Char('v')),
+        Some(ObserverAction::ReadSelected)
+    );
+    assert_eq!(
+        observer.action_for_key(ObserverKey::Char('w')),
+        Some(ObserverAction::WaitSelected)
+    );
+    let rendered = render_to_text(64, 10, &observer).unwrap();
+    assert!(rendered.contains("Mission Control"), "{rendered}");
+    assert!(rendered.contains("WORKING"), "{rendered}");
+    assert!(rendered.contains("v read"), "{rendered}");
+    assert!(!rendered.contains("p prompt"), "{rendered}");
+}
+
+#[test]
+fn mission_control_states_and_prompt_authority_are_explicit() {
+    let states = [
+        (ObserverAgentState::Detached, "DETACHED", false),
+        (ObserverAgentState::Idle, "IDLE", true),
+        (ObserverAgentState::Working, "WORKING", false),
+        (ObserverAgentState::Blocked, "BLOCKED", false),
+        (ObserverAgentState::Done, "DONE", true),
+        (ObserverAgentState::Unknown, "UNKNOWN", false),
+        (ObserverAgentState::Unreachable, "UNREACHABLE", false),
+        (ObserverAgentState::Stale, "STALE", false),
+    ];
+    for (state, label, can_prompt) in states {
+        let candidate = mission_worker(label, state);
+        assert_eq!(candidate.status_label(), label);
+        assert_eq!(candidate.can_prompt(), can_prompt, "{label}");
+    }
+    assert_eq!(action_for_key(ObserverKey::Char('d')), None);
+    assert_eq!(action_for_key(ObserverKey::Char('s')), None);
+    let observer_only = state(1);
+    assert_eq!(observer_only.action_for_key(ObserverKey::Char('p')), None);
+    let mission = ObserverState::new(vec![mission_worker("active", ObserverAgentState::Idle)]);
+    assert_eq!(
+        mission.action_for_key(ObserverKey::Char('p')),
+        Some(ObserverAction::ComposePrompt)
+    );
+}
+
+#[test]
+fn mission_control_bounds_multi_target_prompt_selection() {
+    let workers = (0..=MAX_PROMPT_TARGETS)
+        .map(|index| mission_worker(&index.to_string(), ObserverAgentState::Idle))
+        .collect();
+    let mut observer = ObserverState::new(workers);
+    for index in 0..MAX_PROMPT_TARGETS {
+        assert_eq!(
+            observer.apply(ObserverAction::TogglePromptTarget),
+            ObserverOutcome::None
+        );
+        if index + 1 < MAX_PROMPT_TARGETS {
+            observer.apply(ObserverAction::NextWorker);
+        }
+    }
+    observer.apply(ObserverAction::NextWorker);
+    observer.apply(ObserverAction::TogglePromptTarget);
+    assert!(
+        observer
+            .notice()
+            .unwrap()
+            .contains("At most 8 prompt destinations")
+    );
+    assert_eq!(observer.prompt_target_ids().len(), MAX_PROMPT_TARGETS);
+    assert!(matches!(
+        observer.apply(ObserverAction::ComposePrompt),
+        ObserverOutcome::ComposePrompt { worker_ids }
+            if worker_ids.len() == MAX_PROMPT_TARGETS
+    ));
+}
+
+#[test]
+fn live_agent_loss_preserves_last_known_information_as_stale() {
+    let mut observer = ObserverState::new(vec![mission_worker("agent", ObserverAgentState::Idle)]);
+    let mut unreachable = mission_worker("agent", ObserverAgentState::Unreachable);
+    unreachable.capture = None;
+    unreachable.last_observed = None;
+    observer.update_workers(vec![unreachable]);
+
+    let retained = &observer.workers()[0];
+    assert_eq!(retained.agent_state, ObserverAgentState::Stale);
+    assert_eq!(retained.capture.as_deref(), Some("output-agent"));
+    assert_eq!(
+        retained.last_observed.as_deref(),
+        Some("2026-07-24T12:00:00Z")
+    );
+    assert!(!retained.can_prompt());
+    let rendered = render_to_text(64, 10, &observer).unwrap();
+    assert!(rendered.contains("STALE"));
+    assert!(rendered.contains("last live 2026-07-24T12:00:00Z"));
+    let mut recovered = mission_worker("agent", ObserverAgentState::Done);
+    recovered.capture = None;
+    recovered.last_observed = Some("2026-07-24T12:01:00Z".to_owned());
+    observer.update_workers(vec![recovered]);
+    assert_eq!(observer.workers()[0].agent_state, ObserverAgentState::Done);
+    assert!(observer.workers()[0].can_prompt());
+    assert!(!render_to_text(64, 10, &observer).unwrap().contains("STALE"));
 }

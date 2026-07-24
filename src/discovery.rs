@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     backend::{CommandSpec, ProcessBinaries},
-    sshcfg::openssh_target,
+    sshcfg::{openssh_connection_args, openssh_target},
     status::{BoundedOutput, run_bounded},
 };
 const MAX_DISCOVERY_WORKERS: usize = 16;
@@ -863,14 +863,7 @@ fn remote_spec(
     ];
     remote_args.extend(roots.iter().cloned());
     let remote_command = CommandSpec::new("/bin/sh", remote_args).posix_command_line()?;
-    let mut ssh_args = vec![
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "ServerAliveInterval=15".to_owned(),
-        "-o".to_owned(),
-        "ServerAliveCountMax=3".to_owned(),
-    ];
+    let mut ssh_args = openssh_connection_args(false);
     if let Some(port) = target.port {
         ssh_args.extend(["-p".to_owned(), port.to_string()]);
     }

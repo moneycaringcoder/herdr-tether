@@ -24,6 +24,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
+    agent_view::AgentViewFilter,
     model::{OrchestrationGroupId, OrchestrationTitle, SessionId},
     orchestration::OrchestrationWorkerSpec,
     state::{
@@ -40,6 +41,7 @@ const MANAGER_RESIZE_MESSAGE: &str = "Resize terminal to at least 40x8";
 const DEFAULT_CAPABILITIES: OrchestrationCapabilities = OrchestrationCapabilities {
     observe_output: true,
     open_interactive: true,
+    prompt_agent: false,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +63,7 @@ pub enum ObserverManagerEvent {
     Confirm,
     Back,
     Toggle,
+    TogglePrompt,
     Create,
     Edit,
     Delete,
@@ -86,6 +89,7 @@ pub enum ObserverManagerAction {
     },
     SetAgentView {
         group_id: OrchestrationGroupId,
+        filter: AgentViewFilter,
     },
     ClearAgentView,
     Delete {
@@ -110,6 +114,7 @@ struct Candidate {
     host: String,
     repository: String,
     title: OrchestrationTitle,
+    agent_kind: Option<String>,
     existing: Option<OrchestrationMember>,
 }
 
@@ -132,6 +137,8 @@ pub struct ObserverManagerState {
     selected_group: Option<usize>,
     selected_orchestrator: Option<SessionId>,
     selected_workers: HashSet<SessionId>,
+    prompt_workers: HashSet<SessionId>,
+    mission_control_available: bool,
     review_kind: Option<ReviewKind>,
     review_return_index: usize,
     notice: Option<String>,
@@ -189,6 +196,8 @@ impl ObserverManagerState {
             selected_group: None,
             selected_orchestrator: None,
             selected_workers: HashSet::new(),
+            prompt_workers: HashSet::new(),
+            mission_control_available: true,
             review_kind: None,
             review_return_index: 0,
             notice,
@@ -197,6 +206,10 @@ impl ObserverManagerState {
 
     pub fn screen(&self) -> ObserverManagerScreen {
         self.screen
+    }
+
+    pub fn set_mission_control_available(&mut self, available: bool) {
+        self.mission_control_available = available;
     }
 
     pub fn frame_title(&self) -> &'static str {
@@ -238,17 +251,31 @@ impl ObserverManagerState {
                     } else {
                         "[ ]"
                     };
-                    format!("{marker} WORKER {}", candidate.label)
+                    let prompt = if self.prompt_workers.contains(&candidate.session_id) {
+                        " [PROMPT]"
+                    } else {
+                        ""
+                    };
+                    format!("{marker}{prompt} WORKER {}", candidate.label)
                 })
                 .collect(),
-            ObserverManagerScreen::GroupActions => vec![
-                "Open Observer".to_owned(),
-                "Edit workers".to_owned(),
-                "Change orchestrator".to_owned(),
-                "Show group in Agents sidebar".to_owned(),
-                "Restore default Agents sidebar".to_owned(),
-                "Delete group".to_owned(),
-            ],
+            ObserverManagerScreen::GroupActions => {
+                let open = if self.mission_control_available {
+                    "Open Mission Control"
+                } else {
+                    "Open Observer · Herdr 0.7.5+ unlocks Mission Control"
+                };
+                vec![
+                    open.to_owned(),
+                    "Edit workers".to_owned(),
+                    "Change orchestrator".to_owned(),
+                    "Show group in Agents sidebar".to_owned(),
+                    "Show attention in Agents sidebar".to_owned(),
+                    "Show remote agents in sidebar".to_owned(),
+                    "Restore default Agents sidebar".to_owned(),
+                    "Delete group".to_owned(),
+                ]
+            }
             ObserverManagerScreen::ReviewTopology => self.review_labels(),
             ObserverManagerScreen::ConfirmDelete => vec![format!(
                 "Metadata only; workloads keep running. Delete {}?",
@@ -293,13 +320,13 @@ impl ObserverManagerState {
                 "Enter choose orchestrator · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::CreateWorkers => {
-                "Space select workers · Enter review · ↑/↓ navigate · Esc/Backspace back"
+                "Space select · p prompt permission · Enter review · ↑/↓ navigate · Esc/Backspace back"
+            }
+            ObserverManagerScreen::EditWorkers => {
+                "Space add/remove · p prompt permission · Enter review · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::GroupActions => {
                 "Enter choose · e Edit · d Delete · Agents view is opt-in · ↑/↓ navigate · Esc/Backspace back"
-            }
-            ObserverManagerScreen::EditWorkers => {
-                "Space add/remove · Enter review · ↑/↓ navigate · Esc/Backspace back"
             }
             ObserverManagerScreen::ChangeOrchestrator => {
                 "Enter review replacement · ↑/↓ navigate · Esc/Backspace back"
@@ -343,6 +370,10 @@ impl ObserverManagerState {
             ObserverManagerEvent::Back => self.back(),
             ObserverManagerEvent::Toggle => {
                 self.toggle_worker();
+                ObserverManagerOutcome::Continue
+            }
+            ObserverManagerEvent::TogglePrompt => {
+                self.toggle_prompt();
                 ObserverManagerOutcome::Continue
             }
             ObserverManagerEvent::Create if self.screen == ObserverManagerScreen::Groups => {
@@ -406,11 +437,20 @@ impl ObserverManagerState {
                     self.begin_reassign();
                     ObserverManagerOutcome::Continue
                 }
-                3 => ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
-                    group_id: self.selected_group_id(),
-                }),
-                4 => ObserverManagerOutcome::Action(ObserverManagerAction::ClearAgentView),
-                5 => {
+                3..=5 => {
+                    let filter = match self.selected_index {
+                        3 => AgentViewFilter::All,
+                        4 => AgentViewFilter::NeedsAttention,
+                        5 => AgentViewFilter::Remote,
+                        _ => unreachable!(),
+                    };
+                    ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
+                        group_id: self.selected_group_id(),
+                        filter,
+                    })
+                }
+                6 => ObserverManagerOutcome::Action(ObserverManagerAction::ClearAgentView),
+                7 => {
                     self.screen = ObserverManagerScreen::ConfirmDelete;
                     self.selected_index = 0;
                     ObserverManagerOutcome::Continue
@@ -447,6 +487,7 @@ impl ObserverManagerState {
         self.selected_group = None;
         self.selected_orchestrator = None;
         self.selected_workers.clear();
+        self.prompt_workers.clear();
     }
 
     fn begin_edit(&mut self) {
@@ -473,6 +514,7 @@ impl ObserverManagerState {
                         title: safe_component(&label, 96)
                             .parse()
                             .expect("safe member title"),
+                        agent_kind: None,
                         existing: None,
                     }
                 });
@@ -492,6 +534,12 @@ impl ObserverManagerState {
         self.selected_workers = group
             .workers
             .iter()
+            .map(|worker| worker.session_id)
+            .collect();
+        self.prompt_workers = group
+            .workers
+            .iter()
+            .filter(|worker| worker.capabilities.prompt_agent)
             .map(|worker| worker.session_id)
             .collect();
         self.screen_candidates = candidates;
@@ -584,18 +632,19 @@ impl ObserverManagerState {
             .iter()
             .filter(|candidate| self.selected_workers.contains(&candidate.session_id))
             .map(|candidate| {
-                candidate.existing.as_ref().map_or_else(
-                    || OrchestrationWorkerSpec {
-                        session_id: candidate.session_id,
-                        title: Some(candidate.title.clone()),
-                        capabilities: DEFAULT_CAPABILITIES,
-                    },
-                    |existing| OrchestrationWorkerSpec {
-                        session_id: existing.session_id,
-                        title: existing.title.clone(),
-                        capabilities: existing.capabilities,
-                    },
-                )
+                let mut capabilities = candidate
+                    .existing
+                    .as_ref()
+                    .map_or(DEFAULT_CAPABILITIES, |existing| existing.capabilities);
+                capabilities.prompt_agent = self.prompt_workers.contains(&candidate.session_id);
+                OrchestrationWorkerSpec {
+                    session_id: candidate.session_id,
+                    title: candidate.existing.as_ref().map_or_else(
+                        || Some(candidate.title.clone()),
+                        |existing| existing.title.clone(),
+                    ),
+                    capabilities,
+                }
             })
             .collect()
     }
@@ -651,9 +700,41 @@ impl ObserverManagerState {
         let Some(candidate) = self.screen_candidates.get(self.selected_index) else {
             return;
         };
-        if !self.selected_workers.remove(&candidate.session_id) {
+        if self.selected_workers.remove(&candidate.session_id) {
+            self.prompt_workers.remove(&candidate.session_id);
+        } else {
             self.selected_workers.insert(candidate.session_id);
         }
+        self.notice = None;
+    }
+    fn toggle_prompt(&mut self) {
+        if !matches!(
+            self.screen,
+            ObserverManagerScreen::CreateWorkers | ObserverManagerScreen::EditWorkers
+        ) {
+            return;
+        }
+        let Some(candidate) = self.screen_candidates.get(self.selected_index) else {
+            return;
+        };
+        if self.prompt_workers.remove(&candidate.session_id) {
+            self.notice = None;
+            return;
+        }
+        if !self.mission_control_available {
+            self.notice = Some("Agent prompt permission requires Herdr 0.7.5 or newer".to_owned());
+            return;
+        }
+        if candidate.agent_kind.is_none() {
+            self.notice =
+                Some("Prompt permission requires an explicit --herdr-agent KIND hint".to_owned());
+            return;
+        }
+        if !self.selected_workers.contains(&candidate.session_id) {
+            self.notice = Some("Select the worker before granting prompt permission".to_owned());
+            return;
+        }
+        self.prompt_workers.insert(candidate.session_id);
         self.notice = None;
     }
 
@@ -864,6 +945,10 @@ fn candidate(record: &SessionRecord, label: &str) -> Result<Candidate> {
         label: label.to_owned(),
         host,
         repository,
+        agent_kind: record
+            .herdr_agent
+            .as_ref()
+            .map(|kind| kind.as_str().to_owned()),
         title: safe_component(label, 96)
             .parse()
             .context("generate safe Observer member title")?,
@@ -1044,6 +1129,9 @@ fn event_for_key(key: KeyEvent, screen: ObserverManagerScreen) -> Option<Observe
         KeyCode::Char(' ') if key.kind == KeyEventKind::Press => Some(ObserverManagerEvent::Toggle),
         KeyCode::Char('n' | 'N') if key.kind == KeyEventKind::Press => {
             Some(ObserverManagerEvent::Create)
+        }
+        KeyCode::Char('p' | 'P') if key.kind == KeyEventKind::Press => {
+            Some(ObserverManagerEvent::TogglePrompt)
         }
         KeyCode::Char('e' | 'E') if key.kind == KeyEventKind::Press => {
             Some(ObserverManagerEvent::Edit)

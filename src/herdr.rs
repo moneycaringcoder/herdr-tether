@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::{
-    agent_view::{AGENT_VIEW_SOURCE, GROUP_TOKEN},
+    agent_view::{AGENT_VIEW_SOURCE, GROUP_TOKEN, REMOTE_TOKEN},
     backend::CommandSpec,
     model::{OrchestrationGroupId, Placement},
     quote::posix_quote,
@@ -601,6 +601,7 @@ impl HerdrClient {
         &self,
         pane_id: &str,
         group_id: &OrchestrationGroupId,
+        remote: bool,
     ) -> Result<()> {
         let output = self.execute("read version", &["--version".to_owned()])?;
         if parse_herdr_version(&output.stdout)? < (0, 7, 5) {
@@ -616,6 +617,8 @@ impl HerdrClient {
                 AGENT_VIEW_SOURCE.to_owned(),
                 "--token".to_owned(),
                 format!("{GROUP_TOKEN}={group_id}"),
+                "--token".to_owned(),
+                format!("{REMOTE_TOKEN}={remote}"),
             ],
         )?;
         require_result_type(&response, "ok")
