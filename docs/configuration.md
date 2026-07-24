@@ -42,7 +42,10 @@ herdr-tether host list --json
 
 Remove only the configuration entry with `herdr-tether host remove build`. Existing owned records retain their resolved target and remain visible in an owned-only group; Tether does not retarget or contact them through a different host definition.
 
-Tether discovers literal `Host` aliases in the primary `~/.ssh/config`. OpenSSH still interprets the complete selected configuration, but Tether does not traverse `Include` directives when building its picker list. Explicitly add an included-only alias if needed.
+Tether discovers literal `Host` aliases in the primary `~/.ssh/config` and
+bounded, cycle-safe `Include` files whose canonical paths remain beneath
+`~/.ssh`. Wildcard `Host` patterns and escaping includes are ignored. OpenSSH
+still interprets the complete selected configuration when connecting.
 
 ## Configuration schema
 
@@ -99,14 +102,32 @@ the durable workload lifecycle. Ad hoc creation supports the equivalent
 `herdr-tether open --command COMMAND --herdr-agent KIND` option. Agent kinds
 must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
+### Mission Control prompt capability
+
+Each orchestration worker stores independent `observe_output`,
+`open_interactive`, and optional `prompt_agent` booleans in `state.json`.
+Missing `prompt_agent` defaults to `false` and is omitted when false, preserving
+existing schema-v4 files. Use the native reviewed group editor or the optional
+`orchestration add-worker --prompt-agent` adapter; do not hand-edit state.
+For an exactly bound recognized agent, `observe_output` enables recent-output
+read and semantic wait, while `open_interactive` enables focus/open.
+`prompt_agent` is checked independently; neither of the other capabilities can
+authorize input.
+
+The grant is inert unless Herdr 0.7.5+ recognizes the worker's explicit
+`herdr_agent` kind and every live ownership, membership, pane-binding, and
+settled-state check succeeds. Prompt text and delivery results are never stored
+in `state.json` or `agent-view.json`.
+
 ### Agent sidebar preference
 
-On Herdr 0.7.5 and newer, **Show group in Agents sidebar** stores one optional
-orchestration-group ID in `agent-view.json` beside `state.json`. Herdr plugin
-actions use the same authoritative `HERDR_PLUGIN_STATE_DIR`; standalone
-defaults use the path shown above. The file is created lazily with the same
-private permissions, advisory locking, and atomic replacement as other Tether
-state.
+On Herdr 0.7.5 and newer, the group action screen stores one optional
+orchestration-group ID and one of three view modes in `agent-view.json` beside
+`state.json`: all group agents, agents needing attention, or remote group
+agents. Herdr plugin actions use the same authoritative
+`HERDR_PLUGIN_STATE_DIR`; standalone defaults use the path shown above. The
+file is created lazily with the same private permissions, advisory locking, and
+atomic replacement as other Tether state.
 
 The preference is presentation-only. It contains no command, terminal output,
 agent state, credential, host, or path. Tether restores its source-owned view

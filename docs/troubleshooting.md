@@ -40,6 +40,12 @@ Use your actual configured target in place of `build.example.net`. Fix DNS, netw
 
 Never work around this with global `StrictHostKeyChecking=no`. Tether deliberately preserves OpenSSH's host-key policy.
 
+Tether uses bounded OpenSSH connection setup and reuses a validated master for
+60 seconds through `ControlMaster=auto`, `ControlPersist=60`, and a `%C` socket
+under `~/.ssh`. This reduces repeated remote discovery and observation setup
+without bypassing your SSH configuration. If multiplexing fails, confirm that
+`~/.ssh` exists, is private, and is writable by the current user.
+
 ## A workload is shown as unreachable
 
 Unreachable means Tether cannot prove the exact workload state. It is not evidence that the process ended. Tether therefore disables Open, Stop, Restart, and Remove when those actions would require a state guess.
@@ -72,7 +78,9 @@ Never kill a broad `tmux` name prefix. Tether lifecycle operations target exact 
 - Increase the relevant discovery bound deliberately if the tree is deeper or larger than the current limit.
 - Symlinked directories are not followed.
 - A recent directory is only a picker suggestion; it does not become a scan root.
-- Tether does not traverse OpenSSH `Include` directives to discover aliases. Add an included-only alias explicitly.
+- Literal aliases are discovered from bounded `Include` files beneath the
+  primary `~/.ssh` directory. Wildcard `Host` patterns, include cycles, and
+  includes that resolve outside that directory are deliberately ignored.
 
 You can still enter a literal existing path from the directory stage.
 
@@ -96,15 +104,44 @@ Start with `herdr --version`.
   `--herdr-agent KIND`. Tether never guesses a kind from the command. Changing
   a preset later does not rewrite an existing durable workload record.
 
-If **Show group in Agents sidebar** is active, the filter intentionally hides
-unrelated agents. Open an applicable member from Tether or Observer after
-activating the view so Tether can label that pane for the selected group. Use
-**Restore default Agents sidebar** to remove Tether's filter.
+If a Tether Agents sidebar view is active, it intentionally hides agents
+outside the selected group, status, or remote-origin filter. Open an applicable
+member from Tether or Mission Control after activating the view so Tether can
+label that pane for the selected group and remote origin. Use **Restore default
+Agents sidebar** to remove Tether's filter.
 
 If applying or clearing the view fails, the prior preference is preserved.
 Confirm the plugin is still enabled on Herdr 0.7.5 or newer, then retry from the
 group action screen. Tether's Agent view is presentation-only and never changes
 workload lifecycle or ownership.
+
+## Mission Control cannot prompt an agent
+
+Start with `herdr --version`. Agent control requires Herdr 0.7.5+; Herdr 0.7.3
+and 0.7.4 keep ordinary Observer and workload management and show an upgrade
+message instead.
+
+The worker must be running and exact-owned, have an explicit `herdr_agent`
+preset value or `--herdr-agent KIND`, and have prompt permission granted with
+`p` in the reviewed group topology. Open that group member from Mission Control
+so Tether can report its bounded group, session, membership, and remote-origin
+metadata to Herdr.
+
+Prompt is allowed only while Herdr resolves exactly one matching recognized
+agent in `IDLE` or `DONE`. `WORKING`, `BLOCKED`, `UNKNOWN`, `UNREACHABLE`, and
+`STALE` deliberately reject input. A verified pane move remains valid when the
+same recognized occupant moved; a replacement, unverified move, stale
+membership, or ambiguous binding rejects delivery. Press `r` to
+retry/resnapshot rather than bypassing the binding check.
+
+`REJECTED` means Herdr confirmed no delivery. `UNCERTAIN` means the connection
+failed or timed out after delivery may have begun. Tether never retries an
+uncertain prompt automatically. Inspect the agent state/output before deciding
+whether to submit a new reviewed prompt.
+
+An SSH or Herdr connection loss preserves the last-known tile as `STALE`.
+Reconnect and press `r`; Tether will resubscribe and resnapshot. Closing Mission
+Control while disconnected still leaves every Tether workload running.
 
 ## The picker is difficult to read or use with assistive technology
 

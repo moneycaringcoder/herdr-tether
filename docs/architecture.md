@@ -57,15 +57,19 @@ migrate by assigning and persisting fresh membership epochs. Each group stores
 a bounded, harness-neutral ID and title,
 one exact orchestrator session reference, and an ordered worker-membership
 list. Each worker stores its opaque epoch, an exact session reference, an
-optional display title, and two independent capabilities:
+optional display title, and three independent capabilities:
 
-- `observe_output` authorizes bounded, read-only output capture; and
-- `open_interactive` authorizes opening that worker from Observer.
+- `observe_output` authorizes bounded output observation;
+- `open_interactive` authorizes opening that worker from Observer; and
+- `prompt_agent` authorizes a reviewed Herdr agent prompt only after every
+  Mission Control authority check succeeds.
 
-A worker must have at least one capability. The orchestrator reference records
-the coordinating role but does not grant lifecycle or capture authority.
-Creating or deleting a group and adding or removing a worker mutate only group
-metadata: they never create, adopt, stop, remove, or send input to a session.
+`prompt_agent` is additive and defaults to `false` when absent, so existing
+schema-v4 files and Herdr 0.7.3/0.7.4 behavior remain valid. A worker must have
+at least one capability. The orchestrator reference records the coordinating
+role but grants no lifecycle, capture, or input authority. Creating or deleting
+a group and adding or removing a worker mutate only group metadata: they never
+create, adopt, stop, remove, or send input to a session.
 State admits at most 32 groups and 64 workers per group. Identifiers and titles
 are validated and bounded; references carry no host, path, command, or
 orchestration-runtime assumptions.
@@ -90,18 +94,20 @@ that worker role while preserving every unaffected membership.
 ## Native Agent views
 
 Herdr 0.7.5 and newer can project one orchestration group into the native
-Agents sidebar. The user must select **Show group in Agents sidebar**; Tether
-never installs a view implicitly. `AgentViewService` persists only the selected
-group ID in bounded `agent-view.json` beside `state.json`, then installs one
-transient view owned by source `plugin:moneycaringcoder.tether`. The filter
-matches the bounded `tether_group` token and applies only to Herdr-recognized
-agent panes.
+Agents sidebar. The user explicitly selects all group agents, agents needing
+attention (`blocked` or `done`), or remote group agents; Tether never installs
+a view implicitly. `AgentViewService` persists only the selected group ID and
+view mode in bounded `agent-view.json` beside `state.json`, then installs one
+transient view owned by source `plugin:moneycaringcoder.tether`. Filters combine
+Herdr's status with bounded `tether_group` and `tether_remote` tokens and apply
+only to Herdr-recognized agent panes.
 
 When Tether opens an owned session that belongs to the selected group, it
-reports that group token on the newly placed pane. The token and view are
-display-only: group membership remains in `state.json`, and lifecycle,
-observation, and interactive-open authority continue to require the ordinary
-exact-owned state and capability checks.
+reports the group and remote-origin tokens on the newly placed pane. Exact
+Mission Control members also receive session and membership-epoch tokens. The
+tokens and view are display-only: group membership remains in `state.json`,
+and lifecycle, observation, and interactive-open authority continue to require
+the ordinary exact-owned state and capability checks.
 
 Set and clear operations hold the preference lock, persist the desired value,
 and roll it back if Herdr rejects the corresponding socket request. Deleting
@@ -111,79 +117,117 @@ or live handoff and drops a preference whose group no longer exists. Herdr
 0.7.3 and 0.7.4 ignore the newer startup hook and retain the titled-pane
 fallback; Tether skips their unavailable metadata-token API.
 
-## Observer projection
+## Observer and Mission Control projection
 
-`orchestration observe` creates exactly one outer Herdr pane. Inside that pane,
-Observer projects the selected group's current workers into at most four
-read-only tiles per page. Layout is deterministic and row-major: one tile uses
-the full canvas, two divide it side by side, and three or four use a 2×2 grid.
-Additional workers remain in membership order on deterministic pages; the
-footer reports overflow. The persisted 64-worker limit also bounds projection
-work.
-When the available geometry cannot fit useful bordered tiles, Observer renders
-one bounded resize message instead of subdividing the pane. Picker and manager
-viewports reserve actionable rows and report position plus more-above/below
-content. Observer chrome uses terminal-default foreground and background
-colors; untrusted captured output remains sanitized rather than interpreting
-its color escapes or splitting extended grapheme clusters during truncation.
+`orchestration observe` creates exactly one outer Herdr pane. On Herdr 0.7.3
+and 0.7.4 it retains the existing Observer behavior. On Herdr 0.7.5+, every
+exactly bound recognized agent uses event-driven status. `observe_output`
+authorizes `agent.read` and semantic wait, while `open_interactive` authorizes
+focus/open. The independent `prompt_agent` grant alone enables prompt
+selection and delivery; read/open capabilities never imply it. The manager
+offers that grant only when Herdr 0.7.5+ is reachable and the durable session
+has an explicit Herdr agent hint. Removing a grant remains possible while
+Herdr is unavailable.
 
-Observer reloads group and session metadata while it runs, so membership,
-selection, and lifecycle labels follow state changes without creating one Herdr
-pane per worker. Labels distinguish `STARTING`, `RUNNING`, `STOPPING`, `ENDED`,
-`MISSING`, `REMOVED`, and `UNKNOWN`; stopping is never reported as ended.
-Successful refresh that finds the observed group deleted ends with an explicit
-error rather than retaining a stale authority view. A recoverable post-initial
-refresh failure retains the last authorized tiles, page, and selection with a
-sanitized warning until a successful retry; navigation does not clear it.
+The view projects at most four workers per deterministic row-major page. One
+tile uses the full canvas, two divide it side by side, and three or four use a
+2×2 grid. Additional workers remain in membership order. Geometry, text,
+capture lines, bytes, display cells, group count, worker count, and prompt
+target count are all bounded. Untrusted titles, timestamps, notices, and output
+are sanitized before rendering.
 
-Capture requires all of the following at refresh time: the exact persisted
-membership epoch, `observe_output`, running status, and a Tether record with
-both ownership proof and exact internal `tmux` identity. Tether captures only
-the visible page, checks the same complete authorization fingerprint again
-after each asynchronous capture, and rejects results if membership,
-capabilities, session identity, ownership proof, or internal `tmux` identity
-changed while capture was in flight. Each request reads at most the recent 200
-joined lines. Rendering strips terminal escape sequences and unsafe formatting
-and caps each capture at 200 logical lines, 16 KiB, and 16,384 display cells.
-Tiles distinguish loading, successful empty output, and unavailable output.
-Capture failure is unavailable rather than successful error-text output; it
-does not broaden the target or make the worker interactive. With no workers,
-only refresh and back remain actionable. Observer has no worker-input path.
+### State and observation
 
-`Enter` is a separate, capability-checked transition. It succeeds only when the
-selected member still has `open_interactive` and still resolves to a running
-exact-owned session. Tether then opens it through the ordinary lifecycle and
-Herdr placement boundary while Observer remains available. Both the outer
-Observer launch and an interactive worker open normalize configured or explicit
-`replace-current-pane` to `split-right`, preserving the companion/source pane.
-Observer debounces repeated opens of the same selected worker after one
-placement completes, so queued `Enter` presses cannot fan out duplicate panes.
-Navigation accepts held-key repeats with bounded, non-wrapping selection.
-Refresh and open accept press events only, so repeat events cannot duplicate
-their side effects.
-This gate is local to Observer and does not change ordinary intentional
-multi-attachment elsewhere. Companion placement creates and runs only the
-destination pane; it does not run a command in or close the source launcher
-pane.
-Native manager launch also requires a valid
-`HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id`; it fails before placement rather
-than treating the managed plugin surface as the source. The optional standalone
-adapter path retains its generic Herdr environment compatibility.
-Observer terminal teardown independently attempts to restore cursor visibility,
-leave the alternate screen, and disable raw mode on every guarded exit path;
-one restoration error cannot prevent the remaining attempts.
+Durable lifecycle and group metadata remain authoritative in `state.json`.
+Mission Control adds a typed, bounded `HerdrSocketClient` for:
 
-The outer `observe` launch itself requires an invoking Herdr pane context.
-Processes nested inside a Tether `tmux` workload must not assume that Herdr's
-plugin environment is inherited; they must request or hand off an explicit
-launch from a Herdr pane. This keeps pane placement authority at the Herdr
-boundary and prevents a harness adapter from becoming a runtime dependency.
+- `session.snapshot` and reconnecting `events.subscribe`;
+- `agent.read`, `agent.focus`, and semantic `agent.wait`;
+- pane metadata reports; and
+- one atomic `agent.prompt` plus `agent.wait` delivery.
+
+The event monitor reports a mandatory resnapshot after initial connection and
+every reconnect. Agent status events update the control room without recurring
+SSH capture processes. Workers that are not attached as recognized Herdr
+agents keep the existing adaptive local/SSH `tmux` capture fallback. A periodic
+resnapshot remains a recovery boundary for pane moves and dropped events.
+Each exact snapshot or successful fallback capture records its bounded
+round-trip latency. Failed captures do not publish time-to-error as healthy
+latency.
+
+Tiles distinguish `DETACHED`, `IDLE`, `WORKING`, `BLOCKED`, `DONE`, `UNKNOWN`,
+`UNREACHABLE`, and `STALE`. A socket or SSH loss never fabricates completion:
+the last known capture, observation time, and status are retained as `STALE`,
+agent input is disabled, and destructive actions remain absent. A successful
+resnapshot restores the live state. Closing the view drops only the presentation
+and event subscription; durable Tether workloads continue running.
+
+Fallback capture still requires the exact membership epoch, `observe_output`,
+running status, ownership proof, and exact internal `tmux` identity. Tether
+captures only the visible fallback workers, checks the complete authorization
+fingerprint again after each asynchronous result, strips terminal escape
+sequences, and caps each capture at 200 logical lines, 16 KiB, and 16,384
+display cells.
+
+### Exact group-member binding
+
+When Mission Control opens a group member, Tether reports bounded
+`tether_group`, `tether_session`, `tether_membership`, and `tether_remote`
+metadata on the new Herdr pane. The membership token is the persisted unique
+membership epoch. Exact binding matches the group, session, and membership
+values, then requires the recognized agent kind to match the immutable
+session's explicit Herdr agent hint.
+
+Missing, ambiguous, stale, replaced, unknown, or unverified moved occupants
+fail closed. A pane move remains valid only when the same recognized
+terminal/name/kind identity remains bound. Metadata tokens are not authority by
+themselves: Tether also revalidates the current state capability, membership
+epoch, exact ownership, running state, and live Herdr occupant. Ordinary
+`Enter` open keeps its separate `open_interactive` and exact-owned lifecycle
+gate.
+
+### Reviewed one-shot prompt delivery
+
+`Space` selects at most eight prompt destinations and `p` opens a review flow.
+The prompt is held in memory only. The user sees the exact destination IDs and
+sanitized prompt and must type `SEND`; cancellation sends nothing.
+
+Immediately before each delivery, Tether reloads state, resolves the pane
+binding twice, requires `prompt_agent`, exact ownership, running state, the
+expected agent kind, and settled `IDLE` or `DONE` state, then calls Herdr's
+atomic prompt-and-wait operation once. `WORKING`, `BLOCKED`, `UNKNOWN`,
+`UNREACHABLE`, and `STALE` targets reject input. Multi-target fan-out reports
+each destination independently. A confirmed pre-delivery rejection is
+`REJECTED`; a timeout or connection loss after the call begins is `UNCERTAIN`
+and is never retried automatically because delivery may already have occurred.
+Partial success is shown explicitly and cannot be rolled back.
+
+`f`, `v`, and `w` use the same exact current binding. Focus requires
+`open_interactive`; read and semantic wait require `observe_output`. None of
+those capabilities implies `prompt_agent`. Mission Control never exposes Stop,
+Restart, Remove, arbitrary shell, raw terminal bytes, synthesized Enter, or
+unattended retry. Prompt permission cannot authorize lifecycle mutation.
+
+### Placement and teardown
+
+Opening a worker normalizes `replace-current-pane` to `split-right`, preserving
+Mission Control. Queued `Enter` presses are debounced so one gesture cannot
+create duplicate panes. Native manager launch requires the current
+`HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id`; nested Tether workloads must hand
+placement back to an actual Herdr pane. Terminal teardown independently
+restores cursor visibility, leaves the alternate screen, and disables raw mode
+on every guarded exit path.
 
 ## Durable workload backend
 
 `DurableBackend` is transport-independent. Its implementation creates, observes, attaches to, and stops exact Tether-owned workloads. `TmuxBackend` supplies local and SSH-backed behavior without knowing about Herdr panes or picker state.
 
-Local operations preserve argv. Remote operations build a POSIX-quoted remote `tmux` command and pass it to OpenSSH after `--`. Every remote operation uses `BatchMode=yes`; Tether does not weaken strict host-key verification or replace OpenSSH configuration.
+Local operations preserve argv. Remote operations build a POSIX-quoted remote
+`tmux` command and pass it to OpenSSH after `--`. Every remote operation uses
+`BatchMode=yes`, a bounded connection timeout, server-alive checks, and
+OpenSSH-native connection reuse (`ControlMaster=auto`, `ControlPersist=60`,
+and a `%C` control path under `~/.ssh`). Tether does not weaken strict host-key
+verification or replace OpenSSH configuration.
 
 Creation:
 
@@ -265,9 +309,9 @@ exact backend evidence, not the presence or absence of a JSON record.
 
 Stored data may include host targets, directories, trusted preset commands,
 explicit agent kinds, owned identifiers, launch information, lifecycle status,
-orchestration metadata, one selected Agent view group ID, exit context, and
-timestamps. Tether does not store SSH passwords, private keys, access tokens,
-terminal contents, or telemetry identifiers.
+orchestration metadata, one selected Agent view group and filter mode, exit
+context, and timestamps. Tether does not store SSH passwords, private keys,
+access tokens, terminal contents, or telemetry identifiers.
 
 ## Discovery and snapshots
 
@@ -276,8 +320,13 @@ message, worker, and cancellation budgets across every configured location.
 Completion reports whether the request completed, reached a budget/deadline, or
 was cancelled; stable request and lexical ordering survive truncation. Local
 traversal does not follow symlinks. Remote traversal uses a fixed portable
-scanner through validated BatchMode SSH. Status requests reject over-budget
-input and deduplicate exact targets before bounded classification. Discovery and
+scanner through validated BatchMode SSH.
+
+Literal OpenSSH aliases are parsed from the primary config and bounded,
+cycle-safe `Include` files whose canonical paths remain beneath its directory.
+Wildcard `Host` patterns and escaping includes are ignored. Status requests
+reject over-budget input and deduplicate exact targets before bounded
+classification. Discovery and
 status results are presentation data and never rewrite configured roots or
 lifecycle state.
 
