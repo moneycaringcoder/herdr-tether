@@ -36,18 +36,28 @@ Tether does not sandbox configured commands, secure a compromised endpoint, conf
 
 Within that boundary, Tether:
 
-- invokes OpenSSH with validated targets and `BatchMode=yes` while preserving host-key policy;
+- invokes OpenSSH with validated targets, `BatchMode=yes`, bounded connection
+  setup, and user-private `%C` control sockets while preserving host-key policy;
 - preserves separated argv and POSIX-quotes values only where a remote shell or Herdr pane command requires a command line;
 - uses exact `tmux` targets for owned lifecycle actions;
 - reserves `tether-*` names and permits only validated nonreserved external names through an attach-only path;
 - never adopts, persists, renames, stops, removes, or otherwise manages discovered external sessions;
 - treats unreachable or unknown observation as unsafe for destructive action;
 - bounds status and repository discovery with deadlines, output caps, cancellation, and child-process cleanup;
+- bounds SSH alias `Include` discovery by canonical directory, cycle, depth,
+  file-count, and byte limits;
 - records lifecycle transitions so interrupted Stop and Restart operations remain recoverable;
 - keeps metadata cleanup separate from SSH, `tmux`, probing, and Stop capabilities;
 - migrates and writes configuration, lifecycle/orchestration state, and Agent view preferences with advisory locks, private Unix permissions, and atomic replacement;
 - excludes command bodies, child output, raw backend errors, and private storage paths from scriptable snapshots;
-- treats explicit agent hints, Agent view filters, and pane metadata tokens as presentation data that cannot authorize capture, input, or lifecycle mutation; and
-- stores no SSH passwords, private keys, access tokens, terminal contents, or telemetry identifiers.
+- treats explicit agent hints, Agent view filters, and pane metadata tokens as
+  presentation/binding evidence that cannot authorize capture, input, or
+  lifecycle mutation by themselves;
+- delivers a Mission Control prompt only after explicit capability, exact
+  membership epoch, ownership, running-state, recognized-agent, settled-state,
+  and reviewed-destination checks; prompt text is memory-only and uncertain
+  delivery is never retried automatically; and
+- stores no SSH passwords, private keys, access tokens, terminal contents, prompt
+  text, or telemetry identifiers.
 
 Detailed component, lifecycle, persistence, and trust boundaries are documented in [Architecture and security](docs/architecture.md).

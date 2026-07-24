@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::{self, BufRead, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::{SecondsFormat, Utc};
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -23,14 +24,20 @@ use crate::{
     backend::ProcessBinaries,
     config::ConfigStore,
     herdr::{HerdrClient, HerdrContext, PaneTitle},
+    herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient},
     lifecycle::LifecycleService,
+    mission_control::{
+        MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
+        label_materialized_member, resolve_binding,
+    },
     model::{
         OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle, OwnershipProof,
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        ObserverCapabilities, ObserverCapture, ObserverInputKind, ObserverKey, ObserverLifecycle,
-        ObserverOutcome, ObserverState, ObserverWorker, render,
+        ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
+        ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
+        ObserverWorker, render,
     },
     paths::AppPaths,
     state::{
@@ -474,6 +481,144 @@ fn handle_observer_open(
     Ok(())
 }
 
+const MAX_REVIEWED_PROMPT_BYTES: usize = 16 * 1024;
+fn read_bounded_prompt_line() -> Result<Option<String>> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes = Vec::with_capacity(MAX_REVIEWED_PROMPT_BYTES.min(1024));
+    let mut byte = [0_u8; 1];
+    let mut saw_input = false;
+    let mut overflow = false;
+    loop {
+        let read = input
+            .read(&mut byte)
+            .context("read Mission Control prompt")?;
+        if read == 0 {
+            break;
+        }
+        saw_input = true;
+        if byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] == b'\r' {
+            continue;
+        }
+        if bytes.len() < MAX_REVIEWED_PROMPT_BYTES {
+            bytes.push(byte[0]);
+        } else {
+            overflow = true;
+        }
+    }
+    if !saw_input {
+        return Ok(None);
+    }
+    if overflow {
+        anyhow::bail!("prompt exceeds the {MAX_REVIEWED_PROMPT_BYTES}-byte Mission Control limit");
+    }
+    String::from_utf8(bytes)
+        .context("Mission Control prompt must be valid UTF-8")
+        .map(Some)
+}
+
+fn review_mission_prompt(worker_ids: &[String]) -> Result<Option<String>> {
+    execute!(io::stdout(), LeaveAlternateScreen).context("leave Mission Control screen")?;
+    disable_raw_mode().context("suspend Mission Control raw mode")?;
+    let input_result = (|| -> Result<Option<String>> {
+        println!("Mission Control prompt");
+        println!("Destinations:");
+        for worker_id in worker_ids {
+            println!("  - {worker_id}");
+        }
+        print!("\nPrompt: ");
+        io::stdout().flush().context("flush prompt")?;
+        let Some(prompt) = read_bounded_prompt_line()? else {
+            return Ok(None);
+        };
+        if prompt.trim().is_empty() {
+            return Ok(None);
+        }
+        println!("\nReview exact destinations:");
+        for worker_id in worker_ids {
+            println!("  - {worker_id}");
+        }
+        println!(
+            "\nPrompt:\n{}\n",
+            crate::observer::sanitize_capture(&prompt)
+        );
+        print!("Type SEND to deliver exactly once, or press Enter to cancel: ");
+        io::stdout().flush().context("flush prompt review")?;
+        let mut confirmation = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut confirmation)
+            .context("read prompt confirmation")?;
+        Ok((confirmation.trim() == "SEND").then_some(prompt))
+    })();
+    let raw_result = enable_raw_mode().context("resume Mission Control raw mode");
+    let screen_result =
+        execute!(io::stdout(), EnterAlternateScreen).context("resume Mission Control screen");
+    raw_result?;
+    screen_result?;
+    input_result
+}
+
+fn mission_targets(
+    store: &StateStore,
+    group_id: &OrchestrationGroupId,
+    worker_ids: &[String],
+) -> Result<Vec<MemberTarget>> {
+    let state = store
+        .load_read_only()
+        .context("load Mission Control destinations")?;
+    let group = state
+        .orchestration_groups
+        .iter()
+        .find(|group| &group.id == group_id)
+        .context("Mission Control group no longer exists")?;
+    worker_ids
+        .iter()
+        .map(|worker_id| {
+            let session_id = worker_id
+                .parse::<SessionId>()
+                .context("parse Mission Control worker ID")?;
+            let member = group
+                .workers
+                .iter()
+                .find(|member| member.session_id == session_id)
+                .context("Mission Control worker membership changed")?;
+            Ok(MemberTarget {
+                session_id,
+                membership_id: member.membership_id,
+            })
+        })
+        .collect()
+}
+
+fn target_delivery_summary(deliveries: &[TargetDelivery]) -> String {
+    deliveries
+        .iter()
+        .map(|delivery| match delivery {
+            TargetDelivery::Delivered {
+                session_id,
+                final_state,
+            } => format!(
+                "{}:DELIVERED→{}",
+                session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH),
+                final_state.label()
+            ),
+            TargetDelivery::Rejected { session_id, .. } => format!(
+                "{}:REJECTED",
+                session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH)
+            ),
+            TargetDelivery::Uncertain { session_id } => format!(
+                "{}:UNCERTAIN",
+                session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 pub fn run_observer(
     paths: &AppPaths,
     group_id: OrchestrationGroupId,
@@ -481,16 +626,22 @@ pub fn run_observer(
 ) -> Result<()> {
     let store = StateStore::new(paths.state_file.clone());
     let service = OrchestrationService::new(store.clone());
+    let mission_client = HerdrSocketClient::from_env().ok();
     let group = service.group(&group_id)?;
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
     let (capture_worker, observer_results) = CaptureWorker::spawn();
+    let mission_events = mission_client.as_ref().map(HerdrSocketClient::subscribe);
+    let (prompt_delivery_sender, prompt_delivery_results) = mpsc::channel::<Vec<TargetDelivery>>();
+    let mut prompt_delivery: Option<JoinHandle<()>> = None;
+    let mut force_quit_armed = false;
     let initial_refresh = refresh_observer_metadata(
         &store,
         &group_id,
         &mut observer,
         &mut capture_fingerprints,
         capture_worker.sender(),
+        mission_client.as_ref(),
     )?;
     require_observer_authority(initial_refresh)?;
     enable_raw_mode().context("enable Observer terminal raw mode")?;
@@ -524,6 +675,49 @@ pub fn run_observer(
                 }
             }
         }
+        match prompt_delivery_results.try_recv() {
+            Ok(deliveries) => {
+                if let Some(handle) = prompt_delivery.take() {
+                    let _ = handle.join();
+                }
+                force_quit_armed = false;
+                observer.set_notice(Some(target_delivery_summary(&deliveries)));
+            }
+            Err(TryRecvError::Empty)
+                if prompt_delivery
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished) =>
+            {
+                if let Some(handle) = prompt_delivery.take() {
+                    let _ = handle.join();
+                }
+                force_quit_armed = false;
+                observer.set_notice(Some(
+                    "Prompt delivery worker ended without a result; outcome is UNCERTAIN"
+                        .to_owned(),
+                ));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        let mut mission_changed = false;
+        if let Some(events) = mission_events.as_ref() {
+            while events.try_recv().is_ok() {
+                mission_changed = true;
+            }
+        }
+        if mission_changed {
+            let refresh = refresh_observer_metadata(
+                &store,
+                &group_id,
+                &mut observer,
+                &mut capture_fingerprints,
+                capture_worker.sender(),
+                mission_client.as_ref(),
+            );
+            let outcome = apply_observer_refresh_result(&mut observer, refresh);
+            require_observer_authority(outcome)?;
+            last_refresh = Instant::now();
+        }
         if last_refresh.elapsed() >= OBSERVER_REFRESH_INTERVAL {
             let refresh = refresh_observer_metadata(
                 &store,
@@ -531,6 +725,7 @@ pub fn run_observer(
                 &mut observer,
                 &mut capture_fingerprints,
                 capture_worker.sender(),
+                mission_client.as_ref(),
             );
             let outcome = apply_observer_refresh_result(&mut observer, refresh);
             require_observer_authority(outcome)?;
@@ -545,14 +740,18 @@ pub fn run_observer(
         let Some((observer_key, input_kind)) = observer_key_for_event(key) else {
             continue;
         };
-        // Actions finish synchronously before this loop polls again. ObserverOpenGate
-        // separately suppresses queued/repeated opens, so no action is in flight here.
-        let Some(action) = observer.action_for_input(observer_key, input_kind, false) else {
+        // Navigation and quit remain responsive during prompt-and-wait. Every
+        // operation that could duplicate or retarget input is gated while busy.
+        let prompt_busy = prompt_delivery.is_some();
+        let Some(action) = observer.action_for_input(observer_key, input_kind, prompt_busy) else {
             continue;
         };
+        if !matches!(action, ObserverAction::Quit) {
+            force_quit_armed = false;
+        }
+        clear_transient_observer_notice(&mut observer, &ObserverOutcome::None);
         let previous_page = observer.page();
         let outcome = observer.apply(action);
-        clear_transient_observer_notice(&mut observer, &outcome);
         match outcome {
             ObserverOutcome::None if observer.page() != previous_page => {
                 let refresh = refresh_observer_metadata(
@@ -561,6 +760,7 @@ pub fn run_observer(
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
+                    mission_client.as_ref(),
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -574,6 +774,7 @@ pub fn run_observer(
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
+                    mission_client.as_ref(),
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -591,13 +792,145 @@ pub fn run_observer(
                             .context("draw Observer open feedback")?;
                         Ok(())
                     },
-                    |worker_id| open_worker(paths, &store, &group_id, worker_id, &herdr_context),
+                    |worker_id| {
+                        open_worker(
+                            paths,
+                            &store,
+                            &group_id,
+                            worker_id,
+                            &herdr_context,
+                            mission_client.as_ref(),
+                        )
+                    },
                 )?;
             }
             ObserverOutcome::OpenUnavailable { worker_id } => {
                 observer.set_notice(Some(format!(
                     "Worker {worker_id} is not authorized, running, and exact-owned"
                 )));
+            }
+            ObserverOutcome::ComposePrompt { worker_ids } => {
+                let Some(client) = mission_client.as_ref() else {
+                    observer.set_notice(Some(
+                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                    ));
+                    continue;
+                };
+                match mission_targets(&store, &group_id, &worker_ids) {
+                    Ok(targets) => match review_mission_prompt(&worker_ids) {
+                        Ok(Some(prompt)) => {
+                            let mission = MissionControlService::new(store.clone(), client.clone());
+                            let delivery_group = group_id.clone();
+                            let delivery_sender = prompt_delivery_sender.clone();
+                            let target_count = targets.len();
+                            force_quit_armed = false;
+                            prompt_delivery = Some(thread::spawn(move || {
+                                let deliveries = mission.deliver_reviewed_prompt(
+                                    &delivery_group,
+                                    &targets,
+                                    &prompt,
+                                    true,
+                                );
+                                let _ = delivery_sender.send(deliveries);
+                            }));
+                            observer.set_notice(Some(format!(
+                                "Prompt delivery in progress for {target_count} reviewed target(s)"
+                            )));
+                        }
+                        Ok(None) => {
+                            observer.set_notice(Some("Prompt cancelled; nothing sent".to_owned()));
+                        }
+                        Err(error) => {
+                            observer.set_notice(Some(format!("Prompt review failed: {error:#}")));
+                        }
+                    },
+                    Err(error) => {
+                        observer.set_notice(Some(format!("Prompt targets changed: {error:#}")));
+                    }
+                }
+                terminal
+                    .clear()
+                    .context("clear Mission Control after prompt review")?;
+            }
+            ObserverOutcome::FocusSelected { worker_id } => {
+                let Some(client) = mission_client.as_ref() else {
+                    observer.set_notice(Some(
+                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                    ));
+                    continue;
+                };
+                let result = mission_targets(&store, &group_id, std::slice::from_ref(&worker_id))
+                    .and_then(|targets| {
+                        let mission = MissionControlService::new(store.clone(), client.clone());
+                        let binding = mission.binding_for_open(&group_id, &targets[0])?;
+                        client.focus_agent(binding.target())
+                    });
+                observer.set_notice(Some(match result {
+                    Ok(agent) => format!(
+                        "Focused {} · {}",
+                        worker_id,
+                        MissionAgentState::from(agent.agent_status).label()
+                    ),
+                    Err(error) => format!("Focus rejected: {error:#}"),
+                }));
+            }
+            ObserverOutcome::WaitSelected { worker_id } => {
+                let Some(client) = mission_client.as_ref() else {
+                    observer.set_notice(Some(
+                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                    ));
+                    continue;
+                };
+                let result = mission_targets(&store, &group_id, std::slice::from_ref(&worker_id))
+                    .and_then(|targets| {
+                        let mission = MissionControlService::new(store.clone(), client.clone());
+                        let binding = mission.binding_for_observation(&group_id, &targets[0])?;
+                        client.wait_agent(binding.target(), Duration::from_secs(2))
+                    });
+                observer.set_notice(Some(match result {
+                    Ok(agent) => format!(
+                        "Wait returned {} for {}",
+                        MissionAgentState::from(agent.agent_status).label(),
+                        worker_id
+                    ),
+                    Err(error) => format!("Wait ended without a state change: {error:#}"),
+                }));
+            }
+            ObserverOutcome::ReadSelected { worker_id } => {
+                let Some(client) = mission_client.as_ref() else {
+                    observer.set_notice(Some(
+                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                    ));
+                    continue;
+                };
+                let result = mission_targets(&store, &group_id, std::slice::from_ref(&worker_id))
+                    .and_then(|targets| {
+                        let mission = MissionControlService::new(store.clone(), client.clone());
+                        let binding = mission.binding_for_observation(&group_id, &targets[0])?;
+                        client.agent_read(binding.target(), 80)
+                    });
+                match result {
+                    Ok(read) => {
+                        observer.merge_capture(&worker_id, ObserverCapture::Ready(read.text));
+                        observer
+                            .set_notice(Some(format!("Read Herdr agent output for {worker_id}")));
+                    }
+                    Err(error) => {
+                        observer.set_notice(Some(format!("Read rejected: {error:#}")));
+                    }
+                }
+            }
+            ObserverOutcome::Quit if prompt_delivery.is_some() && force_quit_armed => {
+                bail!(
+                    "Mission Control closed while reviewed prompt delivery was still in flight; per-target outcome is UNCERTAIN"
+                )
+            }
+            ObserverOutcome::Quit if prompt_delivery.is_some() => {
+                force_quit_armed = true;
+                observer.set_notice(Some(
+                    "Prompt still in flight · wait for results or press q/Ctrl+C again to close as UNCERTAIN"
+                        .to_owned(),
+                ));
             }
             ObserverOutcome::Quit => return Ok(()),
         }
@@ -618,7 +951,9 @@ fn apply_observer_refresh_result(
 ) -> ObserverAuthorityOutcome {
     match result {
         Ok(ObserverAuthorityOutcome::Authorized) => {
-            observer.set_notice(None);
+            if observer.notice() == Some(OBSERVER_REFRESH_FAILURE_NOTICE) {
+                observer.set_notice(None);
+            }
             ObserverAuthorityOutcome::Authorized
         }
         Ok(ObserverAuthorityOutcome::GroupDeleted) => ObserverAuthorityOutcome::GroupDeleted,
@@ -657,6 +992,7 @@ fn refresh_observer_metadata(
     observer: &mut ObserverState,
     capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
     capture_requests: &SyncSender<CaptureRequest>,
+    mission_client: Option<&HerdrSocketClient>,
 ) -> Result<ObserverAuthorityOutcome> {
     let state = store.load()?;
     let Some(group) = state
@@ -666,12 +1002,29 @@ fn refresh_observer_metadata(
     else {
         return Ok(ObserverAuthorityOutcome::GroupDeleted);
     };
+    let mission_started = Instant::now();
+    let (mission_snapshot, mission_unreachable, mission_latency_ms) =
+        match mission_client.map(HerdrSocketClient::snapshot) {
+            Some(Ok(snapshot)) if snapshot.supports_mission_control() => (
+                Some(snapshot),
+                false,
+                Some(u64::try_from(mission_started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            ),
+            Some(Ok(_)) | None => (None, false, None),
+            Some(Err(_)) => (None, true, None),
+        };
     let next_fingerprints = capture_fingerprints_for(group, &state.sessions);
     update_observer_metadata(
         observer,
         capture_fingerprints,
         &next_fingerprints,
-        observer_workers(group, &state.sessions),
+        observer_workers(
+            group,
+            &state,
+            mission_snapshot.as_ref(),
+            mission_unreachable,
+            mission_latency_ms,
+        ),
     );
     *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
@@ -699,6 +1052,7 @@ struct CaptureFingerprint {
 struct CapturedWorker {
     fingerprint: CaptureFingerprint,
     capture: ObserverCapture,
+    latency_ms: u64,
 }
 
 struct CaptureResult {
@@ -814,6 +1168,13 @@ fn merge_captured_workers(
         {
             continue;
         }
+        if !matches!(&captured.capture, ObserverCapture::Unavailable) {
+            observer.set_connection_observation(
+                &id,
+                captured.latency_ms,
+                Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            );
+        }
         observer.merge_capture(&id, captured.capture);
     }
     Ok(ObserverAuthorityOutcome::Authorized)
@@ -862,12 +1223,23 @@ fn visible_worker_ids(observer: &ObserverState) -> HashSet<String> {
     observer
         .visible_workers()
         .iter()
+        .filter(|worker| !worker.uses_live_agent())
         .map(|worker| worker.id.clone())
         .collect()
 }
 
-fn observer_workers(group: &OrchestrationGroup, sessions: &[SessionRecord]) -> Vec<ObserverWorker> {
-    let sessions_by_id: HashMap<_, _> = sessions.iter().map(|record| (record.id, record)).collect();
+fn observer_workers(
+    group: &OrchestrationGroup,
+    state: &State,
+    snapshot: Option<&HerdrSessionSnapshot>,
+    mission_unreachable: bool,
+    mission_latency_ms: Option<u64>,
+) -> Vec<ObserverWorker> {
+    let sessions_by_id: HashMap<_, _> = state
+        .sessions
+        .iter()
+        .map(|record| (record.id, record))
+        .collect();
     group
         .workers
         .iter()
@@ -884,19 +1256,60 @@ fn observer_workers(group: &OrchestrationGroup, sessions: &[SessionRecord]) -> V
                 Some(SessionStatus::Removed) => ObserverLifecycle::Removed,
                 None => ObserverLifecycle::Missing,
             };
+            let (agent_state, last_observed, live_agent) = if let Some(snapshot) = snapshot {
+                let target = MemberTarget {
+                    session_id: member.session_id,
+                    membership_id: member.membership_id,
+                };
+                match crate::mission_control::binding_expectation(state, &group.id, &target) {
+                    Ok(expectation) => match resolve_binding(snapshot, &expectation) {
+                        Ok(binding) => (
+                            observer_agent_state(binding.status.into()),
+                            Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                            true,
+                        ),
+                        Err(failure) => (observer_agent_state(failure.state()), None, false),
+                    },
+                    Err(_) => (ObserverAgentState::Unknown, None, false),
+                }
+            } else if mission_unreachable
+                && record.is_some_and(|record| record.herdr_agent.is_some())
+            {
+                (ObserverAgentState::Unreachable, None, false)
+            } else {
+                (ObserverAgentState::Detached, None, false)
+            };
             ObserverWorker {
                 id: member.session_id.to_string(),
                 title: member.title.as_ref().map(|title| title.as_str().to_owned()),
                 capabilities: ObserverCapabilities {
                     observe_output: member.capabilities.observe_output,
                     open_interactive: member.capabilities.open_interactive,
+                    prompt_agent: member.capabilities.prompt_agent,
                 },
                 lifecycle,
+                agent_state,
+                live_agent,
                 owned,
+                last_observed,
+                latency_ms: live_agent.then_some(mission_latency_ms).flatten(),
                 capture: None,
             }
         })
         .collect()
+}
+
+const fn observer_agent_state(state: MissionAgentState) -> ObserverAgentState {
+    match state {
+        MissionAgentState::Detached => ObserverAgentState::Detached,
+        MissionAgentState::Idle => ObserverAgentState::Idle,
+        MissionAgentState::Working => ObserverAgentState::Working,
+        MissionAgentState::Blocked => ObserverAgentState::Blocked,
+        MissionAgentState::Done => ObserverAgentState::Done,
+        MissionAgentState::Unknown => ObserverAgentState::Unknown,
+        MissionAgentState::Unreachable => ObserverAgentState::Unreachable,
+        MissionAgentState::Stale => ObserverAgentState::Stale,
+    }
 }
 
 fn captured_workers(
@@ -913,15 +1326,30 @@ fn captured_workers(
                 let id = member.session_id.to_string();
                 let record = sessions_by_id.get(&member.session_id).copied()?;
                 let fingerprint = capture_fingerprint(member, record)?;
-                (visible.contains(&id) && member.capabilities.observe_output)
-                    .then(|| (fingerprint, scope.spawn(move || capture_record(record))))
+                (visible.contains(&id) && member.capabilities.observe_output).then(|| {
+                    (
+                        fingerprint,
+                        scope.spawn(move || {
+                            let started = Instant::now();
+                            let capture = capture_record(record);
+                            let latency_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            (capture, latency_ms)
+                        }),
+                    )
+                })
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(fingerprint, handle)| CapturedWorker {
-                fingerprint,
-                capture: handle.join().unwrap_or(ObserverCapture::Unavailable),
+            .map(|(fingerprint, handle)| {
+                let (capture, latency_ms) =
+                    handle.join().unwrap_or((ObserverCapture::Unavailable, 0));
+                CapturedWorker {
+                    fingerprint,
+                    capture,
+                    latency_ms,
+                }
             })
             .collect()
     })
@@ -946,6 +1374,7 @@ fn open_worker(
     group_id: &OrchestrationGroupId,
     worker_id: &str,
     herdr_context: &HerdrContext,
+    mission_client: Option<&HerdrSocketClient>,
 ) -> Result<()> {
     let state = store.load()?;
     let group = state
@@ -986,7 +1415,22 @@ fn open_worker(
             .ui
             .placement,
     );
-    HerdrClient::new(herdr_context.clone()).place(&command, &title, placement)?;
+    let placed = HerdrClient::new(herdr_context.clone()).place(&command, &title, placement)?;
+    if let Some(client) = mission_client {
+        label_materialized_member(
+            client,
+            &placed.pane_id,
+            group_id,
+            member,
+            record.target != "local",
+        )
+        .with_context(|| {
+            format!(
+                "opened worker `{worker_id}` in pane `{}` but could not bind it to Mission Control",
+                placed.pane_id
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1049,9 +1493,14 @@ mod tests {
             capabilities: ObserverCapabilities {
                 observe_output: true,
                 open_interactive: true,
+                prompt_agent: false,
             },
             lifecycle,
+            agent_state: ObserverAgentState::Detached,
+            live_agent: false,
             owned: true,
+            last_observed: None,
+            latency_ms: None,
             capture: capture.map(str::to_owned),
         }
     }
@@ -1082,6 +1531,140 @@ mod tests {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+        }
+    }
+
+    #[test]
+    fn attached_read_only_agents_do_not_spawn_recurring_tmux_capture_work() {
+        let mut attached = worker("attached", ObserverLifecycle::Running, None);
+        attached.live_agent = true;
+        attached.agent_state = ObserverAgentState::Working;
+        let mut detached = worker("detached", ObserverLifecycle::Running, None);
+        detached.capabilities.prompt_agent = true;
+        detached.agent_state = ObserverAgentState::Detached;
+        let observer = ObserverState::new(vec![attached, detached]);
+
+        assert_eq!(
+            visible_worker_ids(&observer),
+            HashSet::from(["detached".to_owned()])
+        );
+    }
+
+    #[test]
+    fn mixed_local_and_remote_agents_share_the_live_control_room() {
+        use crate::{
+            agent_view::GROUP_TOKEN,
+            herdr_socket::{AgentStatus, HerdrAgentInfo},
+            mission_control::{MEMBERSHIP_TOKEN, SESSION_TOKEN},
+        };
+
+        let local_id: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+        let remote_id: SessionId = "tether-0197f198000070008000000000000003".parse().unwrap();
+        let local_membership: OrchestrationMembershipId =
+            "0197f198000070008000000000000011".parse().unwrap();
+        let remote_membership: OrchestrationMembershipId =
+            "0197f198000070008000000000000012".parse().unwrap();
+        let mut local = exact_running_session(local_id, "$1");
+        local.herdr_agent = Some("codex".parse().unwrap());
+        let mut remote = exact_running_session(remote_id, "$2");
+        remote.target = "ssh:prod".to_owned();
+        remote.host = "prod".to_owned();
+        remote.herdr_agent = Some("codex".parse().unwrap());
+        let group = OrchestrationGroup {
+            id: "mixed-control".parse().unwrap(),
+            title: "Mixed control".parse().unwrap(),
+            orchestrator_session_id: "tether-0197f198000070008000000000000001".parse().unwrap(),
+            workers: vec![
+                OrchestrationMember {
+                    session_id: local_id,
+                    membership_id: local_membership,
+                    title: Some("Local".parse().unwrap()),
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: true,
+                        open_interactive: true,
+                        prompt_agent: true,
+                    },
+                },
+                OrchestrationMember {
+                    session_id: remote_id,
+                    membership_id: remote_membership,
+                    title: Some("Remote".parse().unwrap()),
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: true,
+                        open_interactive: true,
+                        prompt_agent: false,
+                    },
+                },
+            ],
+        };
+        let state = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![local, remote],
+            orchestration_groups: vec![group],
+        };
+        let agent = |session_id: SessionId,
+                     membership_id: OrchestrationMembershipId,
+                     pane_id: &str,
+                     status: AgentStatus| HerdrAgentInfo {
+            terminal_id: format!("term-{pane_id}"),
+            name: Some(format!("agent-{pane_id}")),
+            agent: Some("codex".to_owned()),
+            title: None,
+            agent_status: status,
+            tokens: HashMap::from([
+                (GROUP_TOKEN.to_owned(), "mixed-control".to_owned()),
+                (SESSION_TOKEN.to_owned(), session_id.to_string()),
+                (MEMBERSHIP_TOKEN.to_owned(), membership_id.to_string()),
+            ]),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            pane_id: pane_id.to_owned(),
+            focused: false,
+            state_change_seq: 1,
+            revision: 1,
+        };
+        let snapshot = HerdrSessionSnapshot {
+            version: "0.7.5".to_owned(),
+            protocol: 17,
+            focused_workspace_id: None,
+            focused_tab_id: None,
+            focused_pane_id: None,
+            panes: Vec::new(),
+            agents: vec![
+                agent(local_id, local_membership, "w1:p1", AgentStatus::Idle),
+                agent(remote_id, remote_membership, "w1:p2", AgentStatus::Working),
+            ],
+        };
+
+        let workers = observer_workers(
+            &state.orchestration_groups[0],
+            &state,
+            Some(&snapshot),
+            false,
+            Some(17),
+        );
+        assert_eq!(workers[0].agent_state, ObserverAgentState::Idle);
+        assert_eq!(workers[1].agent_state, ObserverAgentState::Working);
+        assert!(workers.iter().all(ObserverWorker::uses_live_agent));
+        assert!(workers.iter().all(|worker| worker.latency_ms == Some(17)));
+        assert!(!workers[1].capabilities.prompt_agent);
+        assert!(workers[1].can_observe_agent());
+        assert!(!workers[1].can_prompt());
+        let mut transitioned = snapshot.clone();
+        for (status, expected) in [
+            (AgentStatus::Working, ObserverAgentState::Working),
+            (AgentStatus::Done, ObserverAgentState::Done),
+        ] {
+            transitioned.agents[0].agent_status = status;
+            let refreshed = observer_workers(
+                &state.orchestration_groups[0],
+                &state,
+                Some(&transitioned),
+                false,
+                Some(17),
+            );
+            assert_eq!(refreshed[0].agent_state, expected);
+            assert!(refreshed[0].uses_live_agent());
         }
     }
 
@@ -1420,6 +2003,7 @@ mod tests {
             &mut observer,
             &mut fingerprints,
             &capture_requests,
+            None,
         )
         .unwrap();
 
@@ -1492,6 +2076,7 @@ mod tests {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: true,
+                prompt_agent: false,
             },
         }
     }
@@ -1533,6 +2118,7 @@ mod tests {
                         capabilities: OrchestrationCapabilities {
                             observe_output: true,
                             open_interactive: true,
+                            prompt_agent: false,
                         },
                     }],
                 }],
@@ -1559,6 +2145,7 @@ mod tests {
             workers: vec![CapturedWorker {
                 fingerprint,
                 capture: ObserverCapture::Ready(capture.to_owned()),
+                latency_ms: 23,
             }],
         }
     }
@@ -1632,6 +2219,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(observer.workers()[0].capture.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn remote_capture_loss_retains_last_output_as_stale_without_fake_latency() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, group_id, worker_id) = capture_state("0197f198000070008000000000000011");
+        state.sessions[0].target = "builder@example.test".to_owned();
+        let fingerprint = capture_fingerprint(
+            &state.orchestration_groups[0].workers[0],
+            &state.sessions[0],
+        )
+        .unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        store.save(&state).unwrap();
+        let mut observer = ObserverState::new(vec![worker(
+            &worker_id.to_string(),
+            ObserverLifecycle::Running,
+            None,
+        )]);
+
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            capture_result(fingerprint.clone(), "last remote output"),
+        )
+        .unwrap();
+        merge_captured_workers(
+            &store,
+            &group_id,
+            &mut observer,
+            CaptureResult {
+                visible: HashSet::from([worker_id.to_string()]),
+                workers: vec![CapturedWorker {
+                    fingerprint,
+                    capture: ObserverCapture::Unavailable,
+                    latency_ms: 10_000,
+                }],
+            },
+        )
+        .unwrap();
+
+        let worker = &observer.workers()[0];
+        assert_eq!(worker.capture.as_deref(), Some("last remote output"));
+        assert_eq!(worker.agent_state, ObserverAgentState::Stale);
+        assert_eq!(worker.latency_ms, Some(23));
+        assert!(worker.last_observed.is_some());
     }
 
     #[test]
@@ -1735,6 +2369,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: false,
+            prompt_agent: false,
         };
         store
             .save(&State {
@@ -1787,6 +2422,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         };
         let first_spec = OrchestrationWorkerSpec {
             session_id: first_worker,
@@ -1845,6 +2481,7 @@ mod tests {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: true,
+                prompt_agent: false,
             },
         };
         let mut state = State {
@@ -1899,6 +2536,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         };
         let spec = |session_id| OrchestrationWorkerSpec {
             session_id,
@@ -1990,6 +2628,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         };
         let spec = |session_id| OrchestrationWorkerSpec {
             session_id,
@@ -2097,6 +2736,7 @@ mod tests {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: false,
+                prompt_agent: false,
             },
         };
         let group = OrchestrationGroup {
@@ -2128,6 +2768,7 @@ mod tests {
             &group_id,
             &worker_id.to_string(),
             &herdr_context,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2145,6 +2786,7 @@ mod tests {
             &group_id,
             &worker_id.to_string(),
             &herdr_context,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2163,6 +2805,7 @@ mod tests {
             &group_id,
             &worker_id.to_string(),
             &herdr_context,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2179,6 +2822,7 @@ mod tests {
             &group_id,
             &worker_id.to_string(),
             &herdr_context,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2259,6 +2903,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: false,
+            prompt_agent: false,
         };
         let retained_member = OrchestrationMember {
             session_id: retained,
@@ -2309,6 +2954,7 @@ mod tests {
         let capabilities = OrchestrationCapabilities {
             observe_output: true,
             open_interactive: false,
+            prompt_agent: false,
         };
         let retained_member = OrchestrationMember {
             session_id: retained,
@@ -2404,6 +3050,7 @@ mod tests {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: false,
+                prompt_agent: false,
             },
         };
         let second = OrchestrationMember {
@@ -2413,6 +3060,7 @@ mod tests {
             capabilities: OrchestrationCapabilities {
                 observe_output: false,
                 open_interactive: true,
+                prompt_agent: false,
             },
         };
         let expected = OrchestrationGroup {

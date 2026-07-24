@@ -1,7 +1,7 @@
 ---
 name: tether
-version: 1.1.1
-description: Observe and operate durable workloads and opt-in groups through Tether's public CLI without depending on tmux internals.
+version: 1.2.0
+description: Observe and operate durable workloads and reviewed Mission Control groups through Tether's public surfaces without depending on tmux or Herdr internals.
 author: Tether maintainers
 license: MIT
 platforms: [macos, linux]
@@ -46,9 +46,10 @@ Use this skill when a user wants to:
 - see repositories or durable workloads visible to Tether;
 - start a user-chosen command in a Tether-owned workload;
 - reopen, restart, stop, or remove a specific Tether-owned workload;
-- compare workload state across configured local and remote hosts; or
-- configure and view an opt-in orchestration group on stable v0.4.1,
-  development `main`, or an immutable reviewed commit.
+- compare workload state across configured local and remote hosts;
+- configure and view an opt-in orchestration group; or
+- hand an approved group to Herdr's interactive Observer or Mission Control
+  surface when the installed Tether and Herdr versions support it.
 
 ## Preflight
 
@@ -146,8 +147,10 @@ The user or calling adapter must provide all orchestration values externally:
 - a safe group ID and display title;
 - one exact orchestrator session ID;
 - each exact worker session ID and optional title;
-- `observe_output`, `open_interactive`, or both for every worker; and
-- any host selection, workload command, directory, and Herdr placement.
+- an explicit decision for each independent `observe_output`,
+  `open_interactive`, and optional `prompt_agent` worker capability; and
+- any host selection, workload command, directory, agent kind, and Herdr
+  placement.
 
 Do not infer these values from a repository name, machine layout, process title,
 or assumed agent topology. Resolve session IDs from Tether's public snapshot,
@@ -163,10 +166,17 @@ herdr-tether orchestration list --json
 
 Repeat `add-worker` once per approved worker, passing only its approved
 capabilities. At least one capability is required. `observe_output` authorizes
-bounded read-only capture of a running exact-owned worker;
-`open_interactive` independently authorizes `Enter` to open that worker when it
-is still running and exact-owned. Neither capability authorizes lifecycle
-mutation or worker input.
+bounded read-only capture and, for an exactly bound recognized agent, recent
+output reads and semantic waits. `open_interactive` independently authorizes
+`Enter` open and exact-pane focus while the worker remains running and
+exact-owned.
+
+Add `--prompt-agent` only when the user explicitly approved input authority,
+the durable workload has an explicit user-supplied Herdr agent kind, and the
+interactive Mission Control flow will run on Herdr 0.7.5 or newer. The flag
+does not deliver a prompt, and neither observation nor open permission implies
+it. This skill must never infer the grant or deliver agent input through a
+private socket/API.
 
 To remove only membership or group metadata:
 
@@ -178,33 +188,38 @@ herdr-tether orchestration delete GROUP
 These commands never stop or remove referenced sessions. Re-run
 `orchestration list --json` to verify the exact resulting membership.
 
-## Launch Observer from Herdr
+## Launch Observer or Mission Control from Herdr
 
-Observer is an interactive companion view and must be launched from a Herdr
-pane:
+The companion is an interactive view and must be launched from a Herdr pane:
 
 ```sh
 herdr-tether orchestration observe GROUP --placement split-right
 ```
 
-The command creates one outer Herdr pane. That pane renders up to four
-read-only worker tiles per deterministic page and refreshes membership and
-lifecycle labels while it runs. It never forwards input to a worker. `Enter`
-opens only a capability-authorized, running, exact-owned worker as an ordinary
-Tether view while Observer remains.
+The command creates one outer Herdr pane with up to four deterministic worker
+tiles per page. Herdr 0.7.3 and 0.7.4 retain read-only Observer behavior. On
+Herdr 0.7.5 or newer, exactly bound recognized agents use event-driven Mission
+Control status. `Enter` open and `f` focus require `open_interactive`; `v` read
+and `w` wait require `observe_output`.
+
+Only the user-facing Mission Control screen may review and deliver a prompt.
+It shows exact destinations and prompt text, requires the user to type `SEND`,
+and reports every target independently. Hermes may hand off the approved group
+launch to a Herdr-pane context, but it must not scrape/drive the terminal UI,
+confirm `SEND`, synthesize Enter, retry uncertain delivery, or call Herdr's
+socket directly. Closing either companion leaves every workload running.
 
 A Hermes process running inside a Tether `tmux` workload must not assume it has
-Herdr's plugin pane environment. In that situation, request or hand off the
-explicit command and approved values to a Herdr-pane context instead of
-attempting to reconstruct environment variables. Prefer `split-right`,
-`split-down`, or `new-tab`; Tether normalizes `replace-current-pane` to
-`split-right` so the invoking or Observer pane remains available.
+Herdr's plugin pane environment. Request or hand off the explicit command and
+approved values to a Herdr-pane context instead of reconstructing environment
+variables. Prefer `split-right`, `split-down`, or `new-tab`; Tether normalizes
+`replace-current-pane` to `split-right` so the invoking companion remains
+available.
 
-The native **Show group in Agents sidebar** and **Restore default Agents
-sidebar** actions are user-facing Herdr plugin surfaces, not public
-orchestration CLI commands. An adapter must not call Herdr's socket directly,
-edit `agent-view.json`, or claim that creating a group activated a sidebar
-filter.
+The native sidebar actions for the full group, agents needing attention,
+remote group agents, and restoring the default Agents sidebar are user-facing
+Herdr plugin surfaces, not public orchestration CLI commands. An adapter must
+not edit `agent-view.json` or claim that creating a group activated a filter.
 
 ## Safety Boundaries
 
@@ -213,9 +228,19 @@ filter.
 - Never use hidden/internal Tether commands or infer backend session names.
 - Never expose credentials, environment values, raw errors, or private paths in summaries.
 - Never turn repeated snapshots into a daemon, watcher, scheduled observer, or autonomous remediation loop.
+- Never deliver, approve, repeat, or claim success for a Mission Control prompt;
+  prompt review and per-target outcomes remain in the interactive user surface.
 - Never stop, restart, remove, or attach to an external catalog entry.
 - When data is ambiguous, ask the user to choose; do not select a host, directory, command, preset, placement, or destructive action by convenience.
 
 ## Verification
 
-A successful workload observation has parseable snapshot JSON with `schema_version: 1`, an explicit top-level `completion`, and typed per-host statuses. A successful launch or lifecycle request is verified by a subsequent snapshot showing the exact owned workload and expected state. A successful group mutation is verified separately with `orchestration list --json`; it is not proof that a referenced workload is running. Report partial collection and typed degradation verbatim; never replace uncertainty with a success claim.
+A successful workload observation has parseable snapshot JSON with
+`schema_version: 1`, an explicit top-level `completion`, and typed per-host
+statuses. A successful launch or lifecycle request is verified by a subsequent
+snapshot showing the exact owned workload and expected state. A successful
+group mutation is verified separately with `orchestration list --json`; it is
+not proof that a referenced workload is running, bound to a Herdr agent, or
+prompt-authorized. Mission Control prompt outcomes are intentionally not a
+machine-readable adapter contract. Report partial collection and typed
+degradation verbatim; never replace uncertainty with a success claim.

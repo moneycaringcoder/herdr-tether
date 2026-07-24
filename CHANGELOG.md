@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Herdr 0.7.5+ Mission Control: event-driven agent states, exact metadata-bound group-member resolution, bounded multi-target reviewed prompt-and-wait delivery, focus/read/wait actions, reconnect resnapshots, and explicit stale-state recovery without recurring SSH capture for attached agents.
+- Added the fail-closed `prompt_agent` worker capability, defaulting to false
+  in existing schema-v4 state, with native reviewed manager grants and the
+  optional `orchestration add-worker --prompt-agent` adapter. Recognized
+  read-only agents still use event-driven status and their separately granted
+  read/focus actions without inheriting prompt authority.
+- Added bounded OpenSSH `Include` alias discovery with cycle, file, byte, and
+  directory-containment guards; remote operations now reuse OpenSSH control
+  connections and report successful observation latency in Mission Control.
+- Added native Agents sidebar presets for the full group, agents needing
+  attention, and remote group agents, backed by source-owned group and
+  remote-origin metadata tokens.
+
+### Security
+
+- Revalidate membership epoch, Tether ownership, running state, explicit agent kind, exact current Herdr occupant, and settled state before every prompt; prompt text remains memory-only, ambiguous or replaced panes receive no input, partial fan-out is explicit, and uncertain delivery is never retried automatically.
+- Keep Herdr 0.7.3/0.7.4 workload management and Observer behavior intact while exposing active agent controls only on Herdr 0.7.5+.
+
+
 ## [0.4.1] - 2026-07-23
 
 ### Fixed

@@ -91,12 +91,17 @@ pub struct SessionRecord {
 pub struct OrchestrationCapabilities {
     pub observe_output: bool,
     pub open_interactive: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_agent: bool,
 }
 
 impl OrchestrationCapabilities {
     pub fn is_empty(self) -> bool {
-        !self.observe_output && !self.open_interactive
+        !self.observe_output && !self.open_interactive && !self.prompt_agent
     }
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

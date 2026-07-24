@@ -4,6 +4,7 @@ use herdr_tether::observer_manager::{
     ObserverManagerState, render_to_text,
 };
 use herdr_tether::{
+    agent_view::AgentViewFilter,
     model::{OrchestrationMembershipId, SessionId},
     state::{
         OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
@@ -70,6 +71,7 @@ fn group(state: &State) -> OrchestrationGroup {
             capabilities: OrchestrationCapabilities {
                 observe_output: true,
                 open_interactive: true,
+                prompt_agent: false,
             },
         }],
     }
@@ -219,6 +221,67 @@ fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() 
 }
 
 #[test]
+fn prompt_capability_requires_supported_herdr_and_an_explicit_agent_hint() {
+    let mut state = state_with_sessions();
+    state.sessions[1].herdr_agent = Some("codex".parse().unwrap());
+
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.handle(ObserverManagerEvent::Create);
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Toggle);
+    manager.handle(ObserverManagerEvent::TogglePrompt);
+    manager.handle(ObserverManagerEvent::Confirm);
+    let ObserverManagerOutcome::Action(ObserverManagerAction::Create { workers, .. }) =
+        manager.handle(ObserverManagerEvent::Confirm)
+    else {
+        panic!("reviewed prompt-capable topology must create atomically");
+    };
+    assert!(workers[0].capabilities.prompt_agent);
+
+    let mut unsupported = ObserverManagerState::from_state(&state, None).unwrap();
+    unsupported.set_mission_control_available(false);
+    unsupported.handle(ObserverManagerEvent::Create);
+    unsupported.handle(ObserverManagerEvent::Confirm);
+    unsupported.handle(ObserverManagerEvent::Toggle);
+    unsupported.handle(ObserverManagerEvent::TogglePrompt);
+    assert!(
+        unsupported
+            .footer_text()
+            .contains("requires Herdr 0.7.5 or newer")
+    );
+
+    let no_hint = state_with_sessions();
+    let mut no_hint_manager = ObserverManagerState::from_state(&no_hint, None).unwrap();
+    no_hint_manager.handle(ObserverManagerEvent::Create);
+    no_hint_manager.handle(ObserverManagerEvent::Confirm);
+    no_hint_manager.handle(ObserverManagerEvent::Toggle);
+    no_hint_manager.handle(ObserverManagerEvent::TogglePrompt);
+    assert!(
+        no_hint_manager
+            .footer_text()
+            .contains("explicit --herdr-agent KIND hint")
+    );
+}
+
+#[test]
+fn unsupported_herdr_keeps_observer_available_with_an_upgrade_message() {
+    let mut state = state_with_sessions();
+    state.orchestration_groups.push(group(&state));
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.set_mission_control_available(false);
+    manager.handle(ObserverManagerEvent::Confirm);
+
+    assert_eq!(
+        manager.item_labels()[0],
+        "Open Observer · Herdr 0.7.5+ unlocks Mission Control"
+    );
+    assert!(matches!(
+        manager.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::Launch { .. })
+    ));
+}
+
+#[test]
 fn create_explains_missing_or_insufficient_running_workloads_immediately() {
     let mut empty = state_with_sessions();
     empty.sessions.clear();
@@ -251,10 +314,12 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     assert_eq!(
         open.item_labels(),
         vec![
-            "Open Observer",
+            "Open Mission Control",
             "Edit workers",
             "Change orchestrator",
             "Show group in Agents sidebar",
+            "Show attention in Agents sidebar",
+            "Show remote agents in sidebar",
             "Restore default Agents sidebar",
             "Delete group"
         ]
@@ -274,7 +339,24 @@ fn existing_groups_open_edit_and_delete_without_lifecycle_actions() {
     assert_eq!(
         views.handle(ObserverManagerEvent::Confirm),
         ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
-            group_id: group_id.clone()
+            group_id: group_id.clone(),
+            filter: AgentViewFilter::All,
+        })
+    );
+    views.handle(ObserverManagerEvent::Next);
+    assert_eq!(
+        views.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
+            group_id: group_id.clone(),
+            filter: AgentViewFilter::NeedsAttention,
+        })
+    );
+    views.handle(ObserverManagerEvent::Next);
+    assert_eq!(
+        views.handle(ObserverManagerEvent::Confirm),
+        ObserverManagerOutcome::Action(ObserverManagerAction::SetAgentView {
+            group_id: group_id.clone(),
+            filter: AgentViewFilter::Remote,
         })
     );
     views.handle(ObserverManagerEvent::Next);
@@ -378,6 +460,7 @@ fn edit_without_changes_preserves_existing_worker_order() {
         capabilities: OrchestrationCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         },
     });
     let expected = existing
@@ -641,6 +724,7 @@ fn group_rows_report_topology_health_without_raw_session_ids() {
         capabilities: OrchestrationCapabilities {
             observe_output: true,
             open_interactive: true,
+            prompt_agent: false,
         },
     });
     state.sessions[1].status = SessionStatus::Ended;
@@ -658,6 +742,29 @@ fn group_rows_report_topology_health_without_raw_session_ids() {
         assert!(!row.contains(&record.id.to_string()));
     }
 }
+#[test]
+fn existing_prompt_permission_can_be_revoked_while_agent_control_is_unavailable() {
+    let mut state = state_with_sessions();
+    let mut existing = group(&state);
+    existing.workers[0].capabilities.prompt_agent = true;
+    state.orchestration_groups.push(existing);
+    let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
+    manager.set_mission_control_available(false);
+    manager.handle(ObserverManagerEvent::Confirm);
+    manager.handle(ObserverManagerEvent::Next);
+    manager.handle(ObserverManagerEvent::Confirm);
+    assert!(manager.item_labels()[0].contains("[PROMPT]"));
+
+    manager.handle(ObserverManagerEvent::TogglePrompt);
+    manager.handle(ObserverManagerEvent::Confirm);
+    let ObserverManagerOutcome::Action(ObserverManagerAction::ReplaceWorkers { workers, .. }) =
+        manager.handle(ObserverManagerEvent::Confirm)
+    else {
+        panic!("revoking a grant must remain an atomic reviewed update");
+    };
+    assert!(!workers[0].capabilities.prompt_agent);
+}
+
 #[test]
 fn back_from_group_list_returns_to_the_main_tether_picker() {
     let state = state_with_sessions();

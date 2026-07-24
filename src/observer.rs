@@ -26,6 +26,7 @@ pub const MAX_WORKERS: usize = 64;
 pub const MAX_CAPTURE_LINES: usize = 200;
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 pub const MAX_CAPTURE_CELLS: usize = 16 * 1024;
+pub const MAX_PROMPT_TARGETS: usize = 8;
 const MIN_TILE_WIDTH: u16 = 12;
 const MIN_TILE_HEIGHT: u16 = 3;
 
@@ -33,6 +34,7 @@ const MIN_TILE_HEIGHT: u16 = 3;
 pub struct ObserverCapabilities {
     pub observe_output: bool,
     pub open_interactive: bool,
+    pub prompt_agent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,6 +62,37 @@ impl ObserverLifecycle {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObserverAgentState {
+    Detached,
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    #[default]
+    Unknown,
+    Unreachable,
+    Stale,
+}
+
+impl ObserverAgentState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Detached => "DETACHED",
+            Self::Idle => "IDLE",
+            Self::Working => "WORKING",
+            Self::Blocked => "BLOCKED",
+            Self::Done => "DONE",
+            Self::Unknown => "UNKNOWN",
+            Self::Unreachable => "UNREACHABLE",
+            Self::Stale => "STALE",
+        }
+    }
+
+    pub const fn permits_prompt(self) -> bool {
+        matches!(self, Self::Idle | Self::Done)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObserverCapture {
@@ -73,6 +106,13 @@ enum CaptureStatus {
     Loading,
     Ready,
     Unavailable,
+    Stale,
+}
+struct PreviousWorkerState {
+    capture: Option<String>,
+    last_observed: Option<String>,
+    latency_ms: Option<u64>,
+    live_agent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,7 +121,11 @@ pub struct ObserverWorker {
     pub title: Option<String>,
     pub capabilities: ObserverCapabilities,
     pub lifecycle: ObserverLifecycle,
+    pub agent_state: ObserverAgentState,
+    pub live_agent: bool,
     pub owned: bool,
+    pub last_observed: Option<String>,
+    pub latency_ms: Option<u64>,
     /// Untrusted capture content. Rendering sanitizes and bounds it before display.
     pub capture: Option<String>,
 }
@@ -90,7 +134,52 @@ impl ObserverWorker {
     pub fn can_open(&self) -> bool {
         self.owned
             && self.lifecycle == ObserverLifecycle::Running
+            && !matches!(
+                self.agent_state,
+                ObserverAgentState::Unreachable | ObserverAgentState::Stale
+            )
             && self.capabilities.open_interactive
+    }
+    pub fn can_focus(&self) -> bool {
+        self.owned
+            && self.lifecycle == ObserverLifecycle::Running
+            && self.live_agent
+            && !matches!(
+                self.agent_state,
+                ObserverAgentState::Unreachable | ObserverAgentState::Stale
+            )
+            && self.capabilities.open_interactive
+    }
+
+    pub fn can_observe_agent(&self) -> bool {
+        self.owned
+            && self.lifecycle == ObserverLifecycle::Running
+            && self.live_agent
+            && !matches!(
+                self.agent_state,
+                ObserverAgentState::Unreachable | ObserverAgentState::Stale
+            )
+            && self.capabilities.observe_output
+    }
+
+    pub fn can_prompt(&self) -> bool {
+        self.owned
+            && self.lifecycle == ObserverLifecycle::Running
+            && self.live_agent
+            && self.agent_state.permits_prompt()
+            && self.capabilities.prompt_agent
+    }
+
+    pub const fn uses_live_agent(&self) -> bool {
+        self.live_agent
+    }
+
+    pub const fn status_label(&self) -> &'static str {
+        if !self.live_agent || !matches!(self.lifecycle, ObserverLifecycle::Running) {
+            self.lifecycle.label()
+        } else {
+            self.agent_state.label()
+        }
     }
 
     fn human_display_title(&self) -> Option<String> {
@@ -118,6 +207,11 @@ pub enum ObserverAction {
     NextPage,
     Refresh,
     OpenSelected,
+    TogglePromptTarget,
+    ComposePrompt,
+    FocusSelected,
+    WaitSelected,
+    ReadSelected,
     Quit,
 }
 
@@ -127,6 +221,10 @@ pub enum ObserverOutcome {
     Refresh,
     OpenSelected { worker_id: String },
     OpenUnavailable { worker_id: String },
+    ComposePrompt { worker_ids: Vec<String> },
+    FocusSelected { worker_id: String },
+    WaitSelected { worker_id: String },
+    ReadSelected { worker_id: String },
     Quit,
 }
 
@@ -171,6 +269,11 @@ pub fn action_for_key(key: ObserverKey) -> Option<ObserverAction> {
             Some(ObserverAction::NextPage)
         }
         ObserverKey::Enter => Some(ObserverAction::OpenSelected),
+        ObserverKey::Char(' ') => Some(ObserverAction::TogglePromptTarget),
+        ObserverKey::Char('p' | 'P') => Some(ObserverAction::ComposePrompt),
+        ObserverKey::Char('f' | 'F') => Some(ObserverAction::FocusSelected),
+        ObserverKey::Char('w' | 'W') => Some(ObserverAction::WaitSelected),
+        ObserverKey::Char('v' | 'V') => Some(ObserverAction::ReadSelected),
         ObserverKey::Char('r' | 'R') => Some(ObserverAction::Refresh),
         ObserverKey::Escape | ObserverKey::ControlC | ObserverKey::Char('q' | 'Q') => {
             Some(ObserverAction::Quit)
@@ -202,13 +305,26 @@ fn gate_action_for_input(
         | ObserverAction::NextWorker
         | ObserverAction::PreviousPage
         | ObserverAction::NextPage => Some(action),
-        ObserverAction::Refresh | ObserverAction::OpenSelected
+        ObserverAction::Refresh
+        | ObserverAction::OpenSelected
+        | ObserverAction::TogglePromptTarget
+        | ObserverAction::ComposePrompt
+        | ObserverAction::FocusSelected
+        | ObserverAction::WaitSelected
+        | ObserverAction::ReadSelected
             if kind == ObserverInputKind::Press && !busy =>
         {
             Some(action)
         }
         ObserverAction::Quit if kind == ObserverInputKind::Press => Some(action),
-        ObserverAction::Refresh | ObserverAction::OpenSelected | ObserverAction::Quit => None,
+        ObserverAction::Refresh
+        | ObserverAction::OpenSelected
+        | ObserverAction::TogglePromptTarget
+        | ObserverAction::ComposePrompt
+        | ObserverAction::FocusSelected
+        | ObserverAction::WaitSelected
+        | ObserverAction::ReadSelected
+        | ObserverAction::Quit => None,
     }
 }
 
@@ -217,6 +333,7 @@ pub struct ObserverState {
     workers: Vec<ObserverWorker>,
     capture_statuses: HashMap<String, CaptureStatus>,
     selected_id: Option<String>,
+    prompt_targets: HashSet<String>,
     notice: Option<String>,
 }
 
@@ -250,7 +367,18 @@ impl ObserverState {
         {
             return None;
         }
-        Some(action)
+        let available = match action {
+            ObserverAction::TogglePromptTarget | ObserverAction::ComposePrompt => self
+                .workers
+                .iter()
+                .any(|worker| worker.capabilities.prompt_agent),
+            ObserverAction::FocusSelected => self.workers.iter().any(ObserverWorker::can_focus),
+            ObserverAction::WaitSelected | ObserverAction::ReadSelected => {
+                self.workers.iter().any(ObserverWorker::can_observe_agent)
+            }
+            _ => true,
+        };
+        available.then_some(action)
     }
 
     /// Projects a key through both view availability and input event gating.
@@ -272,10 +400,20 @@ impl ObserverState {
     /// numeric position is retained where possible.
     pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) {
         let previous_index = self.selected_index().unwrap_or(0);
-        let previous_workers: HashMap<String, Option<String>> = self
+        let previous_workers: HashMap<String, PreviousWorkerState> = self
             .workers
             .drain(..)
-            .map(|worker| (worker.id, worker.capture))
+            .map(|worker| {
+                (
+                    worker.id,
+                    PreviousWorkerState {
+                        capture: worker.capture,
+                        last_observed: worker.last_observed,
+                        live_agent: worker.live_agent,
+                        latency_ms: worker.latency_ms,
+                    },
+                )
+            })
             .collect();
         let previous_statuses = std::mem::take(&mut self.capture_statuses);
         let mut seen = HashSet::with_capacity(workers.len().min(MAX_WORKERS));
@@ -292,18 +430,66 @@ impl ObserverState {
                         .get(&worker.id)
                         .copied()
                         .unwrap_or(CaptureStatus::Loading);
-                    if status == CaptureStatus::Ready {
-                        worker.capture = previous_workers.get(&worker.id).cloned().flatten();
+                    let previous = previous_workers.get(&worker.id);
+                    if matches!(status, CaptureStatus::Ready | CaptureStatus::Stale)
+                        && let Some(previous) = previous
+                    {
+                        worker.capture.clone_from(&previous.capture);
                     }
-                    status
+                    if worker.last_observed.is_none()
+                        && let Some(previous) = previous
+                    {
+                        worker.last_observed.clone_from(&previous.last_observed);
+                    }
+                    if worker.latency_ms.is_none()
+                        && let Some(previous) = previous
+                    {
+                        worker.latency_ms = previous.latency_ms;
+                    }
+                    let lost_live_agent = previous.is_some_and(|previous| previous.live_agent)
+                        && worker.agent_state == ObserverAgentState::Unreachable;
+                    if lost_live_agent {
+                        worker.live_agent = true;
+                    }
+                    if lost_live_agent
+                        || (worker.capture.is_some()
+                            && matches!(
+                                worker.agent_state,
+                                ObserverAgentState::Unreachable | ObserverAgentState::Stale
+                            ))
+                    {
+                        worker.agent_state = ObserverAgentState::Stale;
+                        CaptureStatus::Stale
+                    } else if matches!(
+                        worker.agent_state,
+                        ObserverAgentState::Idle
+                            | ObserverAgentState::Working
+                            | ObserverAgentState::Blocked
+                            | ObserverAgentState::Done
+                    ) && status == CaptureStatus::Stale
+                    {
+                        if worker.capture.is_some() {
+                            CaptureStatus::Ready
+                        } else {
+                            CaptureStatus::Loading
+                        }
+                    } else {
+                        status
+                    }
                 };
                 self.capture_statuses.insert(worker.id.clone(), status);
                 worker
             })
             .collect();
+        self.prompt_targets.retain(|id| {
+            self.workers
+                .iter()
+                .any(|worker| worker.id == *id && worker.can_prompt())
+        });
 
         if self.workers.is_empty() {
             self.selected_id = None;
+            self.prompt_targets.clear();
             return;
         }
         if let Some(selected) = self.selected_id.as_deref()
@@ -313,6 +499,26 @@ impl ObserverState {
         }
         let index = previous_index.min(self.workers.len() - 1);
         self.selected_id = Some(self.workers[index].id.clone());
+    }
+
+    pub fn set_connection_observation(
+        &mut self,
+        worker_id: &str,
+        latency_ms: u64,
+        observed: Option<String>,
+    ) -> bool {
+        let Some(worker) = self
+            .workers
+            .iter_mut()
+            .find(|worker| worker.id == worker_id)
+        else {
+            return false;
+        };
+        worker.latency_ms = Some(latency_ms);
+        if observed.is_some() {
+            worker.last_observed = observed;
+        }
+        true
     }
 
     /// Merges one capture result without changing worker identity or membership.
@@ -333,8 +539,17 @@ impl ObserverState {
                 worker.capture = Some(sanitize_capture(&capture));
                 CaptureStatus::Ready
             }
+            ObserverCapture::Unavailable
+                if worker.capture.is_some() && worker.last_observed.is_some() =>
+            {
+                worker.agent_state = ObserverAgentState::Stale;
+                CaptureStatus::Stale
+            }
             ObserverCapture::Unavailable => {
                 worker.capture = None;
+                if worker.capabilities.prompt_agent {
+                    worker.agent_state = ObserverAgentState::Unreachable;
+                }
                 CaptureStatus::Unavailable
             }
         };
@@ -344,6 +559,17 @@ impl ObserverState {
 
     pub fn selected_id(&self) -> Option<&str> {
         self.selected_id.as_deref()
+    }
+    pub fn prompt_target_ids(&self) -> Vec<String> {
+        self.workers
+            .iter()
+            .filter(|worker| self.prompt_targets.contains(&worker.id))
+            .map(|worker| worker.id.clone())
+            .collect()
+    }
+
+    pub fn is_prompt_target(&self, worker_id: &str) -> bool {
+        self.prompt_targets.contains(worker_id)
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -415,6 +641,78 @@ impl ObserverState {
                         }
                     };
                 }
+            }
+            ObserverAction::TogglePromptTarget => {
+                let Some((id, can_prompt)) = self
+                    .selected_worker()
+                    .map(|worker| (worker.id.clone(), worker.can_prompt()))
+                else {
+                    return ObserverOutcome::None;
+                };
+                if self.prompt_targets.remove(&id) {
+                    self.notice = None;
+                } else if !can_prompt {
+                    self.notice = Some(
+                        "Prompt requires exact-owned, authorized, IDLE or DONE agent".to_owned(),
+                    );
+                } else if self.prompt_targets.len() >= MAX_PROMPT_TARGETS {
+                    self.notice = Some(format!(
+                        "At most {MAX_PROMPT_TARGETS} prompt destinations may be selected"
+                    ));
+                } else {
+                    self.prompt_targets.insert(id);
+                    self.notice = None;
+                }
+            }
+            ObserverAction::ComposePrompt => {
+                if self.prompt_targets.is_empty()
+                    && let Some((id, true)) = self
+                        .selected_worker()
+                        .map(|worker| (worker.id.clone(), worker.can_prompt()))
+                {
+                    self.prompt_targets.insert(id);
+                }
+                let worker_ids = self.prompt_target_ids();
+                if worker_ids.is_empty() {
+                    self.notice =
+                        Some("Select at least one prompt-authorized IDLE or DONE agent".to_owned());
+                } else {
+                    return ObserverOutcome::ComposePrompt { worker_ids };
+                }
+            }
+            ObserverAction::FocusSelected => {
+                if let Some((worker_id, true)) = self
+                    .selected_worker()
+                    .map(|worker| (worker.id.clone(), worker.can_focus()))
+                {
+                    return ObserverOutcome::FocusSelected { worker_id };
+                }
+                self.notice = Some(
+                    "Focus requires an exact live agent with interactive-open permission"
+                        .to_owned(),
+                );
+            }
+            ObserverAction::WaitSelected => {
+                if let Some((worker_id, true)) = self
+                    .selected_worker()
+                    .map(|worker| (worker.id.clone(), worker.can_observe_agent()))
+                {
+                    return ObserverOutcome::WaitSelected { worker_id };
+                }
+                self.notice = Some(
+                    "Wait requires an exact live agent with observation permission".to_owned(),
+                );
+            }
+            ObserverAction::ReadSelected => {
+                if let Some((worker_id, true)) = self
+                    .selected_worker()
+                    .map(|worker| (worker.id.clone(), worker.can_observe_agent()))
+                {
+                    return ObserverOutcome::ReadSelected { worker_id };
+                }
+                self.notice = Some(
+                    "Read requires an exact live agent with observation permission".to_owned(),
+                );
             }
             ObserverAction::Quit => return ObserverOutcome::Quit,
         }
@@ -511,6 +809,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     frame.render_widget(Block::default().style(observer_theme_style(false)), area);
 
     let worker_count = observer.workers.len();
+    let mission_control = observer
+        .workers
+        .iter()
+        .any(|worker| worker.live_agent || worker.capabilities.prompt_agent);
+    let prompt_available = observer
+        .workers
+        .iter()
+        .any(|worker| worker.capabilities.prompt_agent);
+    let surface_name = if mission_control {
+        "Mission Control"
+    } else {
+        "Observer"
+    };
     let controls_height = if worker_count == 0 || area.width >= 64 {
         1
     } else if area.width >= 30 {
@@ -527,7 +838,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         || (visible_count > 0 && !can_render_worker_grid(canvas, visible_count))
     {
         frame.render_widget(
-            Paragraph::new("Observer\nResize pane").style(observer_theme_style(false)),
+            Paragraph::new(format!("{surface_name}\nResize pane"))
+                .style(observer_theme_style(false)),
             area,
         );
         return;
@@ -540,10 +852,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         "workers"
     };
     let header_text = if worker_count == 0 {
-        "Observer  0 workers".to_owned()
+        format!("{surface_name}  0 workers")
     } else {
         format!(
-            "Observer  {worker_count} {noun}  page {}/{}",
+            "{surface_name}  {worker_count} {noun}  page {}/{}",
             observer.page() + 1,
             observer.page_count()
         )
@@ -573,6 +885,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
                     .unwrap_or(CaptureStatus::Loading),
                 &observer.worker_display_title(worker),
                 observer.selected_id() == Some(worker.id.as_str()),
+                observer.is_prompt_target(&worker.id),
             );
         }
     }
@@ -591,27 +904,73 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
     let hidden = worker_count.saturating_sub((observer.page() + 1) * WORKERS_PER_PAGE);
     let controls = if worker_count == 0 {
         "r refresh  q back".to_owned()
-    } else if controls_height == 1 {
+    } else if !mission_control && controls_height == 1 {
         let overflow = if hidden == 0 {
             String::new()
         } else {
             format!("+{hidden} more  ")
         };
         format!("{overflow}↑↓ select  Tab/[ ] page  r refresh  Enter open  q back")
-    } else if controls_height == 2 {
+    } else if !mission_control && controls_height == 2 {
         let overflow = if hidden == 0 {
             String::new()
         } else {
             format!("  +{hidden} more")
         };
         format!("↑↓ select  [] page  r refresh\nEnter open  q back{overflow}")
-    } else {
+    } else if !mission_control {
         let overflow = if hidden == 0 {
             String::new()
         } else {
             format!("  +{hidden} more")
         };
         format!("↑↓ select  [] page\nr refresh  Enter open\nq back{overflow}")
+    } else if !prompt_available && controls_height == 1 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("+{hidden} more  ")
+        };
+        format!("{overflow}↑↓ select  Enter open  f focus  v read  w wait  r retry  q back")
+    } else if !prompt_available && controls_height == 2 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  Enter open  f focus\nv read  w wait  r retry  q back{overflow}")
+    } else if !prompt_available {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!("↑↓ select  Enter open\nf focus  v read  w wait\nr retry  q back{overflow}")
+    } else if controls_height == 1 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("+{hidden} more  ")
+        };
+        format!("{overflow}↑↓ select  Space target  p prompt  Enter open  f focus  r retry  q back")
+    } else if controls_height == 2 {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!(
+            "↑↓ select  Space target  p prompt  Enter open\nf focus  v read  w wait  r retry  q back{overflow}"
+        )
+    } else {
+        let overflow = if hidden == 0 {
+            String::new()
+        } else {
+            format!("  +{hidden} more")
+        };
+        format!(
+            "↑↓ select  Space target\np prompt  Enter open  f focus\nv read  w wait  r retry  q back{overflow}"
+        )
     };
     let controls_area = Rect::new(area.x, footer_y, area.width, controls_height);
     frame.render_widget(
@@ -627,16 +986,33 @@ fn render_worker(
     capture_status: CaptureStatus,
     display_title: &str,
     selected: bool,
+    prompt_target: bool,
 ) {
     if area.is_empty() {
         return;
     }
-    let marker = if selected { "▶ " } else { "  " };
-    let eligibility = if worker.can_open() { " · OPEN" } else { "" };
+    let marker = if selected {
+        "▶ "
+    } else if prompt_target {
+        "✓ "
+    } else {
+        "  "
+    };
+    let eligibility = if worker.can_prompt() {
+        " · PROMPT"
+    } else if worker.can_open() {
+        " · OPEN"
+    } else {
+        ""
+    };
+    let latency = worker
+        .latency_ms
+        .map(|latency| format!(" · {latency}ms"))
+        .unwrap_or_default();
     let title = format!(
-        "{marker}{} · {}{eligibility}",
+        "{marker}{} · {}{latency}{eligibility}",
         display_title,
-        worker.lifecycle.label()
+        worker.status_label()
     );
     let style = observer_theme_style(selected);
     let block = Block::default()
@@ -647,8 +1023,24 @@ fn render_worker(
         "Output not authorized".to_owned()
     } else {
         match capture_status {
+            CaptureStatus::Loading if worker.uses_live_agent() => {
+                "Herdr agent attached · press v to read output".to_owned()
+            }
             CaptureStatus::Loading => "Loading output".to_owned(),
             CaptureStatus::Unavailable => "Output unavailable".to_owned(),
+            CaptureStatus::Stale => {
+                let capture = worker
+                    .capture
+                    .as_deref()
+                    .map(sanitize_capture)
+                    .unwrap_or_default();
+                let observed = worker
+                    .last_observed
+                    .as_deref()
+                    .map(|value| sanitize_label(value, 80))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                format!("STALE · last live {observed}\n{capture}")
+            }
             CaptureStatus::Ready => worker
                 .capture
                 .as_deref()

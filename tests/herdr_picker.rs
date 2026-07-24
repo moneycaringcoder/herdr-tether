@@ -828,11 +828,11 @@ fn current_herdr_receives_source_owned_agent_view_group_token() {
     let group_id = "build-group".parse::<OrchestrationGroupId>().unwrap();
 
     HerdrClient::new(context(&binary))
-        .report_agent_view_group("w1:p9", &group_id)
+        .report_agent_view_group("w1:p9", &group_id, true)
         .unwrap();
 
     assert!(fs::read_to_string(log).unwrap().contains(
-        "CALL\tpane\treport-metadata\tw1:p9\t--source\tplugin:moneycaringcoder.tether\t--token\ttether_group=build-group"
+        "CALL\tpane\treport-metadata\tw1:p9\t--source\tplugin:moneycaringcoder.tether\t--token\ttether_group=build-group\t--token\ttether_remote=true"
     ));
 }
 
@@ -856,6 +856,7 @@ fn minimum_herdr_skips_unavailable_agent_view_metadata_api() {
         .report_agent_view_group(
             "w1:p9",
             &"build-group".parse::<OrchestrationGroupId>().unwrap(),
+            false,
         )
         .unwrap();
 

@@ -23,6 +23,7 @@ use crate::{
     },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
+    herdr_socket::HerdrSocketClient,
     lifecycle::{LifecycleService, PruneError, PruneService},
     model::{
         ExternalSessionName, HerdrAgentKind, OrchestrationGroupId, OrchestrationTitle,
@@ -32,7 +33,7 @@ use crate::{
     orchestration::{MANAGER_STALE_GROUP_ERROR, OrchestrationService, companion_placement},
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
-    sshcfg::discover_aliases,
+    sshcfg::{discover_aliases, openssh_connection_args, openssh_target},
     state::{
         OrchestrationCapabilities, OrchestrationGroup, SessionRecord, SessionStatus, State,
         StateStore, compare_normal_sessions, is_normal_session,
@@ -260,6 +261,8 @@ enum OrchestrationCommand {
         observe_output: bool,
         #[arg(long)]
         open_interactive: bool,
+        #[arg(long)]
+        prompt_agent: bool,
     },
     /// Remove one exact worker membership without touching its session or panes.
     RemoveWorker {
@@ -642,8 +645,18 @@ fn check_host(name: &str, target: &str) -> Result<()> {
 }
 
 fn ssh_probe(ssh: &Path, target: &str, remote_command: &str) -> Result<std::process::Output> {
+    let parsed = openssh_target(target)?;
+    let mut arguments = openssh_connection_args(false);
+    if let Some(port) = parsed.port {
+        arguments.extend(["-p".to_owned(), port.to_string()]);
+    }
+    arguments.extend([
+        "--".to_owned(),
+        parsed.destination,
+        remote_command.to_owned(),
+    ]);
     Command::new(ssh)
-        .args(["-o", "BatchMode=yes", "--", target, remote_command])
+        .args(arguments)
         .output()
         .with_context(|| format!("probe SSH target `{target}`"))
 }
@@ -729,7 +742,12 @@ fn run_observer_manager_flow(
     let mut notice = None;
     loop {
         let state = state_store.load().context("load Observer manager state")?;
-        let manager = ObserverManagerState::from_state(&state, notice.take())?;
+        let mut manager = ObserverManagerState::from_state(&state, notice.take())?;
+        manager.set_mission_control_available(
+            HerdrSocketClient::from_env()
+                .and_then(|client| client.snapshot())
+                .is_ok_and(|snapshot| snapshot.supports_mission_control()),
+        );
         match run_observer_manager(manager)? {
             ObserverManagerAction::BackToPicker => return Ok(ObserverManagerFlow::BackToPicker),
             ObserverManagerAction::Create {
@@ -778,18 +796,21 @@ fn run_observer_manager_flow(
                     },
                 ));
             }
-            ObserverManagerAction::SetAgentView { group_id } => {
+            ObserverManagerAction::SetAgentView { group_id, filter } => {
                 let title = state
                     .orchestration_groups
                     .iter()
                     .find(|group| group.id == group_id)
                     .map(|group| group.title.as_str().to_owned());
-                let result = AgentViewService::from_env(paths.agent_view_file())
-                    .and_then(|agent_views| agent_views.set_group(&state, &group_id));
+                let result =
+                    AgentViewService::from_env(paths.agent_view_file()).and_then(|agent_views| {
+                        agent_views.set_group_filter(&state, &group_id, filter)
+                    });
                 notice = Some(match (result, title) {
-                    (Ok(()), Some(title)) => {
-                        format!("Agents sidebar now shows {title}; open members to add them")
-                    }
+                    (Ok(()), Some(title)) => format!(
+                        "Agents sidebar now shows {} for {title}; open members to add them",
+                        filter.label()
+                    ),
                     (Ok(()), None) => "Agents sidebar view applied".to_owned(),
                     (Err(_), _) => {
                         "Could not apply Agents sidebar view; previous view was preserved"
@@ -1299,7 +1320,12 @@ fn report_agent_view_group_for_session(
     let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
     let agent_views = AgentViewService::from_env(paths.agent_view_file())?;
     if let Some(group_id) = agent_views.group_for_session(&state, session_id)? {
-        client.report_agent_view_group(pane_id, &group_id)?;
+        let remote = state
+            .sessions
+            .iter()
+            .find(|record| record.id == session_id)
+            .is_some_and(|record| record.target != "local");
+        client.report_agent_view_group(pane_id, &group_id, remote)?;
     }
     Ok(())
 }
@@ -1562,6 +1588,7 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
             title,
             observe_output,
             open_interactive,
+            prompt_agent,
         } => {
             service.add_worker(
                 &group,
@@ -1570,6 +1597,7 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
                 OrchestrationCapabilities {
                     observe_output,
                     open_interactive,
+                    prompt_agent,
                 },
             )?;
             println!("added {session} to {group}");

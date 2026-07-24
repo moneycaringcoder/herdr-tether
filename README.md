@@ -165,58 +165,77 @@ guessing. Presets accept `herdr_agent = "codex"` in `config.toml`; ad hoc CLI
 creation accepts `--herdr-agent codex`. On Herdr 0.7.5 and newer, the resulting
 view is recognized as that agent while retaining Tether's durable lifecycle.
 
-## Orchestration and Observer
+## Orchestration, Observer, and Mission Control
 
-The opt-in orchestration-group and Observer workflow organizes existing
-Tether-owned workloads for observation; it does not launch, adopt, stop,
-restart, or remove them.
+An opt-in orchestration group organizes existing Tether-owned workloads. Group
+metadata never launches, adopts, stops, restarts, or removes a workload.
 
 Use the native workflow from the ordinary `prefix+t` picker:
 
 1. Press `o` to open **Observers**.
-2. Press `n` to create a group, choose one running workload as orchestrator,
-   select one or more running workers with `Space`, then press `Enter`.
-3. Review the explicit `ORCHESTRATOR` and `WORKER` topology, then press `Enter`
-   again to create it. Ambiguous safe labels receive stable bounded references.
-4. Select the group and choose **Open Observer**. The source launcher remains
-   available while one companion pane opens.
+2. Press `n`, choose one running workload as `ORCHESTRATOR`, and select workers
+   with `Space`.
+3. On Herdr 0.7.5+, press `p` on a selected worker to grant explicit agent
+   prompt permission. The workload must already have an explicit
+   `--herdr-agent KIND` hint.
+4. Press `Enter`, review the exact topology and permissions, then press `Enter`
+   again to create it.
+5. Select the group and choose **Open Mission Control**. On Herdr 0.7.3 or
+   0.7.4, the same action remains **Open Observer** with a clear upgrade note;
+   ordinary durable-workload management is unchanged.
 
-Existing groups can change orchestrator, edit workers, or be deleted from the
-same screen. Every role change has a topology review; metadata edits are
-reversible, and confirmed deletion does not touch workloads or panes. Ordinary
-users never need session IDs,
-shell commands, a standalone Tether installation, or environment setup.
+Mission Control is a state-first control room. Tiles show `DETACHED`, `IDLE`,
+`WORKING`, `BLOCKED`, `DONE`, `UNKNOWN`, `UNREACHABLE`, or `STALE` explicitly.
+Herdr-recognized agents refresh through Herdr's event stream and typed socket
+API; detached and non-agent workloads retain bounded `tmux` capture fallback.
+Connection loss preserves last-known information as `STALE` and disables agent
+input.
+Tiles show the most recent successful socket or fallback-capture latency; a
+failed attempt never replaces that value with a misleading time-to-error.
 
-On Herdr 0.7.5 and newer, a group can also become an opt-in native Agents
-sidebar view. Select **Show group in Agents sidebar** from its action screen;
-Tether filters the sidebar to recognized agents in that group and restores the
-selection after Herdr startup or live handoff. Opening a group member labels
-that pane for the view. **Restore default Agents sidebar** removes only
-Tether's filter. This feature never launches, adopts, or sends input to a
-workload, and Herdr 0.7.3/0.7.4 remain supported without it.
+Use `Space` to select up to eight prompt destinations, then `p` to compose.
+Tether shows the exact destinations and prompt, and sends only after the user
+types `SEND`. Every target is revalidated against the current group membership
+epoch, Tether ownership, running state, pane metadata, and recognized agent
+before one atomic Herdr prompt-and-wait request. Mixed fan-out reports
+`DELIVERED`, `REJECTED`, or `UNCERTAIN` per target; uncertain delivery is never
+retried automatically. Prompt text remains in memory only and is never written
+to `state.json`.
 
-The CLI remains an optional machine/adapter API:
+`Enter` opens the selected durable terminal, `f` focuses its current Herdr
+agent pane, `v` reads recent agent output, `w` waits briefly for a semantic
+state, `r` retries/resnapshots, and `q`, `Esc`, or `Ctrl+C` closes the view.
+Focus/open follows `open_interactive`; read/wait follows `observe_output`;
+neither permission enables prompting. Controls unavailable to the selected
+group are omitted or rejected explicitly.
+Closing Mission Control never stops a Tether workload. There are no Stop,
+Restart, Remove, shell-injection, or synthesized-Enter actions in this view.
+
+Existing groups can change orchestrator, edit workers and prompt grants, or be
+deleted from the same screen. Every change has an explicit topology review;
+metadata deletion leaves workloads and panes running. The optional CLI exposes
+the same additive capability:
 
 ```sh
 herdr-tether orchestration create GROUP --title TITLE --orchestrator SESSION
 herdr-tether orchestration add-worker GROUP SESSION --title TITLE \
-  --observe-output --open-interactive
+  --observe-output --open-interactive --prompt-agent
 herdr-tether orchestration list --json
 herdr-tether orchestration observe GROUP --placement split-right
 ```
 
-Observer renders at most four worker captures per page: one worker fills the
-page, two split side by side, and three or four use a 2×2 grid. More workers use
-deterministic pages. Tiles distinguish loading, ready-but-empty output, and
-unavailable output. A recoverable refresh failure keeps the last authorized
-tiles, page, and selection visible with retry guidance until refresh succeeds.
-An empty group offers only refresh and back; output is never forwarded as
-worker input.
+On Herdr 0.7.5+, the group action screen can show all group agents, only group
+agents needing attention (`BLOCKED`/`DONE`), or only remote group agents in
+Herdr's native Agents sidebar. Opening a member from Mission Control labels
+that pane with bounded group, session, membership, and remote-origin tokens.
+Tokens are presentation/binding evidence only; they cannot replace the state
+capability, ownership, lifecycle, explicit agent hint, or live occupant checks.
+**Restore default Agents sidebar** removes only Tether's filter.
 
-Opening Observer requires the current Herdr plugin context. The native picker
-already supplies it. A standalone adapter nested inside a Tether `tmux` workload
-must explicitly hand the launch back to a Herdr pane. Tether normalizes
-`replace-current-pane` to `split-right` so the invoking pane remains available.
+The view uses one outer Herdr pane and deterministic pages of at most four
+workers. Opening it requires current Herdr plugin pane context; a standalone
+adapter nested inside a Tether `tmux` workload must hand launch back to Herdr.
+`replace-current-pane` normalizes to `split-right`, preserving the source pane.
 
 ## Terminal and accessibility notes
 
@@ -286,7 +305,9 @@ The snapshot reports bounded host, repository, owned-workload, and safe external
 - **SSH policy remains yours.** Tether uses `BatchMode=yes` and never weakens host-key verification.
 - **Remote support is SSH + tmux.** Tether does not provide remote Herdr federation or pane streaming.
 - **Agent integration is explicit and versioned.** Herdr 0.7.3 and 0.7.4 cannot register arbitrary workloads hidden behind `tmux` or SSH, so Tether falls back to clear pane/session titles. On Herdr 0.7.5 and newer, validated agent hints and opt-in group views expose recognized panes without Tether guessing agent identity or lifecycle.
-- Tether reads literal aliases from the primary `~/.ssh/config`; it does not traverse `Include` directives for discovery. Explicitly add an alias that is only present in an included file.
+- Tether reads literal aliases from the primary `~/.ssh/config` and bounded,
+  cycle-safe `Include` files beneath `~/.ssh`; wildcard `Host` patterns and
+  escaping includes are ignored.
 
 Read the [architecture and security boundaries](docs/architecture.md) before deploying Tether in a sensitive environment. Vulnerabilities should be reported through the [security policy](SECURITY.md), not a public issue.
 

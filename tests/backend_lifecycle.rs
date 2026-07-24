@@ -828,10 +828,18 @@ fn remote_owned_capture_passes_one_fully_quoted_read_only_command() {
 
     let argv = read_argv(&log);
     assert_eq!(
-        &argv[..10],
+        &argv[..18],
         [
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            "ControlPath=~/.ssh/herdr-tether-%C",
             "-o",
             "ServerAliveInterval=15",
             "-o",
@@ -842,8 +850,8 @@ fn remote_owned_capture_passes_one_fully_quoted_read_only_command() {
             "builder@example.test",
         ]
     );
-    assert_eq!(argv.len(), 11);
-    let remote = &argv[10];
+    assert_eq!(argv.len(), 19);
+    let remote = &argv[18];
     assert!(remote.starts_with("'tmux' 'if-shell' '-t' '$7' '-F' "));
     assert!(remote.contains("'capture-pane -p -J -S -200 -t $7'"));
     assert!(remote.contains(&proof().to_string()));
@@ -1031,10 +1039,18 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
 
     let argv = read_argv(&log);
     assert_eq!(
-        &argv[..10],
+        &argv[..18],
         [
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            "ControlPath=~/.ssh/herdr-tether-%C",
             "-o",
             "ServerAliveInterval=15",
             "-o",
@@ -1047,11 +1063,11 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     );
     assert_eq!(
         argv.len(),
-        11,
+        19,
         "ssh must receive one remote command argument"
     );
     let launch_script = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
-    let remote = &argv[10];
+    let remote = &argv[18];
     for expected in [
         "'tmux' 'new-session' '-d'",
         &posix_quote(directory).unwrap(),
@@ -1085,10 +1101,18 @@ fn remote_ipv6_uri_maps_authority_and_port_to_openssh_argv() {
         .attach_external_command(&"work".parse().unwrap())
         .unwrap();
     assert_eq!(
-        &command.args[..11],
+        &command.args[..19],
         [
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            "ControlPath=~/.ssh/herdr-tether-%C",
             "-t",
             "-o",
             "ServerAliveInterval=15",
@@ -1100,7 +1124,7 @@ fn remote_ipv6_uri_maps_authority_and_port_to_openssh_argv() {
             "builder@2001:db8::10",
         ]
     );
-    assert_eq!(command.args[11], "'tmux' 'attach-session' '-t' '=work'");
+    assert_eq!(command.args[19], "'tmux' 'attach-session' '-t' '=work'");
 }
 
 #[test]
@@ -1423,6 +1447,7 @@ fn orchestration_group(
                 capabilities: OrchestrationCapabilities {
                     observe_output: true,
                     open_interactive: true,
+                    prompt_agent: false,
                 },
             })
             .collect(),

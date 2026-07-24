@@ -135,57 +135,68 @@ herdr-tether host add build build.example.net --root /srv/repos
 herdr-tether host check build
 ```
 
-Tether also discovers literal aliases in the primary `~/.ssh/config`. It does not traverse `Include` directives for alias discovery; add an included-only alias explicitly.
+Tether also discovers literal aliases from bounded, cycle-safe `Include` files
+beneath the primary `~/.ssh` directory. Wildcard `Host` patterns and includes
+that escape that directory are ignored; an included-only literal alias needs no
+duplicate configuration.
 
-## 6. Create an Observer group
+## 6. Create a group and open Mission Control
 
-Orchestration groups and Observer are included in stable v0.4.1.
+Orchestration groups and the read-only Observer work on Herdr 0.7.3+. Herdr
+0.7.5+ additionally unlocks event-driven Mission Control agent actions.
 
 From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
 1. Press `n` for **Create Observer**.
 2. Choose one running workload as `ORCHESTRATOR`.
-3. Select one or more `WORKER` workloads with `Space`, then press `Enter`.
-4. Review the topology and press `Enter` again to create it.
-5. Select the new group and choose **Open Observer**.
+3. Select one or more `WORKER` workloads with `Space`.
+4. Optional on Herdr 0.7.5+: press `p` on a selected worker to grant prompt
+   permission. The workload must have been created with an explicit
+   `herdr_agent` preset value or `--herdr-agent KIND`.
+5. Press `Enter`, review every role and permission, then press `Enter` again.
+6. Select the group and choose **Open Mission Control**. Older supported Herdr
+   versions show **Open Observer** plus the 0.7.5 upgrade requirement.
 
-Tether derives bounded labels from safe workload metadata. New workers receive
-the safe default capabilities: bounded read-only output observation and
-interactive open. Group creation does not create, adopt, stop, restart, remove,
-or send input to a workload. Up to 32 groups and 64 workers per group are
-accepted.
+The default worker capabilities remain bounded output observation and
+interactive open; prompt permission is separate, explicit, and defaults off.
+Group changes mutate metadata only. Up to 32 groups, 64 workers per group, four
+visible workers per page, and eight prompt destinations are accepted.
 
-One outer pane renders one worker full-size, two side by side, or three to four
-in a 2×2 grid. Additional workers appear on deterministic four-worker pages.
-Use arrows to select, Page Up/Page Down, `Tab`/`Shift+Tab`, or `[`/`]` to page;
-use `r` to refresh and `Enter` to open an authorized running worker as a normal
-Tether view. Press `q`, `Esc`, or `Ctrl+C` to leave Observer. Membership and
-lifecycle labels refresh while it runs; worker input is never forwarded.
+Mission Control keys:
 
-To change a group, choose **Edit workers** or **Change orchestrator**, make the
-selection, review the resulting topology, and confirm. Promoting a worker to
-orchestrator removes it from the worker list. To remove a group, press `d` and
-confirm. All operations change only group metadata and leave every workload and
-pane alone.
+- arrows select; `Tab`/`Shift+Tab`, Page Up/Page Down, or `[`/`]` change page;
+- `Enter` opens the selected durable terminal without replacing Mission Control;
+- `Space` selects prompt destinations and `p` begins prompt review;
+- `f` focuses the current Herdr agent, `v` reads recent output, and `w` waits
+  briefly for `IDLE`, `DONE`, or `BLOCKED`;
+- `r` retries/resnapshots; `q`, `Esc`, or `Ctrl+C` closes only the view.
 
-With Herdr 0.7.5 or newer, the same action screen offers **Show group in Agents
-sidebar**. The view contains only panes Herdr recognizes as agents. After
-activating it, open each applicable group member from Tether or Observer;
-Tether labels that pane for the selected group. Agent commands hidden behind
-`tmux` or SSH need the explicit hint described above.
+The footer shows only controls available to the group: focus/open requires
+`open_interactive`, read/wait requires `observe_output`, and prompt selection
+requires the separate `prompt_agent` grant.
 
-The view is explicit and reversible: it persists across Herdr startup or live
-handoff and does not open or mutate workloads by itself. Choose **Restore
-default Agents sidebar** to clear Tether's filter. Herdr 0.7.3 and 0.7.4
-continue to support ordinary Tether and Observer workflows without this
-optional view.
+Before prompting, Tether shows the exact destinations and prompt. Type `SEND`
+to deliver once or press Enter to cancel. Only current exact-owned, running,
+prompt-authorized `IDLE` or `DONE` agents receive input. Per-target
+`REJECTED` and `UNCERTAIN` results are not treated as success, and uncertain
+requests are never retried automatically. Tether does not persist prompt text.
 
-The standalone `herdr-tether orchestration` commands remain available as an
-optional machine/adapter API. Native picker users do not need exact IDs, shell
-commands, a separate CLI installation, or exported Herdr environment variables.
-Opening Observer still occurs at Herdr's plugin placement boundary; Tether
-normalizes `replace-current-pane` to `split-right` so the source pane remains
-available.
+Tiles report explicit agent states. Herdr events update attached agents without
+recurring SSH capture; detached/non-agent workloads retain bounded `tmux`
+fallback. A connection loss retains last-known information as `STALE`, disables
+input, and never fabricates completion. Closing the view never stops a workload.
+
+Use **Edit workers** or **Change orchestrator** to update a group after another
+explicit review. Press `d` to delete group metadata only. The Agents sidebar
+actions can show the whole group, only `BLOCKED`/`DONE` agents needing
+attention, or only remote group agents. Each installs a source-owned Herdr
+0.7.5+ filter used for exact pane binding; **Restore default Agents sidebar**
+clears it.
+
+The standalone `herdr-tether orchestration` commands remain an optional adapter
+API. Native users do not need exact IDs, shell commands, or exported Herdr
+environment variables. Placement still requires a Herdr pane and normalizes
+`replace-current-pane` to `split-right` so the source remains available.
 
 ## Update or remove Tether
 
