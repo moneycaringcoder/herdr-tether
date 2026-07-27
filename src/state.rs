@@ -16,7 +16,7 @@ use crate::{
         HerdrAgentKind, OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle,
         OwnershipProof, SessionId, TmuxSessionId,
     },
-    storage::{atomic_write, with_advisory_lock},
+    storage::{atomic_write_resolved, with_advisory_lock},
 };
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -308,10 +308,11 @@ impl StateStore {
     pub const MAX_INPUT_BYTES: usize = Self::MAX_PERSISTED_BYTES;
 
     pub fn update<T>(&self, operation: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        with_advisory_lock(&self.path, || {
-            let mut state = self.load_unlocked()?;
+        with_advisory_lock(&self.path, |path| {
+            let store = Self::new(path.to_owned());
+            let mut state = store.load_unlocked()?;
             let result = operation(&mut state)?;
-            self.save_unlocked(&state)?;
+            store.save_unlocked(&state)?;
             Ok(result)
         })
     }
@@ -320,11 +321,16 @@ impl StateStore {
         &self,
         operation: impl FnOnce(&LockedStateStore<'_>) -> Result<T>,
     ) -> Result<T> {
-        with_advisory_lock(&self.path, || operation(&LockedStateStore { store: self }))
+        with_advisory_lock(&self.path, |path| {
+            let store = Self::new(path.to_owned());
+            operation(&LockedStateStore { store: &store })
+        })
     }
 
     pub fn load(&self) -> Result<State> {
-        with_advisory_lock(&self.path, || self.load_unlocked())
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).load_unlocked()
+        })
     }
 
     /// Loads and validates state while migrating legacy schemas only in memory.
@@ -332,7 +338,9 @@ impl StateStore {
     /// Observation commands use this path so reading stable state never rewrites
     /// bytes. Explicit mutating/load migration paths continue to persist upgrades.
     pub fn load_read_only(&self) -> Result<State> {
-        with_advisory_lock(&self.path, || self.load_unlocked_with_migration(false))
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).load_unlocked_with_migration(false)
+        })
     }
 
     fn load_unlocked(&self) -> Result<State> {
@@ -430,7 +438,9 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &State) -> Result<()> {
-        with_advisory_lock(&self.path, || self.save_unlocked(state))
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).save_unlocked(state)
+        })
     }
 
     fn save_unlocked(&self, state: &State) -> Result<()> {
@@ -439,7 +449,7 @@ impl StateStore {
             serde_json::to_string_pretty(state).context("serialize state as JSON")?;
         serialized.push('\n');
         require_serialized_state_size(&serialized)?;
-        atomic_write(&self.path, serialized.as_bytes())
+        atomic_write_resolved(&self.path, serialized.as_bytes())
             .with_context(|| format!("save state `{}`", self.path.display()))
     }
 }
@@ -458,19 +468,9 @@ fn read_regular_state_file(path: &std::path::Path, max_bytes: usize) -> io::Resu
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
 
-    let file = match options.open(path) {
-        Ok(file) => file,
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "state path is a symbolic link",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
+    let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

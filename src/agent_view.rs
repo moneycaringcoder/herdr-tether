@@ -16,7 +16,7 @@ use crate::{
     herdr_socket::HerdrSocketClient,
     model::{OrchestrationGroupId, SessionId},
     state::State,
-    storage::{atomic_write, with_advisory_lock},
+    storage::{atomic_write_resolved, with_advisory_lock},
 };
 
 pub const AGENT_VIEW_SOURCE: &str = "plugin:moneycaringcoder.tether";
@@ -114,16 +114,16 @@ impl AgentViewService {
             bail!("unknown orchestration group");
         }
         let group_id = group_id.clone();
-        with_advisory_lock(&self.preference_file, || {
-            let previous = load_preference(&self.preference_file)?;
+        with_advisory_lock(&self.preference_file, |preference_file| {
+            let previous = load_preference(preference_file)?;
             let next = AgentViewPreference {
                 schema_version: PREFERENCE_SCHEMA_VERSION,
                 group_id: Some(group_id.clone()),
                 filter,
             };
-            save_preference(&self.preference_file, &next)?;
+            save_preference(preference_file, &next)?;
             if let Err(error) = self.apply_group(&group_id, filter) {
-                save_preference(&self.preference_file, &previous)
+                save_preference(preference_file, &previous)
                     .context("restore prior Agent view preference after Herdr rejected the view")?;
                 return Err(error);
             }
@@ -132,11 +132,11 @@ impl AgentViewService {
     }
 
     pub fn clear(&self) -> Result<()> {
-        with_advisory_lock(&self.preference_file, || {
-            let previous = load_preference(&self.preference_file)?;
-            save_preference(&self.preference_file, &AgentViewPreference::default())?;
+        with_advisory_lock(&self.preference_file, |preference_file| {
+            let previous = load_preference(preference_file)?;
+            save_preference(preference_file, &AgentViewPreference::default())?;
             if let Err(error) = self.clear_runtime() {
-                save_preference(&self.preference_file, &previous).context(
+                save_preference(preference_file, &previous).context(
                     "restore prior Agent view preference after Herdr rejected the clear",
                 )?;
                 return Err(error);
@@ -146,8 +146,8 @@ impl AgentViewService {
     }
 
     pub fn restore(&self, state: &State) -> Result<()> {
-        with_advisory_lock(&self.preference_file, || {
-            let preference = load_preference(&self.preference_file)?;
+        with_advisory_lock(&self.preference_file, |preference_file| {
+            let preference = load_preference(preference_file)?;
             let Some(group_id) = preference.group_id else {
                 return Ok(());
             };
@@ -156,7 +156,7 @@ impl AgentViewService {
                 .iter()
                 .any(|group| group.id == group_id)
             {
-                save_preference(&self.preference_file, &AgentViewPreference::default())?;
+                save_preference(preference_file, &AgentViewPreference::default())?;
                 return Ok(());
             }
             self.apply_group(&group_id, preference.filter)
@@ -164,14 +164,14 @@ impl AgentViewService {
     }
 
     pub fn clear_group_if_active(&self, group_id: &OrchestrationGroupId) -> Result<bool> {
-        with_advisory_lock(&self.preference_file, || {
-            let previous = load_preference(&self.preference_file)?;
+        with_advisory_lock(&self.preference_file, |preference_file| {
+            let previous = load_preference(preference_file)?;
             if previous.group_id.as_ref() != Some(group_id) {
                 return Ok(false);
             }
-            save_preference(&self.preference_file, &AgentViewPreference::default())?;
+            save_preference(preference_file, &AgentViewPreference::default())?;
             if let Err(error) = self.clear_runtime() {
-                save_preference(&self.preference_file, &previous).context(
+                save_preference(preference_file, &previous).context(
                     "restore prior Agent view preference after Herdr rejected the clear",
                 )?;
                 return Err(error);
@@ -185,9 +185,7 @@ impl AgentViewService {
         state: &State,
         session_id: SessionId,
     ) -> Result<Option<OrchestrationGroupId>> {
-        let preference = with_advisory_lock(&self.preference_file, || {
-            load_preference(&self.preference_file)
-        })?;
+        let preference = with_advisory_lock(&self.preference_file, load_preference)?;
         let Some(group_id) = preference.group_id else {
             return Ok(None);
         };
@@ -277,15 +275,11 @@ fn load_preference(path: &Path) -> Result<AgentViewPreference> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(AgentViewPreference::default());
-        }
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            bail!("Agent view preference path is a symbolic link");
         }
         Err(error) => return Err(error.into()),
     };
@@ -315,13 +309,17 @@ fn save_preference(path: &Path, preference: &AgentViewPreference) -> Result<()> 
     if serialized.len() > MAX_PREFERENCE_BYTES {
         bail!("serialized Agent view preference exceeds {MAX_PREFERENCE_BYTES} bytes");
     }
-    atomic_write(path, &serialized).context("save Agent view preference")
+    atomic_write_resolved(path, &serialized).context("save Agent view preference")
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::net::UnixListener, thread};
+    use std::{
+        io::Write,
+        os::unix::{fs::symlink, net::UnixListener},
+        thread,
+    };
 
     use crate::state::{OrchestrationGroup, State};
 
@@ -336,6 +334,35 @@ mod tests {
                 workers: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn preference_io_follows_relative_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("stowed-agent-view.json");
+        let link = temp.path().join("agent-view.json");
+        let expected = AgentViewPreference {
+            schema_version: PREFERENCE_SCHEMA_VERSION,
+            group_id: Some("build-group".parse().unwrap()),
+            filter: AgentViewFilter::Remote,
+        };
+        save_preference(&target, &expected).unwrap();
+        symlink("stowed-agent-view.json", &link).unwrap();
+
+        assert_eq!(
+            with_advisory_lock(&link, load_preference).unwrap(),
+            expected
+        );
+        with_advisory_lock(&link, |path| {
+            save_preference(path, &AgentViewPreference::default())
+        })
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            load_preference(&target).unwrap(),
+            AgentViewPreference::default()
+        );
     }
 
     #[test]

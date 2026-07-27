@@ -206,6 +206,56 @@ fn setup_preflight_success_creates_stores_without_requiring_cargo() {
     assert!(sandbox.state_file().exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_follows_stowed_config_and_state_files() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let (bin, herdr) = install_setup_runtime_scripts(&sandbox, None);
+    let run_setup = || {
+        sandbox
+            .command()
+            .env("PATH", &bin)
+            .env("HERDR_BIN_PATH", &herdr)
+            .args(["setup", "--yes"])
+            .assert()
+            .success();
+    };
+    run_setup();
+
+    let stow = sandbox.path("stow");
+    fs::create_dir(&stow).unwrap();
+    let stow_mode = fs::metadata(&stow).unwrap().permissions().mode() & 0o777;
+    let config_target = stow.join("config.toml");
+    let state_target = stow.join("state.json");
+    fs::rename(sandbox.config_file(), &config_target).unwrap();
+    fs::rename(sandbox.state_file(), &state_target).unwrap();
+    symlink(Path::new("../../stow/config.toml"), sandbox.config_file()).unwrap();
+    symlink(Path::new("../../stow/state.json"), sandbox.state_file()).unwrap();
+
+    run_setup();
+
+    assert!(
+        fs::symlink_metadata(sandbox.config_file())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(sandbox.state_file())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(config_target.is_file());
+    assert!(state_target.is_file());
+    assert_eq!(
+        fs::metadata(&stow).unwrap().permissions().mode() & 0o777,
+        stow_mode
+    );
+}
+
 #[test]
 fn keybinding_preflight_failure_preserves_exact_herdr_config() {
     let sandbox = Sandbox::new();

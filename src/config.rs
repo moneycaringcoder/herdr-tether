@@ -1,19 +1,19 @@
 use std::{
     collections::HashSet,
-    env, fs,
+    env,
+    fs::{self, OpenOptions},
     io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     model::{HerdrAgentKind, Placement},
-    storage::{
-        atomic_write, atomic_write_preserving_parent, with_advisory_lock,
-        with_advisory_lock_preserving_parent,
-    },
+    storage::{atomic_write_resolved, with_advisory_lock, with_advisory_lock_preserving_parent},
 };
 
 const MAX_SERIALIZABLE_INTEGER: u64 = i64::MAX as u64;
@@ -69,22 +69,25 @@ impl HerdrKeybindingStore {
     }
 
     pub fn install(&self) -> Result<HerdrKeybindingInstall> {
-        with_advisory_lock_preserving_parent(&self.path, || self.install_unlocked())
+        with_advisory_lock_preserving_parent(&self.path, |path| {
+            Self::new(path.to_owned()).install_unlocked()
+        })
     }
 
     pub fn rollback(&self) -> Result<HerdrKeybindingRollback> {
-        with_advisory_lock_preserving_parent(&self.path, || {
-            let backup = Self::backup_path_for(&self.path);
-            let bytes = fs::read(&backup).with_context(|| {
+        with_advisory_lock_preserving_parent(&self.path, |path| {
+            let store = Self::new(path.to_owned());
+            let backup = Self::backup_path_for(&store.path);
+            let (bytes, permissions) = read_regular_bytes(&backup).with_context(|| {
                 format!(
                     "read Tether keybinding backup `{}`; no rollback was performed",
                     backup.display()
                 )
             })?;
-            let current = fs::read(&self.path).with_context(|| {
+            let (current, _) = read_regular_bytes(&store.path).with_context(|| {
                 format!(
                     "read current Herdr config `{}`; no rollback was performed",
-                    self.path.display()
+                    store.path.display()
                 )
             })?;
             let installed = append_keybinding(&bytes);
@@ -93,13 +96,11 @@ impl HerdrKeybindingStore {
                     "Herdr config changed after Tether installed the keybinding; rollback refused without overwriting those edits"
                 );
             }
-            let permissions = fs::metadata(&backup)
-                .with_context(|| format!("read backup metadata `{}`", backup.display()))?
-                .permissions();
-            atomic_write_preserving_parent(&self.path, &bytes)
+            atomic_write_resolved(&store.path, &bytes)
                 .with_context(|| format!("restore Herdr config from `{}`", backup.display()))?;
-            fs::set_permissions(&self.path, permissions)
-                .with_context(|| format!("restore permissions on `{}`", self.path.display()))?;
+            open_regular_file(&store.path)?
+                .set_permissions(permissions)
+                .with_context(|| format!("restore permissions on `{}`", store.path.display()))?;
             fs::remove_file(&backup)
                 .with_context(|| format!("consume restored backup `{}`", backup.display()))?;
             Ok(HerdrKeybindingRollback::Restored)
@@ -107,13 +108,8 @@ impl HerdrKeybindingStore {
     }
 
     fn install_unlocked(&self) -> Result<HerdrKeybindingInstall> {
-        let (source, permissions) = match fs::read(&self.path) {
-            Ok(source) => {
-                let permissions = fs::metadata(&self.path)
-                    .with_context(|| format!("read metadata for `{}`", self.path.display()))?
-                    .permissions();
-                (source, Some(permissions))
-            }
+        let (source, permissions) = match read_regular_bytes(&self.path) {
+            Ok((source, permissions)) => (source, Some(permissions)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
             Err(error) => {
                 return Err(error)
@@ -164,7 +160,7 @@ impl HerdrKeybindingStore {
 
         let backup = Self::backup_path_for(&self.path);
         if backup.exists() {
-            let backup_bytes = fs::read(&backup).with_context(|| {
+            let (backup_bytes, _) = read_regular_bytes(&backup).with_context(|| {
                 format!("read existing keybinding backup `{}`", backup.display())
             })?;
             if backup_bytes == source {
@@ -188,21 +184,23 @@ impl HerdrKeybindingStore {
                 self.path.display()
             )
         })?;
-        atomic_write_preserving_parent(&backup, &source)
+        atomic_write_resolved(&backup, &source)
             .with_context(|| format!("create keybinding backup `{}`", backup.display()))?;
         if let Some(permissions) = permissions.as_ref() {
-            fs::set_permissions(&backup, permissions.clone())
+            open_regular_file(&backup)?
+                .set_permissions(permissions.clone())
                 .with_context(|| format!("preserve permissions on `{}`", backup.display()))?;
         }
 
-        atomic_write_preserving_parent(&self.path, &updated).with_context(|| {
+        atomic_write_resolved(&self.path, &updated).with_context(|| {
             format!(
                 "install Tether keybinding; original remains at `{}`",
                 backup.display()
             )
         })?;
         if let Some(permissions) = permissions {
-            fs::set_permissions(&self.path, permissions)
+            open_regular_file(&self.path)?
+                .set_permissions(permissions)
                 .with_context(|| format!("preserve permissions on `{}`", self.path.display()))?;
         }
         Ok(HerdrKeybindingInstall::Installed { backup })
@@ -490,25 +488,32 @@ impl ConfigStore {
     pub const MAX_INPUT_BYTES: usize = Self::MAX_PERSISTED_BYTES;
 
     pub fn update<T>(&self, operation: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
-        with_advisory_lock(&self.path, || {
-            let mut config = self.load_unlocked()?;
+        with_advisory_lock(&self.path, |path| {
+            let store = Self::new(path.to_owned());
+            let mut config = store.load_unlocked()?;
             let result = operation(&mut config)?;
-            self.save_unlocked(&config)?;
+            store.save_unlocked(&config)?;
             Ok(result)
         })
     }
 
     pub fn load(&self) -> Result<Config> {
-        with_advisory_lock(&self.path, || self.load_unlocked())
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).load_unlocked()
+        })
     }
 
     /// Loads and validates config while migrating legacy schemas only in memory.
     pub fn load_read_only(&self) -> Result<Config> {
-        with_advisory_lock(&self.path, || self.load_unlocked_with_migration(false))
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).load_unlocked_with_migration(false)
+        })
     }
 
     pub fn save(&self, config: &Config) -> Result<()> {
-        with_advisory_lock(&self.path, || self.save_unlocked(config))
+        with_advisory_lock(&self.path, |path| {
+            Self::new(path.to_owned()).save_unlocked(config)
+        })
     }
 
     fn load_unlocked(&self) -> Result<Config> {
@@ -581,7 +586,7 @@ impl ConfigStore {
         config.validate()?;
         let serialized = toml::to_string_pretty(config).context("serialize config as TOML")?;
         require_serialized_config_size(&serialized)?;
-        atomic_write(&self.path, serialized.as_bytes())
+        atomic_write_resolved(&self.path, serialized.as_bytes())
             .with_context(|| format!("save config `{}`", self.path.display()))
     }
 }
@@ -597,7 +602,7 @@ fn require_serialized_config_size(serialized: &str) -> Result<()> {
 }
 
 fn read_config_file(path: &Path, max_bytes: usize) -> io::Result<String> {
-    let file = fs::File::open(path)?;
+    let file = open_regular_file(path)?;
     let size = file.metadata()?.len();
     if size > max_bytes as u64 {
         return Err(io::Error::new(
@@ -615,6 +620,29 @@ fn read_config_file(path: &Path, max_bytes: usize) -> io::Result<String> {
         ));
     }
     Ok(source)
+}
+
+fn read_regular_bytes(path: &Path) -> io::Result<(Vec<u8>, fs::Permissions)> {
+    let mut file = open_regular_file(path)?;
+    let permissions = file.metadata()?.permissions();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, permissions))
+}
+
+fn open_regular_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn require_max_bytes(value: &str, max_bytes: usize, field: &str) -> Result<()> {

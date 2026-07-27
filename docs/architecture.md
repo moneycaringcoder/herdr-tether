@@ -293,10 +293,19 @@ temporary files use private Unix permissions. Mutations hold a per-file
 advisory lock across load, validation, migration or preference checks,
 mutation, and save.
 
+Before locking, storage resolves one existing regular-file identity, including
+supported file or parent-directory links. The resolved path names both the lock
+and every transaction read, backup, permission, and write operation. Existing
+non-regular or dangling targets fail before a blocking reader opens them.
+Tether secures its original non-linked private parent, while preserving an
+existing linked target parent's permissions.
+
 The atomic writer:
 
-1. rejects symlink and non-regular destinations;
-2. writes and synchronizes a unique sibling temporary file;
+1. follows supported links to the resolved regular destination and rejects
+   dangling or non-regular targets;
+2. writes and synchronizes a unique sibling temporary file beside that resolved
+   destination;
 3. preserves an existing regular destination's permission bits, or uses mode
    `0600` for a new private file;
 4. atomically renames it over the destination; and
