@@ -16,7 +16,7 @@ Outside plugin context, defaults are:
 
 Run `herdr-tether setup --yes` to create missing stores, or `herdr-tether doctor` to report which context and dependencies are active.
 
-Tether creates data directories with Unix mode `0700` and files with mode `0600`. Writes use advisory locks, a synchronized same-directory temporary file, atomic replacement, and parent-directory synchronization. Do not edit configuration or state while Tether is running a mutating command.
+Tether creates data directories with Unix mode `0700` and files with mode `0600`, including directories it creates under a symlinked or GNU Stow ancestor. A directory that already exists keeps its own permissions when it is reached through a link, so Tether never re-modes a dotfiles layout you manage. Writes use advisory locks, a synchronized same-directory temporary file, atomic replacement, and parent-directory synchronization. Do not edit configuration or state while Tether is running a mutating command.
 
 ## Hosts
 

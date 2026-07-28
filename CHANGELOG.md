@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored private `0700` permissions on storage directories Tether creates
+  under a symlinked or GNU Stow ancestor; v0.5.1 left those directories at the
+  process umask. Directories that already exist behind a link continue to keep
+  their own permissions.
+- Added path context to Herdr keybinding permission-preservation failures, so a
+  non-regular config or backup target reports which file was rejected.
+
 ## [0.5.1] - 2026-07-28
 
 ### Fixed

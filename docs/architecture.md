@@ -297,8 +297,12 @@ Before locking, storage resolves one existing regular-file identity, including
 supported file or parent-directory links. The resolved path names both the lock
 and every transaction read, backup, permission, and write operation. Existing
 non-regular or dangling targets fail before a blocking reader opens them.
-Tether secures its original non-linked private parent, while preserving an
-existing linked target parent's permissions.
+Tether secures its original non-linked private parent, and privatizes any
+parent directory it creates itself, linked ancestors included. Only an already
+existing linked target parent keeps its own permissions. Resolution necessarily
+precedes the lock; because storage lives in the caller's own private tree, a
+link replaced in that window is an ordering concern rather than a trust
+boundary.
 Persistent `.filename.lock` files and Herdr keybinding backups are siblings of
 that resolved target. A Stow-managed repository can ignore those generated
 sidecars without changing Tether's storage identity.
