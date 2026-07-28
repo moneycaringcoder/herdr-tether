@@ -14,25 +14,27 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub(crate) fn with_advisory_lock<T>(
     path: &Path,
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
     with_advisory_lock_mode(path, operation, true)
 }
 
 pub(crate) fn with_advisory_lock_preserving_parent<T>(
     path: &Path,
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
     with_advisory_lock_mode(path, operation, false)
 }
 
 fn with_advisory_lock_mode<T>(
     path: &Path,
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&Path) -> Result<T>,
     private_parent: bool,
 ) -> Result<T> {
+    let path = prepare_storage_path(path, private_parent)
+        .with_context(|| format!("prepare storage path `{}`", path.display()))?;
+    let path = path.as_path();
     let parent = usable_parent(path);
-    ensure_directory(parent, private_parent)?;
     #[cfg(unix)]
     let parent_lock = {
         let directory = File::open(parent)
@@ -83,7 +85,7 @@ fn with_advisory_lock_mode<T>(
     lock.lock_exclusive()
         .with_context(|| format!("lock storage `{}`", path.display()))?;
 
-    let result = operation();
+    let result = operation(path);
     let unlock =
         FileExt::unlock(&lock).with_context(|| format!("unlock storage `{}`", path.display()));
     #[cfg(unix)]
@@ -113,16 +115,24 @@ impl AtomicWriteError {
     }
 }
 
-pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
-    atomic_write_mode(path, contents, true)
-}
-
+#[cfg(test)]
 pub(crate) fn atomic_write_preserving_parent(
     path: &Path,
     contents: &[u8],
 ) -> Result<(), AtomicWriteError> {
     atomic_write_mode(path, contents, false)
 }
+
+pub(crate) fn atomic_write_resolved(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
+    atomic_write_prepared_mode_with(
+        path,
+        contents,
+        || Ok(()),
+        |parent| File::open(parent).and_then(|directory| directory.sync_all()),
+    )
+}
+
+#[cfg(test)]
 fn atomic_write_mode(
     path: &Path,
     contents: &[u8],
@@ -137,6 +147,7 @@ fn atomic_write_mode(
     )
 }
 
+#[cfg(test)]
 fn atomic_write_mode_with(
     path: &Path,
     contents: &[u8],
@@ -144,11 +155,18 @@ fn atomic_write_mode_with(
     before_rename: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), AtomicWriteError> {
-    let precommit = || -> Result<()> {
-        ensure_directory(usable_parent(path), private_parent)?;
-        Ok(())
-    };
-    precommit().map_err(AtomicWriteError::PreCommit)?;
+    let path = prepare_storage_path(path, private_parent)
+        .with_context(|| format!("prepare atomic write destination `{}`", path.display()))
+        .map_err(AtomicWriteError::PreCommit)?;
+    atomic_write_prepared_mode_with(&path, contents, before_rename, sync_parent)
+}
+
+fn atomic_write_prepared_mode_with(
+    path: &Path,
+    contents: &[u8],
+    before_rename: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), AtomicWriteError> {
     #[cfg(unix)]
     let existing_mode = destination_mode(path)
         .with_context(|| format!("inspect atomic write destination `{}`", path.display()))
@@ -247,6 +265,75 @@ fn validate_destination(path: &Path) -> io::Result<()> {
             "destination is not a regular file",
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_storage_path(path: &Path, private_parent: bool) -> Result<PathBuf> {
+    let parent = usable_parent(path);
+    if contains_linked_component(parent)? {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create storage directory `{}`", parent.display()))?;
+    } else {
+        ensure_directory(parent, private_parent)?;
+    }
+    resolve_storage_path(path).map_err(Into::into)
+}
+
+fn contains_linked_component(path: &Path) -> io::Result<bool> {
+    let mut current = if path.is_relative() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::new()
+    };
+    #[cfg(unix)]
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(unix)]
+    let mut user_tree = path.is_relative()
+        && fs::symlink_metadata(".").is_ok_and(|metadata| metadata.uid() == owner);
+
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    if metadata.file_type().is_symlink() && (user_tree || metadata.uid() == owner) {
+                        return Ok(true);
+                    }
+                    user_tree |= metadata.uid() == owner;
+                }
+                #[cfg(not(unix))]
+                if metadata.file_type().is_symlink() {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_storage_path(path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let resolved = fs::canonicalize(path)?;
+            if fs::metadata(&resolved)?.is_file() {
+                Ok(resolved)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage path is not a regular file",
+                ))
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let file_name = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "storage path has no file name")
+            })?;
+            Ok(fs::canonicalize(usable_parent(path))?.join(file_name))
+        }
         Err(error) => Err(error),
     }
 }
@@ -350,7 +437,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_write_rejects_symlink_and_non_regular_destinations() {
+    fn atomic_write_follows_symlink_and_rejects_non_regular_destinations() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -360,22 +447,50 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
         symlink(&target, &link).unwrap();
 
-        let error = atomic_write_preserving_parent(&link, b"new").unwrap_err();
-        assert!(!error.committed());
+        atomic_write_preserving_parent(&link, b"new").unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read(&target).unwrap(), b"target");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
         assert_eq!(mode(&target), 0o640);
+
+        let missing = temp.path().join("missing.json");
+        let dangling = temp.path().join("dangling.json");
+        symlink(&missing, &dangling).unwrap();
+        let error = atomic_write_preserving_parent(&dangling, b"new").unwrap_err();
+        assert!(!error.committed());
+        assert!(fs::symlink_metadata(&dangling).unwrap().is_symlink());
+        assert!(!missing.exists());
 
         let directory = temp.path().join("directory");
         fs::create_dir(&directory).unwrap();
         let error = atomic_write_preserving_parent(&directory, b"new").unwrap_err();
         assert!(!error.committed());
         assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advisory_lock_rejects_non_regular_symlink_targets() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::symlink},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("config.fifo");
+        let link = temp.path().join("config.toml");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, &link).unwrap();
+
+        let error = with_advisory_lock(&link, |_| Ok(())).unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("regular file"), "unexpected error: {error}");
     }
 
     #[cfg(unix)]

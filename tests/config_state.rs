@@ -23,7 +23,10 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use std::{
     ffi::CString,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    },
 };
 
 fn sample_config() -> Config {
@@ -1340,21 +1343,169 @@ fn concurrent_state_updates_preserve_both_records() {
 
 #[cfg(unix)]
 #[test]
-fn state_rejects_symlink_and_fifo_storage_paths() {
+fn retargeted_config_symlink_updates_the_locked_target() {
+    let temp = tempdir().unwrap();
+    let target_a = temp.path().join("config-a.toml");
+    let target_b = temp.path().join("config-b.toml");
+    let link = temp.path().join("config.toml");
+    fs::write(
+        &target_a,
+        toml::to_string_pretty(&Config::default()).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &target_b,
+        toml::to_string_pretty(&Config::default()).unwrap(),
+    )
+    .unwrap();
+    symlink(&target_a, &link).unwrap();
+
+    ConfigStore::new(link.clone())
+        .update(|config| {
+            fs::remove_file(&link)?;
+            symlink(&target_b, &link)?;
+            config.ui.placement = Placement::SplitDown;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        ConfigStore::new(target_a).load().unwrap().ui.placement,
+        Placement::SplitDown
+    );
+    assert_eq!(
+        ConfigStore::new(target_b).load().unwrap().ui.placement,
+        Placement::SplitRight
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_locked_target_is_rejected_without_following_the_new_link() {
+    let temp = tempdir().unwrap();
+    let target = temp.path().join("config-target.toml");
+    let victim = temp.path().join("config-victim.toml");
+    let link = temp.path().join("config.toml");
+    let original = toml::to_string_pretty(&Config::default()).unwrap();
+    fs::write(&target, &original).unwrap();
+    fs::write(&victim, &original).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = ConfigStore::new(link)
+        .update(|config| {
+            fs::remove_file(&target)?;
+            symlink(&victim, &target)?;
+            config.ui.placement = Placement::SplitDown;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("regular file"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(fs::read_to_string(victim).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn final_config_symlink_secures_original_parent_and_preserves_target_parent() {
+    let temp = tempdir().unwrap();
+    let config_dir = temp.path().join("config");
+    let target_dir = temp.path().join("stow");
+    fs::create_dir(&config_dir).unwrap();
+    fs::create_dir(&target_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let target = target_dir.join("config.toml");
+    let link = config_dir.join("config.toml");
+    fs::write(&target, toml::to_string_pretty(&Config::default()).unwrap()).unwrap();
+    symlink(&target, &link).unwrap();
+
+    ConfigStore::new(link).load().unwrap();
+
+    assert_eq!(
+        fs::metadata(config_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(target_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_under_symlinked_parent_preserves_target_directory_mode() {
+    let temp = tempdir().unwrap();
+    let target_dir = temp.path().join("stow");
+    let config_dir = temp.path().join("config");
+    fs::create_dir(&target_dir).unwrap();
+    fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        target_dir.join("config.toml"),
+        toml::to_string_pretty(&Config::default()).unwrap(),
+    )
+    .unwrap();
+    symlink(&target_dir, &config_dir).unwrap();
+
+    ConfigStore::new(config_dir.join("config.toml"))
+        .load()
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(target_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_under_nested_symlinked_ancestor_preserves_target_directory_mode() {
+    let temp = tempdir().unwrap();
+    let target_root = temp.path().join("stow");
+    let target_dir = target_root.join("tether");
+    let linked_root = temp.path().join("linked-stow");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        target_dir.join("config.toml"),
+        toml::to_string_pretty(&Config::default()).unwrap(),
+    )
+    .unwrap();
+    symlink(&target_root, &linked_root).unwrap();
+
+    ConfigStore::new(linked_root.join("tether/config.toml"))
+        .load()
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(target_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn state_follows_symlink_and_rejects_fifo_storage_paths() {
     let temp = tempdir().unwrap();
     let target = temp.path().join("target.json");
     fs::write(&target, r#"{"version":2,"sessions":[]}"#).unwrap();
     let symlink_path = temp.path().join("symlink-state.json");
     std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
 
-    let symlink_error = format!("{:#}", StateStore::new(symlink_path).load().unwrap_err());
+    let state = StateStore::new(symlink_path.clone()).load().unwrap();
+    assert!(state.sessions.is_empty());
     assert!(
-        symlink_error.contains("symbolic link") || symlink_error.contains("regular file"),
-        "unexpected symlink error: {symlink_error}"
+        fs::symlink_metadata(symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
-    assert_eq!(
-        fs::read_to_string(&target).unwrap(),
-        r#"{"version":2,"sessions":[]}"#
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains(r#""version": 4"#)
     );
 
     let fifo_path = temp.path().join("fifo-state.json");
@@ -1365,6 +1516,134 @@ fn state_rejects_symlink_and_fifo_storage_paths() {
         fifo_error.contains("regular file"),
         "unexpected FIFO error: {fifo_error}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_and_herdr_links_reject_fifo_targets() {
+    let temp = tempdir().unwrap();
+    let fifo = temp.path().join("config.fifo");
+    let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let tether_link = temp.path().join("tether.toml");
+    let herdr_link = temp.path().join("herdr.toml");
+    symlink(&fifo, &tether_link).unwrap();
+    symlink(&fifo, &herdr_link).unwrap();
+
+    for error in [
+        ConfigStore::new(tether_link).load().unwrap_err(),
+        HerdrKeybindingStore::new(herdr_link).install().unwrap_err(),
+    ] {
+        let error = format!("{error:#}");
+        assert!(error.contains("regular file"), "unexpected error: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn config_reader_revalidates_a_fifo_replacement_after_resolution() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, toml::to_string_pretty(&Config::default()).unwrap()).unwrap();
+    let lock_path = temp.path().join(".config.toml.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let load_path = path.clone();
+    let loader = thread::spawn(move || {
+        done_tx.send(ConfigStore::new(load_path).load()).unwrap();
+    });
+
+    for _ in 0..100 {
+        let parent = fs::File::open(temp.path()).unwrap();
+        match parent.try_lock_exclusive() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Ok(()) => FileExt::unlock(&parent).unwrap(),
+            Err(error) => panic!("unexpected parent-lock error: {error}"),
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    let parent = fs::File::open(temp.path()).unwrap();
+    assert_eq!(
+        parent.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    fs::remove_file(&path).unwrap();
+    let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    FileExt::unlock(&lock).unwrap();
+
+    let error = done_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("config reader blocked on the replacement FIFO")
+        .unwrap_err();
+    loader.join().unwrap();
+    assert!(
+        format!("{error:#}").contains("regular file"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn state_reader_rejects_a_symlink_replacement_after_resolution() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let victim = temp.path().join("victim.json");
+    StateStore::new(path.clone())
+        .save(&State::default())
+        .unwrap();
+    StateStore::new(victim.clone())
+        .save(&State::default())
+        .unwrap();
+    let original_victim = fs::read(&victim).unwrap();
+    let lock_path = temp.path().join(".state.json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let load_path = path.clone();
+    let loader = thread::spawn(move || {
+        done_tx.send(StateStore::new(load_path).load()).unwrap();
+    });
+
+    for _ in 0..100 {
+        let parent = fs::File::open(temp.path()).unwrap();
+        match parent.try_lock_exclusive() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Ok(()) => FileExt::unlock(&parent).unwrap(),
+            Err(error) => panic!("unexpected parent-lock error: {error}"),
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+    let parent = fs::File::open(temp.path()).unwrap();
+    assert_eq!(
+        parent.try_lock_exclusive().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    fs::remove_file(&path).unwrap();
+    symlink(&victim, &path).unwrap();
+    FileExt::unlock(&lock).unwrap();
+
+    done_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("state reader blocked after the replacement")
+        .unwrap_err();
+    loader.join().unwrap();
+    assert_eq!(fs::read(victim).unwrap(), original_victim);
 }
 
 #[cfg(unix)]
@@ -1527,6 +1806,46 @@ fn herdr_keybinding_rollback_restores_backup_exactly() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn herdr_keybinding_install_and_rollback_follow_stowed_config() {
+    let temp = tempdir().unwrap();
+    let config_dir = temp.path().join("herdr");
+    let stow_dir = temp.path().join("stow");
+    fs::create_dir(&config_dir).unwrap();
+    fs::create_dir(&stow_dir).unwrap();
+    let stow_mode = fs::metadata(&stow_dir).unwrap().permissions().mode() & 0o777;
+    let target = stow_dir.join("config.toml");
+    let link = config_dir.join("config.toml");
+    let original = b"# stowed\nonboarding = false\n";
+    fs::write(&target, original).unwrap();
+    symlink("../stow/config.toml", &link).unwrap();
+    let store = HerdrKeybindingStore::new(link.clone());
+
+    let installed = store.install().unwrap();
+    let backup = match installed {
+        HerdrKeybindingInstall::Installed { backup } => backup,
+        other => panic!("unexpected install result: {other:?}"),
+    };
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert!(
+        fs::read(&target)
+            .unwrap()
+            .ends_with(TETHER_BINDING.as_bytes())
+    );
+    assert!(backup.is_file());
+
+    store.rollback().unwrap();
+
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert!(!backup.exists());
+    assert_eq!(
+        fs::metadata(&stow_dir).unwrap().permissions().mode() & 0o777,
+        stow_mode
+    );
+}
+
 #[test]
 fn herdr_keybinding_rejects_invalid_toml_without_creating_backup() {
     let temp = tempdir().unwrap();
@@ -1563,6 +1882,31 @@ fn herdr_keybinding_backup_collision_leaves_both_files_unchanged() {
     assert!(error.contains("config was not changed"));
     assert_eq!(fs::read(&path).unwrap(), original);
     assert_eq!(fs::read(&backup).unwrap(), prior_backup);
+}
+
+#[cfg(unix)]
+#[test]
+fn herdr_keybinding_rejects_backup_symlink_without_touching_target() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let original = b"onboarding = false\n";
+    fs::write(&path, original).unwrap();
+    let backup = HerdrKeybindingStore::backup_path_for(&path);
+    let victim = temp.path().join("victim.toml");
+    fs::write(&victim, original).unwrap();
+    symlink(&victim, &backup).unwrap();
+
+    let error = HerdrKeybindingStore::new(path.clone())
+        .install()
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("backup"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(fs::read(victim).unwrap(), original);
+    assert!(fs::symlink_metadata(backup).unwrap().is_symlink());
 }
 
 #[test]
