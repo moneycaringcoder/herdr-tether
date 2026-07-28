@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-28
+
+### Fixed
+
+- Added consistent GNU Stow and symlink support for Tether configuration, state,
+  Agent view preferences, and Herdr keybinding backup/rollback while preserving
+  atomic writes and rejecting dangling or non-regular targets. Thanks to
+  [@lkshrk](https://github.com/lkshrk) for the first community contribution in
+  [#34](https://github.com/moneycaringcoder/herdr-tether/pull/34).
+
 ## [0.5.0] - 2026-07-24
 
 ### Added

@@ -18,10 +18,10 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 Choose one source:
 
-**Stable v0.5.0.** Install the release tag:
+**Stable v0.5.1.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.5.0
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.5.1
 ```
 
 **Development (`main`).** Use this to follow the public development line, not
@@ -63,6 +63,12 @@ The action initializes Tether's private configuration and state, adds `prefix+t`
 - refuses invalid or unmergeable configuration; and
 - saves the exact prior configuration to a sibling backup before changing it.
 
+Existing regular-file symlinks and linked parent directories, including GNU
+Stow layouts, are supported. Locks and the keybinding backup live beside the
+resolved target, so a dotfiles repository may show generated files such as
+`.config.toml.lock` or `config.toml.tether-keybinding.bak`; they may be ignored
+by version control. Dangling links and non-regular targets are rejected.
+
 The backup is consumed when rollback succeeds. Rollback also refuses to
 overwrite configuration changed after setup. While the plugin is still
 installed, invoke its rollback action and check the reported action log for
@@ -100,7 +106,7 @@ The stable release is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.5.0 --locked herdr-tether
+  --tag v0.5.1 --locked herdr-tether
 ```
 
 For development `main`:
