@@ -299,6 +299,9 @@ and every transaction read, backup, permission, and write operation. Existing
 non-regular or dangling targets fail before a blocking reader opens them.
 Tether secures its original non-linked private parent, while preserving an
 existing linked target parent's permissions.
+Persistent `.filename.lock` files and Herdr keybinding backups are siblings of
+that resolved target. A Stow-managed repository can ignore those generated
+sidecars without changing Tether's storage identity.
 
 The atomic writer:
 

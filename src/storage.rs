@@ -495,6 +495,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn advisory_lock_uses_resolved_symlink_target_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let logical_parent = temp.path().join("config");
+        let target_parent = temp.path().join("stow");
+        fs::create_dir_all(&logical_parent).unwrap();
+        fs::create_dir_all(&target_parent).unwrap();
+        let target = target_parent.join("config.toml");
+        let link = logical_parent.join("config.toml");
+        fs::write(&target, b"version = 1\n").unwrap();
+        symlink("../stow/config.toml", &link).unwrap();
+        let resolved = fs::canonicalize(&target).unwrap();
+
+        with_advisory_lock(&link, |locked_path| {
+            assert_eq!(locked_path, resolved);
+            assert!(target_parent.join(".config.toml.lock").is_file());
+            assert!(!logical_parent.join(".config.toml.lock").exists());
+            Ok(())
+        })
+        .unwrap();
+
+        with_advisory_lock(&target, |locked_path| {
+            assert_eq!(locked_path, resolved);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn precommit_failure_preserves_original_mode_and_content() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.json");
