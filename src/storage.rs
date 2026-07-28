@@ -31,6 +31,10 @@ fn with_advisory_lock_mode<T>(
     operation: impl FnOnce(&Path) -> Result<T>,
     private_parent: bool,
 ) -> Result<T> {
+    // Resolution necessarily precedes the lock, so a link replaced in between
+    // is locked under its previous identity. Storage paths live in the caller's
+    // own private tree, where that window is a same-user ordering concern
+    // rather than a trust boundary.
     let path = prepare_storage_path(path, private_parent)
         .with_context(|| format!("prepare storage path `{}`", path.display()))?;
     let path = path.as_path();
@@ -271,12 +275,11 @@ fn validate_destination(path: &Path) -> io::Result<()> {
 
 fn prepare_storage_path(path: &Path, private_parent: bool) -> Result<PathBuf> {
     let parent = usable_parent(path);
-    if contains_linked_component(parent)? {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create storage directory `{}`", parent.display()))?;
-    } else {
-        ensure_directory(parent, private_parent)?;
-    }
+    // A linked parent belongs to the user's own layout, so its existing
+    // permissions are preserved. A directory Tether creates itself is still
+    // privatized, linked ancestors included.
+    let enforce_private = private_parent && !contains_linked_component(parent)?;
+    ensure_directory(parent, enforce_private)?;
     resolve_storage_path(path).map_err(Into::into)
 }
 
@@ -522,6 +525,31 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_ancestors_keep_created_directories_private_without_reclaiming_existing_ones() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stow = temp.path().join("dotfiles");
+        fs::create_dir_all(&stow).unwrap();
+        let link = temp.path().join("config");
+        symlink(&stow, &link).unwrap();
+
+        // Tether creates this directory itself, so it stays private even though
+        // an ancestor is a link.
+        let created = stow.join("herdr-tether");
+        with_advisory_lock(&link.join("herdr-tether/state.json"), |_| Ok(())).unwrap();
+        assert_eq!(mode(&created), 0o700);
+
+        // A directory the user already manages keeps its own permissions.
+        let adopted = stow.join("adopted");
+        fs::create_dir_all(&adopted).unwrap();
+        fs::set_permissions(&adopted, fs::Permissions::from_mode(0o755)).unwrap();
+        with_advisory_lock(&link.join("adopted/state.json"), |_| Ok(())).unwrap();
+        assert_eq!(mode(&adopted), 0o755);
     }
 
     #[cfg(unix)]

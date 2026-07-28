@@ -62,6 +62,12 @@ impl HerdrKeybindingStore {
         Ok(home.join(".config/herdr/config.toml"))
     }
 
+    /// Names the keybinding backup beside `path`.
+    ///
+    /// Callers pass the link-resolved config path, so the backup is a sibling
+    /// of the real config file. The backup itself is Tether-owned and is never
+    /// link-resolved: an existing non-regular backup is rejected rather than
+    /// followed.
     pub fn backup_path_for(path: &Path) -> PathBuf {
         let mut name = path.file_name().unwrap_or_default().to_os_string();
         name.push(".tether-keybinding.bak");
@@ -98,7 +104,13 @@ impl HerdrKeybindingStore {
             }
             atomic_write_resolved(&store.path, &bytes)
                 .with_context(|| format!("restore Herdr config from `{}`", backup.display()))?;
-            open_regular_file(&store.path)?
+            open_regular_file(&store.path)
+                .with_context(|| {
+                    format!(
+                        "open Herdr config `{}` to restore permissions",
+                        store.path.display()
+                    )
+                })?
                 .set_permissions(permissions)
                 .with_context(|| format!("restore permissions on `{}`", store.path.display()))?;
             fs::remove_file(&backup)
@@ -187,7 +199,13 @@ impl HerdrKeybindingStore {
         atomic_write_resolved(&backup, &source)
             .with_context(|| format!("create keybinding backup `{}`", backup.display()))?;
         if let Some(permissions) = permissions.as_ref() {
-            open_regular_file(&backup)?
+            open_regular_file(&backup)
+                .with_context(|| {
+                    format!(
+                        "open keybinding backup `{}` to preserve permissions",
+                        backup.display()
+                    )
+                })?
                 .set_permissions(permissions.clone())
                 .with_context(|| format!("preserve permissions on `{}`", backup.display()))?;
         }
@@ -199,7 +217,13 @@ impl HerdrKeybindingStore {
             )
         })?;
         if let Some(permissions) = permissions {
-            open_regular_file(&self.path)?
+            open_regular_file(&self.path)
+                .with_context(|| {
+                    format!(
+                        "open Herdr config `{}` to preserve permissions",
+                        self.path.display()
+                    )
+                })?
                 .set_permissions(permissions)
                 .with_context(|| format!("preserve permissions on `{}`", self.path.display()))?;
         }
