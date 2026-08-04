@@ -73,6 +73,22 @@ fn manifest_declares_build_startup_actions_and_managed_popup_panes() {
         ]
     );
 
+    let events = value["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    // `pane.exited` fires when a pane's process ends on its own, which is the
+    // signal that a workload's command may have finished. `pane.closed` is a
+    // different event and would fire when a user merely closes a view, which
+    // must leave the workload running.
+    assert_eq!(events[0]["on"].as_str(), Some("pane.exited"));
+    assert_eq!(
+        events[0]["command"].as_array().unwrap(),
+        &[
+            toml::Value::String("target/release/herdr-tether".into()),
+            toml::Value::String("plugin".into()),
+            toml::Value::String("on-event".into()),
+        ]
+    );
+
     let actions = value["actions"].as_array().unwrap();
     assert_eq!(actions.len(), 3);
     assert!(

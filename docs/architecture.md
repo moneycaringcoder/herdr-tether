@@ -115,6 +115,26 @@ the selected group first clears the view; a rejected group deletion attempts
 to restore it. A startup hook restores a valid preference after Herdr startup
 or live handoff and drops a preference whose group no longer exists.
 
+## Pane-exit event hook
+
+Tether declares one manifest event hook on `pane.exited`. Herdr runs
+`herdr-tether plugin on-event` whenever a pane's process ends on its own, which
+lets an ended workload reach its terminal state without any Tether surface open.
+
+The hook concludes nothing from the event. A Herdr pane exiting does not mean
+the workload ended—leaving work running is Tether's purpose, and closing a view
+exits the pane while the durable `tmux` session continues. The hook instead
+re-observes exact-owned workloads and lets the ordinary lifecycle transition
+decide, which is the same path the picker runs.
+
+The hook is deliberately narrow. It reconciles only `local`, `Running`,
+exact-owned records, at most 32 per invocation, because Herdr can emit
+`pane.exited` rapidly while a workspace closes and a burst must never fan out
+into SSH or unbounded process work. Remote records still reconcile when the
+picker opens. The hook has no Stop, kill, or transport authority, so it can
+never end a workload that is still running; it can only record one that already
+ended.
+
 ## Observer and Mission Control projection
 
 `orchestration observe` creates exactly one outer Herdr pane. Every exactly

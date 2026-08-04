@@ -1725,6 +1725,69 @@ class Smoke:
         self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
 
+    def event_hook_contract(self, workspace_id: str, invoking_pane: str) -> None:
+        """A workload whose command exits reconciles with no Tether UI running.
+
+        Before the manifest event hook, an ended workload stayed `running` in
+        Tether's state until something opened the picker. Herdr now invokes
+        `plugin on-event` on `pane.exited`, so the transition happens on its own.
+        """
+        marker = self.root / "work" / "event-hook.marker"
+        workload = (
+            f"exec {self._shell_quote(sys.executable)} -c "
+            + self._shell_quote(
+                f"import pathlib;pathlib.Path({str(marker)!r}).write_text('started')"
+            )
+        )
+        session_id, pane_id, tmux_name = self.create_placed_session(
+            "split-right", workspace_id, invoking_pane, workload
+        )
+        self.wait_until("event-hook workload start", marker.exists)
+
+        # The command exits on its own, which ends the durable tmux session and
+        # exits the attaching pane process. That is what emits `pane.exited`.
+        self.wait_until(
+            "event-hook tmux session exit",
+            lambda: tmux_name not in self.tmux_sessions(),
+        )
+
+        def reconciled() -> bool:
+            for record in self.state_records():
+                if record.get("id") == session_id:
+                    return str(record.get("status", "")).lower() == "ended"
+            return False
+
+        # Deliberately no picker, no Observer, no Tether process of any kind:
+        # the hook is the only thing that can move this record.
+        try:
+            self.wait_until("event-hook lifecycle reconciliation", reconciled)
+        except SmokeFailure:
+            records = [r for r in self.state_records() if r.get("id") == session_id]
+            fail(
+                "Herdr's pane.exited hook did not reconcile an ended workload "
+                f"without a Tether UI: {records}"
+            )
+
+        logs = self.result_object(
+            self.decode_json(
+                self.herdr_run("plugin", "log", "list", "--plugin", PLUGIN_ID),
+                "Herdr plugin log list",
+            ),
+            "Herdr plugin log list",
+        )
+        hook_runs = [
+            entry
+            for entry in logs.get("logs", []) or []
+            if isinstance(entry, dict) and entry.get("event") == "pane.exited"
+        ]
+        if not hook_runs:
+            fail(f"Herdr recorded no pane.exited hook run: {logs}")
+        if any(entry.get("status") != "succeeded" for entry in hook_runs):
+            fail(f"Tether's pane.exited hook did not succeed: {hook_runs}")
+
+        if pane_id in self.pane_ids():
+            self.close_pane(pane_id)
+
     def mission_control_agent_contract(self, workspace_id: str, invoking_pane: str) -> None:
         """Exercise Mission Control's agent reads against a real recognized agent.
 
@@ -2179,6 +2242,7 @@ class Smoke:
             {first_id, second_id, third_id, symlink_id},
         )
         self.mission_control_agent_contract(workspace_id, initial_pane)
+        self.event_hook_contract(workspace_id, initial_pane)
 
         for session_id in (first_id, second_id, third_id, symlink_id):
             self.run([str(self.tether), "session", "stop", session_id])

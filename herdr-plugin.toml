@@ -11,6 +11,10 @@ command = ["cargo", "build", "--release", "--locked"]
 [[startup]]
 command = ["target/release/herdr-tether", "plugin", "restore-agent-view"]
 
+[[events]]
+on = "pane.exited"
+command = ["target/release/herdr-tether", "plugin", "on-event"]
+
 [[actions]]
 id = "open"
 title = "Tether: Open workloads"

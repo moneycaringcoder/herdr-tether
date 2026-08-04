@@ -313,6 +313,8 @@ enum PluginCommand {
     Setup,
     /// Restore an opted-in Agent sidebar view after Herdr startup or handoff.
     RestoreAgentView,
+    /// Reconcile local workload lifecycle after a Herdr pane exits.
+    OnEvent,
 }
 
 pub fn run() -> Result<()> {
@@ -1669,7 +1671,7 @@ fn plugin_command(paths: &AppPaths, command: PluginCommand) -> Result<()> {
             let entrypoint = match command {
                 PluginCommand::Open => "picker",
                 PluginCommand::Setup => "setup",
-                PluginCommand::RestoreAgentView => unreachable!(),
+                PluginCommand::RestoreAgentView | PluginCommand::OnEvent => unreachable!(),
             };
             HerdrClient::new(context).open_plugin_pane(entrypoint)
         }
@@ -1677,7 +1679,63 @@ fn plugin_command(paths: &AppPaths, command: PluginCommand) -> Result<()> {
             let state = StateStore::new(paths.state_file.clone()).load_read_only()?;
             AgentViewService::from_env(paths.agent_view_file())?.restore(&state)
         }
+        PluginCommand::OnEvent => reconcile_local_workloads_after_event(paths),
     }
+}
+
+/// Largest number of workloads one event hook will reconcile.
+///
+/// Herdr can emit `pane.exited` rapidly while a workspace closes. The hook is
+/// bounded so a burst cannot fan out into unbounded process work.
+const MAX_EVENT_RECONCILE: usize = 32;
+
+/// Reconciles local Tether-owned workloads after Herdr reports a pane exit.
+///
+/// A Herdr pane exiting does not mean the workload ended: leaving a workload
+/// running is the entire point of Tether, and closing its view exits the pane
+/// while the durable `tmux` session keeps going. So this never concludes
+/// anything from the event itself. It re-observes the exact owned workloads and
+/// lets the existing lifecycle transition decide, which is the same code the
+/// picker runs.
+///
+/// Only `local` workloads are reconciled. A remote workload would need an SSH
+/// probe, and a pane-exit burst must not fan out into network work; remote
+/// records still reconcile when the picker opens.
+///
+/// This path is metadata-only. `observe_owned` has no Stop, kill, or transport
+/// authority, so an event hook can never end a workload that is still running.
+fn reconcile_local_workloads_after_event(paths: &AppPaths) -> Result<()> {
+    let store = StateStore::new(paths.state_file.clone());
+    let state = store.load_read_only()?;
+    let candidates = event_reconcile_candidates(&state);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let service = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
+    for id in candidates {
+        // One unreconcilable workload must not hide the rest. The picker
+        // re-observes anything missed here.
+        let _ = service.observe_owned(id);
+    }
+    Ok(())
+}
+
+/// Selects the workloads an event hook may re-observe.
+///
+/// Deliberately narrow: `local` only so a pane-exit burst never fans out into
+/// SSH, `Running` only because settled records have nothing to reconcile, and
+/// exact-owned only because a record without both an ownership proof and a
+/// `tmux` incarnation cannot be safely attributed to Tether.
+fn event_reconcile_candidates(state: &State) -> Vec<SessionId> {
+    state
+        .sessions
+        .iter()
+        .filter(|record| record.target == "local")
+        .filter(|record| record.status == SessionStatus::Running)
+        .filter(|record| record.ownership_proof.is_some() && record.tmux_session_id.is_some())
+        .map(|record| record.id)
+        .take(MAX_EVENT_RECONCILE)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -2137,6 +2195,67 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TmuxSessionId;
+
+    fn event_record(target: &str, status: SessionStatus, owned: bool) -> SessionRecord {
+        let now = Utc::now();
+        SessionRecord {
+            id: SessionId::new(),
+            host: target.to_owned(),
+            target: target.to_owned(),
+            directory: "/srv/work".into(),
+            preset: None,
+            herdr_agent: None,
+            command: Some("exec cat".into()),
+            tmux_session_id: owned.then(|| "$1".parse::<TmuxSessionId>().unwrap()),
+            ownership_proof: owned.then(OwnershipProof::new),
+            status,
+            created_at: now,
+            last_used_at: now,
+            closed_at: None,
+            exit_status: None,
+        }
+    }
+
+    #[test]
+    fn event_reconcile_never_reaches_remote_settled_or_unowned_workloads() {
+        let mut state = State::default();
+        let local = event_record("local", SessionStatus::Running, true);
+        let local_id = local.id;
+        state.sessions.push(local);
+        // A remote workload would need an SSH probe. A pane-exit burst must not
+        // fan out into the network, so remote records are left to the picker.
+        state.sessions.push(event_record(
+            "builder@example.test",
+            SessionStatus::Running,
+            true,
+        ));
+        // Settled records have nothing left to reconcile.
+        state
+            .sessions
+            .push(event_record("local", SessionStatus::Ended, true));
+        // Without an ownership proof and tmux incarnation a record cannot be
+        // safely attributed to Tether.
+        state
+            .sessions
+            .push(event_record("local", SessionStatus::Running, false));
+
+        assert_eq!(event_reconcile_candidates(&state), vec![local_id]);
+    }
+
+    #[test]
+    fn event_reconcile_is_bounded_against_a_pane_exit_burst() {
+        let mut state = State::default();
+        for _ in 0..(MAX_EVENT_RECONCILE * 3) {
+            state
+                .sessions
+                .push(event_record("local", SessionStatus::Running, true));
+        }
+        assert_eq!(
+            event_reconcile_candidates(&state).len(),
+            MAX_EVENT_RECONCILE
+        );
+    }
 
     #[test]
     fn external_attach_command_preserves_target_and_name_as_arguments() {
