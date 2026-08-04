@@ -1763,19 +1763,29 @@ class Smoke:
         `plugin on-event` on `pane.exited`, so the transition happens on its own.
         """
         marker = self.root / "work" / "event-hook.marker"
+        stop_file = self.root / "work" / "event-hook.stop"
+        # The workload must outlive creation so the ordinary owned-tmux contract
+        # can verify it, then exit on demand so the exit is what this scenario
+        # observes rather than a race against setup.
+        script = (
+            "import pathlib, time\n"
+            f"pathlib.Path({str(marker)!r}).write_text('started')\n"
+            f"stop = pathlib.Path({str(stop_file)!r})\n"
+            "while not stop.exists():\n"
+            "    time.sleep(0.1)\n"
+        )
         workload = (
             f"exec {self._shell_quote(sys.executable)} -c "
-            + self._shell_quote(
-                f"import pathlib;pathlib.Path({str(marker)!r}).write_text('started')"
-            )
+            + self._shell_quote(script)
         )
         session_id, pane_id, tmux_name = self.create_placed_session(
             "split-right", workspace_id, invoking_pane, workload
         )
         self.wait_until("event-hook workload start", marker.exists)
 
-        # The command exits on its own, which ends the durable tmux session and
-        # exits the attaching pane process. That is what emits `pane.exited`.
+        # Letting the command finish ends the durable tmux session and exits the
+        # attaching pane process, which is what emits `pane.exited`.
+        stop_file.write_text("stop", encoding="utf-8")
         self.wait_until(
             "event-hook tmux session exit",
             lambda: tmux_name not in self.tmux_sessions(),
