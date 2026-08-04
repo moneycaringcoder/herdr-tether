@@ -42,6 +42,12 @@
 
 ### Fixed
 
+- Restored Mission Control's event-driven agent status on Herdr 0.8.0. Herdr
+  requires a `pane_id` on `pane.agent_status_changed`, and an unfiltered entry
+  invalidates the whole `events.subscribe` request rather than just that entry,
+  so Tether was receiving no events at all and silently falling back to its
+  one-second refresh. Pane lifecycle events stay global; agent status is now
+  subscribed per bound group pane and re-established when that set changes.
 - Corrected public Herdr links after the upstream GitHub organization migration
   from `ogulcancelik/herdr` to `herdrdev/herdr`.
 - Repaired the macOS live-product gate, which reported success without running
