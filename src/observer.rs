@@ -960,7 +960,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         } else {
             format!("+{hidden} more  ")
         };
-        format!("{overflow}↑↓ select  Enter open  f focus  v read  w wait  r retry  q back")
+        widest_that_fits(
+            area.width,
+            &[
+                format!(
+                    "{overflow}↑↓ select  Enter open  f focus  v read  w wait  e explain  r retry  q back"
+                ),
+                format!(
+                    "{overflow}↑↓ select  Enter open  f focus  v read  w wait  r retry  q back"
+                ),
+            ],
+        )
     } else if !prompt_available && controls_height == 2 {
         let overflow = if hidden == 0 {
             String::new()
@@ -985,7 +995,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         } else {
             format!("+{hidden} more  ")
         };
-        format!("{overflow}↑↓ select  Space target  p prompt  Enter open  f focus  r retry  q back")
+        widest_that_fits(
+            area.width,
+            &[
+                format!(
+                    "{overflow}↑↓ select  Space target  p prompt  Enter open  f focus  v read  w wait  e explain  r retry  q back"
+                ),
+                format!(
+                    "{overflow}↑↓ select  Space target  p prompt  Enter open  f focus  e explain  r retry  q back"
+                ),
+                format!(
+                    "{overflow}↑↓ select  Space target  p prompt  Enter open  f focus  r retry  q back"
+                ),
+            ],
+        )
     } else if controls_height == 2 {
         let overflow = if hidden == 0 {
             String::new()
@@ -1113,6 +1136,22 @@ fn render_worker(
             .block(block),
         area,
     );
+}
+
+/// Picks the first single-line control string that fits the available width.
+///
+/// The one-line footer is used whenever the pane is at least 64 columns, which
+/// spans everything from a narrow split to a full-width tab. Listing candidates
+/// richest-first lets a wide surface advertise every control while an 80-column
+/// terminal keeps the shorter layout its keyboard checks pin. The last candidate
+/// is the floor and is returned even when it overflows.
+fn widest_that_fits(width: u16, candidates: &[String]) -> String {
+    let width = usize::from(width);
+    candidates
+        .iter()
+        .find(|candidate| candidate.chars().count() <= width)
+        .unwrap_or_else(|| candidates.last().expect("at least one control layout"))
+        .clone()
 }
 
 #[derive(Debug)]
