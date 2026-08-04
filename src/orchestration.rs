@@ -812,7 +812,8 @@ pub fn run_observer(
             ObserverOutcome::ComposePrompt { worker_ids } => {
                 let Some(client) = mission_client.as_ref() else {
                     observer.set_notice(Some(
-                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                        "Mission Control agent actions require a reachable Herdr session"
+                            .to_owned(),
                     ));
                     continue;
                 };
@@ -855,7 +856,8 @@ pub fn run_observer(
             ObserverOutcome::FocusSelected { worker_id } => {
                 let Some(client) = mission_client.as_ref() else {
                     observer.set_notice(Some(
-                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                        "Mission Control agent actions require a reachable Herdr session"
+                            .to_owned(),
                     ));
                     continue;
                 };
@@ -877,7 +879,8 @@ pub fn run_observer(
             ObserverOutcome::WaitSelected { worker_id } => {
                 let Some(client) = mission_client.as_ref() else {
                     observer.set_notice(Some(
-                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                        "Mission Control agent actions require a reachable Herdr session"
+                            .to_owned(),
                     ));
                     continue;
                 };
@@ -899,7 +902,8 @@ pub fn run_observer(
             ObserverOutcome::ReadSelected { worker_id } => {
                 let Some(client) = mission_client.as_ref() else {
                     observer.set_notice(Some(
-                        "Mission Control agent actions require Herdr 0.7.5+".to_owned(),
+                        "Mission Control agent actions require a reachable Herdr session"
+                            .to_owned(),
                     ));
                     continue;
                 };
@@ -1005,7 +1009,7 @@ fn refresh_observer_metadata(
     let mission_started = Instant::now();
     let (mission_snapshot, mission_unreachable, mission_latency_ms) =
         match mission_client.map(HerdrSocketClient::snapshot) {
-            Some(Ok(snapshot)) if snapshot.supports_mission_control() => (
+            Some(Ok(snapshot)) if snapshot.supports_protocol() => (
                 Some(snapshot),
                 false,
                 Some(u64::try_from(mission_started.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -1624,8 +1628,8 @@ mod tests {
             revision: 1,
         };
         let snapshot = HerdrSessionSnapshot {
-            version: "0.7.5".to_owned(),
-            protocol: 17,
+            version: "0.8.0".to_owned(),
+            protocol: 19,
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,

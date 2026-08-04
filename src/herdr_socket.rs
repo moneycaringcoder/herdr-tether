@@ -26,7 +26,10 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(200);
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
-pub const MIN_MISSION_CONTROL_VERSION: (u64, u64, u64) = (0, 7, 5);
+/// Lowest Herdr socket API protocol Tether speaks. Herdr 0.8.0 ships protocol 19.
+pub const MIN_HERDR_PROTOCOL: u32 = 19;
+/// Human-facing label for [`MIN_HERDR_PROTOCOL`], used in upgrade guidance.
+pub const MIN_HERDR_VERSION_LABEL: &str = "0.8.0";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,9 +118,27 @@ impl HerdrSessionSnapshot {
         parse_version(&self.version)
     }
 
-    pub fn supports_mission_control(&self) -> bool {
-        self.version_tuple()
-            .is_ok_and(|version| version >= MIN_MISSION_CONTROL_VERSION)
+    /// Reports whether the connected server speaks a protocol Tether supports.
+    ///
+    /// Tether pins the wire contract rather than the marketing version, so a
+    /// Herdr build that reports an older protocol is rejected even when its
+    /// version string looks new enough.
+    pub fn supports_protocol(&self) -> bool {
+        self.protocol >= MIN_HERDR_PROTOCOL
+    }
+
+    /// Fails with an actionable upgrade message when the protocol is too old.
+    pub fn require_supported_protocol(&self) -> Result<()> {
+        if self.supports_protocol() {
+            return Ok(());
+        }
+        bail!(
+            "Tether requires Herdr {MIN_HERDR_VERSION_LABEL} or newer (API protocol \
+             {MIN_HERDR_PROTOCOL}); the running Herdr {} speaks protocol {}. Upgrade Herdr, \
+             then reopen Tether.",
+            self.version,
+            self.protocol
+        )
     }
 }
 
@@ -328,6 +349,9 @@ impl HerdrSocketClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Herdr rejected the request");
+            if let Some(guidance) = actionable_error_guidance(code) {
+                bail!("{guidance} (Herdr {method}: {code}: {message})");
+            }
             bail!("Herdr rejected {method}: {code}: {message}");
         }
         response
@@ -490,8 +514,24 @@ fn run_subscription(
 
 #[cfg(unix)]
 fn exchange(path: &Path, request: &[u8], timeout: Duration) -> Result<Vec<u8>> {
-    let mut stream = UnixStream::connect(path)
-        .with_context(|| format!("connect to Herdr socket `{}`", path.display()))?;
+    let mut stream = UnixStream::connect(path).map_err(|error| {
+        // Herdr reports `server_not_running` for CLI calls, but a raw socket
+        // connect only yields ENOENT/ECONNREFUSED. Classify it the same way so
+        // a stopped server never reads as an unexplained I/O failure.
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) {
+            anyhow::anyhow!(
+                "Herdr is not running (socket `{}` is not accepting connections). \
+                 Start Herdr, then reopen Tether.",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(error)
+                .context(format!("connect to Herdr socket `{}`", path.display()))
+        }
+    })?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream
@@ -592,6 +632,25 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Maps Herdr's machine-readable error codes to actionable Tether guidance.
+///
+/// Returning `None` keeps the generic `Herdr rejected <method>` wording for
+/// codes whose raw message is already the most useful thing Tether can say.
+fn actionable_error_guidance(code: &str) -> Option<&'static str> {
+    match code {
+        "server_not_running" => Some("Herdr is not running. Start Herdr, then reopen Tether."),
+        "protocol_mismatch" => Some(
+            "This Herdr speaks a different socket API protocol than Tether expects. \
+             Upgrade Herdr and Tether to compatible releases.",
+        ),
+        "method_not_found" | "unsupported" => Some(
+            "This Herdr does not provide an API Tether requires. \
+             Upgrade Herdr to 0.8.0 or newer.",
+        ),
+        _ => None,
+    }
+}
+
 fn prompt_error_confirms_no_delivery(code: &str) -> bool {
     matches!(
         code,
@@ -623,10 +682,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn versions_gate_mission_control_at_075() {
-        assert_eq!(parse_version("0.7.5").unwrap(), (0, 7, 5));
-        assert_eq!(parse_version("v0.7.5-preview").unwrap(), (0, 7, 5));
-        assert!(parse_version("0.7").is_err());
+    fn version_strings_parse_into_comparable_components() {
+        assert_eq!(parse_version("0.8.0").unwrap(), (0, 8, 0));
+        assert_eq!(parse_version("v0.8.0-preview").unwrap(), (0, 8, 0));
+        assert!(parse_version("0.8").is_err());
+    }
+
+    fn snapshot_with_protocol(version: &str, protocol: u32) -> HerdrSessionSnapshot {
+        HerdrSessionSnapshot {
+            version: version.to_owned(),
+            protocol,
+            focused_workspace_id: None,
+            focused_tab_id: None,
+            focused_pane_id: None,
+            panes: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn protocol_gate_pins_the_wire_contract_not_the_version_string() {
+        assert!(snapshot_with_protocol("0.8.0", MIN_HERDR_PROTOCOL).supports_protocol());
+        assert!(snapshot_with_protocol("1.2.0", MIN_HERDR_PROTOCOL + 5).supports_protocol());
+        assert!(!snapshot_with_protocol("0.7.5", 17).supports_protocol());
+        // A build whose version string looks new but whose protocol is old is
+        // still rejected: Tether trusts the wire contract, not the label.
+        assert!(!snapshot_with_protocol("9.9.9", 18).supports_protocol());
+    }
+
+    #[test]
+    fn unsupported_protocol_names_both_versions_and_the_upgrade_step() {
+        let error = snapshot_with_protocol("0.7.5", 17)
+            .require_supported_protocol()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0.8.0"), "{error}");
+        assert!(error.contains("17"), "{error}");
+        assert!(error.contains("Upgrade Herdr"), "{error}");
+        assert!(
+            snapshot_with_protocol("0.8.0", MIN_HERDR_PROTOCOL)
+                .require_supported_protocol()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn actionable_codes_replace_raw_transport_wording() {
+        assert!(
+            actionable_error_guidance("server_not_running")
+                .is_some_and(|guidance| guidance.contains("Start Herdr"))
+        );
+        assert!(
+            actionable_error_guidance("protocol_mismatch")
+                .is_some_and(|guidance| guidance.contains("protocol"))
+        );
+        assert!(
+            actionable_error_guidance("method_not_found")
+                .is_some_and(|guidance| guidance.contains("0.8.0"))
+        );
+        // Codes whose own message is already the most useful text stay generic.
+        assert_eq!(actionable_error_guidance("permission_denied"), None);
+        assert_eq!(actionable_error_guidance("agent_not_found"), None);
     }
 
     #[test]

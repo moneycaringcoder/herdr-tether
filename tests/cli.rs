@@ -978,7 +978,7 @@ fn host_check_reports_remote_tmux_and_read_only_herdr_discovery() {
     let ssh = bin.join("ssh");
     let log = sandbox.path("ssh.log");
     let script = format!(
-        "#!/bin/sh\nfor arg do printf '<%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$*\" in\n  *\"tmux\"*\"-V\"*) printf 'tmux 3.4\\n' ;;\n  *\"herdr\"*\"--version\"*) printf 'herdr 0.7.3\\n' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nfor arg do printf '<%s>' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\ncase \"$*\" in\n  *\"tmux\"*\"-V\"*) printf 'tmux 3.4\\n' ;;\n  *\"herdr\"*\"--version\"*) printf 'herdr 0.8.0\\n' ;;\nesac\nexit 0\n",
         log = log.display()
     );
     fs::write(&ssh, script).unwrap();
@@ -1002,7 +1002,7 @@ fn host_check_reports_remote_tmux_and_read_only_herdr_discovery() {
         .assert()
         .success()
         .stdout(predicate::str::contains("tmux 3.4"))
-        .stdout(predicate::str::contains("herdr 0.7.3"));
+        .stdout(predicate::str::contains("herdr 0.8.0"));
 
     let transcript = fs::read_to_string(log).unwrap();
     assert!(
@@ -1507,7 +1507,7 @@ fn herdr_context_accepts_legacy_pane_and_workspace_fallbacks() {
     let herdr = sandbox.path("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.3'; else printf '%s' '{\"id\":\"cli-1\",\"result\":{\"type\":\"plugin_pane_opened\"}}'; fi\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.8.0'; else printf '%s' '{\"id\":\"cli-1\",\"result\":{\"type\":\"plugin_pane_opened\"}}'; fi\n",
     )
     .unwrap();
     #[cfg(unix)]

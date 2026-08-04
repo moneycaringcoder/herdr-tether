@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/moneycaringcoder/herdr-tether/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/moneycaringcoder/herdr-tether/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0f766e.svg"></a>
-  <a href="https://github.com/herdrdev/herdr"><img alt="Herdr 0.7.3 or newer" src="https://img.shields.io/badge/Herdr-0.7.3%2B-172033.svg"></a>
+  <a href="https://github.com/herdrdev/herdr"><img alt="Herdr 0.8.0 or newer" src="https://img.shields.io/badge/Herdr-0.8.0%2B-172033.svg"></a>
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-475569.svg">
 </p>
 
@@ -32,7 +32,7 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 ### Requirements
 
 - macOS or Linux
-- [Herdr](https://github.com/herdrdev/herdr) 0.7.3 or newer
+- [Herdr](https://github.com/herdrdev/herdr) 0.8.0 or newer
 - `tmux` 3.3 or newer locally and on remote hosts
 - Git and Rust 1.88 or newer
 - OpenSSH with non-interactive access already configured for remote hosts
@@ -162,8 +162,8 @@ The picker keeps actions contextual:
 When a workload command runs a Herdr-supported agent behind Tether's `tmux` or
 SSH boundary, configure an explicit agent hint rather than relying on process
 guessing. Presets accept `herdr_agent = "codex"` in `config.toml`; ad hoc CLI
-creation accepts `--herdr-agent codex`. On Herdr 0.7.5 and newer, the resulting
-view is recognized as that agent while retaining Tether's durable lifecycle.
+creation accepts `--herdr-agent codex`. The resulting view is recognized as that
+agent while retaining Tether's durable lifecycle.
 
 ## Orchestration, Observer, and Mission Control
 
@@ -175,14 +175,13 @@ Use the native workflow from the ordinary `prefix+t` picker:
 1. Press `o` to open **Observers**.
 2. Press `n`, choose one running workload as `ORCHESTRATOR`, and select workers
    with `Space`.
-3. On Herdr 0.7.5+, press `p` on a selected worker to grant explicit agent
-   prompt permission. The workload must already have an explicit
-   `--herdr-agent KIND` hint.
+3. Press `p` on a selected worker to grant explicit agent prompt permission.
+   The workload must already have an explicit `--herdr-agent KIND` hint.
 4. Press `Enter`, review the exact topology and permissions, then press `Enter`
    again to create it.
-5. Select the group and choose **Open Mission Control**. On Herdr 0.7.3 or
-   0.7.4, the same action remains **Open Observer** with a clear upgrade note;
-   ordinary durable-workload management is unchanged.
+5. Select the group and choose **Open Mission Control**. When no Herdr session
+   is reachable, the same action remains **Open Observer**; ordinary
+   durable-workload management is unchanged.
 
 Mission Control is a state-first control room. Tiles show `DETACHED`, `IDLE`,
 `WORKING`, `BLOCKED`, `DONE`, `UNKNOWN`, `UNREACHABLE`, or `STALE` explicitly.
@@ -224,7 +223,7 @@ herdr-tether orchestration list --json
 herdr-tether orchestration observe GROUP --placement split-right
 ```
 
-On Herdr 0.7.5+, the group action screen can show all group agents, only group
+The group action screen can show all group agents, only group
 agents needing attention (`BLOCKED`/`DONE`), or only remote group agents in
 Herdr's native Agents sidebar. Opening a member from Mission Control labels
 that pane with bounded group, session, membership, and remote-origin tokens.
@@ -304,7 +303,7 @@ The snapshot reports bounded host, repository, owned-workload, and safe external
 - **Commands and presets are trusted code.** They run through the selected machine's shell; Tether is not a sandbox.
 - **SSH policy remains yours.** Tether uses `BatchMode=yes` and never weakens host-key verification.
 - **Remote support is SSH + tmux.** Tether does not provide remote Herdr federation or pane streaming.
-- **Agent integration is explicit and versioned.** Herdr 0.7.3 and 0.7.4 cannot register arbitrary workloads hidden behind `tmux` or SSH, so Tether falls back to clear pane/session titles. On Herdr 0.7.5 and newer, validated agent hints and opt-in group views expose recognized panes without Tether guessing agent identity or lifecycle.
+- **Agent integration is explicit.** Validated agent hints and opt-in group views expose recognized panes without Tether guessing agent identity or lifecycle. A workload with no explicit `--herdr-agent KIND` hint keeps clear pane/session titles and no fabricated sidebar agent state.
 - Tether reads literal aliases from the primary `~/.ssh/config` and bounded,
   cycle-safe `Include` files beneath `~/.ssh`; wildcard `Host` patterns and
   escaping includes are ignored.

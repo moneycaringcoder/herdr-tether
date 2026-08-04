@@ -743,10 +743,10 @@ fn run_observer_manager_flow(
     loop {
         let state = state_store.load().context("load Observer manager state")?;
         let mut manager = ObserverManagerState::from_state(&state, notice.take())?;
-        manager.set_mission_control_available(
+        manager.set_herdr_connected(
             HerdrSocketClient::from_env()
                 .and_then(|client| client.snapshot())
-                .is_ok_and(|snapshot| snapshot.supports_mission_control()),
+                .is_ok_and(|snapshot| snapshot.supports_protocol()),
         );
         match run_observer_manager(manager)? {
             ObserverManagerAction::BackToPicker => return Ok(ObserverManagerFlow::BackToPicker),

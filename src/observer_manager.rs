@@ -138,7 +138,7 @@ pub struct ObserverManagerState {
     selected_orchestrator: Option<SessionId>,
     selected_workers: HashSet<SessionId>,
     prompt_workers: HashSet<SessionId>,
-    mission_control_available: bool,
+    herdr_connected: bool,
     review_kind: Option<ReviewKind>,
     review_return_index: usize,
     notice: Option<String>,
@@ -197,7 +197,7 @@ impl ObserverManagerState {
             selected_orchestrator: None,
             selected_workers: HashSet::new(),
             prompt_workers: HashSet::new(),
-            mission_control_available: true,
+            herdr_connected: true,
             review_kind: None,
             review_return_index: 0,
             notice,
@@ -208,8 +208,12 @@ impl ObserverManagerState {
         self.screen
     }
 
-    pub fn set_mission_control_available(&mut self, available: bool) {
-        self.mission_control_available = available;
+    /// Records whether a Herdr session is reachable over the socket.
+    ///
+    /// Tether requires Herdr 0.8.0, so this no longer gates on version. It stays
+    /// because the standalone CLI can run with no Herdr session at all.
+    pub fn set_herdr_connected(&mut self, connected: bool) {
+        self.herdr_connected = connected;
     }
 
     pub fn frame_title(&self) -> &'static str {
@@ -260,10 +264,10 @@ impl ObserverManagerState {
                 })
                 .collect(),
             ObserverManagerScreen::GroupActions => {
-                let open = if self.mission_control_available {
+                let open = if self.herdr_connected {
                     "Open Mission Control"
                 } else {
-                    "Open Observer · Herdr 0.7.5+ unlocks Mission Control"
+                    "Open Observer · Herdr unreachable"
                 };
                 vec![
                     open.to_owned(),
@@ -721,8 +725,9 @@ impl ObserverManagerState {
             self.notice = None;
             return;
         }
-        if !self.mission_control_available {
-            self.notice = Some("Agent prompt permission requires Herdr 0.7.5 or newer".to_owned());
+        if !self.herdr_connected {
+            self.notice =
+                Some("Agent prompt permission requires a reachable Herdr session".to_owned());
             return;
         }
         if candidate.agent_kind.is_none() {

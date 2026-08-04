@@ -1,7 +1,7 @@
 id = "moneycaringcoder.tether"
 name = "Tether for Herdr"
 version = "0.5.1"
-min_herdr_version = "0.7.3"
+min_herdr_version = "0.8.0"
 description = "Keep local and remote terminal workloads running after their Herdr view closes."
 platforms = ["linux", "macos"]
 
@@ -33,11 +33,15 @@ command = ["target/release/herdr-tether", "setup", "keybinding", "--rollback"]
 [[panes]]
 id = "picker"
 title = "Tether: Open workloads"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "80%"
 command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\" open"]
 
 [[panes]]
 id = "setup"
 title = "Tether: Set up"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "80%"
 command = ["sh", "-c", "binary=\"${HERDR_PLUGIN_ROOT:?}/target/release/herdr-tether\"; \"$binary\" setup --yes && \"$binary\" setup keybinding; status=$?; if [ \"$status\" -eq 0 ]; then printf '\\nTether is ready. Press Enter to close setup, then press prefix+t to open it.\\n'; else printf '\\nTether setup did not finish. Read the error above. Press Enter to close.\\n'; fi; IFS= read -r _; exit \"$status\""]

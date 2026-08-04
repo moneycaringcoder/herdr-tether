@@ -97,8 +97,8 @@ Presets are trusted code. Tether starts a login `/bin/sh`, restores the selected
 `herdr_agent` is optional. Set it to a Herdr-supported agent kind such as
 `codex` when that preset runs an agent behind Tether's `tmux` or SSH boundary.
 Tether then attaches with an explicit `HERDR_AGENT=<kind>` screen-manifest
-hint, allowing Herdr 0.7.5 and newer to recognize the agent without changing
-the durable workload lifecycle. Ad hoc creation supports the equivalent
+hint, allowing Herdr to recognize the agent without changing the durable
+workload lifecycle. Ad hoc creation supports the equivalent
 `herdr-tether open --command COMMAND --herdr-agent KIND` option. Agent kinds
 must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
@@ -114,15 +114,14 @@ read and semantic wait, while `open_interactive` enables focus/open.
 `prompt_agent` is checked independently; neither of the other capabilities can
 authorize input.
 
-The grant is inert unless Herdr 0.7.5+ recognizes the worker's explicit
+The grant is inert unless Herdr recognizes the worker's explicit
 `herdr_agent` kind and every live ownership, membership, pane-binding, and
 settled-state check succeeds. Prompt text and delivery results are never stored
 in `state.json` or `agent-view.json`.
 
 ### Agent sidebar preference
 
-On Herdr 0.7.5 and newer, the group action screen stores one optional
-orchestration-group ID and one of three view modes in `agent-view.json` beside
+The group action screen stores one optional orchestration-group ID and one of three view modes in `agent-view.json` beside
 `state.json`: all group agents, agents needing attention, or remote group
 agents. Herdr plugin actions use the same authoritative
 `HERDR_PLUGIN_STATE_DIR`; standalone defaults use the path shown above. The

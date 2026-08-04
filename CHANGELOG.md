@@ -4,6 +4,18 @@
 
 ### Changed
 
+- **Breaking:** Tether now requires Herdr 0.8.0 or newer. `min_herdr_version` is
+  `0.8.0`, so Herdr refuses to install or link Tether on an older release. Stay
+  on Tether v0.5.1 until Herdr is upgraded.
+- Replaced the 0.7.3/0.7.4/0.7.5 capability ladder with one code path. Tether now
+  validates the Herdr socket API protocol reported by `session.snapshot` instead
+  of comparing version strings, so a build whose version looks new but whose
+  protocol is old is rejected with an explicit upgrade message.
+- Managed picker and setup surfaces declare `placement = "popup"` with explicit
+  sizing directly in `herdr-plugin.toml`, removing two `herdr --version`
+  subprocess probes from the pane-open and Agent-view metadata paths.
+- Mission Control availability now reflects Herdr reachability rather than Herdr
+  version; the group action screen and prompt-permission notices say so.
 - Live-product coverage now exercises Herdr 0.8.0 on Ubuntu 24.04 and macOS 14
   instead of Herdr 0.7.3 and 0.7.5.
 
@@ -11,6 +23,8 @@
 
 - Corrected public Herdr links after the upstream GitHub organization migration
   from `ogulcancelik/herdr` to `herdrdev/herdr`.
+- A stopped Herdr server, a protocol mismatch, or a missing API now reports
+  actionable guidance instead of a raw socket I/O error.
 - Restored private `0700` permissions on storage directories Tether creates
   under a symlinked or GNU Stow ancestor; v0.5.1 left those directories at the
   process umask. Directories that already exist behind a link continue to keep

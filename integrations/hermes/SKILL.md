@@ -173,7 +173,7 @@ exact-owned.
 
 Add `--prompt-agent` only when the user explicitly approved input authority,
 the durable workload has an explicit user-supplied Herdr agent kind, and the
-interactive Mission Control flow will run on Herdr 0.7.5 or newer. The flag
+interactive Mission Control flow will run against a reachable Herdr session. The flag
 does not deliver a prompt, and neither observation nor open permission implies
 it. This skill must never infer the grant or deliver agent input through a
 private socket/API.
@@ -197,8 +197,7 @@ herdr-tether orchestration observe GROUP --placement split-right
 ```
 
 The command creates one outer Herdr pane with up to four deterministic worker
-tiles per page. Herdr 0.7.3 and 0.7.4 retain read-only Observer behavior. On
-Herdr 0.7.5 or newer, exactly bound recognized agents use event-driven Mission
+tiles per page. Exactly bound recognized agents use event-driven Mission
 Control status. `Enter` open and `f` focus require `open_interactive`; `v` read
 and `w` wait require `observe_output`.
 

@@ -380,9 +380,7 @@ impl<C: MissionHerdr> MissionControlService<C> {
             .herdr
             .snapshot()
             .context("read Herdr Mission Control snapshot")?;
-        if !snapshot.supports_mission_control() {
-            anyhow::bail!("Mission Control requires Herdr 0.7.5 or newer");
-        }
+        snapshot.require_supported_protocol()?;
         let binding = resolve_binding(&snapshot, &expectation)
             .map_err(|failure| anyhow::anyhow!(failure.message()))?;
         if require_settled && !binding.status.is_settled() {
@@ -680,8 +678,8 @@ mod tests {
 
     fn snapshot(agents: Vec<HerdrAgentInfo>) -> HerdrSessionSnapshot {
         HerdrSessionSnapshot {
-            version: "0.7.5".to_owned(),
-            protocol: 17,
+            version: "0.8.0".to_owned(),
+            protocol: 19,
             focused_workspace_id: None,
             focused_tab_id: None,
             focused_pane_id: None,

@@ -7,7 +7,7 @@ This guide installs Tether, adds the `prefix+t` launcher, and creates a first du
 You need:
 
 - macOS or Linux;
-- Herdr 0.7.3 or newer;
+- Herdr 0.8.0 or newer;
 - `tmux` 3.3 or newer locally and on each remote host;
 - Git and Rust 1.88 or newer; and
 - OpenSSH when using remote hosts.
@@ -81,7 +81,7 @@ herdr plugin action invoke moneycaringcoder.tether.rollback
 If the standalone CLI is installed, the equivalent synchronous command is
 `herdr-tether setup keybinding --rollback`.
 
-Herdr 0.7.3 does not expose a generic plugin-action menu, so this explicit one-time setup action is required. Normal plugin install and open actions do not silently change the keybinding.
+Herdr does not expose a generic plugin-action menu, so this explicit one-time setup action is required. Normal plugin install and open actions do not silently change the keybinding.
 
 ## 4. Create and leave a workload
 
@@ -148,20 +148,19 @@ duplicate configuration.
 
 ## 6. Create a group and open Mission Control
 
-Orchestration groups and the read-only Observer work on Herdr 0.7.3+. Herdr
-0.7.5+ additionally unlocks event-driven Mission Control agent actions.
+Orchestration groups, the read-only Observer, and event-driven Mission Control
+agent actions all require a reachable Herdr session.
 
 From Herdr, press `prefix+t`, then press `o` for **Observers**:
 
 1. Press `n` for **Create Observer**.
 2. Choose one running workload as `ORCHESTRATOR`.
 3. Select one or more `WORKER` workloads with `Space`.
-4. Optional on Herdr 0.7.5+: press `p` on a selected worker to grant prompt
-   permission. The workload must have been created with an explicit
+4. Optional: press `p` on a selected worker to grant prompt permission. The workload must have been created with an explicit
    `herdr_agent` preset value or `--herdr-agent KIND`.
 5. Press `Enter`, review every role and permission, then press `Enter` again.
-6. Select the group and choose **Open Mission Control**. Older supported Herdr
-   versions show **Open Observer** plus the 0.7.5 upgrade requirement.
+6. Select the group and choose **Open Mission Control**. With no reachable
+   Herdr session the action shows **Open Observer** instead.
 
 The default worker capabilities remain bounded output observation and
 interactive open; prompt permission is separate, explicit, and defaults off.
@@ -196,7 +195,7 @@ Use **Edit workers** or **Change orchestrator** to update a group after another
 explicit review. Press `d` to delete group metadata only. The Agents sidebar
 actions can show the whole group, only `BLOCKED`/`DONE` agents needing
 attention, or only remote group agents. Each installs a source-owned Herdr
-0.7.5+ filter used for exact pane binding; **Restore default Agents sidebar**
+filter used for exact pane binding; **Restore default Agents sidebar**
 clears it.
 
 The standalone `herdr-tether orchestration` commands remain an optional adapter
