@@ -1603,23 +1603,27 @@ class Smoke:
         invoking_pane: str,
         command: str,
         directory: Path | None = None,
+        herdr_agent: str | None = None,
     ) -> tuple[str, str, str]:
         directory = directory or self.root / "work"
         before_panes = self.pane_ids()
         before_tmux = self.tmux_sessions()
+        argv = [
+            str(self.tether),
+            "open",
+            "--host",
+            "local",
+            "--directory",
+            str(directory),
+            "--command",
+            command,
+            "--placement",
+            placement,
+        ]
+        if herdr_agent is not None:
+            argv.extend(["--herdr-agent", herdr_agent])
         result = self.run(
-            [
-                str(self.tether),
-                "open",
-                "--host",
-                "local",
-                "--directory",
-                str(directory),
-                "--command",
-                command,
-                "--placement",
-                placement,
-            ],
+            argv,
             env=self.tether_env(workspace_id, invoking_pane),
         )
         match = re.search(r"^created (tether-[0-9a-f]{32})$", result.stdout, re.MULTILINE)
@@ -1720,6 +1724,180 @@ class Smoke:
         self.close_pane(pane)
         self.run([str(self.tether), "session", "stop", session_id])
         self.owned_ids.discard(session_id)
+
+    def mission_control_agent_contract(self, workspace_id: str, invoking_pane: str) -> None:
+        """Exercise Mission Control's agent reads against a real recognized agent.
+
+        Tether only binds an agent when Herdr reports one whose kind matches the
+        workload's explicit hint and whose pane carries Tether's group, session,
+        and membership tokens. Ordinary smoke workloads are plain commands, so
+        none of that is reachable. Here the harness plays the part a coding agent
+        would: it reports agent state through `pane report-agent` and applies the
+        same tokens Tether applies when it opens a member. Everything after that
+        is Tether's own code path against a real Herdr.
+        """
+        agent_kind = "codex"
+        orchestrator_id, orchestrator_pane, _ = self.create_placed_session(
+            "split-right", workspace_id, invoking_pane, "exec cat"
+        )
+        worker_id, worker_pane, _ = self.create_placed_session(
+            "split-right",
+            workspace_id,
+            invoking_pane,
+            "exec cat",
+            herdr_agent=agent_kind,
+        )
+
+        group_id = "smoke-agents"
+        self.run(
+            [
+                str(self.tether),
+                "orchestration",
+                "create",
+                group_id,
+                "--title",
+                "Smoke agents",
+                "--orchestrator",
+                orchestrator_id,
+            ]
+        )
+        self.run(
+            [
+                str(self.tether),
+                "orchestration",
+                "add-worker",
+                group_id,
+                worker_id,
+                "--observe-output",
+                "--open-interactive",
+            ]
+        )
+        groups = self.decode_json(
+            self.run([str(self.tether), "orchestration", "list", "--json"]),
+            "Tether orchestration list",
+        )
+        membership_id = None
+        for group in self.find_objects(groups, "id", group_id):
+            for worker in group.get("workers", []) or []:
+                if isinstance(worker, dict) and worker.get("session_id") == worker_id:
+                    membership_id = worker.get("membership_id")
+        if not isinstance(membership_id, str) or not membership_id:
+            fail(f"orchestration list did not expose a worker membership: {groups}")
+
+        smoke_source = "custom:tether-smoke"
+        self.herdr_run(
+            "pane",
+            "report-agent",
+            worker_pane,
+            "--source",
+            smoke_source,
+            "--agent",
+            agent_kind,
+            "--state",
+            "idle",
+        )
+        self.herdr_run(
+            "pane",
+            "report-metadata",
+            worker_pane,
+            "--source",
+            smoke_source,
+            "--token",
+            f"tether_group={group_id}",
+            "--token",
+            f"tether_session={worker_id}",
+            "--token",
+            f"tether_membership={membership_id}",
+        )
+
+        # Confirm the harness setup before blaming Tether: Herdr must already
+        # expose this pane as a recognized agent carrying all three tokens.
+        agents = self.result_object(
+            self.decode_json(self.herdr_run("agent", "list"), "Herdr agent list"),
+            "Herdr agent list",
+        )
+        bound = [
+            agent
+            for agent in agents.get("agents", []) or []
+            if isinstance(agent, dict) and agent.get("pane_id") == worker_pane
+        ]
+        if not bound:
+            fail(f"Herdr did not expose the reported agent on {worker_pane}: {agents}")
+        reported = bound[0]
+        if reported.get("agent") != agent_kind:
+            fail(f"Herdr reported an unexpected agent kind: {reported}")
+        tokens = reported.get("tokens") or {}
+        expected_tokens = {
+            "tether_group": group_id,
+            "tether_session": worker_id,
+            "tether_membership": membership_id,
+        }
+        if {key: tokens.get(key) for key in expected_tokens} != expected_tokens:
+            fail(f"Herdr did not retain Tether's binding tokens: {tokens}")
+
+        before_panes = self.pane_ids()
+        # A new tab, not a split: this workspace already holds several panes, and
+        # an Observer squeezed into a split renders its resize fallback instead
+        # of tiles and controls.
+        self.run(
+            [
+                str(self.tether),
+                "orchestration",
+                "observe",
+                group_id,
+                "--placement",
+                "new-tab",
+            ],
+            env=self.tether_env(workspace_id, invoking_pane),
+        )
+        observer_pane = self.wait_new_pane(before_panes, "Mission Control agent Observer")
+
+        # With a bound recognized agent the observation controls must appear.
+        try:
+            self.wait_until(
+                "Mission Control offered agent observation controls",
+                lambda: "e explain" in self.pane_visible_text(observer_pane),
+            )
+        except SmokeFailure:
+            fail(
+                "Mission Control never offered agent observation controls for a "
+                f"bound agent. Observer rendered: "
+                f"{self.pane_visible_text(observer_pane)!r}"
+            )
+        controls = self.pane_visible_text(observer_pane)
+        for control in ("v read", "w wait"):
+            if control not in controls:
+                fail(f"Mission Control hid {control!r} for a bound agent: {controls!r}")
+
+        self.send_managed_keys(observer_pane, "v")
+        self.wait_until(
+            "Mission Control read a bound Herdr agent",
+            lambda: "Read Herdr agent output" in self.pane_visible_text(observer_pane),
+        )
+
+        # Herdr classifies agents from screen-detection rules. This agent's state
+        # was reported rather than detected, so Herdr may legitimately decline to
+        # explain it. Assert that the control is wired, authorized, and resolves
+        # to one of Tether's defined outcomes -- not that Herdr classifies a
+        # synthetic agent a particular way, which is Herdr's decision, not
+        # Tether's behavior.
+        explain_outcomes = ("Herdr explains", "no explanation", "Explain rejected")
+        self.send_managed_keys(observer_pane, "e")
+        self.wait_until(
+            "Mission Control resolved an explain request",
+            lambda: any(
+                outcome in self.pane_visible_text(observer_pane)
+                for outcome in explain_outcomes
+            ),
+        )
+
+        self.close_pane(observer_pane)
+        self.run([str(self.tether), "orchestration", "delete", group_id])
+        for session_id in (orchestrator_id, worker_id):
+            self.run([str(self.tether), "session", "stop", session_id])
+        for pane_id in (orchestrator_pane, worker_pane):
+            if pane_id in self.pane_ids():
+                self.close_pane(pane_id)
 
     def observer_manager_contract(self, owned_ids: set[str]) -> None:
         if self.plugin_state is None:
@@ -2000,6 +2178,7 @@ class Smoke:
         self.observer_manager_contract(
             {first_id, second_id, third_id, symlink_id},
         )
+        self.mission_control_agent_contract(workspace_id, initial_pane)
 
         for session_id in (first_id, second_id, third_id, symlink_id):
             self.run([str(self.tether), "session", "stop", session_id])

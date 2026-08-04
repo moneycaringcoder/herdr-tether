@@ -442,6 +442,29 @@ fn truncated_capture_is_marked_and_never_reads_as_complete_output() {
 }
 
 #[test]
+fn wide_mission_control_advertises_explain_and_narrow_keeps_its_pinned_layout() {
+    let mut agent = worker("agent");
+    agent.live_agent = true;
+    let observer = ObserverState::new(vec![agent]);
+
+    // A full-width surface uses the single-line footer, which is what most
+    // sessions see. The control has to be discoverable there, not only in the
+    // narrow multi-line layouts.
+    let wide = render_to_text(120, 16, &observer).unwrap();
+    assert!(wide.contains("e explain"), "{wide}");
+    assert!(wide.contains("v read"), "{wide}");
+
+    // At 80 columns the footer must not overflow the pinned keyboard geometry.
+    let narrow = render_to_text(80, 24, &observer).unwrap();
+    for line in narrow.lines() {
+        assert!(
+            line.chars().count() <= 80,
+            "footer line exceeded 80 columns: {line:?}"
+        );
+    }
+}
+
+#[test]
 fn truncated_capture_with_no_text_still_reports_truncation_not_emptiness() {
     let mut observer = ObserverState::new(vec![worker("capture")]);
     observer.merge_capture("capture", ObserverCapture::Truncated(String::new()));
