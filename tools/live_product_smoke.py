@@ -1836,6 +1836,9 @@ class Smoke:
             fail(f"Herdr did not retain Tether's binding tokens: {tokens}")
 
         before_panes = self.pane_ids()
+        # A new tab, not a split: this workspace already holds several panes, and
+        # an Observer squeezed into a split renders its resize fallback instead
+        # of tiles and controls.
         self.run(
             [
                 str(self.tether),
@@ -1843,7 +1846,7 @@ class Smoke:
                 "observe",
                 group_id,
                 "--placement",
-                "split-right",
+                "new-tab",
             ],
             env=self.tether_env(workspace_id, invoking_pane),
         )
