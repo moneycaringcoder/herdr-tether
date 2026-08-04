@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Live-product coverage now exercises Herdr 0.8.0 on Ubuntu 24.04 and macOS 14
+  instead of Herdr 0.7.3 and 0.7.5.
+
 ### Fixed
 
+- Corrected public Herdr links after the upstream GitHub organization migration
+  from `ogulcancelik/herdr` to `herdrdev/herdr`.
 - Restored private `0700` permissions on storage directories Tether creates
   under a symlinked or GNU Stow ancestor; v0.5.1 left those directories at the
   process umask. Directories that already exist behind a link continue to keep

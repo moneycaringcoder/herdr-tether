@@ -7,11 +7,11 @@
 <p align="center">
   <a href="https://github.com/moneycaringcoder/herdr-tether/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/moneycaringcoder/herdr-tether/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0f766e.svg"></a>
-  <a href="https://github.com/ogulcancelik/herdr"><img alt="Herdr 0.7.3 or newer" src="https://img.shields.io/badge/Herdr-0.7.3%2B-172033.svg"></a>
+  <a href="https://github.com/herdrdev/herdr"><img alt="Herdr 0.7.3 or newer" src="https://img.shields.io/badge/Herdr-0.7.3%2B-172033.svg"></a>
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-475569.svg">
 </p>
 
-Tether gives [Herdr](https://github.com/ogulcancelik/herdr) a safe, focused way to create, leave, reopen, stop, and restart durable terminal work. It handles ordinary local or SSH-backed `tmux` workloads; Herdr keeps owning the terminal surface.
+Tether gives [Herdr](https://github.com/herdrdev/herdr) a safe, focused way to create, leave, reopen, stop, and restart durable terminal work. It handles ordinary local or SSH-backed `tmux` workloads; Herdr keeps owning the terminal surface.
 
 > **The lifecycle in one sentence:** Closing the view leaves it running; **Stop** ends it; **Enter** brings it back.
 
@@ -32,7 +32,7 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 ### Requirements
 
 - macOS or Linux
-- [Herdr](https://github.com/ogulcancelik/herdr) 0.7.3 or newer
+- [Herdr](https://github.com/herdrdev/herdr) 0.7.3 or newer
 - `tmux` 3.3 or newer locally and on remote hosts
 - Git and Rust 1.88 or newer
 - OpenSSH with non-interactive access already configured for remote hosts

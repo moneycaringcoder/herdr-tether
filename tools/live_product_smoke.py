@@ -29,7 +29,7 @@ import time
 from typing import Any, Callable, Iterable
 
 PLUGIN_ID = "moneycaringcoder.tether"
-DEFAULT_HERDR_VERSION = "0.7.3"
+DEFAULT_HERDR_VERSION = "0.8.0"
 COMMAND_TIMEOUT = 20.0
 START_TIMEOUT = 30.0
 STATE_TIMEOUT = 20.0
