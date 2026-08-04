@@ -1810,6 +1810,31 @@ class Smoke:
             f"tether_membership={membership_id}",
         )
 
+        # Confirm the harness setup before blaming Tether: Herdr must already
+        # expose this pane as a recognized agent carrying all three tokens.
+        agents = self.result_object(
+            self.decode_json(self.herdr_run("agent", "list"), "Herdr agent list"),
+            "Herdr agent list",
+        )
+        bound = [
+            agent
+            for agent in agents.get("agents", []) or []
+            if isinstance(agent, dict) and agent.get("pane_id") == worker_pane
+        ]
+        if not bound:
+            fail(f"Herdr did not expose the reported agent on {worker_pane}: {agents}")
+        reported = bound[0]
+        if reported.get("agent") != agent_kind:
+            fail(f"Herdr reported an unexpected agent kind: {reported}")
+        tokens = reported.get("tokens") or {}
+        expected_tokens = {
+            "tether_group": group_id,
+            "tether_session": worker_id,
+            "tether_membership": membership_id,
+        }
+        if {key: tokens.get(key) for key in expected_tokens} != expected_tokens:
+            fail(f"Herdr did not retain Tether's binding tokens: {tokens}")
+
         before_panes = self.pane_ids()
         self.run(
             [
@@ -1825,10 +1850,17 @@ class Smoke:
         observer_pane = self.wait_new_pane(before_panes, "Mission Control agent Observer")
 
         # With a bound recognized agent the observation controls must appear.
-        self.wait_until(
-            "Mission Control offered agent observation controls",
-            lambda: "e explain" in self.pane_visible_text(observer_pane),
-        )
+        try:
+            self.wait_until(
+                "Mission Control offered agent observation controls",
+                lambda: "e explain" in self.pane_visible_text(observer_pane),
+            )
+        except SmokeFailure:
+            fail(
+                "Mission Control never offered agent observation controls for a "
+                f"bound agent. Observer rendered: "
+                f"{self.pane_visible_text(observer_pane)!r}"
+            )
         controls = self.pane_visible_text(observer_pane)
         for control in ("v read", "w wait"):
             if control not in controls:
