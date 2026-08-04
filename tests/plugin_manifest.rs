@@ -7,7 +7,7 @@ fn manifest_declares_build_startup_actions_and_managed_popup_panes() {
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
-    assert_eq!(value["version"].as_str(), Some("0.6.0"));
+    assert_eq!(value["version"].as_str(), Some("0.7.0"));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.8.0"));
     assert_eq!(
         value["description"].as_str(),

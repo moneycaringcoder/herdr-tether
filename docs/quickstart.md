@@ -18,10 +18,10 @@ Remote access must already succeed non-interactively under your normal SSH keys,
 
 Choose one source:
 
-**Stable v0.6.0.** Install the release tag:
+**Stable v0.7.0.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.6.0
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.7.0
 ```
 
 **Development (`main`).** Use this to follow the public development line, not
@@ -106,7 +106,7 @@ The stable release is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.6.0 --locked herdr-tether
+  --tag v0.7.0 --locked herdr-tether
 ```
 
 For development `main`:
