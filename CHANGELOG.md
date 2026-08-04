@@ -10,7 +10,9 @@
   from the event itself: it re-observes exact-owned workloads and lets the
   ordinary lifecycle transition decide, so closing a view still leaves its
   workload running. It is bounded to 32 local records per invocation, never
-  probes remote hosts, and has no Stop, kill, or transport authority.
+  probes remote hosts, holds a non-blocking single-flight guard so a
+  workspace-close burst cannot fan out into competing `tmux` work, and has no
+  Stop, kill, or transport authority.
 - Mission Control now marks a capture `TRUNCATED` when Herdr reports that older
   output was dropped. Tether previously discarded that flag and rendered a
   clipped capture as if it were the worker's complete output.

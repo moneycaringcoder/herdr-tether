@@ -440,7 +440,10 @@ class SmokeEnvironmentTests(unittest.TestCase):
                         mock.call("picker-narrow", expected_steps),
                     ],
                 )
-                self.assertEqual(wait_until.call_count, 2)
+                # Two semantic waits per viewport: one for Herdr to apply the
+                # requested geometry before the picker opens, and one for the
+                # picker to close. Both are observed conditions, never sleeps.
+                self.assertEqual(wait_until.call_count, 4)
                 sleep.assert_not_called()
             finally:
                 shutil.rmtree(smoke.root, ignore_errors=True)

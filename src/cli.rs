@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use serde::Serialize;
 
 use crate::{
@@ -1705,6 +1706,14 @@ const MAX_EVENT_RECONCILE: usize = 32;
 /// This path is metadata-only. `observe_owned` has no Stop, kill, or transport
 /// authority, so an event hook can never end a workload that is still running.
 fn reconcile_local_workloads_after_event(paths: &AppPaths) -> Result<()> {
+    // Closing a workspace exits many panes at once. Without a guard each exit
+    // would start its own reconciliation, and the resulting `tmux` fan-out
+    // competes with whatever the user is actually doing. One reconciliation at a
+    // time is enough: it observes current state, so a run already in flight
+    // covers the workloads a concurrent event would have looked at.
+    let Some(_guard) = EventHookGuard::acquire(paths)? else {
+        return Ok(());
+    };
     let store = StateStore::new(paths.state_file.clone());
     let state = store.load_read_only()?;
     let candidates = event_reconcile_candidates(&state);
@@ -1718,6 +1727,44 @@ fn reconcile_local_workloads_after_event(paths: &AppPaths) -> Result<()> {
         let _ = service.observe_owned(id);
     }
     Ok(())
+}
+
+/// Serializes event-hook reconciliation to one process at a time.
+///
+/// Acquisition is non-blocking on purpose. A hook that cannot take the guard
+/// returns immediately rather than queueing, because the run already in flight
+/// observes current state and therefore covers the same workloads.
+struct EventHookGuard {
+    file: fs::File,
+}
+
+impl EventHookGuard {
+    fn acquire(paths: &AppPaths) -> Result<Option<Self>> {
+        let lock_path = paths.state_file.with_file_name(".on-event.lock");
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let Ok(file) = options.open(&lock_path) else {
+            // A missing storage directory just means there is nothing to
+            // reconcile yet; a hook must never fail the plugin for that.
+            return Ok(None);
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+impl Drop for EventHookGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 /// Selects the workloads an event hook may re-observe.
