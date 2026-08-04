@@ -676,6 +676,35 @@ class Smoke:
         except OSError as error:
             fail(f"could not resize Herdr PTY: {error}")
 
+    def await_herdr_viewport(self, *, rows: int, columns: int) -> None:
+        """Block until Herdr has applied a previously requested shrink.
+
+        The resize ioctl only delivers SIGWINCH; Herdr applies the geometry
+        asynchronously. A popup opened before that lands is sized from the old
+        terminal, which silently turns a "too small to render" assertion into a
+        normally rendered picker.
+        """
+        self.wait_until(
+            f"Herdr applied a {columns}x{rows} viewport",
+            lambda: self.herdr_viewport_within(rows),
+        )
+
+    def herdr_viewport_within(self, rows: int) -> bool:
+        """Report whether every pane fits inside a terminal of `rows` rows."""
+        result = self.herdr_run("pane", "list", check=False)
+        if result.returncode != 0:
+            return False
+        try:
+            panes = json.loads(result.stdout)["result"]["panes"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return False
+        if not panes:
+            return False
+        return all(
+            int(pane.get("scroll", {}).get("viewport_rows", rows + 1)) <= rows
+            for pane in panes
+        )
+
     def send_herdr_bytes(self, keys: bytes) -> None:
         if self.herdr_master is None:
             fail("Herdr PTY is unavailable for keyboard input")
@@ -973,6 +1002,7 @@ class Smoke:
             picker_pane: str | None = None
             try:
                 self.resize_herdr(rows=rows, columns=columns)
+                self.await_herdr_viewport(rows=rows, columns=columns)
                 picker_pane = self.invoke_plugin_picker_via_keyboard()
                 self.assert_managed_picker_viewport(
                     picker_pane,
