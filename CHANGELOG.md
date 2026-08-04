@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- Mission Control no longer reports a refused prompt as `UNCERTAIN`. Herdr
+  returns `agent_not_ready`, `agent_target_ambiguous`, and `empty_agent_prompt`
+  before it writes any bytes, so delivery provably did not happen, but Tether
+  classified them as uncertain and refused to retry. `agent_prompt_failed`
+  stays uncertain because it is raised by the send itself.
 - Corrected the documented agent-kind examples. Herdr recognizes `claude`, not
   `claude-code`; the previous example was a kind Herdr does not know, so anyone
   following it got no sidebar agent row and no explanation.

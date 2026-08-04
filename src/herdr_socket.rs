@@ -818,6 +818,18 @@ fn actionable_error_guidance(code: &str) -> Option<&'static str> {
     }
 }
 
+/// Reports whether a Herdr error proves the prompt text never reached the agent.
+///
+/// Codes here are ones Herdr returns *before* it writes any bytes, verified
+/// against `handle_agent_prompt` in Herdr's source: every `agent_not_ready`,
+/// `empty_agent_prompt`, and target-resolution return happens ahead of the first
+/// `try_send_bytes`. `agent_prompt_failed` is deliberately absent because it is
+/// raised by that send itself, so a partial write is possible and the outcome is
+/// genuinely uncertain.
+///
+/// Being wrong in the permissive direction would tell someone a prompt was not
+/// delivered when it was, inviting a duplicate send. Anything unproven stays
+/// uncertain.
 fn prompt_error_confirms_no_delivery(code: &str) -> bool {
     matches!(
         code,
@@ -829,6 +841,9 @@ fn prompt_error_confirms_no_delivery(code: &str) -> bool {
             | "agent_not_found"
             | "agent_not_running"
             | "agent_ambiguous"
+            | "agent_target_ambiguous"
+            | "agent_not_ready"
+            | "empty_agent_prompt"
             | "unsupported"
     )
 }
@@ -1027,6 +1042,19 @@ mod tests {
         assert!(!prompt_error_confirms_no_delivery("timeout"));
         assert!(!prompt_error_confirms_no_delivery("agent_prompt_stalled"));
         assert!(!prompt_error_confirms_no_delivery("unknown"));
+
+        // Herdr returns these before writing any bytes, so delivery provably
+        // did not happen. `agent_not_ready` covers an unrecognized agent, a
+        // pending managed launch, and an agent that is no longer the pane
+        // foreground process -- all common, all previously reported as
+        // UNCERTAIN.
+        assert!(prompt_error_confirms_no_delivery("agent_not_ready"));
+        assert!(prompt_error_confirms_no_delivery("agent_target_ambiguous"));
+        assert!(prompt_error_confirms_no_delivery("empty_agent_prompt"));
+
+        // Raised by the send itself, so a partial write is possible. This one
+        // must stay uncertain no matter how tempting the name is.
+        assert!(!prompt_error_confirms_no_delivery("agent_prompt_failed"));
     }
 
     #[test]
