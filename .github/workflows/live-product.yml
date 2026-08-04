@@ -38,19 +38,11 @@ jobs:
           - os: ubuntu-24.04
             label: Ubuntu 24.04
             platform: linux
-            herdr_version: "0.7.3"
+            herdr_version: "0.8.0"
           - os: macos-14
             label: macOS 14
             platform: macos
-            herdr_version: "0.7.3"
-          - os: ubuntu-24.04
-            label: Ubuntu 24.04
-            platform: linux
-            herdr_version: "0.7.5"
-          - os: macos-14
-            label: macOS 14
-            platform: macos
-            herdr_version: "0.7.5"
+            herdr_version: "0.8.0"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
@@ -87,37 +79,21 @@ jobs:
         run: |
           set -euo pipefail
           case "${HERDR_VERSION}:${HERDR_PLATFORM}:$(uname -m)" in
-            0.7.3:linux:aarch64|0.7.3:linux:arm64)
+            0.8.0:linux:aarch64|0.8.0:linux:arm64)
               asset="herdr-linux-aarch64"
-              sha256="ea490094f2c7c39099870857d00c64c628ef7b5eba1967df4258033455ee2cb1"
+              sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87"
               ;;
-            0.7.3:linux:x86_64)
+            0.8.0:linux:x86_64)
               asset="herdr-linux-x86_64"
-              sha256="043ef43ecbabda28465dcff1eec3184518150d567b8b8f20cda9c6c88770641d"
+              sha256="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28"
               ;;
-            0.7.3:macos:arm64)
+            0.8.0:macos:arm64)
               asset="herdr-macos-aarch64"
-              sha256="b31345392d004ec1f1b2c821e1ad601019fa8385fe1e4c6931321eb58a920773"
+              sha256="d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178"
               ;;
-            0.7.3:macos:x86_64)
+            0.8.0:macos:x86_64)
               asset="herdr-macos-x86_64"
-              sha256="9b5f35d283b0877eeda0cf66ba1ef1d95ae40f32e858a04da0041f3a20df027c"
-              ;;
-            0.7.5:linux:aarch64|0.7.5:linux:arm64)
-              asset="herdr-linux-aarch64"
-              sha256="32e763a1499a6b694b1d708e4f062b743be1da9f34fcfa4d212d6db6fe09a8b9"
-              ;;
-            0.7.5:linux:x86_64)
-              asset="herdr-linux-x86_64"
-              sha256="3dc83288073e4c2d3c679a30e7be97bcca9141c6fd17dbbb9219142e95c59253"
-              ;;
-            0.7.5:macos:arm64)
-              asset="herdr-macos-aarch64"
-              sha256="37350546b0012555943b92eaf962665de4e264395baeb44227b8015e8ff5b0d6"
-              ;;
-            0.7.5:macos:x86_64)
-              asset="herdr-macos-x86_64"
-              sha256="3fe50c4a63dc8102306b1322178628ddb3655cd3ae56d784f094153408d69e62"
+              sha256="77cb5afd6c8fcaaaf3bc28e474ec01c209331ad08094e20d7f8aa9b0bb78d649"
               ;;
             *)
               echo "unsupported runner: Herdr ${HERDR_VERSION} ${HERDR_PLATFORM}/$(uname -m)" >&2
@@ -127,7 +103,7 @@ jobs:
           destination="$RUNNER_TEMP/herdr-${HERDR_VERSION}"
           curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
             --output "$destination" \
-            "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/${asset}"
+            "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/${asset}"
           if [[ "$HERDR_PLATFORM" == linux ]]; then
             printf '%s  %s\n' "$sha256" "$destination" | sha256sum --check
           else
