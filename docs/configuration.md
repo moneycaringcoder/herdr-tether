@@ -107,11 +107,16 @@ workload lifecycle. Ad hoc creation supports the equivalent
 must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
 The kind is a free-form token that Herdr resolves, so agents Herdr adds later
-work without a Tether release. Current examples include `codex`, `claude-code`,
-`opencode`, `grok`, and `agy` for Antigravity. Herdr owns the authoritative
-list; `herdr agent list` shows what the running binary recognizes. A kind Herdr
-does not recognize simply produces no sidebar agent row, and never changes the
-durable workload lifecycle.
+work without a Tether release. Herdr 0.8.0 recognizes `agy`, `amp`, `claude`,
+`cline`, `codex`, `copilot`, `cursor`, `devin`, `droid`, `gemini`, `grok`,
+`hermes`, `kilo`, `kimi`, `kiro`, `maki`, `opencode`, `pi`, and `qodercli`.
+Herdr owns the authoritative list and updates it independently of Tether; run
+`herdr server agent-manifests` to see what your installed Herdr recognizes.
+
+A kind Herdr does not recognize never changes the durable workload lifecycle,
+but it also produces no sidebar agent row and no Mission Control binding. Tether
+warns when it can reach Herdr and the kind is unrecognized, rather than letting
+a typo fail silently.
 
 ### Mission Control prompt capability
 
