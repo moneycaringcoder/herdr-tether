@@ -37,6 +37,11 @@
 
 - Corrected public Herdr links after the upstream GitHub organization migration
   from `ogulcancelik/herdr` to `herdrdev/herdr`.
+- Repaired the macOS live-product gate, which reported success without running
+  the smoke at all. Bash 3.2 treats an empty `"${array[@]}"` as unbound under
+  `set -u`, and exits with the status of the last command in an `EXIT` trap, so
+  the abort was masked. The expansion is now empty-safe and the trap re-raises
+  the real status.
 - A stopped Herdr server, a protocol mismatch, or a missing API now reports
   actionable guidance instead of a raw socket I/O error.
 - Restored private `0700` permissions on storage directories Tether creates
