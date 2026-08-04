@@ -4,6 +4,11 @@
 
 ### Added
 
+- The picker now brings the invoking pane's sibling Git worktrees forward, after
+  the invocation directory itself. Worktree checkouts of one repository often
+  differ only by branch name, which makes them easy to confuse in a directory
+  list. This remains a preference over entries the picker already has: an
+  unknown worktree stays absent and nothing else about the ordering changes.
 - Tether now warns when Herdr does not recognize an explicit `--herdr-agent` or
   `herdr_agent` kind, listing the kinds the running Herdr does recognize. The
   warning is advisory and never blocks creation, because Herdr updates its agent

@@ -1066,6 +1066,62 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
 }
 
 #[test]
+fn worktree_siblings_are_preferred_after_the_invocation_directory() {
+    let (config, state) = picker_fixture();
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let preference =
+        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
+
+    // `/srv/configured` stands in for a sibling worktree of the same repository.
+    options.prefer_invocation_location_with_worktrees(
+        preference.as_ref(),
+        &state,
+        &[std::path::PathBuf::from("/srv/configured")],
+    );
+
+    // The invocation directory keeps first place; its sibling is pulled ahead of
+    // everything else rather than displacing it.
+    assert_eq!(
+        options.hosts[0]
+            .directories
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["/srv/shared", "/srv/configured", "/srv/recent"]
+    );
+}
+
+#[test]
+fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
+    let (config, state) = picker_fixture();
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let with_worktrees = {
+        let mut options = options.clone();
+        let preference = InvocationLocation::from_plugin_context_json(Some(
+            r#"{"focused_pane_cwd":"/srv/shared"}"#,
+        ));
+        options.prefer_invocation_location_with_worktrees(
+            preference.as_ref(),
+            &state,
+            // A real worktree the picker has no entry for, and one that is not a
+            // directory of this host at all.
+            &[
+                std::path::PathBuf::from("/srv/worktrees/feature"),
+                std::path::PathBuf::from("/untrusted/elsewhere"),
+            ],
+        );
+        options
+    };
+    let preference =
+        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
+    options.prefer_invocation_location(preference.as_ref(), &state);
+
+    // Worktree paths are a preference over entries that already exist. An
+    // unknown path must not appear, and must not change the ordering either.
+    assert_eq!(with_worktrees, options);
+}
+
+#[test]
 fn invocation_location_does_not_choose_between_ambiguous_hosts() {
     let (mut config, state) = picker_fixture();
     config.discovery.local_roots.push("/srv/shared".into());

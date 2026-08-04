@@ -984,9 +984,11 @@ fn selection_from_picker(
     }
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
-    options.prefer_invocation_location(
-        crate::herdr::InvocationLocation::from_plugin_env().as_ref(),
+    let invocation = crate::herdr::InvocationLocation::from_plugin_env();
+    options.prefer_invocation_location_with_worktrees(
+        invocation.as_ref(),
         state,
+        &invocation_worktrees(invocation.as_ref()),
     );
     retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
@@ -1663,6 +1665,21 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
         eprintln!("skipped {id}: changed since preview");
     }
     Ok(())
+}
+
+/// Lists the worktrees sharing a repository with the invoking pane.
+///
+/// Purely a picker preference, so every failure path returns nothing: no Herdr
+/// socket, a directory outside a repository, or a rejected request all simply
+/// leave the ordering alone.
+fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> Vec<PathBuf> {
+    let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
+        return Vec::new();
+    };
+    let Ok(client) = HerdrSocketClient::from_env() else {
+        return Vec::new();
+    };
+    client.worktree_paths(directory).unwrap_or_default()
 }
 
 /// Warns when Herdr does not recognize an explicit agent hint.
