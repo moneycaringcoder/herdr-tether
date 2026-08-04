@@ -68,6 +68,10 @@ workers = 4
 
 [retention]
 closed_days = 30
+
+[notifications]
+agent_blocked = true
+agent_done = true
 ```
 
 Unknown fields and invalid values are rejected rather than ignored.
@@ -157,6 +161,23 @@ Replace current pane first checks for foreground processes and requests interact
 `discovery.local_roots` limits local repository scanning to explicit roots. When it is empty, Tether uses the local home directory. Remote hosts use their `roots`, or remote `~` when no roots are configured.
 
 Discovery is bounded by depth, visited entries, results, time, and worker count. It does not follow symbolic links. Recent directories may appear as picker suggestions, but they never silently expand the configured scan roots.
+
+### Notifications
+
+`notifications.agent_blocked` and `notifications.agent_done` ask Herdr to show a
+toast when a Mission Control agent changes into `BLOCKED` or `DONE`. Both default
+to true. A toast is sent only on a change into that state, so an agent that stays
+blocked does not notify again on every refresh.
+
+These are advisory and best effort. Herdr shows nothing unless you have enabled
+its own `ui.toast.delivery` setting, which ships as `off`, and it may decline
+while another surface owns the screen. Tether treats either outcome as normal:
+the Mission Control tile remains the authoritative view of agent state.
+
+Notification text carries only the worker's already-sanitized display label and
+its state. Host, directory, command, capture, and prompt text are never included.
+Tether notifies only while a Mission Control surface is open; nothing observes
+agent state when no Tether surface is running.
 
 ### Retention
 

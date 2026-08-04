@@ -333,12 +333,37 @@ impl Default for RetentionDefaults {
     }
 }
 
+/// Opt-in Herdr toasts for agent states that want a person's attention.
+///
+/// These are advisory. Herdr delivers a toast only when the user has enabled
+/// `ui.toast.delivery`, and Tether's own surfaces remain the authoritative view
+/// of agent state either way.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDefaults {
+    /// Notify when a Mission Control agent starts waiting on a person.
+    pub agent_blocked: bool,
+    /// Notify when a Mission Control agent settles as done.
+    pub agent_done: bool,
+}
+
+impl Default for NotificationDefaults {
+    fn default() -> Self {
+        Self {
+            agent_blocked: true,
+            agent_done: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     pub hosts: Vec<HostConfig>,
     pub ui: UiDefaults,
+    #[serde(default)]
+    pub notifications: NotificationDefaults,
     pub discovery: DiscoveryDefaults,
     pub retention: RetentionDefaults,
 }
@@ -492,6 +517,7 @@ impl Default for Config {
             version: Self::CURRENT_VERSION,
             hosts: Vec::new(),
             ui: UiDefaults::default(),
+            notifications: NotificationDefaults::default(),
             discovery: DiscoveryDefaults::default(),
             retention: RetentionDefaults::default(),
         }
@@ -724,6 +750,7 @@ impl ConfigV2 {
             version: Config::CURRENT_VERSION,
             hosts: self.hosts,
             ui: self.ui,
+            notifications: NotificationDefaults::default(),
             discovery: self.discovery,
             retention: self.retention,
         }
@@ -746,6 +773,7 @@ impl ConfigV1 {
             version: Config::CURRENT_VERSION,
             hosts: self.hosts,
             ui: self.ui,
+            notifications: NotificationDefaults::default(),
             discovery: DiscoveryDefaults::default(),
             retention: RetentionDefaults::default(),
         }

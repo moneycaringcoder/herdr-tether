@@ -120,6 +120,16 @@ struct PreviousWorkerState {
     last_observed: Option<String>,
     latency_ms: Option<u64>,
     live_agent: bool,
+    agent_state: ObserverAgentState,
+}
+
+/// A worker that just entered a state a person may want to know about.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentAttention {
+    pub worker_id: String,
+    /// Already-sanitized display label. Never a host, directory, or command.
+    pub label: String,
+    pub state: ObserverAgentState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,7 +422,12 @@ impl ObserverState {
     /// worker in loading. Duplicate IDs after their first occurrence and workers beyond
     /// [`MAX_WORKERS`] are ignored. If the selected identity disappeared, the prior
     /// numeric position is retained where possible.
-    pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) {
+    /// Replaces the worker set and reports newly attention-worthy agents.
+    ///
+    /// A transition is only reported when a live agent *changes into* `BLOCKED`
+    /// or `DONE`. Re-reporting a state the worker was already in would turn
+    /// every refresh into a notification.
+    pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) -> Vec<AgentAttention> {
         let previous_index = self.selected_index().unwrap_or(0);
         let previous_workers: HashMap<String, PreviousWorkerState> = self
             .workers
@@ -425,6 +440,7 @@ impl ObserverState {
                         last_observed: worker.last_observed,
                         live_agent: worker.live_agent,
                         latency_ms: worker.latency_ms,
+                        agent_state: worker.agent_state,
                     },
                 )
             })
@@ -495,6 +511,27 @@ impl ObserverState {
                 worker
             })
             .collect();
+        let attention: Vec<AgentAttention> = self
+            .workers
+            .iter()
+            .filter(|worker| worker.live_agent)
+            .filter(|worker| {
+                matches!(
+                    worker.agent_state,
+                    ObserverAgentState::Blocked | ObserverAgentState::Done
+                )
+            })
+            .filter(|worker| {
+                previous_workers
+                    .get(&worker.id)
+                    .is_none_or(|previous| previous.agent_state != worker.agent_state)
+            })
+            .map(|worker| AgentAttention {
+                worker_id: worker.id.clone(),
+                label: worker.display_title(),
+                state: worker.agent_state,
+            })
+            .collect();
         self.prompt_targets.retain(|id| {
             self.workers
                 .iter()
@@ -504,15 +541,17 @@ impl ObserverState {
         if self.workers.is_empty() {
             self.selected_id = None;
             self.prompt_targets.clear();
-            return;
+            return attention;
         }
-        if let Some(selected) = self.selected_id.as_deref()
-            && self.workers.iter().any(|worker| worker.id == selected)
+        if self
+            .selected_id
+            .as_deref()
+            .is_none_or(|selected| !self.workers.iter().any(|worker| worker.id == selected))
         {
-            return;
+            let index = previous_index.min(self.workers.len() - 1);
+            self.selected_id = Some(self.workers[index].id.clone());
         }
-        let index = previous_index.min(self.workers.len() - 1);
-        self.selected_id = Some(self.workers[index].id.clone());
+        attention
     }
 
     pub fn set_connection_observation(
