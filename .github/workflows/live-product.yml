@@ -129,8 +129,13 @@ jobs:
           set -euo pipefail
           witness_socket="tether-parent-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           witness_session="tether-parent-witness"
+          # Bash 3.2, still the default on macOS runners, exits with the status
+          # of the last command run in an EXIT trap. Without capturing and
+          # re-raising the real status, a failing smoke reports success.
           cleanup_witness() {
+            status=$?
             tmux -L "$witness_socket" kill-session -t "=$witness_session" 2>/dev/null || true
+            exit "$status"
           }
           trap cleanup_witness EXIT
           tmux -L "$witness_socket" new-session -d -s "$witness_session"
@@ -165,11 +170,14 @@ jobs:
             echo "::notice::Remote equivalence was not exercised because no disposable SSH target is configured."
           fi
 
+          # Bash 3.2 treats "${array[@]}" as unbound when the array is empty, so
+          # expanding it under `set -u` aborts the run. This guarded form is
+          # empty-safe on both bash 3.2 and bash 5.
           python3 tools/live_product_smoke.py \
             --herdr "$HERDR_BIN" \
             --herdr-version "$HERDR_VERSION" \
             --tether target/release/herdr-tether \
             --repo-root "$GITHUB_WORKSPACE" \
-            "${remote_args[@]}"
+            ${remote_args[@]+"${remote_args[@]}"}
 
           tmux -L "$witness_socket" has-session -t "=$witness_session"

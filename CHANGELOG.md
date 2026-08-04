@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Mission Control now marks a capture `TRUNCATED` when Herdr reports that older
+  output was dropped. Tether previously discarded that flag and rendered a
+  clipped capture as if it were the worker's complete output.
+- Added `e` in Mission Control to relay Herdr's own `agent.explain` reasoning for
+  the selected agent, which is most useful on a `BLOCKED` or `UNKNOWN` tile.
+  Herdr's explain payload is an open object, so Tether flattens only top-level
+  scalars into bounded, sanitized pairs, reports collections by shape, and
+  surfaces unrecognized fields rather than dropping them.
+- Documented `grok`, `agy`, and `opencode` as `--herdr-agent` examples. The kind
+  stays a free-form token that Herdr resolves, so agents Herdr adds later need no
+  Tether release.
+
 ### Changed
 
 - **Breaking:** Tether now requires Herdr 0.8.0 or newer. `min_herdr_version` is
@@ -23,6 +37,11 @@
 
 - Corrected public Herdr links after the upstream GitHub organization migration
   from `ogulcancelik/herdr` to `herdrdev/herdr`.
+- Repaired the macOS live-product gate, which reported success without running
+  the smoke at all. Bash 3.2 treats an empty `"${array[@]}"` as unbound under
+  `set -u`, and exits with the status of the last command in an `EXIT` trap, so
+  the abort was masked. The expansion is now empty-safe and the trap re-raises
+  the real status.
 - A stopped Herdr server, a protocol mismatch, or a missing API now reports
   actionable guidance instead of a raw socket I/O error.
 - Restored private `0700` permissions on storage directories Tether creates

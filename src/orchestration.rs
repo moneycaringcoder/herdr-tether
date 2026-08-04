@@ -915,12 +915,60 @@ pub fn run_observer(
                     });
                 match result {
                     Ok(read) => {
-                        observer.merge_capture(&worker_id, ObserverCapture::Ready(read.text));
-                        observer
-                            .set_notice(Some(format!("Read Herdr agent output for {worker_id}")));
+                        let truncated = read.truncated;
+                        observer.merge_capture(
+                            &worker_id,
+                            if truncated {
+                                ObserverCapture::Truncated(read.text)
+                            } else {
+                                ObserverCapture::Ready(read.text)
+                            },
+                        );
+                        observer.set_notice(Some(if truncated {
+                            format!(
+                                "Read Herdr agent output for {worker_id} · older output was dropped"
+                            )
+                        } else {
+                            format!("Read Herdr agent output for {worker_id}")
+                        }));
                     }
                     Err(error) => {
                         observer.set_notice(Some(format!("Read rejected: {error:#}")));
+                    }
+                }
+            }
+            ObserverOutcome::ExplainSelected { worker_id } => {
+                let Some(client) = mission_client.as_ref() else {
+                    observer.set_notice(Some(
+                        "Mission Control agent actions require a reachable Herdr session"
+                            .to_owned(),
+                    ));
+                    continue;
+                };
+                let result = mission_targets(&store, &group_id, std::slice::from_ref(&worker_id))
+                    .and_then(|targets| {
+                        let mission = MissionControlService::new(store.clone(), client.clone());
+                        let binding = mission.binding_for_observation(&group_id, &targets[0])?;
+                        client.explain_agent(binding.target())
+                    });
+                match result {
+                    Ok(fields) if fields.is_empty() => {
+                        observer.set_notice(Some(format!(
+                            "Herdr returned no explanation for {worker_id}"
+                        )));
+                    }
+                    Ok(fields) => {
+                        // Herdr owns the reasoning; Tether only relays it.
+                        let summary = fields
+                            .iter()
+                            .map(|(key, value)| format!("{key}: {value}"))
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        observer
+                            .set_notice(Some(format!("Herdr explains {worker_id} — {summary}")));
+                    }
+                    Err(error) => {
+                        observer.set_notice(Some(format!("Explain rejected: {error:#}")));
                     }
                 }
             }

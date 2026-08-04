@@ -243,6 +243,13 @@ fn outcomes_are_read_only_and_open_requires_all_eligibility() {
         action_for_key(ObserverKey::Char('q')),
         Some(ObserverAction::Quit)
     );
+    assert_eq!(
+        action_for_key(ObserverKey::Char('e')),
+        Some(ObserverAction::ExplainSelected)
+    );
+    // `x` stops or removes a workload in the picker. Mission Control has no
+    // destructive action, so the key stays unmapped here rather than teaching a
+    // gesture that destroys something one screen over.
     assert_eq!(action_for_key(ObserverKey::Char('x')), None);
     assert_eq!(
         action_for_key(ObserverKey::Up),
@@ -406,6 +413,43 @@ fn capture_lifecycle_renders_loading_ready_empty_and_unavailable_distinctly() {
     assert!(unavailable.contains("Output unavailable"), "{unavailable}");
     assert!(!unavailable.contains("Loading output"), "{unavailable}");
     assert!(!unavailable.contains("No captured output"), "{unavailable}");
+}
+
+#[test]
+fn truncated_capture_is_marked_and_never_reads_as_complete_output() {
+    let mut observer = ObserverState::new(vec![worker("capture")]);
+
+    observer.merge_capture("capture", ObserverCapture::Ready("full output".to_owned()));
+    let complete = render_to_text(60, 10, &observer).unwrap();
+    assert!(complete.contains("full output"), "{complete}");
+    assert!(!complete.contains("TRUNCATED"), "{complete}");
+
+    observer.merge_capture(
+        "capture",
+        ObserverCapture::Truncated("tail of output".to_owned()),
+    );
+    let truncated = render_to_text(60, 10, &observer).unwrap();
+    // The text still renders, but it is explicitly labelled as incomplete.
+    assert!(truncated.contains("tail of output"), "{truncated}");
+    assert!(truncated.contains("TRUNCATED"), "{truncated}");
+    assert!(!truncated.contains("Output unavailable"), "{truncated}");
+    assert!(!truncated.contains("No captured output"), "{truncated}");
+
+    // Truncation is not sticky: a later complete read clears the marker.
+    observer.merge_capture("capture", ObserverCapture::Ready("full output".to_owned()));
+    let recovered = render_to_text(60, 10, &observer).unwrap();
+    assert!(!recovered.contains("TRUNCATED"), "{recovered}");
+}
+
+#[test]
+fn truncated_capture_with_no_text_still_reports_truncation_not_emptiness() {
+    let mut observer = ObserverState::new(vec![worker("capture")]);
+    observer.merge_capture("capture", ObserverCapture::Truncated(String::new()));
+    let rendered = render_to_text(60, 10, &observer).unwrap();
+    assert!(rendered.contains("TRUNCATED"), "{rendered}");
+    // "No captured output" would claim Herdr saw nothing, which is not what a
+    // truncated empty read means.
+    assert!(!rendered.contains("No captured output"), "{rendered}");
 }
 
 #[test]

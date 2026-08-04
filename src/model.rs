@@ -494,7 +494,18 @@ mod tests {
 
     #[test]
     fn herdr_agent_kind_is_bounded_and_shell_safe() {
-        for valid in ["codex", "claude-code", "omp_2", &"a".repeat(32)] {
+        // Herdr keeps adding recognized agents (0.8.0 added Grok and
+        // Antigravity). The kind is a bounded free-form token precisely so a new
+        // upstream agent needs no Tether release.
+        for valid in [
+            "codex",
+            "claude-code",
+            "omp_2",
+            "grok",
+            "agy",
+            "opencode",
+            &"a".repeat(32),
+        ] {
             let kind = valid.parse::<HerdrAgentKind>().unwrap();
             assert_eq!(kind.as_str(), valid);
             assert_eq!(

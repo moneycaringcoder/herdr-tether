@@ -1821,6 +1821,17 @@ class Smoke:
         observer_text = self.pane_visible_text(observer_pane)
         if "ORCHESTRATOR" in observer_text:
             fail("Observer worker tiles rendered the orchestrator role token")
+        # These workloads are ordinary commands, not Herdr-recognized agents, so
+        # the agent-observation controls must be absent. This harness cannot
+        # install a coding agent, so the reachable assertion is the negative one:
+        # capability gating hides read, wait, and explain rather than offering
+        # controls that would be rejected.
+        for hidden_control in ("v read", "w wait", "e explain"):
+            if hidden_control in observer_text:
+                fail(
+                    f"Observer offered {hidden_control!r} for a workload with no "
+                    f"recognized Herdr agent: {observer_text!r}"
+                )
         after_status = owned_status(payload)
         if after_status != before_status:
             fail(
