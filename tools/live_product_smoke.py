@@ -1905,6 +1905,18 @@ class Smoke:
             lambda: "Read Herdr agent output" in self.pane_visible_text(observer_pane),
         )
 
+        # `w` waits for a semantic state. The agent is already idle, so Herdr
+        # answers immediately and Tether reports the settled state.
+        self.send_managed_keys(observer_pane, "w")
+        self.wait_until(
+            "Mission Control waited on a bound Herdr agent",
+            lambda: "IDLE" in self.pane_visible_text(observer_pane)
+            and "Wait" in self.pane_visible_text(observer_pane),
+        )
+        waited = self.pane_visible_text(observer_pane)
+        if "Wait ended without a state change" in waited:
+            fail(f"Mission Control could not wait on a bound agent: {waited!r}")
+
         # Herdr classifies agents from screen-detection rules. This agent's state
         # was reported rather than detected, so Herdr may legitimately decline to
         # explain it. Assert that the control is wired, authorized, and resolves
@@ -1919,6 +1931,14 @@ class Smoke:
                 outcome in self.pane_visible_text(observer_pane)
                 for outcome in explain_outcomes
             ),
+        )
+
+        # `f` focuses the agent's pane, which moves Herdr's focus off the
+        # Observer. Do it last so nothing afterwards depends on Observer focus.
+        self.send_managed_keys(observer_pane, "f")
+        self.wait_until(
+            "Mission Control focused the bound agent pane",
+            lambda: self.focused_pane() == worker_pane,
         )
 
         self.close_pane(observer_pane)
