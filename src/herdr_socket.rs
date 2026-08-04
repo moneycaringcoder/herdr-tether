@@ -237,6 +237,29 @@ impl HerdrSocketClient {
         decode_field(&result, "read", "Herdr agent read")
     }
 
+    /// Lists the agent kinds the running Herdr recognizes.
+    ///
+    /// Herdr updates this set independently of Tether, so it is queried rather
+    /// than hardcoded. Callers use it to warn about an unrecognized hint; they
+    /// must not use it to reject one, because a Herdr that has not yet fetched
+    /// its remote manifests would otherwise block a legitimate kind.
+    pub fn agent_manifest_kinds(&self) -> Result<Vec<String>> {
+        let result = self.request_value("server.agent_manifests", json!({}), self.timeout)?;
+        require_result_type(&result, "agent_manifest_status")?;
+        let manifests = result
+            .get("manifests")
+            .and_then(Value::as_array)
+            .context("Herdr agent manifest status did not contain manifests")?;
+        let mut kinds: Vec<String> = manifests
+            .iter()
+            .filter_map(|entry| entry.get("agent").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        Ok(kinds)
+    }
+
     /// Asks Herdr to show an advisory toast.
     ///
     /// Delivery is best effort and entirely Herdr's decision. Herdr answers

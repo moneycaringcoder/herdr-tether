@@ -499,7 +499,7 @@ mod tests {
         // upstream agent needs no Tether release.
         for valid in [
             "codex",
-            "claude-code",
+            "claude",
             "omp_2",
             "grok",
             "agy",

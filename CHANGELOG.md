@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Tether now warns when Herdr does not recognize an explicit `--herdr-agent` or
+  `herdr_agent` kind, listing the kinds the running Herdr does recognize. The
+  warning is advisory and never blocks creation, because Herdr updates its agent
+  manifests remotely and independently of Tether.
+
+### Fixed
+
+- Corrected the documented agent-kind examples. Herdr recognizes `claude`, not
+  `claude-code`; the previous example was a kind Herdr does not know, so anyone
+  following it got no sidebar agent row and no explanation.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added

@@ -1109,6 +1109,9 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         Some(&selection.command),
     );
     let herdr_agent = selection.herdr_agent.clone();
+    if let Some(kind) = herdr_agent.as_ref() {
+        warn_unrecognized_agent_kind(kind);
+    }
     let record = SessionRecord {
         id,
         host: selection.host,
@@ -1660,6 +1663,29 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
         eprintln!("skipped {id}: changed since preview");
     }
     Ok(())
+}
+
+/// Warns when Herdr does not recognize an explicit agent hint.
+///
+/// Deliberately advisory. Herdr fetches its agent manifests remotely and updates
+/// them independently of Tether, so treating an unknown kind as an error would
+/// block a legitimate agent on a Herdr that has not refreshed yet. Silence is
+/// the real problem being fixed: an unrecognized kind produces no sidebar row
+/// and no Mission Control binding, with nothing to explain why.
+fn warn_unrecognized_agent_kind(kind: &HerdrAgentKind) {
+    let Ok(client) = HerdrSocketClient::from_env() else {
+        return;
+    };
+    let Ok(kinds) = client.agent_manifest_kinds() else {
+        return;
+    };
+    if kinds.is_empty() || kinds.iter().any(|known| known == kind.as_str()) {
+        return;
+    }
+    eprintln!(
+        "warning: Herdr does not recognize agent kind `{kind}`. The workload will run normally, but it will not appear as an agent and Mission Control cannot bind it. Recognized kinds: {}.",
+        kinds.join(", ")
+    );
 }
 
 fn plugin_command(paths: &AppPaths, command: PluginCommand) -> Result<()> {
