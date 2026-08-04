@@ -144,9 +144,13 @@ not a Tether runtime dependency.
 5. Close the Herdr view whenever you want. The workload remains available.
 
 When Herdr supplies an optional pane or workspace working directory, Tether
-brings an already-known matching workload and host to the front. The context is
-only a preference: malformed, unknown, or ambiguous paths change nothing, and
-Tether never creates a host, path, command, or selection from it.
+brings an already-known matching workload and host to the front. If that
+directory sits in a Git worktree, the repository's other worktrees are brought
+up next, since they are the directories most likely wanted after it and their
+names often differ only by branch. The context is only a preference: malformed,
+unknown, or ambiguous paths change nothing, a worktree the picker has no entry
+for stays absent, and Tether never creates a host, path, command, or selection
+from it.
 
 The picker keeps actions contextual:
 

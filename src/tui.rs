@@ -239,6 +239,22 @@ impl PickerOptions {
         location: Option<&crate::herdr::InvocationLocation>,
         state: &State,
     ) {
+        self.prefer_invocation_location_with_worktrees(location, state, &[]);
+    }
+
+    /// Extends the invocation preference to the invoking repository's worktrees.
+    ///
+    /// Sibling worktrees of the pane's repository are the directories most
+    /// likely wanted next, and they are easy to mistake for one another because
+    /// their basenames often differ only by branch. They are still only a
+    /// preference: an entry the picker does not already have stays absent, and
+    /// the exact invocation directory keeps priority over its siblings.
+    pub fn prefer_invocation_location_with_worktrees(
+        &mut self,
+        location: Option<&crate::herdr::InvocationLocation>,
+        state: &State,
+        worktrees: &[std::path::PathBuf],
+    ) {
         let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
             return;
         };
@@ -261,6 +277,13 @@ impl PickerOptions {
 
         self.hosts[..=host_index].rotate_right(1);
         let host = &mut self.hosts[0];
+        // Siblings first, then the exact directory, so the rotation leaves the
+        // invocation directory ahead of its worktrees rather than behind them.
+        if !worktrees.is_empty() {
+            stable_prefer(&mut host.directories, |candidate| {
+                worktrees.iter().any(|path| Path::new(candidate) == path)
+            });
+        }
         stable_prefer(&mut host.directories, |candidate| {
             Path::new(candidate) == directory
         });

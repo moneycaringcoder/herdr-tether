@@ -30,6 +30,8 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MIN_HERDR_PROTOCOL: u32 = 19;
 /// Human-facing label for [`MIN_HERDR_PROTOCOL`], used in upgrade guidance.
 pub const MIN_HERDR_VERSION_LABEL: &str = "0.8.0";
+/// Largest number of sibling worktrees considered as a picker preference.
+const MAX_WORKTREE_PATHS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +237,31 @@ impl HerdrSocketClient {
         )?;
         require_result_type(&result, "pane_read")?;
         decode_field(&result, "read", "Herdr agent read")
+    }
+
+    /// Lists the checkout paths of every worktree sharing a repository.
+    ///
+    /// Used only to reorder picker entries the user already has, so a failure
+    /// simply means no reordering. Bounded because a repository can hold an
+    /// arbitrary number of worktrees.
+    pub fn worktree_paths(&self, cwd: &Path) -> Result<Vec<PathBuf>> {
+        let result = self.request_value(
+            "worktree.list",
+            json!({"cwd": cwd.to_string_lossy()}),
+            self.timeout,
+        )?;
+        require_result_type(&result, "worktree_list")?;
+        let worktrees = result
+            .get("worktrees")
+            .and_then(Value::as_array)
+            .context("Herdr worktree list did not contain worktrees")?;
+        Ok(worktrees
+            .iter()
+            .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+            .filter(|path| !path.is_empty())
+            .take(MAX_WORKTREE_PATHS)
+            .map(PathBuf::from)
+            .collect())
     }
 
     /// Lists the agent kinds the running Herdr recognizes.
