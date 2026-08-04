@@ -94,15 +94,13 @@ GUI applications may provide a reduced `PATH`. Tether checks common system and H
 
 ## A workload is absent from Herdr's Agents sidebar
 
-Start with `herdr --version`.
+Start with `herdr --version` and confirm it reports 0.8.0 or newer.
 
-- On Herdr 0.7.3 and 0.7.4, arbitrary workloads hidden behind SSH and `tmux`
-  cannot be registered as sidebar agents. Use Tether's pane/session title and
-  picker state.
-- On Herdr 0.7.5 and newer, the workload must run a Herdr-supported agent and
-  must have been created with an explicit `herdr_agent` preset value or
-  `--herdr-agent KIND`. Tether never guesses a kind from the command. Changing
-  a preset later does not rewrite an existing durable workload record.
+The workload must run a Herdr-supported agent and must have been created with
+an explicit `herdr_agent` preset value or `--herdr-agent KIND`. Tether never
+guesses a kind from the command. Changing a preset later does not rewrite an
+existing durable workload record. A workload with no hint keeps Tether's
+pane/session title and picker state instead of a sidebar agent row.
 
 If a Tether Agents sidebar view is active, it intentionally hides agents
 outside the selected group, status, or remote-origin filter. Open an applicable
@@ -111,15 +109,14 @@ label that pane for the selected group and remote origin. Use **Restore default
 Agents sidebar** to remove Tether's filter.
 
 If applying or clearing the view fails, the prior preference is preserved.
-Confirm the plugin is still enabled on Herdr 0.7.5 or newer, then retry from the
-group action screen. Tether's Agent view is presentation-only and never changes
+Confirm the plugin is still enabled, then retry from the group action screen. Tether's Agent view is presentation-only and never changes
 workload lifecycle or ownership.
 
 ## Mission Control cannot prompt an agent
 
-Start with `herdr --version`. Agent control requires Herdr 0.7.5+; Herdr 0.7.3
-and 0.7.4 keep ordinary Observer and workload management and show an upgrade
-message instead.
+Start with `herdr --version`. Agent control requires Herdr 0.8.0 or newer and
+a reachable Herdr session; without one, Tether keeps ordinary Observer and
+workload management and says so instead.
 
 The worker must be running and exact-owned, have an explicit `herdr_agent`
 preset value or `--herdr-agent KIND`, and have prompt permission granted with

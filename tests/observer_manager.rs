@@ -221,7 +221,7 @@ fn create_flow_uses_safe_labels_and_default_capabilities_without_exposing_ids() 
 }
 
 #[test]
-fn prompt_capability_requires_supported_herdr_and_an_explicit_agent_hint() {
+fn prompt_capability_requires_reachable_herdr_and_an_explicit_agent_hint() {
     let mut state = state_with_sessions();
     state.sessions[1].herdr_agent = Some("codex".parse().unwrap());
 
@@ -239,7 +239,7 @@ fn prompt_capability_requires_supported_herdr_and_an_explicit_agent_hint() {
     assert!(workers[0].capabilities.prompt_agent);
 
     let mut unsupported = ObserverManagerState::from_state(&state, None).unwrap();
-    unsupported.set_mission_control_available(false);
+    unsupported.set_herdr_connected(false);
     unsupported.handle(ObserverManagerEvent::Create);
     unsupported.handle(ObserverManagerEvent::Confirm);
     unsupported.handle(ObserverManagerEvent::Toggle);
@@ -247,7 +247,7 @@ fn prompt_capability_requires_supported_herdr_and_an_explicit_agent_hint() {
     assert!(
         unsupported
             .footer_text()
-            .contains("requires Herdr 0.7.5 or newer")
+            .contains("requires a reachable Herdr session")
     );
 
     let no_hint = state_with_sessions();
@@ -264,16 +264,16 @@ fn prompt_capability_requires_supported_herdr_and_an_explicit_agent_hint() {
 }
 
 #[test]
-fn unsupported_herdr_keeps_observer_available_with_an_upgrade_message() {
+fn unreachable_herdr_keeps_observer_available_with_a_connectivity_message() {
     let mut state = state_with_sessions();
     state.orchestration_groups.push(group(&state));
     let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
-    manager.set_mission_control_available(false);
+    manager.set_herdr_connected(false);
     manager.handle(ObserverManagerEvent::Confirm);
 
     assert_eq!(
         manager.item_labels()[0],
-        "Open Observer · Herdr 0.7.5+ unlocks Mission Control"
+        "Open Observer · Herdr unreachable"
     );
     assert!(matches!(
         manager.handle(ObserverManagerEvent::Confirm),
@@ -749,7 +749,7 @@ fn existing_prompt_permission_can_be_revoked_while_agent_control_is_unavailable(
     existing.workers[0].capabilities.prompt_agent = true;
     state.orchestration_groups.push(existing);
     let mut manager = ObserverManagerState::from_state(&state, None).unwrap();
-    manager.set_mission_control_available(false);
+    manager.set_herdr_connected(false);
     manager.handle(ObserverManagerEvent::Confirm);
     manager.handle(ObserverManagerEvent::Next);
     manager.handle(ObserverManagerEvent::Confirm);

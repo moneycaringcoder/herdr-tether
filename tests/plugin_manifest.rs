@@ -1,14 +1,14 @@
 use std::{fs, process::Command};
 
 #[test]
-fn manifest_declares_build_startup_actions_and_managed_overlay_panes() {
+fn manifest_declares_build_startup_actions_and_managed_popup_panes() {
     let manifest = fs::read_to_string("herdr-plugin.toml").expect("herdr-plugin.toml is present");
     let value: toml::Value = toml::from_str(&manifest).expect("manifest is valid TOML");
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
     assert_eq!(value["version"].as_str(), Some("0.5.1"));
-    assert_eq!(value["min_herdr_version"].as_str(), Some("0.7.3"));
+    assert_eq!(value["min_herdr_version"].as_str(), Some("0.8.0"));
     assert_eq!(
         value["description"].as_str(),
         Some("Keep local and remote terminal workloads running after their Herdr view closes.")
@@ -134,7 +134,9 @@ fn manifest_declares_build_startup_actions_and_managed_overlay_panes() {
     let panes = value["panes"].as_array().unwrap();
     assert_eq!(panes.len(), 2);
     assert_eq!(panes[0]["id"].as_str(), Some("picker"));
-    assert_eq!(panes[0]["placement"].as_str(), Some("overlay"));
+    assert_eq!(panes[0]["placement"].as_str(), Some("popup"));
+    assert_eq!(panes[0]["width"].as_str(), Some("80%"));
+    assert_eq!(panes[0]["height"].as_str(), Some("80%"));
     assert_eq!(
         panes[0]["command"].as_array().unwrap(),
         &[
@@ -147,7 +149,9 @@ fn manifest_declares_build_startup_actions_and_managed_overlay_panes() {
     );
     assert_eq!(panes[1]["id"].as_str(), Some("setup"));
     assert_eq!(panes[1]["title"].as_str(), Some("Tether: Set up"));
-    assert_eq!(panes[1]["placement"].as_str(), Some("overlay"));
+    assert_eq!(panes[1]["placement"].as_str(), Some("popup"));
+    assert_eq!(panes[1]["width"].as_str(), Some("80%"));
+    assert_eq!(panes[1]["height"].as_str(), Some("80%"));
     let setup_command = panes[1]["command"].as_array().unwrap();
     let shell = setup_command[2].as_str().unwrap();
     assert!(shell.contains("setup --yes"));

@@ -34,7 +34,7 @@ printf 'CALL' >> '{log}'
 for arg do printf '\t%s' "$arg" >> '{log}'; done
 printf '\n' >> '{log}'
 if [ "$1" = "--version" ]; then
-  printf '%s\n' 'herdr 0.7.5'
+  printf '%s\n' 'herdr 0.8.0'
   exit 0
 fi
 if [ "$1 $2" = "pane split" ]; then
@@ -774,7 +774,7 @@ fn replacement_preserves_reused_source_pane_id() {
 }
 
 #[test]
-fn plugin_action_uses_popup_on_current_herdr() {
+fn plugin_pane_open_defers_placement_to_the_manifest() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -786,34 +786,34 @@ fn plugin_action_uses_popup_on_current_herdr() {
 
     client.open_plugin_pane("picker").unwrap();
 
-    assert!(fs::read_to_string(log).unwrap().contains(
-        "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\tpopup"
+    let transcript = fs::read_to_string(log).unwrap();
+    assert!(transcript.contains(
+        "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker"
     ));
+    // The manifest declares `placement = "popup"` with explicit sizing, so the
+    // request must not override placement or size.
+    assert!(!transcript.contains("--placement"));
+    assert!(!transcript.contains("--width"));
+    assert!(!transcript.contains("--height"));
 }
 
 #[test]
-fn plugin_action_keeps_overlay_on_minimum_herdr() {
+fn plugin_pane_open_does_not_probe_the_herdr_version() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
-    let script = format!(
-        "#!/bin/sh\nprintf 'CALL' >> '{log}'\nfor arg do printf '\\t%s' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.3'; else printf '%s' '{{\"id\":\"cli\",\"result\":{{\"type\":\"plugin_pane_opened\"}}}}'; fi\n",
-        log = log.display(),
-    );
-    fs::write(&binary, script).unwrap();
-    #[cfg(unix)]
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    write_fake_herdr(&binary, &log, ":");
 
     HerdrClient::new(context(&binary))
         .open_plugin_pane("picker")
         .unwrap();
 
-    assert!(fs::read_to_string(log).unwrap().contains(
-        "CALL\tplugin\tpane\topen\t--plugin\tmoneycaringcoder.tether\t--entrypoint\tpicker\t--placement\toverlay"
-    ));
+    // Tether pins Herdr 0.8.0 through the manifest, so no capability sniffing
+    // subprocess runs on the open path.
+    assert!(!fs::read_to_string(log).unwrap().contains("CALL\t--version"));
 }
 
 #[test]
@@ -837,20 +837,14 @@ fn current_herdr_receives_source_owned_agent_view_group_token() {
 }
 
 #[test]
-fn minimum_herdr_skips_unavailable_agent_view_metadata_api() {
+fn agent_view_group_token_reports_without_a_version_probe() {
     let _guard = FAKE_HERDR_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = tempdir().unwrap();
     let binary = temp.path().join("herdr");
     let log = temp.path().join("herdr.log");
-    let script = format!(
-        "#!/bin/sh\nprintf 'CALL' >> '{log}'\nfor arg do printf '\\t%s' \"$arg\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nprintf '%s\\n' 'herdr 0.7.3'\n",
-        log = log.display(),
-    );
-    fs::write(&binary, script).unwrap();
-    #[cfg(unix)]
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    write_fake_herdr(&binary, &log, ":");
 
     HerdrClient::new(context(&binary))
         .report_agent_view_group(
@@ -861,8 +855,10 @@ fn minimum_herdr_skips_unavailable_agent_view_metadata_api() {
         .unwrap();
 
     let transcript = fs::read_to_string(log).unwrap();
-    assert!(transcript.contains("CALL\t--version"));
-    assert!(!transcript.contains("report-metadata"));
+    // Herdr 0.8.0 always provides the metadata-token API, so the report goes out
+    // directly instead of paying for a `herdr --version` subprocess first.
+    assert!(!transcript.contains("CALL\t--version"));
+    assert!(transcript.contains("report-metadata"));
 }
 
 #[test]
@@ -874,7 +870,7 @@ fn plugin_action_surfaces_real_stderr_error_envelope() {
     let binary = temp.path().join("herdr");
     fs::write(
         &binary,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.7.5'; exit 0; fi\nprintf '%s' '{\"error\":{\"message\":\"invoking pane vanished\"}}' >&2\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'herdr 0.8.0'; exit 0; fi\nprintf '%s' '{\"error\":{\"message\":\"invoking pane vanished\"}}' >&2\nexit 1\n",
     )
     .unwrap();
     #[cfg(unix)]

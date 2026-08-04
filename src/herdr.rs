@@ -558,55 +558,34 @@ impl HerdrClient {
 
     /// Opens one of this plugin's manifest-declared managed panes.
     ///
-    /// Herdr 0.7.4 and newer use a session-modal popup. Older compatible
-    /// releases retain the overlay behavior.
+    /// The manifest declares `placement = "popup"` with explicit sizing, so the
+    /// open request carries no placement override.
     pub fn open_plugin_pane(&self, entrypoint: &str) -> Result<()> {
         if entrypoint.trim().is_empty() {
             bail!("plugin pane entrypoint must not be empty");
         }
-        let popup = self.supports_popup_plugin_panes()?;
-        let placement = if popup { "popup" } else { "overlay" };
-        let mut arguments = vec![
-            "plugin".to_owned(),
-            "pane".to_owned(),
-            "open".to_owned(),
-            "--plugin".to_owned(),
-            PLUGIN_ID.to_owned(),
-            "--entrypoint".to_owned(),
-            entrypoint.to_owned(),
-            "--placement".to_owned(),
-            placement.to_owned(),
-        ];
-        if popup {
-            arguments.extend([
-                "--width".to_owned(),
-                "80%".to_owned(),
-                "--height".to_owned(),
-                "80%".to_owned(),
-            ]);
-        }
-        let response = self.invoke("open plugin pane", &arguments)?;
-        if popup {
-            require_result_type_in(&response, &["ok", "plugin_pane_opened"])
-        } else {
-            require_result_type(&response, "plugin_pane_opened")
-        }
+        let response = self.invoke(
+            "open plugin pane",
+            &[
+                "plugin".to_owned(),
+                "pane".to_owned(),
+                "open".to_owned(),
+                "--plugin".to_owned(),
+                PLUGIN_ID.to_owned(),
+                "--entrypoint".to_owned(),
+                entrypoint.to_owned(),
+            ],
+        )?;
+        require_result_type_in(&response, &["ok", "plugin_pane_opened"])
     }
 
     /// Labels a pane for an opted-in Tether orchestration view.
-    ///
-    /// Herdr releases before 0.7.5 have no metadata-token API; keeping this a
-    /// no-op preserves Tether's 0.7.3 compatibility outside the optional view.
     pub fn report_agent_view_group(
         &self,
         pane_id: &str,
         group_id: &OrchestrationGroupId,
         remote: bool,
     ) -> Result<()> {
-        let output = self.execute("read version", &["--version".to_owned()])?;
-        if parse_herdr_version(&output.stdout)? < (0, 7, 5) {
-            return Ok(());
-        }
         let response = self.invoke(
             "label pane for Agent view",
             &[
@@ -622,11 +601,6 @@ impl HerdrClient {
             ],
         )?;
         require_result_type(&response, "ok")
-    }
-
-    fn supports_popup_plugin_panes(&self) -> Result<bool> {
-        let output = self.execute("read version", &["--version".to_owned()])?;
-        parse_herdr_version(&output.stdout).map(|version| version >= (0, 7, 4))
     }
 
     fn split(&self, direction: &str) -> Result<String> {
@@ -1024,37 +998,6 @@ fn placed_command_with_paths(
     Ok(CommandSpec::new("env", arguments))
 }
 
-fn parse_herdr_version(stdout: &[u8]) -> Result<(u64, u64, u64)> {
-    let text = std::str::from_utf8(stdout).context("Herdr version output was not UTF-8")?;
-    let version = text
-        .trim()
-        .strip_prefix("herdr ")
-        .ok_or_else(|| anyhow::anyhow!("Herdr version output did not start with `herdr `"))?;
-    let core = version.split_once('-').map_or(version, |(core, _)| core);
-    let mut components = core.split('.');
-    let major = components
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Herdr version output did not contain a numeric major version")
-        })?;
-    let minor = components
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Herdr version output did not contain a numeric minor version")
-        })?;
-    let patch = components
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Herdr version output did not contain a numeric patch version")
-        })?;
-    if components.next().is_some() {
-        bail!("Herdr version output contained too many numeric components");
-    }
-    Ok((major, minor, patch))
-}
 fn require_result_type(envelope: &Value, expected: &str) -> Result<()> {
     require_result_type_in(envelope, &[expected])
 }
@@ -1185,17 +1128,6 @@ mod tests {
 
         assert_eq!(context.pane_id, "w1:p1");
         assert_eq!(context.workspace_id, "w1");
-    }
-
-    #[test]
-    fn parses_popup_capable_herdr_versions() {
-        assert_eq!(parse_herdr_version(b"herdr 0.7.3\n").unwrap(), (0, 7, 3));
-        assert_eq!(parse_herdr_version(b"herdr 0.7.4\n").unwrap(), (0, 7, 4));
-        assert_eq!(
-            parse_herdr_version(b"herdr 1.0.0-preview\n").unwrap(),
-            (1, 0, 0)
-        );
-        assert!(parse_herdr_version(b"unknown\n").is_err());
     }
 
     #[test]

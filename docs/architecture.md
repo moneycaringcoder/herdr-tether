@@ -65,7 +65,7 @@ optional display title, and three independent capabilities:
   Mission Control authority check succeeds.
 
 `prompt_agent` is additive and defaults to `false` when absent, so existing
-schema-v4 files and Herdr 0.7.3/0.7.4 behavior remain valid. A worker must have
+schema-v4 files remain valid. A worker must have
 at least one capability. The orchestrator reference records the coordinating
 role but grants no lifecycle, capture, or input authority. Creating or deleting
 a group and adding or removing a worker mutate only group metadata: they never
@@ -93,7 +93,7 @@ that worker role while preserving every unaffected membership.
 
 ## Native Agent views
 
-Herdr 0.7.5 and newer can project one orchestration group into the native
+Herdr can project one orchestration group into the native
 Agents sidebar. The user explicitly selects all group agents, agents needing
 attention (`blocked` or `done`), or remote group agents; Tether never installs
 a view implicitly. `AgentViewService` persists only the selected group ID and
@@ -113,20 +113,17 @@ Set and clear operations hold the preference lock, persist the desired value,
 and roll it back if Herdr rejects the corresponding socket request. Deleting
 the selected group first clears the view; a rejected group deletion attempts
 to restore it. A startup hook restores a valid preference after Herdr startup
-or live handoff and drops a preference whose group no longer exists. Herdr
-0.7.3 and 0.7.4 ignore the newer startup hook and retain the titled-pane
-fallback; Tether skips their unavailable metadata-token API.
+or live handoff and drops a preference whose group no longer exists.
 
 ## Observer and Mission Control projection
 
-`orchestration observe` creates exactly one outer Herdr pane. On Herdr 0.7.3
-and 0.7.4 it retains the existing Observer behavior. On Herdr 0.7.5+, every
-exactly bound recognized agent uses event-driven status. `observe_output`
+`orchestration observe` creates exactly one outer Herdr pane. Every exactly
+bound recognized agent uses event-driven status. `observe_output`
 authorizes `agent.read` and semantic wait, while `open_interactive` authorizes
 focus/open. The independent `prompt_agent` grant alone enables prompt
 selection and delivery; read/open capabilities never imply it. The manager
-offers that grant only when Herdr 0.7.5+ is reachable and the durable session
-has an explicit Herdr agent hint. Removing a grant remains possible while
+offers that grant only when a Herdr session is reachable and the durable
+session has an explicit Herdr agent hint. Removing a grant remains possible while
 Herdr is unavailable.
 
 The view projects at most four workers per deterministic row-major page. One
@@ -355,8 +352,8 @@ Release-candidate validation is package-derived rather than based on a hand-main
 ## Herdr placement boundary
 
 `HerdrClient` adapts Herdr's pane, tab, plugin-surface, and metadata commands.
-Herdr 0.7.4 and newer open managed picker/setup surfaces as session-modal
-popups; the compatible 0.7.3 path retains overlays. Tether captures the
+Managed picker/setup surfaces are session-modal popups declared directly in
+the plugin manifest, so no runtime capability probe runs. Tether captures the
 invoking pane, creates and focuses the selected split or tab, then runs an
 exact Tether attach command there. It uses its resolved executable and forwards
 Herdr's authoritative plugin config/state directories instead of relying on a
@@ -391,10 +388,9 @@ Replace current pane follows destination-first ordering:
 
 Cancellation, dispatch failure, or readiness failure preserves the source. A final source-close failure preserves the verified destination and reports both pane identities.
 
-Herdr 0.7.3 and 0.7.4 have no general nested-workload registration API, so
-Tether uses clear pane/session titles there. On Herdr 0.7.5 and newer, an
-explicit validated agent hint can expose a supported agent hidden behind SSH
+An explicit validated agent hint can expose a supported agent hidden behind SSH
 or `tmux`, and an opt-in source-owned view can filter recognized group panes.
+A workload with no hint keeps clear pane/session titles.
 Tether still never infers an arbitrary agent identity or lifecycle from a
 command or process title.
 
