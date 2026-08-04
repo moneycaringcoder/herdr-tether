@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Mission Control now marks a capture `TRUNCATED` when Herdr reports that older
+  output was dropped. Tether previously discarded that flag and rendered a
+  clipped capture as if it were the worker's complete output.
+- Added `e` in Mission Control to relay Herdr's own `agent.explain` reasoning for
+  the selected agent, which is most useful on a `BLOCKED` or `UNKNOWN` tile.
+  Herdr's explain payload is an open object, so Tether flattens only top-level
+  scalars into bounded, sanitized pairs, reports collections by shape, and
+  surfaces unrecognized fields rather than dropping them.
+- Documented `grok`, `agy`, and `opencode` as `--herdr-agent` examples. The kind
+  stays a free-form token that Herdr resolves, so agents Herdr adds later need no
+  Tether release.
+
 ### Changed
 
 - **Breaking:** Tether now requires Herdr 0.8.0 or newer. `min_herdr_version` is

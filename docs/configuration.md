@@ -102,6 +102,13 @@ workload lifecycle. Ad hoc creation supports the equivalent
 `herdr-tether open --command COMMAND --herdr-agent KIND` option. Agent kinds
 must match `[a-z][a-z0-9_-]{0,31}`; Tether never guesses one from a command.
 
+The kind is a free-form token that Herdr resolves, so agents Herdr adds later
+work without a Tether release. Current examples include `codex`, `claude-code`,
+`opencode`, `grok`, and `agy` for Antigravity. Herdr owns the authoritative
+list; `herdr agent list` shows what the running binary recognizes. A kind Herdr
+does not recognize simply produces no sidebar agent row, and never changes the
+durable workload lifecycle.
+
 ### Mission Control prompt capability
 
 Each orchestration worker stores independent `observe_output`,

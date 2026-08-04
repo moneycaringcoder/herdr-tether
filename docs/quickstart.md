@@ -174,10 +174,12 @@ Mission Control keys:
 - `Space` selects prompt destinations and `p` begins prompt review;
 - `f` focuses the current Herdr agent, `v` reads recent output, and `w` waits
   briefly for `IDLE`, `DONE`, or `BLOCKED`;
+- `e` asks Herdr to explain the agent's current state, which is most useful on
+  a `BLOCKED` or `UNKNOWN` tile;
 - `r` retries/resnapshots; `q`, `Esc`, or `Ctrl+C` closes only the view.
 
 The footer shows only controls available to the group: focus/open requires
-`open_interactive`, read/wait requires `observe_output`, and prompt selection
+`open_interactive`, read/wait/explain requires `observe_output`, and prompt selection
 requires the separate `prompt_agent` grant.
 
 Before prompting, Tether shows the exact destinations and prompt. Type `SEND`

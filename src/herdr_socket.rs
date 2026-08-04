@@ -219,6 +219,26 @@ impl HerdrSocketClient {
         decode_field(&result, "read", "Herdr agent read")
     }
 
+    /// Asks Herdr why a target agent is in its current state.
+    ///
+    /// Herdr's `explain` payload is an open object whose shape is not pinned by
+    /// the API schema, so Tether never guesses field names. It flattens whatever
+    /// top-level scalars the running server sent into bounded, sanitized
+    /// `key: value` lines. An unknown future field shows up as itself instead of
+    /// being silently dropped.
+    pub fn explain_agent(&self, target: &str) -> Result<Vec<(String, String)>> {
+        if target.trim().is_empty() {
+            bail!("agent explain target must not be empty");
+        }
+        let result =
+            self.request_value("agent.explain", json!({"target": target}), self.timeout)?;
+        require_result_type(&result, "agent_explain")?;
+        let explain = result
+            .get("explain")
+            .context("Herdr agent explain response did not contain an explanation")?;
+        Ok(flatten_explain(explain))
+    }
+
     pub fn focus_agent(&self, target: &str) -> Result<HerdrAgentInfo> {
         if target.trim().is_empty() {
             bail!("agent focus target must not be empty");
@@ -632,6 +652,65 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Largest number of explain fields Tether will surface.
+const MAX_EXPLAIN_FIELDS: usize = 12;
+/// Largest rendered width of a single explain key or value, in characters.
+const MAX_EXPLAIN_FIELD_CHARS: usize = 120;
+
+/// Flattens Herdr's open `explain` object into bounded, sanitized pairs.
+///
+/// Only top-level scalars are kept. Nested objects and arrays are reported by
+/// shape rather than dumped, so an unexpectedly large or deep payload cannot
+/// flood the Observer surface.
+fn flatten_explain(explain: &Value) -> Vec<(String, String)> {
+    let Some(object) = explain.as_object() else {
+        return vec![("explain".to_owned(), explain_scalar(explain))];
+    };
+    let mut fields: Vec<(String, String)> = object
+        .iter()
+        .take(MAX_EXPLAIN_FIELDS)
+        .map(|(key, value)| (bound_explain_text(key), explain_scalar(value)))
+        .collect();
+    if object.len() > MAX_EXPLAIN_FIELDS {
+        fields.push((
+            "…".to_owned(),
+            format!("{} more fields", object.len() - MAX_EXPLAIN_FIELDS),
+        ));
+    }
+    fields
+}
+
+fn explain_scalar(value: &Value) -> String {
+    match value {
+        Value::Null => "none".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => bound_explain_text(value),
+        Value::Array(values) => format!("[{} items]", values.len()),
+        Value::Object(values) => format!("{{{} fields}}", values.len()),
+    }
+}
+
+/// Strips control characters and bounds width, matching capture sanitization.
+fn bound_explain_text(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.chars().count() <= MAX_EXPLAIN_FIELD_CHARS {
+        return trimmed.to_owned();
+    }
+    let kept: String = trimmed.chars().take(MAX_EXPLAIN_FIELD_CHARS - 1).collect();
+    format!("{kept}…")
+}
+
 /// Maps Herdr's machine-readable error codes to actionable Tether guidance.
 ///
 /// Returning `None` keeps the generic `Herdr rejected <method>` wording for
@@ -698,6 +777,70 @@ mod tests {
             panes: Vec::new(),
             agents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn explain_flattens_unknown_shapes_without_guessing_field_names() {
+        // Herdr's explain payload is an open object. Whatever it sends must come
+        // through as itself, including fields Tether has never heard of.
+        let fields = flatten_explain(&json!({
+            "state": "blocked",
+            "matched_rule": "prompt_wait",
+            "future_field_tether_has_not_seen": 7,
+            "evidence": ["a", "b", "c"],
+            "nested": {"x": 1, "y": 2},
+            "absent": null,
+        }));
+        let map: HashMap<_, _> = fields.into_iter().collect();
+        assert_eq!(map.get("state").map(String::as_str), Some("blocked"));
+        assert_eq!(
+            map.get("matched_rule").map(String::as_str),
+            Some("prompt_wait")
+        );
+        assert_eq!(
+            map.get("future_field_tether_has_not_seen")
+                .map(String::as_str),
+            Some("7")
+        );
+        // Collections are summarized by shape, never dumped into the surface.
+        assert_eq!(map.get("evidence").map(String::as_str), Some("[3 items]"));
+        assert_eq!(map.get("nested").map(String::as_str), Some("{2 fields}"));
+        assert_eq!(map.get("absent").map(String::as_str), Some("none"));
+    }
+
+    #[test]
+    fn explain_bounds_field_count_and_width() {
+        let wide = json!({ "long": "x".repeat(10_000) });
+        let fields = flatten_explain(&wide);
+        let (_, value) = &fields[0];
+        assert!(value.chars().count() <= MAX_EXPLAIN_FIELD_CHARS, "{value}");
+        assert!(value.ends_with('…'), "{value}");
+
+        let many: serde_json::Map<String, Value> = (0..50)
+            .map(|index| (format!("k{index}"), json!(index)))
+            .collect();
+        let fields = flatten_explain(&Value::Object(many));
+        assert_eq!(fields.len(), MAX_EXPLAIN_FIELDS + 1);
+        // The overflow is reported rather than silently dropped.
+        assert!(fields.last().unwrap().1.contains("more fields"));
+    }
+
+    #[test]
+    fn explain_sanitizes_control_characters_from_agent_supplied_text() {
+        let fields = flatten_explain(&json!({"reason": "line\u{1b}[31mone\nline\ttwo"}));
+        let (_, value) = &fields[0];
+        assert!(!value.contains('\n'), "{value}");
+        assert!(!value.contains('\t'), "{value}");
+        assert!(!value.contains('\u{1b}'), "{value}");
+    }
+
+    #[test]
+    fn explain_handles_a_non_object_payload() {
+        let fields = flatten_explain(&json!("just a string"));
+        assert_eq!(
+            fields,
+            vec![("explain".to_owned(), "just a string".to_owned())]
+        );
     }
 
     #[test]

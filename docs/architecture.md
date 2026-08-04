@@ -199,9 +199,14 @@ each destination independently. A confirmed pre-delivery rejection is
 and is never retried automatically because delivery may already have occurred.
 Partial success is shown explicitly and cannot be rolled back.
 
-`f`, `v`, and `w` use the same exact current binding. Focus requires
-`open_interactive`; read and semantic wait require `observe_output`. None of
-those capabilities implies `prompt_agent`. Mission Control never exposes Stop,
+`f`, `v`, `w`, and `e` use the same exact current binding. Focus requires
+`open_interactive`; read, semantic wait, and explain require `observe_output`.
+None of those capabilities implies `prompt_agent`. `e` relays Herdr's own
+`agent.explain` payload; because that payload is an open object, Tether
+flattens only its top-level scalars into bounded, sanitized pairs and reports
+collections by shape rather than dumping them. A read Herdr marks truncated
+renders as `TRUNCATED` so a clipped capture is never mistaken for the worker's
+complete output. Mission Control never exposes Stop,
 Restart, Remove, arbitrary shell, raw terminal bytes, synthesized Enter, or
 unattended retry. Prompt permission cannot authorize lifecycle mutation.
 

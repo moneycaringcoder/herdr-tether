@@ -203,9 +203,11 @@ to `state.json`.
 
 `Enter` opens the selected durable terminal, `f` focuses its current Herdr
 agent pane, `v` reads recent agent output, `w` waits briefly for a semantic
-state, `r` retries/resnapshots, and `q`, `Esc`, or `Ctrl+C` closes the view.
-Focus/open follows `open_interactive`; read/wait follows `observe_output`;
-neither permission enables prompting. Controls unavailable to the selected
+state, `e` asks Herdr why the agent is in its current state, `r`
+retries/resnapshots, and `q`, `Esc`, or `Ctrl+C` closes the view.
+Focus/open follows `open_interactive`; read, wait, and explain follow
+`observe_output`; none of them enables prompting. A read Herdr reports as
+truncated is labelled `TRUNCATED` rather than shown as complete output. Controls unavailable to the selected
 group are omitted or rejected explicitly.
 Closing Mission Control never stops a Tether workload. There are no Stop,
 Restart, Remove, shell-injection, or synthesized-Enter actions in this view.

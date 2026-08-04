@@ -98,6 +98,12 @@ impl ObserverAgentState {
 pub enum ObserverCapture {
     Loading,
     Ready(String),
+    /// Output Herdr reported as incomplete because older rows were dropped.
+    ///
+    /// Herdr 0.8.0 reports `truncated: true` on pane and agent reads whenever
+    /// it omitted scrollback. Keeping this distinct from [`Self::Ready`] stops
+    /// a clipped capture from reading as the worker's complete output.
+    Truncated(String),
     Unavailable,
 }
 
@@ -105,6 +111,7 @@ pub enum ObserverCapture {
 enum CaptureStatus {
     Loading,
     Ready,
+    Truncated,
     Unavailable,
     Stale,
 }
@@ -212,6 +219,7 @@ pub enum ObserverAction {
     FocusSelected,
     WaitSelected,
     ReadSelected,
+    ExplainSelected,
     Quit,
 }
 
@@ -225,6 +233,7 @@ pub enum ObserverOutcome {
     FocusSelected { worker_id: String },
     WaitSelected { worker_id: String },
     ReadSelected { worker_id: String },
+    ExplainSelected { worker_id: String },
     Quit,
 }
 
@@ -274,6 +283,7 @@ pub fn action_for_key(key: ObserverKey) -> Option<ObserverAction> {
         ObserverKey::Char('f' | 'F') => Some(ObserverAction::FocusSelected),
         ObserverKey::Char('w' | 'W') => Some(ObserverAction::WaitSelected),
         ObserverKey::Char('v' | 'V') => Some(ObserverAction::ReadSelected),
+        ObserverKey::Char('e' | 'E') => Some(ObserverAction::ExplainSelected),
         ObserverKey::Char('r' | 'R') => Some(ObserverAction::Refresh),
         ObserverKey::Escape | ObserverKey::ControlC | ObserverKey::Char('q' | 'Q') => {
             Some(ObserverAction::Quit)
@@ -312,6 +322,7 @@ fn gate_action_for_input(
         | ObserverAction::FocusSelected
         | ObserverAction::WaitSelected
         | ObserverAction::ReadSelected
+        | ObserverAction::ExplainSelected
             if kind == ObserverInputKind::Press && !busy =>
         {
             Some(action)
@@ -324,6 +335,7 @@ fn gate_action_for_input(
         | ObserverAction::FocusSelected
         | ObserverAction::WaitSelected
         | ObserverAction::ReadSelected
+        | ObserverAction::ExplainSelected
         | ObserverAction::Quit => None,
     }
 }
@@ -373,7 +385,9 @@ impl ObserverState {
                 .iter()
                 .any(|worker| worker.capabilities.prompt_agent),
             ObserverAction::FocusSelected => self.workers.iter().any(ObserverWorker::can_focus),
-            ObserverAction::WaitSelected | ObserverAction::ReadSelected => {
+            ObserverAction::WaitSelected
+            | ObserverAction::ReadSelected
+            | ObserverAction::ExplainSelected => {
                 self.workers.iter().any(ObserverWorker::can_observe_agent)
             }
             _ => true,
@@ -538,6 +552,10 @@ impl ObserverState {
             ObserverCapture::Ready(capture) => {
                 worker.capture = Some(sanitize_capture(&capture));
                 CaptureStatus::Ready
+            }
+            ObserverCapture::Truncated(capture) => {
+                worker.capture = Some(sanitize_capture(&capture));
+                CaptureStatus::Truncated
             }
             ObserverCapture::Unavailable
                 if worker.capture.is_some() && worker.last_observed.is_some() =>
@@ -712,6 +730,17 @@ impl ObserverState {
                 }
                 self.notice = Some(
                     "Read requires an exact live agent with observation permission".to_owned(),
+                );
+            }
+            ObserverAction::ExplainSelected => {
+                if let Some((worker_id, true)) = self
+                    .selected_worker()
+                    .map(|worker| (worker.id.clone(), worker.can_observe_agent()))
+                {
+                    return ObserverOutcome::ExplainSelected { worker_id };
+                }
+                self.notice = Some(
+                    "Explain requires an exact live agent with observation permission".to_owned(),
                 );
             }
             ObserverAction::Quit => return ObserverOutcome::Quit,
@@ -938,14 +967,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         } else {
             format!("  +{hidden} more")
         };
-        format!("↑↓ select  Enter open  f focus\nv read  w wait  r retry  q back{overflow}")
+        format!(
+            "↑↓ select  Enter open  f focus\nv read  w wait  e explain  r retry  q back{overflow}"
+        )
     } else if !prompt_available {
         let overflow = if hidden == 0 {
             String::new()
         } else {
             format!("  +{hidden} more")
         };
-        format!("↑↓ select  Enter open\nf focus  v read  w wait\nr retry  q back{overflow}")
+        format!(
+            "↑↓ select  Enter open\nf focus  v read  w wait  e explain\nr retry  q back{overflow}"
+        )
     } else if controls_height == 1 {
         let overflow = if hidden == 0 {
             String::new()
@@ -960,7 +993,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
             format!("  +{hidden} more")
         };
         format!(
-            "↑↓ select  Space target  p prompt  Enter open\nf focus  v read  w wait  r retry  q back{overflow}"
+            "↑↓ select  Space target  p prompt  Enter open\nf focus  v read  w wait  e explain  r retry  q back{overflow}"
         )
     } else {
         let overflow = if hidden == 0 {
@@ -969,7 +1002,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
             format!("  +{hidden} more")
         };
         format!(
-            "↑↓ select  Space target\np prompt  Enter open  f focus\nv read  w wait  r retry  q back{overflow}"
+            "↑↓ select  Space target\np prompt  Enter open  f focus\nv read  w wait  e explain  r retry  q back{overflow}"
         )
     };
     let controls_area = Rect::new(area.x, footer_y, area.width, controls_height);
@@ -1041,19 +1074,37 @@ fn render_worker(
                     .unwrap_or_else(|| "unknown".to_owned());
                 format!("STALE · last live {observed}\n{capture}")
             }
-            CaptureStatus::Ready => worker
-                .capture
-                .as_deref()
-                .map(sanitize_capture)
-                .filter(|capture| !capture.is_empty())
-                .map(|capture| {
-                    capture_viewport(
-                        &capture,
-                        area.width.saturating_sub(2),
-                        area.height.saturating_sub(2),
-                    )
-                })
-                .unwrap_or_else(|| "No captured output".to_owned()),
+            status @ (CaptureStatus::Ready | CaptureStatus::Truncated) => {
+                // Herdr reports truncation when it dropped older rows. Spend one
+                // row saying so rather than presenting a clipped capture as the
+                // worker's complete output.
+                let truncated = status == CaptureStatus::Truncated;
+                let reserved = if truncated { 3 } else { 2 };
+                worker
+                    .capture
+                    .as_deref()
+                    .map(sanitize_capture)
+                    .filter(|capture| !capture.is_empty())
+                    .map(|capture| {
+                        let viewport = capture_viewport(
+                            &capture,
+                            area.width.saturating_sub(2),
+                            area.height.saturating_sub(reserved),
+                        );
+                        if truncated {
+                            format!("TRUNCATED · older output dropped by Herdr\n{viewport}")
+                        } else {
+                            viewport
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if truncated {
+                            "TRUNCATED · older output dropped by Herdr".to_owned()
+                        } else {
+                            "No captured output".to_owned()
+                        }
+                    })
+            }
         }
     };
     frame.render_widget(

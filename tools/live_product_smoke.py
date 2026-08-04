@@ -1821,6 +1821,15 @@ class Smoke:
         observer_text = self.pane_visible_text(observer_pane)
         if "ORCHESTRATOR" in observer_text:
             fail("Observer worker tiles rendered the orchestrator role token")
+        # The explain control must survive real Herdr geometry and the footer's
+        # width budget. Reading the agent itself needs a Herdr-recognized agent,
+        # which this harness does not install, so the reachable end-to-end
+        # assertion is that the affordance renders.
+        if "e explain" not in observer_text:
+            fail(
+                "Observer footer did not advertise the explain control: "
+                f"{observer_text!r}"
+            )
         after_status = owned_status(payload)
         if after_status != before_status:
             fail(
