@@ -438,8 +438,13 @@ impl HerdrSocketClient {
         Ok(envelope)
     }
 
-    pub fn subscribe(&self) -> HerdrEventMonitor {
-        HerdrEventMonitor::spawn(self.clone())
+    /// Subscribes to pane lifecycle events, plus agent status for named panes.
+    ///
+    /// Herdr requires a `pane_id` on `pane.agent_status_changed`; an unfiltered
+    /// entry makes the whole `events.subscribe` request invalid. Pass the panes
+    /// currently bound to group members to receive their status transitions.
+    pub fn subscribe(&self, agent_panes: Vec<String>) -> HerdrEventMonitor {
+        HerdrEventMonitor::spawn(self.clone(), agent_panes)
     }
 }
 
@@ -450,14 +455,15 @@ pub struct HerdrEventMonitor {
 }
 
 impl HerdrEventMonitor {
-    fn spawn(client: HerdrSocketClient) -> Self {
+    fn spawn(client: HerdrSocketClient, agent_panes: Vec<String>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             let mut connected_once = false;
             while !worker_stop.load(Ordering::Acquire) {
-                match run_subscription(&client, &worker_stop, &sender, connected_once) {
+                match run_subscription(&client, &worker_stop, &sender, connected_once, &agent_panes)
+                {
                     Ok(()) if worker_stop.load(Ordering::Acquire) => break,
                     Ok(()) | Err(_) => {
                         let _ = sender.send(EventSignal::Disconnected);
@@ -491,11 +497,38 @@ impl Drop for HerdrEventMonitor {
 }
 
 #[cfg(unix)]
+/// Largest number of panes Tether will watch for agent status transitions.
+const MAX_AGENT_STATUS_PANES: usize = 64;
+
+/// Builds the `events.subscribe` payload.
+///
+/// Pane lifecycle events subscribe globally. `pane.agent_status_changed` is
+/// per-pane: Herdr requires a `pane_id` on it, and an unfiltered entry makes the
+/// entire request invalid rather than merely dropping that entry.
+fn subscription_payload(agent_panes: &[String]) -> Value {
+    let mut subscriptions = vec![
+        json!({"type": "pane.created"}),
+        json!({"type": "pane.updated"}),
+        json!({"type": "pane.closed"}),
+        json!({"type": "pane.moved"}),
+        json!({"type": "pane.exited"}),
+        json!({"type": "pane.agent_detected"}),
+    ];
+    subscriptions.extend(
+        agent_panes
+            .iter()
+            .take(MAX_AGENT_STATUS_PANES)
+            .map(|pane_id| json!({"type": "pane.agent_status_changed", "pane_id": pane_id})),
+    );
+    json!({ "subscriptions": subscriptions })
+}
+
 fn run_subscription(
     client: &HerdrSocketClient,
     stop: &AtomicBool,
     sender: &mpsc::Sender<EventSignal>,
     reconnected: bool,
+    agent_panes: &[String],
 ) -> Result<()> {
     let mut stream = UnixStream::connect(client.socket_path()).with_context(|| {
         format!(
@@ -509,21 +542,7 @@ fn run_subscription(
         "tether:events:{}",
         client.next_id.fetch_add(1, Ordering::Relaxed)
     );
-    let request = encode_request(
-        &id,
-        "events.subscribe",
-        json!({
-            "subscriptions": [
-                {"type": "pane.created"},
-                {"type": "pane.updated"},
-                {"type": "pane.closed"},
-                {"type": "pane.moved"},
-                {"type": "pane.exited"},
-                {"type": "pane.agent_detected"},
-                {"type": "pane.agent_status_changed"}
-            ]
-        }),
-    )?;
+    let request = encode_request(&id, "events.subscribe", subscription_payload(agent_panes))?;
     stream.write_all(&request)?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
@@ -826,6 +845,51 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_subscriptions_always_name_a_pane() {
+        // Herdr rejects the entire events.subscribe request when
+        // pane.agent_status_changed omits pane_id -- not just that entry. An
+        // unfiltered entry therefore costs every event, not one event type.
+        let payload = subscription_payload(&["w1:p1".to_owned(), "w1:p2".to_owned()]);
+        let subscriptions = payload["subscriptions"].as_array().unwrap();
+        let status: Vec<_> = subscriptions
+            .iter()
+            .filter(|entry| entry["type"] == "pane.agent_status_changed")
+            .collect();
+        assert_eq!(status.len(), 2);
+        assert!(status.iter().all(|entry| entry["pane_id"].is_string()));
+
+        // Lifecycle events stay global; they take no pane filter.
+        let lifecycle: Vec<_> = subscriptions
+            .iter()
+            .filter(|entry| entry["type"] != "pane.agent_status_changed")
+            .collect();
+        assert_eq!(lifecycle.len(), 6);
+        assert!(lifecycle.iter().all(|entry| entry.get("pane_id").is_none()));
+    }
+
+    #[test]
+    fn subscription_without_bound_panes_still_watches_lifecycle() {
+        let payload = subscription_payload(&[]);
+        let subscriptions = payload["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), 6);
+        assert!(
+            subscriptions
+                .iter()
+                .all(|entry| entry["type"] != "pane.agent_status_changed")
+        );
+    }
+
+    #[test]
+    fn agent_status_subscriptions_are_bounded() {
+        let panes: Vec<String> = (0..MAX_AGENT_STATUS_PANES * 2)
+            .map(|index| format!("w1:p{index}"))
+            .collect();
+        let payload = subscription_payload(&panes);
+        let subscriptions = payload["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), 6 + MAX_AGENT_STATUS_PANES);
+    }
+
+    #[test]
     fn explain_flattens_unknown_shapes_without_guessing_field_names() {
         // Herdr's explain payload is an open object. Whatever it sends must come
         // through as itself, including fields Tether has never heard of.
@@ -1016,7 +1080,7 @@ mod event_monitor_tests {
             }
         });
 
-        let monitor = HerdrSocketClient::new(socket).subscribe();
+        let monitor = HerdrSocketClient::new(socket).subscribe(vec!["w1:p1".to_owned()]);
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut signals = Vec::new();
         while Instant::now() < deadline

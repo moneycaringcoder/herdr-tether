@@ -21,6 +21,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
+    agent_view::GROUP_TOKEN,
     backend::ProcessBinaries,
     config::{ConfigStore, NotificationDefaults},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
@@ -637,7 +638,9 @@ pub fn run_observer(
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
     let (capture_worker, observer_results) = CaptureWorker::spawn();
-    let mission_events = mission_client.as_ref().map(HerdrSocketClient::subscribe);
+    // Herdr needs the pane ids up front, so the first refresh discovers the
+    // group's panes and the event monitor subscribes afterwards.
+    let mut agent_panes: Vec<String> = Vec::new();
     let (prompt_delivery_sender, prompt_delivery_results) = mpsc::channel::<Vec<TargetDelivery>>();
     let mut prompt_delivery: Option<JoinHandle<()>> = None;
     let mut force_quit_armed = false;
@@ -647,10 +650,17 @@ pub fn run_observer(
         &mut observer,
         &mut capture_fingerprints,
         capture_worker.sender(),
-        mission_client.as_ref(),
-        notifications,
+        MissionRefresh {
+            client: mission_client.as_ref(),
+            notifications,
+            agent_panes: &mut agent_panes,
+        },
     )?;
     require_observer_authority(initial_refresh)?;
+    let mut subscribed_panes = agent_panes.clone();
+    let mut mission_events = mission_client
+        .as_ref()
+        .map(|client| client.subscribe(subscribed_panes.clone()));
     enable_raw_mode().context("enable Observer terminal raw mode")?;
     let _guard = ObserverTerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen).context("enter Observer alternate screen")?;
@@ -719,8 +729,11 @@ pub fn run_observer(
                 &mut observer,
                 &mut capture_fingerprints,
                 capture_worker.sender(),
-                mission_client.as_ref(),
-                notifications,
+                MissionRefresh {
+                    client: mission_client.as_ref(),
+                    notifications,
+                    agent_panes: &mut agent_panes,
+                },
             );
             let outcome = apply_observer_refresh_result(&mut observer, refresh);
             require_observer_authority(outcome)?;
@@ -733,12 +746,24 @@ pub fn run_observer(
                 &mut observer,
                 &mut capture_fingerprints,
                 capture_worker.sender(),
-                mission_client.as_ref(),
-                notifications,
+                MissionRefresh {
+                    client: mission_client.as_ref(),
+                    notifications,
+                    agent_panes: &mut agent_panes,
+                },
             );
             let outcome = apply_observer_refresh_result(&mut observer, refresh);
             require_observer_authority(outcome)?;
             last_refresh = Instant::now();
+        }
+        if agent_panes != subscribed_panes {
+            // Members are opened and closed while Mission Control is running, so
+            // the watched pane set has to follow. Herdr fixes a subscription's
+            // panes at subscribe time, which means re-establishing it.
+            subscribed_panes.clone_from(&agent_panes);
+            mission_events = mission_client
+                .as_ref()
+                .map(|client| client.subscribe(subscribed_panes.clone()));
         }
         if !event::poll(OBSERVER_INPUT_POLL).context("poll Observer input")? {
             continue;
@@ -769,8 +794,11 @@ pub fn run_observer(
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
-                    mission_client.as_ref(),
-                    notifications,
+                    MissionRefresh {
+                        client: mission_client.as_ref(),
+                        notifications,
+                        agent_panes: &mut agent_panes,
+                    },
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -784,8 +812,11 @@ pub fn run_observer(
                     &mut observer,
                     &mut capture_fingerprints,
                     capture_worker.sender(),
-                    mission_client.as_ref(),
-                    notifications,
+                    MissionRefresh {
+                        client: mission_client.as_ref(),
+                        notifications,
+                        agent_panes: &mut agent_panes,
+                    },
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -1055,9 +1086,13 @@ fn refresh_observer_metadata(
     observer: &mut ObserverState,
     capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
     capture_requests: &SyncSender<CaptureRequest>,
-    mission_client: Option<&HerdrSocketClient>,
-    notifications: NotificationDefaults,
+    mission: MissionRefresh<'_>,
 ) -> Result<ObserverAuthorityOutcome> {
+    let MissionRefresh {
+        client: mission_client,
+        notifications,
+        agent_panes,
+    } = mission;
     let state = store.load()?;
     let Some(group) = state
         .orchestration_groups
@@ -1091,6 +1126,7 @@ fn refresh_observer_metadata(
         ),
     );
     notify_agent_attention(mission_client, notifications, &attention);
+    *agent_panes = group_agent_panes(mission_snapshot.as_ref(), group_id);
     *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
         group: group.clone(),
@@ -1209,6 +1245,40 @@ fn update_observer_metadata(
         }
     }
     observer.update_workers(workers)
+}
+
+/// Mission Control inputs and outputs for one Observer refresh.
+struct MissionRefresh<'a> {
+    client: Option<&'a HerdrSocketClient>,
+    notifications: NotificationDefaults,
+    /// Receives the panes whose agent status this Observer should watch.
+    agent_panes: &'a mut Vec<String>,
+}
+
+/// Lists the Herdr panes currently carrying this group's Tether token.
+///
+/// Herdr requires a `pane_id` on `pane.agent_status_changed` subscriptions, so
+/// Mission Control has to name the panes it wants transitions for. The group
+/// token is exactly that set, and it comes straight from the snapshot without
+/// re-resolving bindings.
+fn group_agent_panes(
+    snapshot: Option<&HerdrSessionSnapshot>,
+    group_id: &OrchestrationGroupId,
+) -> Vec<String> {
+    let group = group_id.to_string();
+    let mut panes: Vec<String> = snapshot
+        .map(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .filter(|agent| agent.tokens.get(GROUP_TOKEN) == Some(&group))
+                .map(|agent| agent.pane_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    panes.sort();
+    panes.dedup();
+    panes
 }
 
 /// Sends one advisory Herdr toast per newly attention-worthy agent.
@@ -2098,8 +2168,11 @@ mod tests {
             &mut observer,
             &mut fingerprints,
             &capture_requests,
-            None,
-            NotificationDefaults::default(),
+            MissionRefresh {
+                client: None,
+                notifications: NotificationDefaults::default(),
+                agent_panes: &mut Vec::new(),
+            },
         )
         .unwrap();
 
