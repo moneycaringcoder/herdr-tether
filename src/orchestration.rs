@@ -22,9 +22,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     backend::ProcessBinaries,
-    config::ConfigStore,
+    config::{ConfigStore, NotificationDefaults},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
-    herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient},
+    herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient, NotificationSound},
     lifecycle::LifecycleService,
     mission_control::{
         MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
@@ -35,7 +35,7 @@ use crate::{
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
+        AgentAttention, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
         ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
         ObserverWorker, render,
     },
@@ -627,6 +627,12 @@ pub fn run_observer(
     let store = StateStore::new(paths.state_file.clone());
     let service = OrchestrationService::new(store.clone());
     let mission_client = HerdrSocketClient::from_env().ok();
+    // Notifications are advisory, so an unreadable config must not stop the
+    // Observer from opening; fall back to the documented defaults.
+    let notifications = ConfigStore::new(paths.config_file.clone())
+        .load()
+        .map(|config| config.notifications)
+        .unwrap_or_default();
     let group = service.group(&group_id)?;
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
@@ -642,6 +648,7 @@ pub fn run_observer(
         &mut capture_fingerprints,
         capture_worker.sender(),
         mission_client.as_ref(),
+        notifications,
     )?;
     require_observer_authority(initial_refresh)?;
     enable_raw_mode().context("enable Observer terminal raw mode")?;
@@ -713,6 +720,7 @@ pub fn run_observer(
                 &mut capture_fingerprints,
                 capture_worker.sender(),
                 mission_client.as_ref(),
+                notifications,
             );
             let outcome = apply_observer_refresh_result(&mut observer, refresh);
             require_observer_authority(outcome)?;
@@ -726,6 +734,7 @@ pub fn run_observer(
                 &mut capture_fingerprints,
                 capture_worker.sender(),
                 mission_client.as_ref(),
+                notifications,
             );
             let outcome = apply_observer_refresh_result(&mut observer, refresh);
             require_observer_authority(outcome)?;
@@ -761,6 +770,7 @@ pub fn run_observer(
                     &mut capture_fingerprints,
                     capture_worker.sender(),
                     mission_client.as_ref(),
+                    notifications,
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -775,6 +785,7 @@ pub fn run_observer(
                     &mut capture_fingerprints,
                     capture_worker.sender(),
                     mission_client.as_ref(),
+                    notifications,
                 );
                 let outcome = apply_observer_refresh_result(&mut observer, refresh);
                 require_observer_authority(outcome)?;
@@ -1045,6 +1056,7 @@ fn refresh_observer_metadata(
     capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
     capture_requests: &SyncSender<CaptureRequest>,
     mission_client: Option<&HerdrSocketClient>,
+    notifications: NotificationDefaults,
 ) -> Result<ObserverAuthorityOutcome> {
     let state = store.load()?;
     let Some(group) = state
@@ -1066,7 +1078,7 @@ fn refresh_observer_metadata(
             Some(Err(_)) => (None, true, None),
         };
     let next_fingerprints = capture_fingerprints_for(group, &state.sessions);
-    update_observer_metadata(
+    let attention = update_observer_metadata(
         observer,
         capture_fingerprints,
         &next_fingerprints,
@@ -1078,6 +1090,7 @@ fn refresh_observer_metadata(
             mission_latency_ms,
         ),
     );
+    notify_agent_attention(mission_client, notifications, &attention);
     *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
         group: group.clone(),
@@ -1171,7 +1184,7 @@ fn update_observer_metadata(
     previous_fingerprints: &HashMap<String, CaptureFingerprint>,
     current_fingerprints: &HashMap<String, CaptureFingerprint>,
     mut workers: Vec<ObserverWorker>,
-) {
+) -> Vec<AgentAttention> {
     let previous_captures: HashMap<_, _> = observer
         .workers()
         .iter()
@@ -1195,7 +1208,37 @@ fn update_observer_metadata(
             observer.merge_capture(&worker.id, ObserverCapture::Loading);
         }
     }
-    observer.update_workers(workers);
+    observer.update_workers(workers)
+}
+
+/// Sends one advisory Herdr toast per newly attention-worthy agent.
+///
+/// Delivery is best effort: the Observer tile is the authoritative view, so a
+/// disabled or refused toast changes nothing and is never surfaced as an error.
+/// Only the worker's already-sanitized display label travels in the body; host,
+/// directory, command, and prompt text never do.
+fn notify_agent_attention(
+    mission_client: Option<&HerdrSocketClient>,
+    notifications: NotificationDefaults,
+    attention: &[AgentAttention],
+) {
+    let Some(client) = mission_client else {
+        return;
+    };
+    for event in attention {
+        let (enabled, sound) = match event.state {
+            ObserverAgentState::Blocked => {
+                (notifications.agent_blocked, NotificationSound::Request)
+            }
+            ObserverAgentState::Done => (notifications.agent_done, NotificationSound::Done),
+            _ => continue,
+        };
+        if !enabled {
+            continue;
+        }
+        let body = format!("{} is {}", event.label, event.state.label());
+        let _ = client.show_notification("Tether", Some(&body), sound);
+    }
 }
 
 fn merge_captured_workers(
@@ -2056,6 +2099,7 @@ mod tests {
             &mut fingerprints,
             &capture_requests,
             None,
+            NotificationDefaults::default(),
         )
         .unwrap();
 

@@ -4,6 +4,13 @@
 
 ### Added
 
+- Added opt-in Herdr toasts when a Mission Control agent changes into `BLOCKED`
+  or `DONE`, configured under `[notifications]` and on by default. A toast is
+  sent only on a change into that state, never repeatedly while an agent stays
+  there. Delivery is advisory: Herdr shows nothing unless its own
+  `ui.toast.delivery` is enabled, and Tether treats a refused toast as normal
+  because the Mission Control tile remains the authoritative view. Notification
+  text carries only the sanitized worker label and its state.
 - Mission Control now marks a capture `TRUNCATED` when Herdr reports that older
   output was dropped. Tether previously discarded that flag and rendered a
   clipped capture as if it were the worker's complete output.

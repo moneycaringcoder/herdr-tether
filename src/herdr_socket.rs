@@ -142,6 +142,24 @@ impl HerdrSessionSnapshot {
     }
 }
 
+/// Sound Herdr plays with a toast. Mirrors Herdr's `NotificationShowSound`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotificationSound {
+    None,
+    Done,
+    Request,
+}
+
+impl NotificationSound {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Done => "done",
+            Self::Request => "request",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct HerdrAgentRead {
     pub pane_id: String,
@@ -217,6 +235,34 @@ impl HerdrSocketClient {
         )?;
         require_result_type(&result, "pane_read")?;
         decode_field(&result, "read", "Herdr agent read")
+    }
+
+    /// Asks Herdr to show an advisory toast.
+    ///
+    /// Delivery is best effort and entirely Herdr's decision. Herdr answers
+    /// `shown: false` when the user has not enabled `ui.toast.delivery`, or when
+    /// another surface currently owns the screen. Neither is an error, and
+    /// neither changes Tether state, so the return value reports what happened
+    /// without ever failing the caller's real work.
+    pub fn show_notification(
+        &self,
+        title: &str,
+        body: Option<&str>,
+        sound: NotificationSound,
+    ) -> Result<bool> {
+        if title.trim().is_empty() {
+            bail!("notification title must not be empty");
+        }
+        let mut params = json!({"title": title, "sound": sound.as_str()});
+        if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+            params["body"] = json!(body);
+        }
+        let result = self.request_value("notification.show", params, self.timeout)?;
+        require_result_type(&result, "notification_show")?;
+        Ok(result
+            .get("shown")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// Asks Herdr why a target agent is in its current state.

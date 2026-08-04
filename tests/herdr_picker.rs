@@ -889,6 +889,7 @@ fn picker_fixture() -> (Config, State) {
     let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
     let config = Config {
         version: Config::CURRENT_VERSION,
+        notifications: Default::default(),
         hosts: vec![HostConfig {
             name: "build-box".into(),
             target: "builder@example.test".into(),

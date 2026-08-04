@@ -32,6 +32,7 @@ use std::{
 fn sample_config() -> Config {
     Config {
         version: Config::CURRENT_VERSION,
+        notifications: Default::default(),
         hosts: vec![HostConfig {
             name: "build-box".into(),
             target: "builder@example.test".into(),
@@ -181,6 +182,7 @@ roots = ["/work"]
                 presets: Vec::new(),
             }],
             ui: UiDefaults::default(),
+            notifications: Default::default(),
             discovery: DiscoveryDefaults::default(),
             retention: RetentionDefaults::default(),
         }
@@ -627,6 +629,8 @@ fn config_serialized_ceiling_round_trips_current_and_migrated_bytes() {
             table.insert("version".into(), 1.into());
             table.remove("discovery");
             table.remove("retention");
+            // v1 predates opt-in notifications and rejects unknown fields.
+            table.remove("notifications");
             let source = toml::to_string(&legacy).unwrap();
             assert!(source.len() <= ConfigStore::MAX_INPUT_BYTES);
             fs::write(&path, source).unwrap();

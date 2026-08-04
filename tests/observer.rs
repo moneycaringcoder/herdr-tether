@@ -441,6 +441,83 @@ fn truncated_capture_is_marked_and_never_reads_as_complete_output() {
     assert!(!recovered.contains("TRUNCATED"), "{recovered}");
 }
 
+fn live_worker(id: &str, state: ObserverAgentState) -> ObserverWorker {
+    ObserverWorker {
+        live_agent: true,
+        agent_state: state,
+        ..worker(id)
+    }
+}
+
+#[test]
+fn attention_reports_each_transition_into_blocked_or_done_exactly_once() {
+    let mut observer = ObserverState::new(Vec::new());
+
+    // First sight of a working agent is not attention-worthy.
+    let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Working)]);
+    assert!(attention.is_empty());
+
+    let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Blocked)]);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].state, ObserverAgentState::Blocked);
+    assert_eq!(attention[0].worker_id, "a");
+
+    // Staying blocked across refreshes must not notify again; the Observer
+    // refreshes on a timer and would otherwise notify continuously.
+    let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Blocked)]);
+    assert!(attention.is_empty(), "{attention:?}");
+
+    // A genuine change back into an attention state notifies once more.
+    observer.update_workers(vec![live_worker("a", ObserverAgentState::Working)]);
+    let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Done)]);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].state, ObserverAgentState::Done);
+}
+
+#[test]
+fn attention_ignores_states_and_workers_that_are_not_waiting_on_a_person() {
+    let mut observer = ObserverState::new(Vec::new());
+    let detached = ObserverWorker {
+        live_agent: false,
+        agent_state: ObserverAgentState::Blocked,
+        ..worker("detached")
+    };
+    // Without a live agent binding the state is not authoritative.
+    assert!(observer.update_workers(vec![detached]).is_empty());
+
+    let mut observer = ObserverState::new(Vec::new());
+    for state in [
+        ObserverAgentState::Idle,
+        ObserverAgentState::Working,
+        ObserverAgentState::Unknown,
+        ObserverAgentState::Unreachable,
+        ObserverAgentState::Stale,
+    ] {
+        let attention = observer.update_workers(vec![live_worker("w", state)]);
+        assert!(attention.is_empty(), "{state:?} should not notify");
+    }
+}
+
+#[test]
+fn attention_labels_never_carry_host_directory_or_command_text() {
+    let mut observer = ObserverState::new(Vec::new());
+    let secret = ObserverWorker {
+        live_agent: true,
+        agent_state: ObserverAgentState::Blocked,
+        title: Some("builder@example.test /srv/secret exec deploy --token abc".to_owned()),
+        ..worker("w")
+    };
+    let attention = observer.update_workers(vec![secret]);
+    assert_eq!(attention.len(), 1);
+    // The label is the same sanitized, bounded display title the tile renders.
+    // Whatever it contains came from the group's own worker title, never from
+    // Tether joining in a host, directory, or command.
+    assert_eq!(
+        attention[0].label,
+        observer.workers()[0].title.clone().unwrap()
+    );
+}
+
 #[test]
 fn wide_mission_control_advertises_explain_and_narrow_keeps_its_pinned_layout() {
     let mut agent = worker("agent");
