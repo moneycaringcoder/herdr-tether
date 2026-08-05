@@ -182,6 +182,13 @@ pub enum EventSignal {
 pub enum PromptDeliveryError {
     #[error("Herdr rejected the prompt before delivery: {code}: {message}")]
     Rejected { code: String, message: String },
+    /// The prompt reached the agent, which then showed no state change in time.
+    ///
+    /// Distinct from [`Self::Uncertain`] because delivery is not in doubt here,
+    /// only the agent's reaction. Reporting it as uncertain would invite
+    /// re-sending a prompt that definitely landed.
+    #[error("prompt was delivered but the agent showed no state change: {message}")]
+    Stalled { message: String },
     #[error("prompt delivery outcome is uncertain; Tether will not retry automatically")]
     Uncertain,
 }
@@ -404,6 +411,9 @@ impl HerdrSocketClient {
                 .to_owned();
             if prompt_error_confirms_no_delivery(&code) {
                 return Err(PromptDeliveryError::Rejected { code, message });
+            }
+            if prompt_error_confirms_delivery(&code) {
+                return Err(PromptDeliveryError::Stalled { message });
             }
             return Err(PromptDeliveryError::Uncertain);
         }
@@ -845,6 +855,15 @@ fn actionable_error_guidance(code: &str) -> Option<&'static str> {
     }
 }
 
+/// Reports whether a Herdr error proves the prompt text *did* reach the agent.
+///
+/// Herdr raises `agent_prompt_stalled` from its wait phase, after the prompt was
+/// written, when the agent produces no observed state change in time. Delivery
+/// is certain; only the reaction is missing.
+fn prompt_error_confirms_delivery(code: &str) -> bool {
+    matches!(code, "agent_prompt_stalled")
+}
+
 /// Reports whether a Herdr error proves the prompt text never reached the agent.
 ///
 /// Codes here are ones Herdr returns *before* it writes any bytes, verified
@@ -1082,6 +1101,27 @@ mod tests {
         // Raised by the send itself, so a partial write is possible. This one
         // must stay uncertain no matter how tempting the name is.
         assert!(!prompt_error_confirms_no_delivery("agent_prompt_failed"));
+    }
+
+    #[test]
+    fn a_stalled_wait_is_delivery_not_uncertainty() {
+        // Herdr raises this from its wait phase, after the prompt was written:
+        // "agent prompt produced no observed state change within N ms". The
+        // prompt landed; only the reaction is missing.
+        assert!(prompt_error_confirms_delivery("agent_prompt_stalled"));
+        // It must never also count as proof of non-delivery.
+        assert!(!prompt_error_confirms_no_delivery("agent_prompt_stalled"));
+
+        // Nothing else claims delivery. A code Tether has not verified against
+        // Herdr's source stays uncertain in both directions.
+        for code in [
+            "agent_prompt_failed",
+            "agent_not_ready",
+            "timeout",
+            "unknown",
+        ] {
+            assert!(!prompt_error_confirms_delivery(code), "{code}");
+        }
     }
 
     #[test]
