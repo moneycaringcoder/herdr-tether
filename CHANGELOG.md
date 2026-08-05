@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A prompt Herdr delivered whose agent then showed no state change is now
+  reported as `DELIVERED→NO CHANGE` rather than `UNCERTAIN`. Herdr raises
+  `agent_prompt_stalled` from its wait phase, after the prompt was written, so
+  delivery is certain and only the reaction is missing. Reporting it as
+  uncertain invited resending a prompt that had definitely arrived.
+
 ## [0.7.0] - 2026-08-04
 
 ### Added

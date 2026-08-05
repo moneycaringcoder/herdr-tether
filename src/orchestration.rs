@@ -611,6 +611,10 @@ fn target_delivery_summary(deliveries: &[TargetDelivery]) -> String {
                 "{}:REJECTED",
                 session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH)
             ),
+            TargetDelivery::Stalled { session_id, .. } => format!(
+                "{}:DELIVERED→NO CHANGE",
+                session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH)
+            ),
             TargetDelivery::Uncertain { session_id } => format!(
                 "{}:UNCERTAIN",
                 session_id.reference_token(SessionId::SHORT_REFERENCE_WIDTH)

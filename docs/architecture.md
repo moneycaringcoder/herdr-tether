@@ -195,8 +195,11 @@ expected agent kind, and settled `IDLE` or `DONE` state, then calls Herdr's
 atomic prompt-and-wait operation once. `WORKING`, `BLOCKED`, `UNKNOWN`,
 `UNREACHABLE`, and `STALE` targets reject input. Multi-target fan-out reports
 each destination independently. A confirmed pre-delivery rejection is
-`REJECTED`; a timeout or connection loss after the call begins is `UNCERTAIN`
-and is never retried automatically because delivery may already have occurred.
+`REJECTED`. A prompt Herdr wrote to the agent that then produced no observed
+state change is `DELIVERED→NO CHANGE`: delivery is certain, only the reaction is
+missing, so it must not read as a candidate for resending. A timeout or
+connection loss after the call begins is `UNCERTAIN` and is never retried
+automatically because delivery may already have occurred.
 Partial success is shown explicitly and cannot be rolled back.
 
 `f`, `v`, `w`, and `e` use the same exact current binding. Focus requires

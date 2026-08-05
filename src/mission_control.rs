@@ -153,6 +153,14 @@ pub enum TargetDelivery {
         session_id: SessionId,
         reason: String,
     },
+    /// Delivered, but the agent showed no state change before the wait expired.
+    ///
+    /// Kept apart from [`Self::Uncertain`] so a person is not invited to resend
+    /// a prompt that definitely arrived.
+    Stalled {
+        session_id: SessionId,
+        reason: String,
+    },
     Uncertain {
         session_id: SessionId,
     },
@@ -331,6 +339,10 @@ impl<C: MissionHerdr> MissionControlService<C> {
             }
             Ok(_) | Err(PromptDeliveryError::Uncertain) => TargetDelivery::Uncertain {
                 session_id: target.session_id,
+            },
+            Err(PromptDeliveryError::Stalled { message }) => TargetDelivery::Stalled {
+                session_id: target.session_id,
+                reason: message,
             },
             Err(PromptDeliveryError::Rejected { code, message }) => TargetDelivery::Rejected {
                 session_id: target.session_id,

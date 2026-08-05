@@ -201,8 +201,10 @@ Tether shows the exact destinations and prompt, and sends only after the user
 types `SEND`. Every target is revalidated against the current group membership
 epoch, Tether ownership, running state, pane metadata, and recognized agent
 before one atomic Herdr prompt-and-wait request. Mixed fan-out reports
-`DELIVERED`, `REJECTED`, or `UNCERTAIN` per target; uncertain delivery is never
-retried automatically. Prompt text remains in memory only and is never written
+`DELIVERED`, `REJECTED`, `DELIVERED→NO CHANGE`, or `UNCERTAIN` per target;
+uncertain delivery is never retried automatically. `DELIVERED→NO CHANGE` means
+the prompt reached the agent and the agent showed no state change in time, so it
+is reported apart from uncertainty rather than inviting a resend. Prompt text remains in memory only and is never written
 to `state.json`.
 
 `Enter` opens the selected durable terminal, `f` focuses its current Herdr
