@@ -1,0 +1,295 @@
+name: Herdr upstream canary
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+    - cron: "41 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Runner platform
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - linux
+          - macos
+
+permissions: {}
+
+concurrency:
+  group: herdr-upstream-canary-${{ github.event_name }}-${{ github.event.schedule || inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: resolve exact Herdr master
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      herdr_sha: ${{ steps.resolve.outputs.herdr_sha }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Check out exact Tether helpers without a token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Tether workflow revision is not a full lowercase SHA" >&2
+            exit 1
+          fi
+          git -c protocol.version=2 init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add tether \
+            https://github.com/moneycaringcoder/herdr-tether.git
+          git -C "$GITHUB_WORKSPACE" fetch --quiet --no-tags --depth=1 tether "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Test offline canary helpers
+        run: python3 tools/test_upstream_canary.py
+
+      - name: Resolve master once and select bounded runners
+        id: resolve
+        shell: bash
+        env:
+          UPSTREAM_SCHEDULE: ${{ github.event.schedule }}
+          UPSTREAM_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          remote="$RUNNER_TEMP/herdr-ls-remote"
+          timeout 30s git -c protocol.version=2 ls-remote --exit-code \
+            https://github.com/herdrdev/herdr.git refs/heads/master > "$remote"
+          herdr_sha="$(python3 tools/upstream_canary.py resolve < "$remote")"
+          matrix="$(python3 tools/upstream_canary.py matrix \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --schedule "$UPSTREAM_SCHEDULE" \
+            --platform "$UPSTREAM_PLATFORM")"
+          printf 'Resolved Herdr master: %s\n' "$herdr_sha"
+          printf 'Runner matrix: %s\n' "$matrix"
+          {
+            printf 'herdr_sha=%s\n' "$herdr_sha"
+            printf 'matrix=%s\n' "$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+  canary:
+    name: Herdr master / ${{ matrix.label }}
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      HERDR_RUST_TOOLCHAIN: "1.96.1"
+      HERDR_SHA: ${{ needs.resolve.outputs.herdr_sha }}
+      HERDR_ZIG_VERSION: "0.15.2"
+    steps:
+      - name: Check out exact Tether source without a token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Tether workflow revision is not a full lowercase SHA" >&2
+            exit 1
+          fi
+          git -c protocol.version=2 init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add tether \
+            https://github.com/moneycaringcoder/herdr-tether.git
+          git -C "$GITHUB_WORKSPACE" fetch --quiet --no-tags --depth=1 tether "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Check out exact detached Herdr source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$HERDR_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "resolved Herdr revision is not a full lowercase SHA" >&2
+            exit 1
+          fi
+          upstream_dir="$RUNNER_TEMP/herdr-upstream"
+          git -c protocol.version=2 init --quiet "$upstream_dir"
+          git -C "$upstream_dir" remote add origin https://github.com/herdrdev/herdr.git
+          git -C "$upstream_dir" fetch --quiet --no-tags --depth=1 origin "$HERDR_SHA"
+          git -C "$upstream_dir" checkout --quiet --detach "$HERDR_SHA"
+          actual_sha="$(git -C "$upstream_dir" rev-parse HEAD)"
+          if [[ "$actual_sha" != "$HERDR_SHA" ]]; then
+            echo "detached Herdr checkout does not match resolved SHA" >&2
+            exit 1
+          fi
+          if git -C "$upstream_dir" symbolic-ref --quiet HEAD; then
+            echo "Herdr checkout is not detached" >&2
+            exit 1
+          fi
+          printf 'UPSTREAM_DIR=%s\n' "$upstream_dir" >> "$GITHUB_ENV"
+          printf 'Herdr SHA: %s\n' "$actual_sha"
+
+      - name: Install tmux and Herdr build tools on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build tmux
+          tmux -V
+
+      - name: Install tmux and Herdr build tools on macOS
+        if: runner.os == 'macOS'
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja tmux
+          echo "ZIG_GLOBAL_CACHE_DIR=$UPSTREAM_DIR/.zig-cache" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$UPSTREAM_DIR/.zig-cache" >> "$GITHUB_ENV"
+          tmux -V
+
+      - name: Install exact Herdr Rust toolchain
+        run: |
+          rustup toolchain install "$HERDR_RUST_TOOLCHAIN" --profile minimal
+          rustc "+$HERDR_RUST_TOOLCHAIN" --version --verbose
+          cargo "+$HERDR_RUST_TOOLCHAIN" --version
+
+      - name: Install exact Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.HERDR_ZIG_VERSION }}
+          # The action's only cache is a version-keyed Zig distribution tarball;
+          # never persist Herdr's source-derived compilation cache.
+          use-cache: false
+
+      - name: Build Herdr at the detached SHA
+        shell: bash
+        # Threat model: Herdr master is trusted against intentional runner escape.
+        # This advisory job detects accidental compatibility regressions; it is
+        # not a sandbox for hostile upstream code. Defense in depth still strips
+        # Actions service credentials and workflow command-file paths anywhere
+        # upstream build code or binaries execute.
+        env:
+          ACTIONS_CACHE_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RESULTS_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_RUNTIME_URL: ""
+        run: |
+          set -euo pipefail
+          printf 'Platform: %s / %s\n' "${{ matrix.label }}" "$(uname -m)"
+          printf 'Herdr SHA: %s\n' "$HERDR_SHA"
+          printf 'Rust toolchain: %s\n' "$HERDR_RUST_TOOLCHAIN"
+          actual_zig="$(zig version)"
+          if [[ "$actual_zig" != "$HERDR_ZIG_VERSION" ]]; then
+            echo "installed Zig does not match the pinned version" >&2
+            exit 1
+          fi
+          printf 'Zig toolchain: %s\n' "$actual_zig"
+          export ZIG_GLOBAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"
+          export ZIG_LOCAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"
+          unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
+          cargo "+$HERDR_RUST_TOOLCHAIN" build \
+            --locked \
+            --release \
+            --manifest-path "$UPSTREAM_DIR/Cargo.toml"
+
+      - name: Export Herdr version and API schema without service credentials
+        shell: bash
+        env:
+          ACTIONS_CACHE_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RESULTS_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_RUNTIME_URL: ""
+        run: |
+          set -euo pipefail
+          herdr_bin="$UPSTREAM_DIR/target/release/herdr"
+          schema="$RUNNER_TEMP/herdr-master-api.schema.json"
+          unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
+          "$herdr_bin" --version > "$RUNNER_TEMP/herdr-master-version.txt"
+          "$herdr_bin" api schema --output "$schema"
+
+      - name: Verify external code preserved exact Tether source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet HEAD --
+          test -z "$(git ls-files --others --exclude-standard)"
+          test -z "$(git ls-files --others --ignored --exclude-standard)"
+
+      - name: Verify required API contract
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          schema="$RUNNER_TEMP/herdr-master-api.schema.json"
+          herdr_version="$(python3 tools/upstream_canary.py version \
+            < "$RUNNER_TEMP/herdr-master-version.txt")"
+          python3 tools/check_herdr_api_contract.py "$schema"
+          protocol="$(python3 tools/upstream_canary.py protocol "$schema")"
+          printf 'Herdr version: %s\n' "$herdr_version"
+          printf 'Herdr protocol: %s\n' "$protocol"
+          {
+            printf 'herdr_version=%s\n' "$herdr_version"
+            printf 'protocol=%s\n' "$protocol"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build locked Tether release artifact
+        run: cargo build --release --locked
+
+      - name: Run deterministic compatibility harnesses
+        run: |
+          python3 tools/test_upstream_canary.py
+          python3 tools/test_check_herdr_api_contract.py
+          python3 tools/test_live_product_smoke.py
+
+      - name: Run isolated live product smoke
+        shell: bash
+        env:
+          ACTIONS_CACHE_URL: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ACTIONS_RESULTS_URL: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_RUNTIME_URL: ""
+        run: |
+          set -euo pipefail
+          witness_socket="tether-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          witness_session="tether-canary-parent"
+          cleanup_witness() {
+            status=$?
+            tmux -L "$witness_socket" kill-session -t "=$witness_session" 2>/dev/null || true
+            exit "$status"
+          }
+          trap cleanup_witness EXIT
+          tmux -L "$witness_socket" new-session -d -s "$witness_session"
+          socket_path="$(tmux -L "$witness_socket" display-message -p \
+            -t "=$witness_session" '#{socket_path}')"
+          server_pid="$(tmux -L "$witness_socket" display-message -p \
+            -t "=$witness_session" '#{pid}')"
+          export TMUX="${socket_path},${server_pid},0"
+
+          unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY
+          python3 tools/live_product_smoke.py \
+            --herdr "$UPSTREAM_DIR/target/release/herdr" \
+            --herdr-version "${{ steps.contract.outputs.herdr_version }}" \
+            --tether target/release/herdr-tether \
+            --repo-root "$GITHUB_WORKSPACE"
+
+          tmux -L "$witness_socket" has-session -t "=$witness_session"
+
+      - name: Verify live external code preserved exact Tether source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet HEAD --
+
+      - name: Record advisory canary result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Herdr upstream canary"
+            echo
+            echo "- Herdr SHA: \`$HERDR_SHA\`"
+            echo "- Protocol: \`${{ steps.contract.outputs.protocol || 'unavailable' }}\`"
+            echo "- Rust: \`$HERDR_RUST_TOOLCHAIN\`"
+            echo "- Zig: \`$HERDR_ZIG_VERSION\`"
+            echo "- Platform: \`${{ matrix.label }} / $(uname -m)\`"
+            echo "- Result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -83,6 +83,7 @@ jobs:
         run: |
           python3 tools/test_live_product_smoke.py
           python3 tools/test_check_herdr_api_contract.py
+          python3 tools/test_upstream_canary.py
           python3 tools/test_workflow_security.py
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py

@@ -19,6 +19,8 @@ REMOTE_SMOKE_SECRETS = {
     "TETHER_SMOKE_REMOTE_KNOWN_HOSTS",
     "TETHER_SMOKE_REMOTE_TARGET",
 }
+UPSTREAM_DAILY_CRON = "23 5 * * *"
+UPSTREAM_WEEKLY_MACOS_CRON = "41 5 * * 0"
 
 
 class WorkflowContractError(ValueError):
@@ -45,21 +47,29 @@ def validate_workflow(name: str, text: str) -> None:
         raise WorkflowContractError(f"{name} contains a tab")
     if re.search(r"^ *-? *(?:\"[^\"\n]*\"|'[^'\n]*') *:", text, re.MULTILINE):
         raise WorkflowContractError(f"{name} contains a quoted mapping key")
-    if re.search(
-        r"^(?: *- *)?\{|^ *[A-Za-z0-9_-]+ *: *\{(?!\{)",
+    flow_mappings = re.findall(
+        r"^(?: *- *)?\{.*$|^ *[A-Za-z0-9_-]+ *: *\{(?!\{).*$",
         text,
         re.MULTILINE,
-    ):
+    )
+    allowed_empty_permissions = name == "upstream-canary.yml" and flow_mappings == [
+        "permissions: {}"
+    ]
+    if flow_mappings and not allowed_empty_permissions:
         raise WorkflowContractError(f"{name} contains a flow-style mapping")
     on_block = top_level_block(text, "on")
-    permissions = [
-        line.strip()
-        for line in top_level_block(text, "permissions").splitlines()
-        if line.strip()
-    ]
-    if permissions != ["contents: read"]:
+    if allowed_empty_permissions:
+        permissions: list[str] = []
+    else:
+        permissions = [
+            line.strip()
+            for line in top_level_block(text, "permissions").splitlines()
+            if line.strip()
+        ]
+    expected_permissions = [] if name == "upstream-canary.yml" else ["contents: read"]
+    if permissions != expected_permissions:
         raise WorkflowContractError(
-            f"{name} permissions must contain only contents: read"
+            f"{name} permissions do not match the workflow trust boundary"
         )
     if re.findall(r"^( *)permissions *:", text, re.MULTILINE) != [""]:
         raise WorkflowContractError(
@@ -185,6 +195,87 @@ def validate_live_product_boundaries(workflows: dict[str, str]) -> None:
         raise WorkflowContractError("live-product core secret allowlist is not exact")
 
 
+def validate_upstream_canary_boundaries(workflows: dict[str, str]) -> None:
+    canary = workflows["upstream-canary.yml"]
+    on_block = top_level_block(canary, "on")
+    top_level_triggers = re.findall(r"^  ([A-Za-z0-9_-]+)\s*:\s*$", on_block, re.MULTILINE)
+    if top_level_triggers != ["schedule", "workflow_dispatch"]:
+        raise WorkflowContractError("upstream canary triggers must be exactly schedule and manual")
+    for cron in (UPSTREAM_DAILY_CRON, UPSTREAM_WEEKLY_MACOS_CRON):
+        if on_block.count(f'cron: "{cron}"') != 1:
+            raise WorkflowContractError("upstream canary cadence is not exact")
+    if re.search(r"\bsecrets\b", canary) or re.search(
+        r"^\s+environment:\s*", canary, re.MULTILINE
+    ):
+        raise WorkflowContractError("upstream canary must not access secrets")
+    if "permissions: {}" not in canary or "actions/checkout@" in canary:
+        raise WorkflowContractError("upstream canary must not receive a repository token")
+    if "continue-on-error:" in canary:
+        raise WorkflowContractError("upstream canary failures must stay visible")
+    if canary.count("git -c protocol.version=2 ls-remote --exit-code") != 1:
+        raise WorkflowContractError("Herdr master must be resolved exactly once")
+    exact_checkout_counts = {
+        'fetch --quiet --no-tags --depth=1 tether "$GITHUB_SHA"': 2,
+        'checkout --quiet --detach "$GITHUB_SHA"': 2,
+        'test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"': 2,
+        'upstream_dir="$RUNNER_TEMP/herdr-upstream"': 1,
+        'git -C "$upstream_dir" fetch --quiet --no-tags --depth=1 origin "$HERDR_SHA"': 1,
+        'git -C "$upstream_dir" checkout --quiet --detach "$HERDR_SHA"': 1,
+        'if [[ "$actual_sha" != "$HERDR_SHA" ]]; then': 1,
+        'git -C "$upstream_dir" symbolic-ref --quiet HEAD': 1,
+    }
+    if any(
+        canary.count(fragment) != count
+        for fragment, count in exact_checkout_counts.items()
+    ):
+        raise WorkflowContractError("upstream canary checkout is not exact and detached")
+    for variable in (
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+    ):
+        if canary.count(f'          {variable}: ""') != 3:
+            raise WorkflowContractError("external canary execution must scrub runner service data")
+    unset_commands = (
+        "unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY"
+    )
+    if len(re.findall(rf"^          {re.escape(unset_commands)}$", canary, re.MULTILINE)) != 3:
+        raise WorkflowContractError("external canary execution must unset command-file paths")
+    if "actions/cache@" in canary or "Swatinem/rust-cache@" in canary:
+        raise WorkflowContractError("upstream canary must not create source-derived caches")
+    if canary.count("uses: mlugg/setup-zig@") != 1 or len(
+        re.findall(r"^          use-cache: false$", canary, re.MULTILINE)
+    ) != 1:
+        raise WorkflowContractError("upstream canary Zig distribution cache is not bounded")
+    if not all(
+        fragment in canary
+        for fragment in (
+            "timeout-minutes: 5",
+            "timeout-minutes: 45",
+            "timeout 30s git",
+            "python3 tools/check_herdr_api_contract.py",
+            "python3 tools/live_product_smoke.py",
+            'if [[ "$actual_zig" != "$HERDR_ZIG_VERSION" ]]; then',
+            "Threat model: Herdr master is trusted against intentional runner escape.",
+            "Result: \\`${{ job.status }}\\`",
+        )
+    ) or any(
+        len(
+            re.findall(
+                rf'^          export ZIG_{kind}_CACHE_DIR="\$UPSTREAM_DIR/\.zig-cache"$',
+                canary,
+                re.MULTILINE,
+            )
+        )
+        != 1
+        for kind in ("GLOBAL", "LOCAL")
+    ) or canary.count('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"') != 2 or canary.count(
+        "git diff --quiet HEAD --"
+    ) != 2 or canary.count('test -z "$(git ls-files --others --exclude-standard)"') != 1 or canary.count(
+        'test -z "$(git ls-files --others --ignored --exclude-standard)"'
+    ) != 1:
+        raise WorkflowContractError("upstream canary gates or reporting are incomplete")
+
+
 def minimal_workflow(*, action: str, checkout_option: str = "persist-credentials: false") -> str:
     return f"""\
 name: Fixture
@@ -239,6 +330,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             with self.subTest(name=name):
                 validate_workflow(name, text)
         validate_live_product_boundaries(workflows)
+        validate_upstream_canary_boundaries(workflows)
 
     def test_live_product_secret_boundary_fails_closed(self) -> None:
         baseline = self.repository_workflows()
@@ -289,6 +381,58 @@ class WorkflowSecurityTests(unittest.TestCase):
                 WorkflowContractError
             ):
                 validate_live_product_boundaries(workflows)
+
+    def test_upstream_canary_boundary_fails_closed(self) -> None:
+        baseline = self.repository_workflows()
+        mutations = []
+        for old, new in (
+            ('cron: "23 5 * * *"', 'cron: "0 * * * *"'),
+            ("  workflow_dispatch:", "  pull_request:"),
+            ("  workflow_dispatch:", "  pull_request :"),
+            ("--depth=1", "--depth=2"),
+            ("checkout --quiet --detach", "checkout --quiet"),
+            ("use-cache: false", "use-cache: true"),
+            ("          use-cache: false", "          # use-cache: false"),
+            ('          ACTIONS_RUNTIME_TOKEN: ""', '          ACTIONS_RUNTIME_TOKEN: "inherited"'),
+            (
+                "unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY",
+                "true # command paths inherited",
+            ),
+            (
+                "          unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY",
+                "          # unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY",
+            ),
+            (
+                '          export ZIG_GLOBAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"',
+                '          # export ZIG_GLOBAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"',
+            ),
+            (
+                '          export ZIG_LOCAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"',
+                '          export ZIG_GLOBAL_CACHE_DIR="$UPSTREAM_DIR/.zig-cache"',
+            ),
+            (
+                'test -z "$(git ls-files --others --exclude-standard)"',
+                "true # nonignored untracked files ignored",
+            ),
+            (
+                'test -z "$(git ls-files --others --ignored --exclude-standard)"',
+                "true # ignored untracked files ignored",
+            ),
+        ):
+            changed = dict(baseline)
+            changed["upstream-canary.yml"] = changed["upstream-canary.yml"].replace(
+                old, new, 1
+            )
+            mutations.append(changed)
+        with_secret = dict(baseline)
+        with_secret["upstream-canary.yml"] += "\nenv:\n  TOKEN: ${{ secrets.VALUE }}\n"
+        mutations.append(with_secret)
+
+        for workflows in mutations:
+            with self.subTest(workflows=workflows), self.assertRaises(
+                WorkflowContractError
+            ):
+                validate_upstream_canary_boundaries(workflows)
 
     def test_external_actions_require_immutable_commit_pins(self) -> None:
         for action in ("actions/checkout@v4", "owner/action@main", "owner/action@abc123"):
