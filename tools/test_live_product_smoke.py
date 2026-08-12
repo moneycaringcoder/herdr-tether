@@ -102,6 +102,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 {
                     "TMUX": "/tmp/tmux-parent/default,123,0",
                     "HERDR_BIN_PATH": "/operator/herdr",
+                    "HERDR_SOCKET_PATH": "/operator/private/herdr.sock",
                     "HERDR_PANE_ID": "operator-pane",
                     "HERDR_WORKSPACE_ID": "operator-workspace",
                     "HERDR_PLUGIN_CONTEXT_JSON": "{}",
@@ -122,6 +123,7 @@ class SmokeEnvironmentTests(unittest.TestCase):
                 self.assertNotIn("TMUX", smoke.env)
                 for variable in (
                     "HERDR_BIN_PATH",
+                    "HERDR_SOCKET_PATH",
                     "HERDR_PANE_ID",
                     "HERDR_WORKSPACE_ID",
                     "HERDR_PLUGIN_CONTEXT_JSON",

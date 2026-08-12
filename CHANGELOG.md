@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- `doctor` now reports whether a connected Herdr socket protocol is unsupported,
+  audited (19 or 20), or newer and not yet verified. Protocols above 20 continue
+  with an advisory; Tether's minimum remains protocol 19.
 - Session snapshots with an agent status added by a newer Herdr now degrade that
   status to `UNKNOWN` instead of making every snapshot consumer fail. Unknown
   statuses remain unsettled and cannot receive Mission Control prompts.

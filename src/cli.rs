@@ -3,7 +3,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::AtomicBool,
+    sync::{atomic::AtomicBool, mpsc},
+    thread,
     time::Duration as StdDuration,
 };
 
@@ -23,7 +24,9 @@ use crate::{
     },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
-    herdr_socket::HerdrSocketClient,
+    herdr_socket::{
+        HerdrSocketClient, MAX_AUDITED_HERDR_PROTOCOL, MIN_HERDR_PROTOCOL, ProtocolConfidence,
+    },
     lifecycle::{LifecycleService, PruneError, PruneService},
     model::{
         ExternalSessionName, HerdrAgentKind, OrchestrationGroupId, OrchestrationTitle,
@@ -1727,6 +1730,9 @@ fn plugin_command(paths: &AppPaths, command: PluginCommand) -> Result<()> {
 #[serde(rename_all = "snake_case")]
 enum DoctorStatus {
     Ok,
+    Advisory,
+    NotChecked,
+    Unsupported,
     Missing,
     Unusable,
     Failed,
@@ -1744,6 +1750,8 @@ struct DoctorCheck {
     required: bool,
     diagnostic: Option<&'static str>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_protocol: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1759,7 +1767,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     if !args.json {
         return doctor_human(paths);
     }
-    let mut checks = Vec::with_capacity(7);
+    let mut checks = Vec::with_capacity(8);
 
     let config_status = if !paths.config_file.exists() {
         DoctorStatus::Missing
@@ -1788,6 +1796,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("herdr"));
     checks.push(probe_binary("herdr", herdr, "--version"));
+    checks.push(doctor_protocol_check());
     let herdr_binary_provided = env::var_os("HERDR_BIN_PATH")
         .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
     let plugin_context_signaled = herdr_binary_provided
@@ -1842,6 +1851,9 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
 fn doctor_check(name: &'static str, status: DoctorStatus, required: bool) -> DoctorCheck {
     let diagnostic = match status {
         DoctorStatus::Ok | DoctorStatus::Standalone => None,
+        DoctorStatus::Advisory => Some("newer_protocol_unverified"),
+        DoctorStatus::NotChecked => Some("socket_not_provided"),
+        DoctorStatus::Unsupported => Some("protocol_too_old"),
         DoctorStatus::Missing => Some("not_found"),
         DoctorStatus::Unusable => Some("invalid_data"),
         DoctorStatus::Failed => Some("nonzero_exit"),
@@ -1856,11 +1868,63 @@ fn doctor_check(name: &'static str, status: DoctorStatus, required: bool) -> Doc
         required,
         diagnostic,
         truncated: false,
+        observed_protocol: None,
     }
 }
 
 fn doctor_status_passes(status: DoctorStatus) -> bool {
-    matches!(status, DoctorStatus::Ok | DoctorStatus::Standalone)
+    matches!(
+        status,
+        DoctorStatus::Ok
+            | DoctorStatus::Advisory
+            | DoctorStatus::NotChecked
+            | DoctorStatus::Standalone
+    )
+}
+
+fn doctor_protocol_check() -> DoctorCheck {
+    let Some(socket_path) = env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from) else {
+        return doctor_check("herdr_protocol", DoctorStatus::NotChecked, false);
+    };
+    if socket_path.as_os_str().is_empty() {
+        return doctor_check("herdr_protocol", DoctorStatus::Incomplete, true);
+    }
+
+    let timeout = StdDuration::from_secs(3);
+    let snapshot = match run_doctor_probe_with_timeout(timeout, move || {
+        HerdrSocketClient::new_with_timeout(socket_path, timeout).snapshot()
+    }) {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return doctor_check("herdr_protocol", DoctorStatus::Unavailable, true);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return doctor_check("herdr_protocol", DoctorStatus::TimedOut, true);
+        }
+    };
+    let status = match snapshot.protocol_confidence() {
+        ProtocolConfidence::Unsupported => DoctorStatus::Unsupported,
+        ProtocolConfidence::Audited => DoctorStatus::Ok,
+        ProtocolConfidence::NewerUnverified => DoctorStatus::Advisory,
+    };
+    let mut check = doctor_check("herdr_protocol", status, true);
+    check.observed_protocol = Some(snapshot.protocol);
+    check
+}
+
+fn run_doctor_probe_with_timeout<T, F>(
+    timeout: StdDuration,
+    probe: F,
+) -> std::result::Result<T, mpsc::RecvTimeoutError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(probe());
+    });
+    receiver.recv_timeout(timeout)
 }
 
 fn probe_binary(name: &'static str, program: PathBuf, version_flag: &str) -> DoctorCheck {
@@ -1924,6 +1988,7 @@ fn doctor_human(paths: &AppPaths) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("herdr"));
     println!("Herdr binary: {}", herdr.display());
     failures += usize::from(!report_binary_path(herdr, &["--version"]));
+    failures += usize::from(!report_herdr_protocol());
     let binary = env::var_os("HERDR_BIN_PATH")
         .is_some_and(|value| !value.to_string_lossy().trim().is_empty());
     let signaled = binary
@@ -1971,6 +2036,46 @@ fn doctor_human(paths: &AppPaths) -> Result<()> {
             if failures == 1 { "" } else { "s" }
         )
     }
+}
+
+fn report_herdr_protocol() -> bool {
+    let check = doctor_protocol_check();
+    match check.status {
+        DoctorStatus::Ok => println!(
+            "Herdr protocol: {} audited",
+            check
+                .observed_protocol
+                .expect("audited protocol is observed")
+        ),
+        DoctorStatus::Advisory => println!(
+            "Herdr protocol: {} newer than audited {}; continuing (update Tether when compatibility support ships)",
+            check
+                .observed_protocol
+                .expect("advisory protocol is observed"),
+            MAX_AUDITED_HERDR_PROTOCOL
+        ),
+        DoctorStatus::Unsupported => println!(
+            "Herdr protocol: {} unsupported; requires {}+",
+            check
+                .observed_protocol
+                .expect("unsupported protocol is observed"),
+            MIN_HERDR_PROTOCOL
+        ),
+        DoctorStatus::NotChecked => {
+            println!("Herdr protocol: not checked (HERDR_SOCKET_PATH not provided)")
+        }
+        DoctorStatus::Incomplete => {
+            println!("Herdr protocol: unavailable (HERDR_SOCKET_PATH is empty)")
+        }
+        DoctorStatus::Unavailable => println!(
+            "Herdr protocol: unavailable (verify HERDR_SOCKET_PATH points to a running Herdr)"
+        ),
+        DoctorStatus::TimedOut => println!(
+            "Herdr protocol: timed out after 3s (verify HERDR_SOCKET_PATH points to a responsive Herdr)"
+        ),
+        _ => unreachable!("protocol probe uses only protocol-specific doctor statuses"),
+    }
+    doctor_status_passes(check.status)
 }
 
 fn report_binary(program: &str, args: &[&str]) -> bool {
@@ -2180,6 +2285,15 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_probe_deadline_bounds_a_stalled_operation() {
+        let result = run_doctor_probe_with_timeout(StdDuration::from_millis(20), || {
+            std::thread::sleep(StdDuration::from_secs(1));
+        });
+
+        assert!(matches!(result, Err(mpsc::RecvTimeoutError::Timeout)));
+    }
 
     #[test]
     fn external_attach_command_preserves_target_and_name_as_arguments() {

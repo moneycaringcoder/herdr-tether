@@ -9,7 +9,11 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
+    thread::JoinHandle,
+};
 
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -45,6 +49,7 @@ impl Sandbox {
             .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
             .env_remove("HERDR_BIN_PATH")
             .env_remove("HERDR_CONFIG_PATH")
+            .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("HERDR_WORKSPACE_ID")
             .env_remove("HERDR_TAB_ID")
@@ -60,6 +65,62 @@ impl Sandbox {
     fn state_file(&self) -> std::path::PathBuf {
         self.path("xdg-state/herdr-tether/state.json")
     }
+}
+
+#[cfg(unix)]
+fn prepare_doctor_sandbox(sandbox: &Sandbox) -> std::path::PathBuf {
+    let (bin, herdr) = install_setup_runtime_scripts(sandbox, None);
+    sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_BIN_PATH", herdr)
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+fn serve_snapshot(
+    sandbox: &Sandbox,
+    name: &str,
+    protocol: u32,
+) -> (std::path::PathBuf, JoinHandle<()>) {
+    let socket = sandbox.path(name);
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "session.snapshot");
+        assert_eq!(request["params"], serde_json::json!({}));
+        let id = request["id"].as_str().unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "result": {
+                    "type": "session_snapshot",
+                    "snapshot": {
+                        "version": "0.8.0",
+                        "protocol": protocol,
+                        "panes": [],
+                        "agents": [],
+                    }
+                }
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+    (socket, server)
 }
 
 const SESSION_ID: &str = "tether-0197f198000070008000000000000001";
@@ -1810,6 +1871,150 @@ fn doctor_json_uses_supported_version_flags_for_each_binary() {
         assert_eq!(check["diagnostic"], serde_json::Value::Null);
         assert_eq!(check["truncated"], false);
     }
+    let protocol = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "herdr_protocol")
+        .unwrap();
+    assert_eq!(protocol["status"], "not_checked");
+    assert_eq!(protocol["required"], false);
+    assert_eq!(protocol["diagnostic"], "socket_not_provided");
+    assert!(protocol.get("observed_protocol").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_json_classifies_protocol_18_19_20_and_21() {
+    let sandbox = Sandbox::new();
+    let bin = prepare_doctor_sandbox(&sandbox);
+
+    for (protocol, expected_status, expected_diagnostic, success) in [
+        (18, "unsupported", "protocol_too_old", false),
+        (19, "ok", "", true),
+        (20, "ok", "", true),
+        (21, "advisory", "newer_protocol_unverified", true),
+    ] {
+        let (socket, server) = serve_snapshot(
+            &sandbox,
+            &format!("herdr-protocol-{protocol}.sock"),
+            protocol,
+        );
+        let output = sandbox
+            .command()
+            .env("PATH", &bin)
+            .env("HERDR_SOCKET_PATH", socket)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(output.status.success(), success, "protocol {protocol}");
+        assert!(output.stdout.len() < 2_048, "doctor JSON exceeded bound");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["completion"],
+            if success { "complete" } else { "failed" }
+        );
+        assert_eq!(report["failure_count"], if success { 0 } else { 1 });
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "herdr_protocol")
+            .unwrap();
+        assert_eq!(check["status"], expected_status);
+        assert_eq!(check["required"], true);
+        assert_eq!(check["observed_protocol"], protocol);
+        if expected_diagnostic.is_empty() {
+            assert_eq!(check["diagnostic"], serde_json::Value::Null);
+        } else {
+            assert_eq!(check["diagnostic"], expected_diagnostic);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_human_advises_on_new_protocol_and_rejects_old_protocol() {
+    let sandbox = Sandbox::new();
+    let bin = prepare_doctor_sandbox(&sandbox);
+
+    let (socket, server) = serve_snapshot(&sandbox, "herdr-protocol-21.sock", 21);
+    sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_SOCKET_PATH", socket)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Herdr protocol: 21 newer than audited 20; continuing",
+        ));
+    server.join().unwrap();
+
+    let (socket, server) = serve_snapshot(&sandbox, "herdr-protocol-18.sock", 18);
+    sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_SOCKET_PATH", socket)
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "Herdr protocol: 18 unsupported; requires 19+",
+        ));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_protocol_failures_are_typed_and_redacted() {
+    let sandbox = Sandbox::new();
+    let bin = prepare_doctor_sandbox(&sandbox);
+    let secret_socket = sandbox.path("private-secret/socket-token.sock");
+
+    let output = sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_SOCKET_PATH", &secret_socket)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.len() < 2_048, "doctor JSON exceeded bound");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("private-secret"), "{stdout}");
+    assert!(!stdout.contains("socket-token"), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "herdr_protocol")
+        .unwrap();
+    assert_eq!(check["status"], "unavailable");
+    assert_eq!(check["diagnostic"], "io_error");
+    assert!(check.get("observed_protocol").is_none());
+
+    let output = sandbox
+        .command()
+        .env("PATH", &bin)
+        .env("HERDR_SOCKET_PATH", "")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "herdr_protocol")
+        .unwrap();
+    assert_eq!(check["status"], "incomplete");
+    assert_eq!(check["diagnostic"], "missing_context");
+    assert!(check.get("observed_protocol").is_none());
 }
 
 #[test]
@@ -1879,6 +2084,7 @@ fn doctor_json_is_stable_bounded_and_redacts_adversarial_probe_data() {
             "ssh",
             "cargo",
             "herdr",
+            "herdr_protocol",
             "herdr_context"
         ]
     );
