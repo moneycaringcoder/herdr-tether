@@ -4,10 +4,87 @@ import unittest
 from check_release import (
     PUBLIC_RELEASE_FILES,
     ReleaseIdentityError,
+    resolve_target_tag,
     validate_readme_install,
     validate_hermes_install,
     validate_release_context,
 )
+
+
+class TargetTagTests(unittest.TestCase):
+    def test_candidate_derives_the_package_tag(self) -> None:
+        self.assertEqual(
+            resolve_target_tag(
+                candidate=True,
+                explicit_tag=None,
+                release=False,
+                package_version="0.7.1",
+            ),
+            "v0.7.1",
+        )
+
+    def test_matching_explicit_tag_is_accepted(self) -> None:
+        self.assertEqual(
+            resolve_target_tag(
+                candidate=False,
+                explicit_tag="v0.7.1",
+                release=True,
+                package_version="0.7.1",
+            ),
+            "v0.7.1",
+        )
+
+    def test_environment_tag_remains_the_implicit_non_candidate_fallback(self) -> None:
+        self.assertEqual(
+            resolve_target_tag(
+                candidate=False,
+                explicit_tag=None,
+                environment_tag="v0.7.1",
+                release=False,
+                package_version="0.7.1",
+            ),
+            "v0.7.1",
+        )
+        self.assertEqual(
+            resolve_target_tag(
+                candidate=True,
+                explicit_tag=None,
+                environment_tag="pull/55/merge",
+                release=False,
+                package_version="0.7.1",
+            ),
+            "v0.7.1",
+        )
+
+    def test_target_mode_must_be_unambiguous(self) -> None:
+        invalid = (
+            dict(candidate=False, explicit_tag=None, release=False),
+            dict(candidate=True, explicit_tag="v0.7.1", release=False),
+            dict(candidate=True, explicit_tag=None, release=True),
+        )
+        for selection in invalid:
+            with self.subTest(selection=selection):
+                with self.assertRaises(ReleaseIdentityError):
+                    resolve_target_tag(package_version="0.7.1", **selection)
+
+    def test_tag_and_package_version_must_be_stable_semver_and_match(self) -> None:
+        invalid = (
+            dict(explicit_tag="0.7.1", package_version="0.7.1"),
+            dict(explicit_tag="v0.7.0", package_version="0.7.1"),
+            dict(explicit_tag="v0.7.1", package_version="0.7.1-rc.1"),
+            dict(explicit_tag="v0.7.1", package_version="00.7.1"),
+            dict(explicit_tag="v0.7.1", package_version="0.07.1"),
+            dict(explicit_tag="v0.7.1", package_version="0.7.01"),
+            dict(explicit_tag="v0.7.1", package_version=701),
+        )
+        for identity in invalid:
+            with self.subTest(identity=identity):
+                with self.assertRaises(ReleaseIdentityError):
+                    resolve_target_tag(
+                        candidate=False,
+                        release=False,
+                        **identity,
+                    )
 
 
 class ReadmeInstallIdentityTests(unittest.TestCase):
