@@ -1655,6 +1655,42 @@ mod tests {
 
     use crate::observer::{ObserverAction, action_for_input};
 
+    #[test]
+    fn prompt_delivery_summary_keeps_safety_distinctions_visible() {
+        let delivered: SessionId = "tether-0197f198000070008000000000000081".parse().unwrap();
+        let rejected: SessionId = "tether-0197f198000070008000000000000082".parse().unwrap();
+        let stalled: SessionId = "tether-0197f198000070008000000000000083".parse().unwrap();
+        let uncertain: SessionId = "tether-0197f198000070008000000000000084".parse().unwrap();
+        let summary = target_delivery_summary(&[
+            TargetDelivery::Delivered {
+                session_id: delivered,
+                final_state: MissionAgentState::Done,
+            },
+            TargetDelivery::Rejected {
+                session_id: rejected,
+                reason: "fixture".to_owned(),
+            },
+            TargetDelivery::Stalled {
+                session_id: stalled,
+                reason: "fixture".to_owned(),
+            },
+            TargetDelivery::Uncertain {
+                session_id: uncertain,
+            },
+        ]);
+
+        assert_eq!(
+            summary,
+            format!(
+                "{}:DELIVERED→DONE · {}:REJECTED · {}:DELIVERED→NO CHANGE · {}:UNCERTAIN",
+                delivered.reference_token(SessionId::SHORT_REFERENCE_WIDTH),
+                rejected.reference_token(SessionId::SHORT_REFERENCE_WIDTH),
+                stalled.reference_token(SessionId::SHORT_REFERENCE_WIDTH),
+                uncertain.reference_token(SessionId::SHORT_REFERENCE_WIDTH),
+            )
+        );
+    }
+
     fn worker(id: &str, lifecycle: ObserverLifecycle, capture: Option<&str>) -> ObserverWorker {
         ObserverWorker {
             id: id.to_owned(),

@@ -1343,3 +1343,173 @@ mod event_monitor_tests {
         server.join().unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+mod prompt_socket_tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        time::{Duration, Instant},
+    };
+
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+
+    use super::{AgentStatus, HerdrSocketClient, PromptDeliveryError};
+
+    enum Reply {
+        Error(&'static str),
+        Success,
+        MissingResult,
+        WrongId,
+        Raw(&'static str),
+        Disconnect,
+    }
+
+    fn prompt_once(
+        reply: Reply,
+    ) -> std::result::Result<super::HerdrAgentInfo, PromptDeliveryError> {
+        let temp = tempdir().unwrap();
+        let socket = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "prompt client did not connect");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("prompt fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "agent.prompt");
+            assert_eq!(request["params"]["target"], "worker");
+            assert_eq!(request["params"]["text"], "Do one reviewed thing");
+            assert_eq!(
+                request["params"]["wait"]["until"],
+                json!(["idle", "done", "blocked"])
+            );
+            assert_eq!(request["params"]["wait"]["timeout_ms"], 25);
+            let id = request["id"].as_str().unwrap();
+            match reply {
+                Reply::Error(code) => writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": id,
+                        "error": {"code": code, "message": "fixture message"},
+                    })
+                )
+                .unwrap(),
+                Reply::Success => writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": id,
+                        "future_envelope_field": true,
+                        "result": {
+                            "type": "agent_prompted",
+                            "future_result_field": [1, 2, 3],
+                            "agent": {
+                                "terminal_id": "term-1",
+                                "name": "worker",
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "tokens": {"owner": "fixture"},
+                                "workspace_id": "w1",
+                                "tab_id": "w1:t1",
+                                "pane_id": "w1:p1",
+                                "future_agent_field": {"ignored": true},
+                            },
+                        },
+                    })
+                )
+                .unwrap(),
+                Reply::MissingResult => writeln!(stream, "{}", json!({"id": id})).unwrap(),
+                Reply::WrongId => writeln!(
+                    stream,
+                    "{}",
+                    json!({"id": "not-the-request-id", "result": {}})
+                )
+                .unwrap(),
+                Reply::Raw(raw) => write!(stream, "{raw}").unwrap(),
+                Reply::Disconnect => return,
+            }
+            stream.flush().unwrap();
+        });
+
+        let result = HerdrSocketClient::new(socket).prompt_and_wait(
+            "worker",
+            "Do one reviewed thing",
+            Duration::from_millis(25),
+        );
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn socket_error_codes_preserve_prompt_delivery_certainty() {
+        for code in [
+            "agent_not_ready",
+            "agent_target_ambiguous",
+            "empty_agent_prompt",
+        ] {
+            assert_eq!(
+                prompt_once(Reply::Error(code)),
+                Err(PromptDeliveryError::Rejected {
+                    code: code.to_owned(),
+                    message: "fixture message".to_owned(),
+                }),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            prompt_once(Reply::Error("agent_prompt_stalled")),
+            Err(PromptDeliveryError::Stalled {
+                message: "fixture message".to_owned(),
+            })
+        );
+        for code in ["agent_prompt_failed", "future_prompt_error"] {
+            assert_eq!(
+                prompt_once(Reply::Error(code)),
+                Err(PromptDeliveryError::Uncertain),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_incomplete_socket_responses_are_uncertain() {
+        for reply in [
+            Reply::Raw("not-json\n"),
+            Reply::WrongId,
+            Reply::MissingResult,
+            Reply::Disconnect,
+        ] {
+            assert_eq!(prompt_once(reply), Err(PromptDeliveryError::Uncertain));
+        }
+    }
+
+    #[test]
+    fn additive_prompt_response_fields_decode_successfully() {
+        let agent = prompt_once(Reply::Success).unwrap();
+        assert_eq!(agent.terminal_id, "term-1");
+        assert_eq!(agent.pane_id, "w1:p1");
+        assert_eq!(agent.agent_status, AgentStatus::Done);
+    }
+}
