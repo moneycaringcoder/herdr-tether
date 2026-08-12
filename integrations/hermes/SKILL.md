@@ -18,10 +18,10 @@ Use Tether as the visibility and lifecycle boundary for durable development work
 
 Choose the source that matches the Tether installation:
 
-**Stable v0.7.0:**
+**Stable v0.7.1:**
 
 ```sh
-hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.7.0/integrations/hermes/SKILL.md
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.7.1/integrations/hermes/SKILL.md
 ```
 
 **Development (`main`):**

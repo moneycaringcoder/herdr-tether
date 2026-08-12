@@ -1,13 +1,13 @@
 [package]
 name = "herdr-tether"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Durable local and SSH-backed tmux workloads for Herdr"
 license = "MIT"
 repository = "https://github.com/moneycaringcoder/herdr-tether"
 homepage = "https://github.com/moneycaringcoder/herdr-tether"
-documentation = "https://github.com/moneycaringcoder/herdr-tether/blob/v0.7.0/docs/architecture.md"
+documentation = "https://github.com/moneycaringcoder/herdr-tether/blob/v0.7.1/docs/architecture.md"
 keywords = ["herdr", "terminal", "ssh", "tmux"]
 categories = ["command-line-utilities"]
 include = [
