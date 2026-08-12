@@ -1,6 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.1] - 2026-08-12
+
+### Added
+
+- Added an advisory upstream canary that resolves one exact Herdr `master`
+  commit, validates Tether's required API contract, and runs the live-product
+  smoke path on Linux and macOS without weakening stable release gates.
 
 ### Fixed
 
