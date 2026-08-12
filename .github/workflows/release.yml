@@ -78,6 +78,7 @@ jobs:
       - name: Run deterministic compatibility and package harness tests
         run: |
           python3 tools/test_live_product_smoke.py
+          python3 tools/test_check_herdr_api_contract.py
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py
           python3 tools/check_package.py
