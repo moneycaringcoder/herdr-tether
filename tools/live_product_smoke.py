@@ -70,6 +70,19 @@ EXERCISED_ACTIONS = (
 EXERCISED_PLACEMENTS = ("split-right", "split-down", "new-tab")
 
 
+def external_attach_picker_steps(session: str) -> list[tuple[str, bytes]]:
+    """Select the isolated external row even if catalog arrival moved selection."""
+    return [
+        ("Hosts", b"\r"),
+        # The external row and Create action can race during catalog refresh.
+        # Re-entering the host resets Resources to its first row.
+        (session, b"\x1b"),
+        ("Hosts", b"\r"),
+        (session, b"\r"),
+        ("Split right", b"\x1b[B\x1b[B\r"),
+    ]
+
+
 def safe_version(value: str) -> str:
     """Bound tool versions to a printable token grammar with no paths."""
     value = value.strip()
@@ -1112,11 +1125,7 @@ class Smoke:
         self.interact(
             [str(self.tether), "open", "--host", "local"],
             picker_env,
-            [
-                ("Hosts", b"\r"),
-                (self.external_session, b"\r"),
-                ("Split right", b"\x1b[B\x1b[B\r"),
-            ],
+            external_attach_picker_steps(self.external_session),
         )
         external_pane = self.wait_new_pane(before_panes, "external session new-tab pane")
         self.verify_placement("new-tab", invoking_pane, external_pane)
