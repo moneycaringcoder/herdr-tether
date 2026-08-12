@@ -10,6 +10,8 @@ on:
       - "src/**"
       - "tools/live_product_smoke.py"
       - "tools/test_live_product_smoke.py"
+      - "tools/check_herdr_api_contract.py"
+      - "tools/test_check_herdr_api_contract.py"
       - ".github/workflows/live-product.yml"
   push:
     branches:
@@ -23,6 +25,8 @@ on:
       - "src/**"
       - "tools/live_product_smoke.py"
       - "tools/test_live_product_smoke.py"
+      - "tools/check_herdr_api_contract.py"
+      - "tools/test_check_herdr_api_contract.py"
       - ".github/workflows/live-product.yml"
 
 permissions:
@@ -111,13 +115,18 @@ jobs:
           fi
           chmod 0755 "$destination"
           "$destination" --version
+          "$destination" api schema --output "$RUNNER_TEMP/herdr-api.schema.json"
+          python3 tools/check_herdr_api_contract.py \
+            "$RUNNER_TEMP/herdr-api.schema.json"
           printf 'HERDR_BIN=%s\n' "$destination" >> "$GITHUB_ENV"
 
       - name: Build locked release artifact
         run: cargo build --release --locked
 
       - name: Run deterministic harness tests
-        run: python3 tools/test_live_product_smoke.py
+        run: |
+          python3 tools/test_live_product_smoke.py
+          python3 tools/test_check_herdr_api_contract.py
 
       - name: Run isolated live product smoke and preserve parent tmux
         shell: bash
