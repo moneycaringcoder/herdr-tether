@@ -45,6 +45,16 @@ class IsolatedRuntimeEnvironmentTests(unittest.TestCase):
                 )
             self.assertEqual(environment["RUSTUP_HOME"], explicit)
 
+    def test_does_not_inherit_a_developer_herdr_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as sandbox:
+            with mock.patch.dict(
+                os.environ, {"HERDR_SOCKET_PATH": "/operator/private/herdr.sock"}, clear=False
+            ):
+                environment = isolated_build_environment(
+                    Path(sandbox) / "cargo", Path(sandbox) / "home"
+                )
+            self.assertNotIn("HERDR_SOCKET_PATH", environment)
+
 
 class DependencyCacheTests(unittest.TestCase):
     def test_fetches_locked_dependencies_in_repository_environment(self) -> None:

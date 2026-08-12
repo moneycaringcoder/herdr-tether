@@ -395,6 +395,7 @@ def _write_probe(path: Path, output: str) -> None:
 
 def isolated_build_environment(cargo_home: Path, home: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    environment.pop("HERDR_SOCKET_PATH", None)
     if not environment.get("RUSTUP_HOME"):
         original_home = Path(environment.get("HOME", str(Path.home())))
         default_rustup_home = original_home / ".rustup"

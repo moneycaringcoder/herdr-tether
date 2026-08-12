@@ -30,6 +30,8 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MIN_HERDR_PROTOCOL: u32 = 19;
 /// Human-facing label for [`MIN_HERDR_PROTOCOL`], used in upgrade guidance.
 pub const MIN_HERDR_VERSION_LABEL: &str = "0.8.0";
+/// Newest Herdr socket protocol covered by Tether's stable and upstream checks.
+pub(crate) const MAX_AUDITED_HERDR_PROTOCOL: u32 = 20;
 /// Largest number of sibling worktrees considered as a picker preference.
 const MAX_WORKTREE_PATHS: usize = 64;
 
@@ -116,6 +118,13 @@ pub struct HerdrSessionSnapshot {
     pub agents: Vec<HerdrAgentInfo>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProtocolConfidence {
+    Unsupported,
+    Audited,
+    NewerUnverified,
+}
+
 impl HerdrSessionSnapshot {
     pub fn version_tuple(&self) -> Result<(u64, u64, u64)> {
         parse_version(&self.version)
@@ -128,6 +137,16 @@ impl HerdrSessionSnapshot {
     /// version string looks new enough.
     pub fn supports_protocol(&self) -> bool {
         self.protocol >= MIN_HERDR_PROTOCOL
+    }
+
+    pub(crate) const fn protocol_confidence(&self) -> ProtocolConfidence {
+        if self.protocol < MIN_HERDR_PROTOCOL {
+            ProtocolConfidence::Unsupported
+        } else if self.protocol <= MAX_AUDITED_HERDR_PROTOCOL {
+            ProtocolConfidence::Audited
+        } else {
+            ProtocolConfidence::NewerUnverified
+        }
     }
 
     /// Fails with an actionable upgrade message when the protocol is too old.
@@ -211,10 +230,14 @@ impl HerdrSocketClient {
     }
 
     pub fn new(socket_path: PathBuf) -> Self {
+        Self::new_with_timeout(socket_path, DEFAULT_SOCKET_TIMEOUT)
+    }
+
+    pub(crate) fn new_with_timeout(socket_path: PathBuf, timeout: Duration) -> Self {
         Self {
             socket_path: Arc::new(socket_path),
             next_id: Arc::new(AtomicU64::new(1)),
-            timeout: DEFAULT_SOCKET_TIMEOUT,
+            timeout,
         }
     }
 
@@ -1120,9 +1143,19 @@ mod tests {
 
     #[test]
     fn protocol_gate_pins_the_wire_contract_not_the_version_string() {
-        assert!(snapshot_with_protocol("0.8.0", MIN_HERDR_PROTOCOL).supports_protocol());
-        assert!(snapshot_with_protocol("1.2.0", MIN_HERDR_PROTOCOL + 5).supports_protocol());
-        assert!(!snapshot_with_protocol("0.7.5", 17).supports_protocol());
+        use ProtocolConfidence::{Audited, NewerUnverified, Unsupported};
+
+        for (protocol, confidence, supported) in [
+            (18, Unsupported, false),
+            (19, Audited, true),
+            (20, Audited, true),
+            (21, NewerUnverified, true),
+            (u32::MAX, NewerUnverified, true),
+        ] {
+            let snapshot = snapshot_with_protocol("9.9.9", protocol);
+            assert_eq!(snapshot.protocol_confidence(), confidence, "{protocol}");
+            assert_eq!(snapshot.supports_protocol(), supported, "{protocol}");
+        }
         // A build whose version string looks new but whose protocol is old is
         // still rejected: Tether trusts the wire contract, not the label.
         assert!(!snapshot_with_protocol("9.9.9", 18).supports_protocol());

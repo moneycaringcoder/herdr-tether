@@ -394,6 +394,7 @@ class Smoke:
         for variable in (
             "TMUX",
             "HERDR_BIN_PATH",
+            "HERDR_SOCKET_PATH",
             "HERDR_PANE_ID",
             "HERDR_WORKSPACE_ID",
             "HERDR_PLUGIN_CONTEXT_JSON",
