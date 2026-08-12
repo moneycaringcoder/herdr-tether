@@ -16,6 +16,7 @@ from live_product_smoke import (
     Smoke,
     SmokeInterrupted,
     REPORT_MAX_BYTES,
+    external_attach_picker_steps,
     failure_category,
     finalize_cleanup_verdict,
     smoke_report,
@@ -95,6 +96,18 @@ class SmokeJsonReportTests(unittest.TestCase):
 
 
 class SmokeEnvironmentTests(unittest.TestCase):
+    def test_external_attach_reselects_first_row_before_enter(self) -> None:
+        self.assertEqual(
+            external_attach_picker_steps("external-smoke"),
+            [
+                ("Hosts", b"\r"),
+                ("external-smoke", b"\x1b"),
+                ("Hosts", b"\r"),
+                ("external-smoke", b"\r"),
+                ("Split right", b"\x1b[B\x1b[B\r"),
+            ],
+        )
+
     def test_parent_tmux_socket_is_not_inherited(self) -> None:
         with tempfile.TemporaryDirectory() as repository:
             with mock.patch.dict(
