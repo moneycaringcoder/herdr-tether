@@ -1,0 +1,37 @@
+name: Live product smoke (trusted)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "herdr-plugin.toml"
+      - "src/**"
+      - "tools/live_product_smoke.py"
+      - "tools/test_live_product_smoke.py"
+      - "tools/check_herdr_api_contract.py"
+      - "tools/test_check_herdr_api_contract.py"
+      - ".github/workflows/live-product.yml"
+      - ".github/workflows/live-product-core.yml"
+      - ".github/workflows/live-product-trusted.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  live-product-main:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/live-product-core.yml
+    secrets:
+      TETHER_SMOKE_REMOTE_TARGET: ${{ secrets.TETHER_SMOKE_REMOTE_TARGET }}
+      TETHER_SMOKE_REMOTE_DIRECTORY: ${{ secrets.TETHER_SMOKE_REMOTE_DIRECTORY }}
+      TETHER_SMOKE_REMOTE_KNOWN_HOSTS: ${{ secrets.TETHER_SMOKE_REMOTE_KNOWN_HOSTS }}
+
+  live-product-non-main:
+    if: github.ref != 'refs/heads/main'
+    uses: ./.github/workflows/live-product-core.yml
