@@ -41,6 +41,7 @@ pub enum AgentStatus {
     Blocked,
     Done,
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -909,11 +910,91 @@ fn wait_for_stop(stop: &AtomicBool, duration: Duration) -> bool {
 mod tests {
     use super::*;
 
+    fn snapshot_json(pane_status: Value, agent_status: Value) -> Value {
+        json!({
+            "version": "0.8.0",
+            "protocol": MIN_HERDR_PROTOCOL,
+            "focused_workspace_id": "workspace-1",
+            "focused_tab_id": "tab-1",
+            "focused_pane_id": "pane-1",
+            "future_root_field": {"ignored": true},
+            "panes": [{
+                "pane_id": "pane-1",
+                "terminal_id": "terminal-1",
+                "workspace_id": "workspace-1",
+                "tab_id": "tab-1",
+                "agent": "codex",
+                "agent_status": pane_status,
+                "future_pane_field": [1, 2, 3],
+            }],
+            "agents": [{
+                "terminal_id": "terminal-1",
+                "agent": "codex",
+                "agent_status": agent_status,
+                "workspace_id": "workspace-1",
+                "tab_id": "tab-1",
+                "pane_id": "pane-1",
+                "future_agent_field": "ignored",
+            }],
+        })
+    }
+
     #[test]
     fn version_strings_parse_into_comparable_components() {
         assert_eq!(parse_version("0.8.0").unwrap(), (0, 8, 0));
         assert_eq!(parse_version("v0.8.0-preview").unwrap(), (0, 8, 0));
         assert!(parse_version("0.8").is_err());
+    }
+
+    #[test]
+    fn future_agent_status_and_additive_snapshot_fields_fail_closed() {
+        let snapshot: HerdrSessionSnapshot = serde_json::from_value(snapshot_json(
+            json!("future_pane_state"),
+            json!("future_agent_state"),
+        ))
+        .unwrap();
+        assert_eq!(snapshot.panes[0].agent_status, AgentStatus::Unknown);
+        assert_eq!(snapshot.agents[0].agent_status, AgentStatus::Unknown);
+        assert!(!snapshot.agents[0].agent_status.is_settled());
+
+        for (status, expected) in [
+            ("idle", AgentStatus::Idle),
+            ("working", AgentStatus::Working),
+            ("blocked", AgentStatus::Blocked),
+            ("done", AgentStatus::Done),
+            ("unknown", AgentStatus::Unknown),
+        ] {
+            let decoded: AgentStatus = serde_json::from_value(json!(status)).unwrap();
+            assert_eq!(decoded, expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn malformed_required_snapshot_fields_stay_rejected() {
+        let mut missing_protocol = snapshot_json(json!("idle"), json!("idle"));
+        missing_protocol.as_object_mut().unwrap().remove("protocol");
+
+        let mut missing_pane_id = snapshot_json(json!("idle"), json!("idle"));
+        missing_pane_id["panes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("pane_id");
+
+        let mut missing_agent_workspace = snapshot_json(json!("idle"), json!("idle"));
+        missing_agent_workspace["agents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_id");
+
+        for malformed in [
+            missing_protocol,
+            missing_pane_id,
+            missing_agent_workspace,
+            snapshot_json(json!(7), json!("idle")),
+            snapshot_json(json!("idle"), json!({"future": "shape"})),
+        ] {
+            assert!(serde_json::from_value::<HerdrSessionSnapshot>(malformed).is_err());
+        }
     }
 
     fn snapshot_with_protocol(version: &str, protocol: u32) -> HerdrSessionSnapshot {

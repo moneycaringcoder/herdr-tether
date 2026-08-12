@@ -816,6 +816,31 @@ mod tests {
     }
 
     #[test]
+    fn unknown_agent_status_never_receives_a_prompt() {
+        let unknown = agent(
+            MEMBERSHIP,
+            "w1:p1",
+            "term-1",
+            Some("codex"),
+            AgentStatus::Unknown,
+        );
+        let (service, prompts, _temp) = service(
+            &test_state(true),
+            vec![snapshot(vec![unknown.clone()])],
+            Ok(unknown),
+        );
+        let group_id = "build-group".parse().unwrap();
+        let target = MemberTarget {
+            session_id: SESSION.parse().unwrap(),
+            membership_id: MEMBERSHIP.parse().unwrap(),
+        };
+
+        let result = service.deliver_reviewed_prompt(&group_id, &[target], "Do work", true);
+        assert!(matches!(result[0], TargetDelivery::Rejected { .. }));
+        assert!(prompts.lock().is_empty());
+    }
+
+    #[test]
     fn binding_rejects_unknown_and_different_agents() {
         assert_eq!(
             resolve_binding(

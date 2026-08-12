@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Session snapshots with an agent status added by a newer Herdr now degrade that
+  status to `UNKNOWN` instead of making every snapshot consumer fail. Unknown
+  statuses remain unsettled and cannot receive Mission Control prompts.
 - A prompt Herdr delivered whose agent then showed no state change is now
   reported as `DELIVERED→NO CHANGE` rather than `UNCERTAIN`. Herdr raises
   `agent_prompt_stalled` from its wait phase, after the prompt was written, so
