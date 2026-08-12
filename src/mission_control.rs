@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_delivery_is_never_retried() {
+    fn prompt_outcomes_are_classified_without_automatic_retry() {
         let idle = agent(
             MEMBERSHIP,
             "w1:p1",
@@ -1096,22 +1096,83 @@ mod tests {
             Some("codex"),
             AgentStatus::Idle,
         );
+        let session_id = SESSION.parse().unwrap();
+        for (error, expected) in [
+            (
+                PromptDeliveryError::Rejected {
+                    code: "agent_not_ready".to_owned(),
+                    message: "fixture".to_owned(),
+                },
+                TargetDelivery::Rejected {
+                    session_id,
+                    reason: "Herdr rejected prompt: agent_not_ready: fixture".to_owned(),
+                },
+            ),
+            (
+                PromptDeliveryError::Stalled {
+                    message: "fixture".to_owned(),
+                },
+                TargetDelivery::Stalled {
+                    session_id,
+                    reason: "fixture".to_owned(),
+                },
+            ),
+            (
+                PromptDeliveryError::Uncertain,
+                TargetDelivery::Uncertain { session_id },
+            ),
+        ] {
+            let (service, prompts, _temp) = service(
+                &test_state(true),
+                vec![snapshot(vec![idle.clone()]), snapshot(vec![idle.clone()])],
+                Err(error),
+            );
+            let result = service.deliver_reviewed_prompt(
+                &"build-group".parse().unwrap(),
+                &[MemberTarget {
+                    session_id: SESSION.parse().unwrap(),
+                    membership_id: MEMBERSHIP.parse().unwrap(),
+                }],
+                "Do work",
+                true,
+            );
+            assert_eq!(result, vec![expected]);
+            assert_eq!(prompts.lock().as_slice(), ["worker"]);
+        }
+    }
+
+    #[test]
+    fn rejected_prompt_can_be_retried_only_by_a_second_reviewed_invocation() {
+        let idle = agent(
+            MEMBERSHIP,
+            "w1:p1",
+            "term-1",
+            Some("codex"),
+            AgentStatus::Idle,
+        );
+        let snapshots = (0..4).map(|_| snapshot(vec![idle.clone()])).collect();
         let (service, prompts, _temp) = service(
             &test_state(true),
-            vec![snapshot(vec![idle.clone()]), snapshot(vec![idle])],
-            Err(PromptDeliveryError::Uncertain),
+            snapshots,
+            Err(PromptDeliveryError::Rejected {
+                code: "agent_not_ready".to_owned(),
+                message: "fixture".to_owned(),
+            }),
         );
         let target = MemberTarget {
             session_id: SESSION.parse().unwrap(),
             membership_id: MEMBERSHIP.parse().unwrap(),
         };
-        let result = service.deliver_reviewed_prompt(
-            &"build-group".parse().unwrap(),
-            &[target],
-            "Do work",
-            true,
-        );
-        assert!(matches!(result[0], TargetDelivery::Uncertain { .. }));
-        assert_eq!(prompts.lock().len(), 1);
+
+        for _ in 0..2 {
+            let result = service.deliver_reviewed_prompt(
+                &"build-group".parse().unwrap(),
+                std::slice::from_ref(&target),
+                "Do work",
+                true,
+            );
+            assert!(matches!(result[0], TargetDelivery::Rejected { .. }));
+        }
+        assert_eq!(prompts.lock().as_slice(), ["worker", "worker"]);
     }
 }
