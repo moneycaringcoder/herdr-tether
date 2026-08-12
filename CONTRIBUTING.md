@@ -33,6 +33,26 @@ gate runs without it.
 
 Do not commit credentials, host details, generated state, or build output. Describe which local, SSH, tmux, and Herdr paths you actually exercised; call out paths that were not verified. Changes to process invocation, quoting, persistence, session lifecycle, host handling, Agent metadata, or view restoration need boundary and failure-path tests.
 
+## Versioning and rollout
+
+Before 1.0, `0.x.0` is the feature and breaking-change train. A `0.x.y`
+release where `y` is greater than zero is a backward-compatible patch train
+limited to fixes, corrective diagnostics, tests, documentation, CI, and
+release hardening. State or configuration migrations, new commands, actions,
+or capabilities, platform expansion, and a higher minimum Herdr version belong
+in the next `0.x.0` release.
+
+Every changed behavior needs a focused regression test, including its relevant
+boundary or failure path. The current stable Herdr release is a blocking
+integration gate; unreleased upstream builds remain an advisory canary until
+their behavior ships in a stable release and its compatibility is reviewed.
+
+Validate an exact candidate commit SHA through every applicable local and CI
+gate before release. Creating the final tag requires explicit maintainer
+approval. Keep temporary scope, sequencing, acceptance, and rollout
+coordination in GitHub issues and pull requests rather than product
+documentation.
+
 ## Public documentation boundary
 
 README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep temporary planning, release coordination, test-machine details, review transcripts, local usernames, and local paths out of tracked product documentation. Use pull requests or untracked working notes for temporary coordination.
