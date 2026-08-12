@@ -70,7 +70,7 @@ jobs:
           python3 tools/test_live_product_smoke.py
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py
-          python3 tools/check_release.py --tag v0.7.0
+          python3 tools/check_release.py --candidate
           python3 tools/test_check_docs.py
           python3 tools/test_check_public_contracts.py
           python3 tools/check_docs.py

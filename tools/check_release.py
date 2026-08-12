@@ -53,6 +53,49 @@ class ReleaseIdentityError(ValueError):
     pass
 
 
+STABLE_VERSION_PATTERN = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+
+
+def resolve_target_tag(
+    *,
+    candidate: bool,
+    explicit_tag: str | None,
+    environment_tag: str | None = None,
+    release: bool,
+    package_version: object,
+) -> str:
+    """Resolve one release target without duplicating the package version."""
+    if candidate and explicit_tag is not None:
+        raise ReleaseIdentityError("choose exactly one of --candidate or --tag")
+    if not candidate and explicit_tag is None:
+        explicit_tag = environment_tag
+    if not candidate and explicit_tag is None:
+        raise ReleaseIdentityError(
+            "provide --candidate, --tag v<version>, or GITHUB_REF_NAME"
+        )
+    if candidate and release:
+        raise ReleaseIdentityError("--candidate cannot be combined with --release")
+    if not isinstance(package_version, str) or not re.fullmatch(
+        STABLE_VERSION_PATTERN, package_version
+    ):
+        raise ReleaseIdentityError(
+            f"Cargo.toml package version {package_version!r} is not <major>.<minor>.<patch>"
+        )
+
+    package_tag = f"v{package_version}"
+    if candidate:
+        return package_tag
+    if not re.fullmatch(rf"v{STABLE_VERSION_PATTERN}", explicit_tag or ""):
+        raise ReleaseIdentityError(
+            f"tag {explicit_tag!r} is not v<major>.<minor>.<patch>"
+        )
+    if explicit_tag != package_tag:
+        raise ReleaseIdentityError(
+            f"tag {explicit_tag!r} does not match Cargo.toml version {package_version!r}"
+        )
+    return explicit_tag
+
+
 def validate_release_context(
     tag: str,
     *,
@@ -154,8 +197,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--tag",
-        default=os.environ.get("GITHUB_REF_NAME"),
-        help="release tag to verify (defaults to GITHUB_REF_NAME)",
+        help="explicit release tag to verify (defaults to GITHUB_REF_NAME outside candidate mode)",
+    )
+    parser.add_argument(
+        "--candidate",
+        action="store_true",
+        help="derive the candidate tag from Cargo.toml",
     )
     parser.add_argument(
         "--release",
@@ -163,20 +210,28 @@ def main() -> None:
         help="enforce tagged release install instructions (candidate mode is the default)",
     )
     args = parser.parse_args()
-    if not args.tag:
-        fail("provide --tag v<version> or set GITHUB_REF_NAME")
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", args.tag):
-        fail(f"tag {args.tag!r} is not v<major>.<minor>.<patch>")
-    version = args.tag[1:]
+    cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
+    cargo_version = cargo_package["version"]
+    try:
+        tag = resolve_target_tag(
+            candidate=args.candidate,
+            explicit_tag=args.tag,
+            environment_tag=os.environ.get("GITHUB_REF_NAME"),
+            release=args.release,
+            package_version=cargo_version,
+        )
+    except ReleaseIdentityError as error:
+        fail(str(error))
+    version = tag[1:]
     if args.release:
         try:
             head_commit = resolve_git_commit("HEAD")
             if head_commit is None:
                 raise ReleaseIdentityError("could not resolve Git HEAD")
             validate_release_context(
-                args.tag,
+                tag,
                 head_commit=head_commit,
-                tagged_commit=resolve_git_commit(f"refs/tags/{args.tag}"),
+                tagged_commit=resolve_git_commit(f"refs/tags/{tag}"),
                 github_actions=os.environ.get("GITHUB_ACTIONS") == "true",
                 github_ref_type=os.environ.get("GITHUB_REF_TYPE"),
                 github_ref_name=os.environ.get("GITHUB_REF_NAME"),
@@ -184,8 +239,6 @@ def main() -> None:
         except ReleaseIdentityError as error:
             fail(str(error))
 
-    cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
-    cargo_version = cargo_package["version"]
     plugin_version = load_toml(ROOT / "herdr-plugin.toml")["version"]
     lock_packages = load_toml(ROOT / "Cargo.lock")["package"]
     lock_versions = [
@@ -202,7 +255,7 @@ def main() -> None:
         if actual != version:
             fail(f"{surface} version {actual!r} != {version!r}")
     documentation = cargo_package.get("documentation", "")
-    valid_documentation_refs = (args.tag,) if args.release else ("main", args.tag)
+    valid_documentation_refs = (tag,) if args.release else ("main", tag)
     if not any(
         f"/blob/{reference}/" in documentation for reference in valid_documentation_refs
     ):
@@ -217,14 +270,14 @@ def main() -> None:
         fail(f"CHANGELOG.md has no dated [{version}] release heading")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     try:
-        validate_readme_install(readme, args.tag, args.release)
+        validate_readme_install(readme, tag, args.release)
     except ReleaseIdentityError as error:
         fail(str(error))
     quickstart_path = Path("docs/quickstart.md")
     try:
         validate_readme_install(
             (ROOT / quickstart_path).read_text(encoding="utf-8"),
-            args.tag,
+            tag,
             args.release,
             surface=str(quickstart_path),
         )
@@ -235,7 +288,7 @@ def main() -> None:
         try:
             validate_hermes_install(
                 (ROOT / relative_path).read_text(encoding="utf-8"),
-                args.tag,
+                tag,
                 surface=str(relative_path),
             )
         except ReleaseIdentityError as error:
@@ -249,7 +302,7 @@ def main() -> None:
                 fail(f"{relative_path}:{line} contains {label}")
 
     identity = "release" if args.release else "candidate"
-    print(f"{identity} identity verified: {args.tag}")
+    print(f"{identity} identity verified: {tag}")
 
 
 if __name__ == "__main__":
