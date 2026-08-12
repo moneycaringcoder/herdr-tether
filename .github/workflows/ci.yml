@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install stable Rust
         run: |
@@ -69,6 +71,7 @@ jobs:
         run: |
           python3 tools/test_live_product_smoke.py
           python3 tools/test_check_herdr_api_contract.py
+          python3 tools/test_workflow_security.py
           python3 tools/test_check_package.py
           python3 tools/test_check_release.py
           python3 tools/check_release.py --candidate
@@ -89,6 +92,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.88
         run: |
@@ -119,6 +124,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install stable Rust
         run: |

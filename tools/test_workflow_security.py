@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Security contract tests for repository GitHub Actions workflows."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW_DIR = ROOT / ".github" / "workflows"
+PINNED_ACTION = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+CANONICAL_USES_LINE = re.compile(
+    r"^(?P<indent> *)(?P<dash>- +)?uses: *(?P<target>[^#\s]+)(?: +#.*)?$",
+    re.MULTILINE,
+)
+REMOTE_SMOKE_SECRETS = {
+    "TETHER_SMOKE_REMOTE_DIRECTORY",
+    "TETHER_SMOKE_REMOTE_KNOWN_HOSTS",
+    "TETHER_SMOKE_REMOTE_TARGET",
+}
+
+
+class WorkflowContractError(ValueError):
+    pass
+
+
+def top_level_block(text: str, key: str) -> str:
+    lines = text.splitlines()
+    marker = f"{key}:"
+    try:
+        start = lines.index(marker) + 1
+    except ValueError as error:
+        raise WorkflowContractError(f"missing block-form {marker}") from error
+    block: list[str] = []
+    for line in lines[start:]:
+        if line and not line[0].isspace():
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+def validate_workflow(name: str, text: str) -> None:
+    if "\t" in text:
+        raise WorkflowContractError(f"{name} contains a tab")
+    if re.search(r"^ *-? *(?:\"[^\"\n]*\"|'[^'\n]*') *:", text, re.MULTILINE):
+        raise WorkflowContractError(f"{name} contains a quoted mapping key")
+    if re.search(
+        r"^(?: *- *)?\{|^ *[A-Za-z0-9_-]+ *: *\{(?!\{)",
+        text,
+        re.MULTILINE,
+    ):
+        raise WorkflowContractError(f"{name} contains a flow-style mapping")
+    on_block = top_level_block(text, "on")
+    permissions = [
+        line.strip()
+        for line in top_level_block(text, "permissions").splitlines()
+        if line.strip()
+    ]
+    if permissions != ["contents: read"]:
+        raise WorkflowContractError(
+            f"{name} permissions must contain only contents: read"
+        )
+    if re.findall(r"^( *)permissions *:", text, re.MULTILINE) != [""]:
+        raise WorkflowContractError(
+            f"{name} must not override permissions below the workflow level"
+        )
+    if "pull_request_target:" in on_block:
+        raise WorkflowContractError(f"{name} must not use pull_request_target")
+
+    lines = text.splitlines()
+    uses_matches = list(CANONICAL_USES_LINE.finditer(text))
+    possible_uses = re.findall(
+        r"^.*(?:^|[-{,\s])uses\s*:.*$", text, re.MULTILINE
+    )
+    if len(possible_uses) != len(uses_matches):
+        raise WorkflowContractError(f"{name} contains a noncanonical uses entry")
+    for match in uses_matches:
+        target = match.group("target")
+        if not target.startswith("./") and not PINNED_ACTION.fullmatch(target):
+            raise WorkflowContractError(
+                f"{name} external action is not pinned to a full commit SHA"
+            )
+        if not target.startswith("actions/checkout@"):
+            continue
+        uses_line = text.count("\n", 0, match.start())
+        uses_indent = len(match.group("indent"))
+        step_indent = uses_indent if match.group("dash") else max(uses_indent - 2, 0)
+        end = len(lines)
+        for index in range(uses_line + 1, len(lines)):
+            line = lines[index]
+            if line.startswith(" " * step_indent + "- "):
+                end = index
+                break
+        step = "\n".join(lines[uses_line:end])
+        if not re.search(r"^\s+persist-credentials:\s*false\s*$", step, re.MULTILINE):
+            raise WorkflowContractError(
+                f"{name} checkout must set persist-credentials: false"
+            )
+
+    if re.search(r"^\s+pull_request:\s*$", on_block, re.MULTILINE):
+        if re.search(r"\bsecrets\b", text) or re.search(
+            r"^\s+inherit\s*$", text, re.MULTILINE
+        ):
+            raise WorkflowContractError(
+                f"{name} pull-request workflow must not reference or pass secrets"
+            )
+
+
+def validate_live_product_boundaries(workflows: dict[str, str]) -> None:
+    untrusted = workflows["live-product.yml"]
+    untrusted_on = top_level_block(untrusted, "on")
+    if not re.search(r"^\s+pull_request:\s*$", untrusted_on, re.MULTILINE):
+        raise WorkflowContractError("live-product.yml must be pull-request triggered")
+    if re.search(r"^\s+(?:push|workflow_dispatch):\s*$", untrusted_on, re.MULTILINE):
+        raise WorkflowContractError("live-product.yml must contain only untrusted triggers")
+    if "uses: ./.github/workflows/live-product-core.yml" not in untrusted:
+        raise WorkflowContractError("live-product.yml must call the shared smoke workflow")
+
+    trusted = workflows["live-product-trusted.yml"]
+    trusted_on = top_level_block(trusted, "on")
+    if not all(trigger in trusted_on for trigger in ("  push:", "  workflow_dispatch:")):
+        raise WorkflowContractError("trusted smoke must support push and manual triggers")
+    if "pull_request:" in trusted_on or "pull_request_target:" in trusted_on:
+        raise WorkflowContractError("trusted smoke must not run for pull requests")
+    trusted_job = workflow_job_block(trusted, "live-product-main")
+    main_conditions = re.findall(r"^    if:.*$", trusted_job, re.MULTILINE)
+    if main_conditions != ["    if: github.ref == 'refs/heads/main'"]:
+        raise WorkflowContractError("secret-bearing smoke must be restricted to main")
+    if "uses: ./.github/workflows/live-product-core.yml" not in trusted_job:
+        raise WorkflowContractError("trusted main smoke must call the shared workflow")
+    passed_pairs = re.findall(
+        r"^      ([A-Z][A-Z0-9_]+):\s*\$\{\{\s*secrets\.([A-Z][A-Z0-9_]+)\s*\}\}\s*$",
+        trusted_job,
+        re.MULTILINE,
+    )
+    referenced = set(
+        re.findall(
+            r"\$\{\{\s*secrets\.([A-Z][A-Z0-9_]+)\s*\}\}", trusted_job
+        )
+    )
+    expected_pairs = {(name, name) for name in REMOTE_SMOKE_SECRETS}
+    if set(passed_pairs) != expected_pairs or len(passed_pairs) != len(expected_pairs):
+        raise WorkflowContractError("trusted smoke secret mapping is not exact")
+    if referenced != REMOTE_SMOKE_SECRETS:
+        raise WorkflowContractError("trusted smoke secret allowlist is not exact")
+    if re.search(r"^\s+inherit\s*$", trusted, re.MULTILINE):
+        raise WorkflowContractError("trusted smoke must pass named secrets, not inherit")
+
+    non_main_job = workflow_job_block(trusted, "live-product-non-main")
+    non_main_conditions = re.findall(r"^    if:.*$", non_main_job, re.MULTILINE)
+    if non_main_conditions != ["    if: github.ref != 'refs/heads/main'"]:
+        raise WorkflowContractError("non-main smoke must exclude main")
+    if "uses: ./.github/workflows/live-product-core.yml" not in non_main_job:
+        raise WorkflowContractError("non-main smoke must call the shared workflow")
+    if re.search(r"\bsecrets(?:\.|\[|:)", non_main_job):
+        raise WorkflowContractError("non-main smoke must not receive secrets")
+
+    core = workflows["live-product-core.yml"]
+    core_on = top_level_block(core, "on")
+    if "  workflow_call:" not in core_on or re.search(
+        r"^\s+(?:push|pull_request|pull_request_target|workflow_dispatch):\s*$",
+        core_on,
+        re.MULTILINE,
+    ):
+        raise WorkflowContractError("live-product core must be reusable-call only")
+    if re.search(r"^\s+environment:\s*", core, re.MULTILINE):
+        raise WorkflowContractError(
+            "live-product core must not acquire environment secrets"
+        )
+    declared = set(
+        re.findall(r"^      ([A-Z][A-Z0-9_]+):\s*$", core_on, re.MULTILINE)
+    )
+    referenced = set(
+        re.findall(r"\$\{\{\s*secrets\.([A-Z][A-Z0-9_]+)\s*\}\}", core)
+    )
+    optional_count = len(
+        re.findall(r"^        required:\s*false\s*$", core_on, re.MULTILINE)
+    )
+    if (
+        declared != REMOTE_SMOKE_SECRETS
+        or referenced != REMOTE_SMOKE_SECRETS
+        or optional_count != len(REMOTE_SMOKE_SECRETS)
+    ):
+        raise WorkflowContractError("live-product core secret allowlist is not exact")
+
+
+def minimal_workflow(*, action: str, checkout_option: str = "persist-credentials: false") -> str:
+    return f"""\
+name: Fixture
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: {action}
+        with:
+          {checkout_option}
+"""
+
+
+def workflow_paths(directory: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    )
+
+
+def workflow_job_block(text: str, job: str) -> str:
+    lines = text.splitlines()
+    marker = f"  {job}:"
+    try:
+        start = lines.index(marker)
+    except ValueError as error:
+        raise WorkflowContractError(f"missing workflow job {job}") from error
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index]):
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
+class WorkflowSecurityTests(unittest.TestCase):
+    def repository_workflows(self) -> dict[str, str]:
+        return {
+            path.name: path.read_text(encoding="utf-8")
+            for path in workflow_paths(WORKFLOW_DIR)
+        }
+
+    def test_repository_workflows_satisfy_security_contract(self) -> None:
+        workflows = self.repository_workflows()
+        self.assertTrue(workflows)
+        for name, text in workflows.items():
+            with self.subTest(name=name):
+                validate_workflow(name, text)
+        validate_live_product_boundaries(workflows)
+
+    def test_live_product_secret_boundary_fails_closed(self) -> None:
+        baseline = self.repository_workflows()
+        mutations = []
+
+        environment = dict(baseline)
+        environment["live-product-core.yml"] += "\nenvironment: production\n"
+        mutations.append(environment)
+
+        mismatched = dict(baseline)
+        mismatched["live-product-trusted.yml"] = mismatched[
+            "live-product-trusted.yml"
+        ].replace(
+            "secrets.TETHER_SMOKE_REMOTE_TARGET",
+            "secrets.TETHER_SMOKE_REMOTE_DIRECTORY",
+            1,
+        )
+        mutations.append(mismatched)
+
+        branch_gate = dict(baseline)
+        branch_gate["live-product-trusted.yml"] = branch_gate[
+            "live-product-trusted.yml"
+        ].replace(
+            "github.ref == 'refs/heads/main'",
+            "github.ref != 'refs/heads/main'",
+            1,
+        )
+        mutations.append(branch_gate)
+
+        broadened_gate = dict(baseline)
+        broadened_gate["live-product-trusted.yml"] = broadened_gate[
+            "live-product-trusted.yml"
+        ].replace(
+            "github.ref == 'refs/heads/main'",
+            "github.ref == 'refs/heads/main' || always()",
+            1,
+        )
+        mutations.append(broadened_gate)
+
+        required = dict(baseline)
+        required["live-product-core.yml"] = required["live-product-core.yml"].replace(
+            "required: false", "required: true", 1
+        )
+        mutations.append(required)
+
+        for workflows in mutations:
+            with self.subTest(workflows=workflows), self.assertRaises(
+                WorkflowContractError
+            ):
+                validate_live_product_boundaries(workflows)
+
+    def test_external_actions_require_immutable_commit_pins(self) -> None:
+        for action in ("actions/checkout@v4", "owner/action@main", "owner/action@abc123"):
+            with self.subTest(action=action), self.assertRaisesRegex(
+                WorkflowContractError, "full commit SHA"
+            ):
+                validate_workflow("fixture.yml", minimal_workflow(action=action))
+
+        pinned = "actions/checkout@" + "a" * 40
+        canonical = f"      - uses: {pinned}"
+        for entry in (
+            f"      - {{ uses: {pinned} }}",
+            f"      - uses : {pinned}",
+        ):
+            with self.subTest(entry=entry), self.assertRaises(WorkflowContractError):
+                validate_workflow(
+                    "fixture.yml",
+                    minimal_workflow(action=pinned).replace(canonical, entry),
+                )
+
+    def test_every_checkout_disables_persisted_credentials(self) -> None:
+        action = "actions/checkout@" + "a" * 40
+        for option in ("fetch-depth: 0", "persist-credentials: true"):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                WorkflowContractError, "persist-credentials: false"
+            ):
+                validate_workflow(
+                    "fixture.yml", minimal_workflow(action=action, checkout_option=option)
+                )
+
+    def test_pull_request_workflows_cannot_access_or_pass_secrets(self) -> None:
+        action = "actions/checkout@" + "a" * 40
+        baseline = minimal_workflow(action=action)
+        mutations = (
+            "env:\n  VALUE: ${{ secrets.VALUE }}\n",
+            "env:\n  VALUE: ${{ secrets['VALUE'] }}\n",
+            "env:\n  VALUE: ${{ toJSON(secrets) }}\n",
+            "secrets:\n  VALUE: ${{ secrets.VALUE }}\n",
+            "secrets:\n  inherit\n",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                WorkflowContractError, "must not reference or pass secrets"
+            ):
+                validate_workflow("fixture.yml", baseline + mutation)
+
+    def test_permissions_and_pull_request_target_fail_closed(self) -> None:
+        action = "actions/checkout@" + "a" * 40
+        baseline = minimal_workflow(action=action)
+        invalid = (
+            baseline.replace("contents: read", "contents: write"),
+            baseline.replace("permissions:\n  contents: read", "permissions: write-all"),
+            baseline.replace("pull_request:", "pull_request_target:"),
+            baseline.replace(
+                "    runs-on: ubuntu-24.04",
+                "    permissions: write-all\n    runs-on: ubuntu-24.04",
+            ),
+        )
+        for workflow in invalid:
+            with self.subTest(workflow=workflow), self.assertRaises(WorkflowContractError):
+                validate_workflow("fixture.yml", workflow)
+
+    def test_quoted_security_keys_fail_closed(self) -> None:
+        action = "actions/checkout@" + "a" * 40
+        baseline = minimal_workflow(action=action)
+        invalid = (
+            baseline.replace("permissions:", '"permissions":'),
+            baseline.replace("pull_request:", '"pull_request":'),
+            baseline.replace(
+                f"- uses: {action}",
+                f'- "uses": {action}',
+            ),
+            baseline.replace(
+                f"- uses: {action}",
+                f'- "u\\x73es": {action}',
+            ),
+        )
+        for workflow in invalid:
+            with self.subTest(workflow=workflow), self.assertRaisesRegex(
+                WorkflowContractError, "quoted mapping key"
+            ):
+                validate_workflow("fixture.yml", workflow)
+
+    def test_flow_style_mappings_fail_closed(self) -> None:
+        action = "actions/checkout@" + "a" * 40
+        workflow = minimal_workflow(action=action).replace(
+            "  check:\n    runs-on: ubuntu-24.04\n    steps:",
+            "  check: { permissions: write-all, runs-on: ubuntu-24.04, steps: [] }",
+        )
+        with self.assertRaisesRegex(WorkflowContractError, "flow-style mapping"):
+            validate_workflow("fixture.yml", workflow)
+
+    def test_both_workflow_suffixes_are_discovered(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("one.yml", "two.yaml", "ignored.txt"):
+                (root / name).write_text("fixture", encoding="utf-8")
+            self.assertEqual(
+                [path.name for path in workflow_paths(root)],
+                ["one.yml", "two.yaml"],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

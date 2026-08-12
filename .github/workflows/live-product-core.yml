@@ -1,0 +1,178 @@
+name: Live product smoke core
+
+on:
+  workflow_call:
+    secrets:
+      TETHER_SMOKE_REMOTE_TARGET:
+        description: Disposable SSH smoke target
+        required: false
+      TETHER_SMOKE_REMOTE_DIRECTORY:
+        description: Disposable SSH smoke directory
+        required: false
+      TETHER_SMOKE_REMOTE_KNOWN_HOSTS:
+        description: Pinned known-hosts entry for the disposable SSH target
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  live-product:
+    name: Herdr ${{ matrix.herdr_version }} / tmux / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Ubuntu 24.04
+            platform: linux
+            herdr_version: "0.8.0"
+          - os: macos-14
+            label: macOS 14
+            platform: macos
+            herdr_version: "0.8.0"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      HERDR_VERSION: "${{ matrix.herdr_version }}"
+      HERDR_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install tmux on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
+
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux
+          tmux -V
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version --verbose
+          cargo --version
+
+      - name: Download verified official Herdr binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${HERDR_VERSION}:${HERDR_PLATFORM}:$(uname -m)" in
+            0.8.0:linux:aarch64|0.8.0:linux:arm64)
+              asset="herdr-linux-aarch64"
+              sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87"
+              ;;
+            0.8.0:linux:x86_64)
+              asset="herdr-linux-x86_64"
+              sha256="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28"
+              ;;
+            0.8.0:macos:arm64)
+              asset="herdr-macos-aarch64"
+              sha256="d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178"
+              ;;
+            0.8.0:macos:x86_64)
+              asset="herdr-macos-x86_64"
+              sha256="77cb5afd6c8fcaaaf3bc28e474ec01c209331ad08094e20d7f8aa9b0bb78d649"
+              ;;
+            *)
+              echo "unsupported runner: Herdr ${HERDR_VERSION} ${HERDR_PLATFORM}/$(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          destination="$RUNNER_TEMP/herdr-${HERDR_VERSION}"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$destination" \
+            "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/${asset}"
+          if [[ "$HERDR_PLATFORM" == linux ]]; then
+            printf '%s  %s\n' "$sha256" "$destination" | sha256sum --check
+          else
+            printf '%s  %s\n' "$sha256" "$destination" | shasum --algorithm 256 --check
+          fi
+          chmod 0755 "$destination"
+          "$destination" --version
+          "$destination" api schema --output "$RUNNER_TEMP/herdr-api.schema.json"
+          python3 tools/check_herdr_api_contract.py \
+            "$RUNNER_TEMP/herdr-api.schema.json"
+          printf 'HERDR_BIN=%s\n' "$destination" >> "$GITHUB_ENV"
+
+      - name: Build locked release artifact
+        run: cargo build --release --locked
+
+      - name: Run deterministic harness tests
+        run: |
+          python3 tools/test_live_product_smoke.py
+          python3 tools/test_check_herdr_api_contract.py
+
+      - name: Run isolated live product smoke and preserve parent tmux
+        shell: bash
+        env:
+          TETHER_SMOKE_REMOTE_TARGET: ${{ secrets.TETHER_SMOKE_REMOTE_TARGET }}
+          TETHER_SMOKE_REMOTE_DIRECTORY: ${{ secrets.TETHER_SMOKE_REMOTE_DIRECTORY }}
+          TETHER_SMOKE_REMOTE_KNOWN_HOSTS: ${{ secrets.TETHER_SMOKE_REMOTE_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          witness_socket="tether-parent-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          witness_session="tether-parent-witness"
+          # Bash 3.2, still the default on macOS runners, exits with the status
+          # of the last command run in an EXIT trap. Without capturing and
+          # re-raising the real status, a failing smoke reports success.
+          cleanup_witness() {
+            status=$?
+            tmux -L "$witness_socket" kill-session -t "=$witness_session" 2>/dev/null || true
+            exit "$status"
+          }
+          trap cleanup_witness EXIT
+          tmux -L "$witness_socket" new-session -d -s "$witness_session"
+          socket_path="$(tmux -L "$witness_socket" display-message -p -t "=$witness_session" '#{socket_path}')"
+          server_pid="$(tmux -L "$witness_socket" display-message -p -t "=$witness_session" '#{pid}')"
+          export TMUX="${socket_path},${server_pid},0"
+
+          remote_args=()
+          remote_values=0
+          if [[ -n "$TETHER_SMOKE_REMOTE_TARGET" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_DIRECTORY" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ -n "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" ]]; then
+            remote_values=$((remote_values + 1))
+          fi
+          if [[ "$remote_values" -eq 3 ]]; then
+            remote_known_hosts="$RUNNER_TEMP/tether-remote-known-hosts"
+            umask 077
+            printf '%s\n' "$TETHER_SMOKE_REMOTE_KNOWN_HOSTS" > "$remote_known_hosts"
+            remote_args=(
+              --remote-target "$TETHER_SMOKE_REMOTE_TARGET"
+              --remote-directory "$TETHER_SMOKE_REMOTE_DIRECTORY"
+              --remote-known-hosts "$remote_known_hosts"
+            )
+          elif [[ "$remote_values" -ne 0 ]]; then
+            echo "remote smoke requires target, directory, and pinned known-hosts together" >&2
+            exit 1
+          else
+            echo "::notice::Remote equivalence was not exercised because no disposable SSH target is configured."
+          fi
+
+          # Bash 3.2 treats "${array[@]}" as unbound when the array is empty, so
+          # expanding it under `set -u` aborts the run. This guarded form is
+          # empty-safe on both bash 3.2 and bash 5.
+          python3 tools/live_product_smoke.py \
+            --herdr "$HERDR_BIN" \
+            --herdr-version "$HERDR_VERSION" \
+            --tether target/release/herdr-tether \
+            --repo-root "$GITHUB_WORKSPACE" \
+            ${remote_args[@]+"${remote_args[@]}"}
+
+          tmux -L "$witness_socket" has-session -t "=$witness_session"
