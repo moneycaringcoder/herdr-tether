@@ -736,7 +736,16 @@ fn encode_request(id: &str, method: &str, params: Value) -> Result<Vec<u8>> {
 fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
     loop {
-        let available = reader.fill_buf()?;
+        // A signal delivered while this read is blocked surfaces as `EINTR`,
+        // which says nothing about the connection and must be retried rather
+        // than reported. Herdr's own TUI raises `SIGWINCH` freely, so a
+        // Mission Control read that happened to span a resize was rejected
+        // with `Interrupted system call (os error 4)`.
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
         if available.is_empty() {
             if output.is_empty() {
                 return Ok(None);
@@ -1249,6 +1258,53 @@ mod tests {
         assert!(read_bounded_line(&mut oversized, 4).is_err());
         let mut partial = BufReader::new(&b"partial"[..]);
         assert!(read_bounded_line(&mut partial, 16).is_err());
+    }
+
+    /// A source interrupted by a signal before every byte it yields, wrapped
+    /// the same way the real socket is. `EINTR` says nothing about the
+    /// connection, so every one of these must be retried rather than reported.
+    struct SignalInterrupted {
+        remaining: &'static [u8],
+        interrupted: bool,
+    }
+
+    impl io::Read for SignalInterrupted {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.interrupted = false;
+            if buffer.is_empty() || self.remaining.is_empty() {
+                return Ok(0);
+            }
+            buffer[0] = self.remaining[0];
+            self.remaining = &self.remaining[1..];
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn bounded_line_retries_a_read_interrupted_by_a_signal() {
+        // Herdr's own TUI raises `SIGWINCH` freely, so a Mission Control read
+        // that spanned a resize used to fail with `Interrupted system call
+        // (os error 4)` and be reported as `Read rejected`.
+        let mut record = BufReader::new(SignalInterrupted {
+            remaining: b"ok\n",
+            interrupted: false,
+        });
+        assert_eq!(
+            read_bounded_line(&mut record, 16).unwrap(),
+            Some(b"ok\n".to_vec())
+        );
+
+        // An interruption immediately before a closed connection is still an
+        // interruption, and must not be mistaken for a record.
+        let mut closed = BufReader::new(SignalInterrupted {
+            remaining: b"",
+            interrupted: false,
+        });
+        assert_eq!(read_bounded_line(&mut closed, 16).unwrap(), None);
     }
 }
 
