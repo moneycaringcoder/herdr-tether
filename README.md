@@ -329,6 +329,7 @@ Read the [architecture and security boundaries](docs/architecture.md) before dep
 | [Architecture and security](docs/architecture.md) | reviewing trust boundaries, persistence, transport, ownership, or Agent view metadata |
 | [Contributing](CONTRIBUTING.md) | developing or testing Tether |
 | [Security policy](SECURITY.md) | reporting a vulnerability |
+| [Code of conduct](CODE_OF_CONDUCT.md) | taking part in the project |
 
 ## License
 

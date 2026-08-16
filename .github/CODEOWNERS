@@ -1,0 +1,32 @@
+# Every change requests a review from the maintainer automatically.
+# This is about staying informed, not about gatekeeping: contributions are
+# welcome and reviewed personally.
+*       @moneycaringcoder
+
+# The files where a mistake is not a wrong answer but a lost workload, a
+# leaked credential, or a command run on the wrong machine. Changes here get
+# the closest reading.
+
+# Ownership and lifecycle: what Tether believes it started, and what it is
+# therefore willing to stop or restart.
+/src/lifecycle.rs        @moneycaringcoder
+/src/orchestration.rs    @moneycaringcoder
+/src/state.rs            @moneycaringcoder
+/src/storage.rs          @moneycaringcoder
+
+# The socket and status paths. A misread here reports a live workload as dead
+# or a delivered prompt as uncertain, and both invite the wrong recovery.
+/src/herdr_socket.rs     @moneycaringcoder
+/src/status.rs           @moneycaringcoder
+
+# Anything that builds a command line or resolves a host. Presets are trusted
+# code: Tether runs them through a login shell and does not sandbox them.
+/src/quote.rs            @moneycaringcoder
+/src/sshcfg.rs           @moneycaringcoder
+/src/config.rs           @moneycaringcoder
+/src/paths.rs            @moneycaringcoder
+
+# The release gate and the API contract check. These are what stand between a
+# green run and a release that does not match what it claims to be.
+/tools/                  @moneycaringcoder
+/.github/workflows/      @moneycaringcoder
