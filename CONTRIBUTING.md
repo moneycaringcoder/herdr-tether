@@ -33,6 +33,27 @@ gate runs without it.
 
 Do not commit credentials, host details, generated state, or build output. Describe which local, SSH, tmux, and Herdr paths you actually exercised; call out paths that were not verified. Changes to process invocation, quoting, persistence, session lifecycle, host handling, Agent metadata, or view restoration need boundary and failure-path tests.
 
+## Commit subjects
+
+Write the subject as a sentence describing what the change does, in the
+imperative mood, capitalized, with no trailing period and no `type:` prefix.
+`Tolerate future Herdr agent states`, `Report refused prompts as refused, not
+uncertain`, and `Prefer the invoking pane's sibling worktrees in the picker` are
+the shape to follow. Squash-merging appends the pull request number, so
+`(#68)` is added for you rather than written by hand.
+
+Conventional-Commits prefixes such as `chore:`, `ci:`, `test:`, and `feat:` are
+not used here. They classify the change by the kind of file it touches, which
+the diff already shows, and spend the most readable part of the subject line on
+it. A few commits carry them anyway; those predate this section and stay as
+they are, because rewriting published history would break every tag, release,
+and canary run that names an existing SHA.
+
+The body, when a change needs one, explains why the change is right rather than
+restating the diff. Do not add `Co-Authored-By` trailers, "Generated with"
+lines, or any other tool or model attribution to commits, tags, or release
+notes.
+
 ## Versioning and rollout
 
 Before 1.0, `0.x.0` is the feature and breaking-change train. A `0.x.y`

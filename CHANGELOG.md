@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.2] - 2026-08-16
+
+### Fixed
+
+- A Mission Control read interrupted by a signal is now retried instead of being
+  reported as `Read rejected: Interrupted system call (os error 4)`. Herdr's own
+  TUI raises `SIGWINCH` freely, and a blocked socket read that spanned one
+  returned `EINTR`, which says nothing about the connection and describes no
+  failure the reader can act on. The same retry also keeps an interruption from
+  tearing down the Mission Control event subscription and forcing a reconnect.
+  The advisory upstream canary caught this on 2026-08-15; it was a Tether bug
+  rather than an incompatibility with a newer Herdr.
+
 ## [0.7.1] - 2026-08-12
 
 ### Added

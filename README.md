@@ -40,10 +40,10 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 Choose the source that matches your stability and reproducibility needs. Herdr
 shows the source and build commands for review before you confirm.
 
-**Stable v0.7.1.** Install the release tag:
+**Stable v0.7.2.** Install the release tag:
 
 ```sh
-herdr plugin install moneycaringcoder/herdr-tether --ref v0.7.1
+herdr plugin install moneycaringcoder/herdr-tether --ref v0.7.2
 ```
 
 **Development (`main`).** This follows the public development line, not a
@@ -77,7 +77,7 @@ Want the standalone administration commands too? The stable install is:
 
 ```sh
 cargo install --git https://github.com/moneycaringcoder/herdr-tether \
-  --tag v0.7.1 --locked herdr-tether
+  --tag v0.7.2 --locked herdr-tether
 ```
 
 For development `main`:
@@ -112,10 +112,10 @@ See the [quickstart](docs/quickstart.md) for plugin data paths, keybinding rollb
 Hermes users can install Tether's optional, runtime-independent reference guide
 directly from this repository.
 
-**Stable v0.7.1:**
+**Stable v0.7.2:**
 
 ```sh
-hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.7.1/integrations/hermes/SKILL.md
+hermes skills install https://raw.githubusercontent.com/moneycaringcoder/herdr-tether/v0.7.2/integrations/hermes/SKILL.md
 ```
 
 **Development (`main`):**
