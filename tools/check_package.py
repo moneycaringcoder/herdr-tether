@@ -55,6 +55,7 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "docs/configuration.md",
         "docs/lifecycle.md",
         "docs/quickstart.md",
+        "docs/roadmap.md",
         "docs/troubleshooting.md",
         "herdr-plugin.toml",
         "src/agent_view.rs",
