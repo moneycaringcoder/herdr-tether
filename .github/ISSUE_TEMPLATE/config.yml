@@ -1,0 +1,21 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or general discussion
+    url: https://github.com/moneycaringcoder/herdr-tether/issues
+    about: >
+      Questions are welcome as issues — there is no separate forum, and asking
+      one is not an imposition.
+  - name: Security issue
+    url: https://github.com/moneycaringcoder/herdr-tether/security/advisories/new
+    about: >
+      Report privately rather than in a public issue, and do not include host
+      names, SSH configuration, key material, or terminal contents. See
+      SECURITY.md for what a useful report contains.
+  - name: Troubleshooting guide
+    url: https://github.com/moneycaringcoder/herdr-tether/blob/main/docs/troubleshooting.md
+    about: >
+      prefix+t doing nothing, an unreachable host or workload, a record that
+      outlives its command, and what `herdr-tether doctor` reports.
+  - name: Herdr itself
+    url: https://github.com/herdrdev/herdr
+    about: For bugs in Herdr rather than in this plugin.
