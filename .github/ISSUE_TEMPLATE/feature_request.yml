@@ -1,0 +1,96 @@
+name: Feature request
+description: Suggest something Tether should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Worth knowing before you write, because it decides
+        most of these:
+
+        - Tether manages ordinary local and SSH-backed `tmux` workloads. It does
+          not stream a remote Herdr workspace, federate Herdr instances, or
+          replace Herdr's ownership of the terminal surface.
+        - Destructive actions apply only to workloads Tether created. Discovered
+          external sessions are attach-only and are never adopted, renamed,
+          stopped, or removed.
+        - When Tether cannot prove a workload's state, it refuses the action
+          rather than guessing. Suggestions that trade that for convenience are
+          unlikely to land.
+        - Tether stores no passwords, keys, tokens, prompt text, or terminal
+          contents, and does not sandbox the commands you configure. Presets are
+          trusted code.
+
+        Something that needs one of those to change is a much larger
+        conversation than a feature — say so explicitly and it can be had.
+
+        Please keep host names, paths, and SSH configuration out of the
+        examples; this is a public issue.
+
+        If you are willing to implement it, say so. "Would you take a PR that
+        does X?" gets a fast answer.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What you were trying to do when you wanted this. Concrete situations
+        make for much better features than abstract capabilities — how many
+        workloads, on how many hosts, and what you were doing by hand instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: >
+        What Tether would do differently, and where you would expect to see it —
+        the picker, Mission Control, the CLI, `config.toml`, or somewhere else.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Tether
+      options:
+        - The prefix+t picker
+        - Workload lifecycle — create, open, leave, stop, restart, remove
+        - Remote hosts and SSH
+        - External session discovery and attach
+        - Orchestration, Observer, or Mission Control
+        - Setup, keybinding, or rollback
+        - The standalone CLI
+        - Herdr integration — agent hints, sidebar, pane metadata
+        - Configuration and presets
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: ownership
+    attributes:
+      label: Ownership and safety
+      description: >
+        If this would let Tether act on something it did not create, act while a
+        workload's state is unverified, or keep something it currently refuses to
+        store, say so here and say why it is worth it. Naming it yourself is far
+        better than having it found in review.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Including anything that already gets you part of the way there — a
+        preset, a shell alias, plain `tmux` or `ssh`, or another Herdr plugin.
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Implementation
+      options:
+        - label: I would be willing to implement this

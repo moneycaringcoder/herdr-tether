@@ -1,0 +1,161 @@
+name: Bug report
+description: Something behaves differently than it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **This is a public issue. Please do not paste anything that identifies
+        your infrastructure or unlocks it** — real host names or IP addresses,
+        SSH configuration, key material, agent socket paths, tokens, or terminal
+        contents. Replace a host with `build.example.net`, a path with
+        `/home/you/repos/app`, and a session name with `tether-work-1`. A report
+        with placeholders in it is just as useful.
+
+        If what you found is a security problem rather than a malfunction —
+        Tether acting on a workload it does not own, something private reaching
+        state or logs, or anything crossing the boundary described in
+        [SECURITY.md](https://github.com/moneycaringcoder/herdr-tether/blob/main/SECURITY.md)
+        — report it privately through
+        [security advisories](https://github.com/moneycaringcoder/herdr-tether/security/advisories/new)
+        instead of here.
+
+        Worth trying first: `herdr-tether doctor`, and the
+        [troubleshooting guide](https://github.com/moneycaringcoder/herdr-tether/blob/main/docs/troubleshooting.md),
+        which
+        covers `prefix+t` doing nothing, unreachable hosts, unreachable
+        workloads, and records that outlive the command.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+      placeholder: |
+        Stop on a running remote workload reported success, but the tmux
+        session was still there when I checked on the host.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        The steps, from a state you can describe. Which picker rows you moved
+        through, which key you pressed, and what the screen said. If it involves
+        a workload, say whether Tether created it or discovered it as an
+        external session, and whether it was running, ended, or unreachable at
+        the time.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: locality
+    attributes:
+      label: Where the workload runs
+      options:
+        - Local
+        - Remote over SSH
+        - Both, or it does not depend on this
+        - No workload involved
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Tether
+      description: A best guess is fine.
+      options:
+        - The prefix+t picker
+        - Workload lifecycle — create, open, leave, stop, restart, remove
+        - Remote hosts and SSH
+        - External session discovery and attach
+        - Orchestration, Observer, or Mission Control
+        - Setup, keybinding, or rollback
+        - The standalone CLI
+        - Herdr integration — agent hints, sidebar, pane metadata
+        - Something else, or not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `herdr-tether doctor --json`
+      description: >
+        This carries the versions, the resolved context, and the typed check
+        statuses, which is usually enough to find the problem on its own. Its
+        diagnostics are bounded and redacted by design — read it before pasting
+        anyway, and replace anything you would rather not publish.
+      render: json
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: >
+        Output of `herdr-tether --version`, `herdr --version`, `tmux -V`, and
+        `ssh -V`. For a remote-only problem, the remote `tmux -V` too. Say how
+        Tether was installed — a release tag, `main`, or a specific commit.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Of the machine running Herdr. Name the remote one below if it differs.
+      options:
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >
+        The parts of Tether's `config.toml` that bear on this — a preset's
+        command shape, `herdr_agent`, placement. Replace host names, user names,
+        and paths with placeholders, and do not paste your SSH configuration:
+        describe what it does instead ("the alias goes through a ProxyJump")
+        rather than pasting the block.
+      render: toml
+
+  - type: textarea
+    id: state
+    attributes:
+      label: What the workload was actually doing
+      description: >
+        For anything where the reported state and the real state might have
+        diverged, what you found when you looked directly — `tmux ls` on the
+        machine in question, whether the process was still alive, whether the
+        host was reachable. This is the difference between a display bug and a
+        correctness bug, and Tether cannot tell you which one it was.
+      render: shell
+
+  - type: checkboxes
+    id: before-submitting
+    attributes:
+      label: Before submitting
+      options:
+        - label: >
+            I have replaced real host names, addresses, paths, user names, and
+            session names with placeholders
+          required: true
+        - label: >
+            I have not pasted SSH configuration, key material, tokens, or
+            terminal output containing any of those
+          required: true
+        - label: >
+            This is a malfunction rather than a security issue — those go to
+            private advisories instead
+          required: true
