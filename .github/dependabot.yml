@@ -1,0 +1,23 @@
+# Thirteen direct dependencies and four dev dependencies, several of them the
+# TUI stack, so updates are grouped into one monthly pull request per ecosystem
+# rather than arriving one crate at a time. The live-product jobs are what
+# actually catch a breaking bump here, and they are expensive to run once per
+# crate.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
