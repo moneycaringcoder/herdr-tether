@@ -768,6 +768,43 @@ fn is_repository(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether a path is a Git checkout: a directory holding a `.git` entry.
+///
+/// Exposed because a reported worktree path has to be checked before the picker
+/// offers it. Anything unreadable answers `false`: a directory that cannot be
+/// inspected is not one to send a user into, and the caller's fallback is simply
+/// not reordering.
+///
+/// Unlike the scanner, this follows symlinks. The scanner refuses a symlinked
+/// root because a scan that follows one can leave the root it was given; a
+/// single path handed over for comparison has nowhere to escape to, and a
+/// checkout reached through a symlink, or one whose `.git` is itself a symlink
+/// to a relocated Git store, is somewhere a user can work. Only the presence of
+/// the `.git` entry matters, not what kind of entry it is.
+///
+/// This says nothing about which repository the checkout belongs to. It
+/// separates a checkout from a Git directory, which is the distinction
+/// `--separate-git-dir` and submodule layouts blur, and it is deliberately not
+/// a claim that the checkout is a worktree of any particular repository.
+pub fn is_checkout_directory(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && fs::symlink_metadata(path.join(".git")).is_ok()
+}
+
+/// Whether a path is a bare repository: a Git directory used as a repository in
+/// its own right, holding `HEAD`, `objects`, and `refs` and no checkout.
+///
+/// `git worktree list` reports a bare repository as one of its own worktree
+/// entries, so it arrives alongside the checkouts. It is not somewhere to work,
+/// but it is an ordinary part of a bare-clone-plus-worktrees layout rather than
+/// a mistake, so a caller can leave it out without complaining about it.
+pub fn is_bare_repository(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && ["HEAD", "objects", "refs"]
+            .iter()
+            .all(|entry| fs::metadata(path.join(entry)).is_ok())
+}
+
 fn scan_remote(
     location: &DiscoveryLocation,
     target: &str,

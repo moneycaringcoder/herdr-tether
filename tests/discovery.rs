@@ -144,6 +144,129 @@ fn local_discovery_is_lexical_deduplicated_and_prunes_repositories() {
 }
 
 #[test]
+fn separate_git_dir_and_submodule_layouts_offer_checkouts_and_not_git_directories() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("root");
+    // `--separate-git-dir`: the checkout keeps a `.git` file and its Git
+    // directory lives elsewhere under the same scan root, where a scan will
+    // walk straight into it.
+    let checkout = root.join("app");
+    let separate = root.join("gitdirs/app");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(separate.join("worktrees/app-feature")).unwrap();
+    fs::write(separate.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", separate.display()),
+    )
+    .unwrap();
+    // A submodule: a `.git` file with a relative target inside the
+    // superproject's own Git directory.
+    let superproject = root.join("super");
+    let submodule = superproject.join("lib");
+    fs::create_dir_all(&submodule).unwrap();
+    fs::create_dir_all(superproject.join(".git/modules/lib")).unwrap();
+    fs::write(submodule.join(".git"), "gitdir: ../.git/modules/lib\n").unwrap();
+
+    let service = DiscoveryService::new(ProcessBinaries::new("ssh", "tmux"), limits());
+    let messages = collect(
+        &service,
+        DiscoveryRequest {
+            generation: 1,
+            locations: vec![DiscoveryLocation {
+                host: "local".into(),
+                target: None,
+                roots: vec![root.to_string_lossy().into_owned()],
+            }],
+        },
+    );
+
+    let repositories: Vec<String> = messages
+        .iter()
+        .filter_map(|message| match message {
+            DiscoveryMessage::Repository { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    // Both `.git` files are recognized, the superproject prunes its submodule
+    // the way it prunes any nested repository, and no Git directory is offered
+    // as somewhere to work.
+    assert_eq!(
+        repositories,
+        [
+            checkout.to_string_lossy().into_owned(),
+            superproject.to_string_lossy().into_owned()
+        ]
+    );
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        DiscoveryMessage::HostFinished {
+            completion: DiscoveryCompletion::Complete,
+            ..
+        }
+    )));
+
+    // The same distinction, directly: a checkout holds a `.git` entry whether
+    // it is a file or a directory, and a Git directory holds none.
+    assert!(herdr_tether::discovery::is_checkout_directory(&checkout));
+    assert!(herdr_tether::discovery::is_checkout_directory(&submodule));
+    assert!(herdr_tether::discovery::is_checkout_directory(
+        &superproject
+    ));
+    assert!(!herdr_tether::discovery::is_checkout_directory(&separate));
+    assert!(!herdr_tether::discovery::is_checkout_directory(
+        &separate.join("worktrees/app-feature")
+    ));
+    assert!(!herdr_tether::discovery::is_checkout_directory(
+        &superproject.join(".git/modules/lib")
+    ));
+    assert!(!herdr_tether::discovery::is_checkout_directory(
+        &root.join("missing")
+    ));
+
+    // A checkout reached through a symlink, and a checkout whose `.git` is a
+    // symlink to a relocated Git store, are both somewhere a user can work.
+    // The scanner refuses a symlinked root because a scan can leave the root it
+    // was given; a single path handed over for comparison cannot.
+    #[cfg(unix)]
+    {
+        let linked_checkout = root.join("linked-app");
+        symlink(&checkout, &linked_checkout).unwrap();
+        assert!(herdr_tether::discovery::is_checkout_directory(
+            &linked_checkout
+        ));
+
+        let linked_git = root.join("linked-git");
+        fs::create_dir_all(&linked_git).unwrap();
+        symlink(&separate, linked_git.join(".git")).unwrap();
+        assert!(herdr_tether::discovery::is_checkout_directory(&linked_git));
+
+        // A symlink to a Git directory is still a Git directory.
+        let linked_separate = root.join("linked-separate");
+        symlink(&separate, &linked_separate).unwrap();
+        assert!(!herdr_tether::discovery::is_checkout_directory(
+            &linked_separate
+        ));
+    }
+
+    // `git worktree list` reports a bare repository as a worktree of itself. It
+    // is not a checkout, and it is not a mistake either.
+    let bare = root.join("proj.git");
+    fs::create_dir_all(bare.join("objects")).unwrap();
+    fs::create_dir_all(bare.join("refs")).unwrap();
+    fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert!(!herdr_tether::discovery::is_checkout_directory(&bare));
+    assert!(herdr_tether::discovery::is_bare_repository(&bare));
+    assert!(!herdr_tether::discovery::is_bare_repository(&checkout));
+    // A `--separate-git-dir` target is a Git directory but not a bare
+    // repository: nothing points at it as one, and it has no `refs` of a
+    // repository in its own right until Git puts them there.
+    assert!(!herdr_tether::discovery::is_bare_repository(
+        &root.join("missing")
+    ));
+}
+
+#[test]
 fn repository_root_is_emitted_without_a_trailing_separator() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("repository");

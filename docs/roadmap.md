@@ -18,12 +18,6 @@ before installing is which Herdr versions a given Tether release was actually
 exercised against. The upstream canary produces exactly that evidence on a
 schedule; publishing it turns a private signal into something a user can check.
 
-### Cover the picker's worktree paths
-
-The picker brings the invoking pane's sibling Git worktrees forward.
-`--separate-git-dir` and submodule layouts are the cases most likely to make that
-resolution wrong, and they are not covered.
-
 ## Lifecycle
 
 ### Crash-loop detection and restart backoff

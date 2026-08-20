@@ -50,6 +50,11 @@ use crate::{
 };
 
 const OBSERVER_PLUGIN_CONTEXT_ERROR: &str = "Observer must be launched from the Tether plugin pane";
+/// How long the picker will spend confirming reported worktree paths.
+///
+/// The preference is cosmetic and the picker is waiting on it, so a wedged
+/// mount costs this much and then nothing.
+const WORKTREE_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "herdr-tether", version, about)]
@@ -1672,9 +1677,11 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
 
 /// Lists the worktrees sharing a repository with the invoking pane.
 ///
-/// Purely a picker preference, so every failure path returns nothing: no Herdr
-/// socket, a directory outside a repository, or a rejected request all simply
-/// leave the ordering alone.
+/// Purely a picker preference, so an absent capability returns nothing: no
+/// Herdr socket, a directory outside a repository, or a rejected request all
+/// simply leave the ordering alone, and none of them is worth a warning on
+/// every picker open. An answer Tether refuses to use is different: something
+/// was reported and deliberately left out, so it is said out loud.
 fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> Vec<PathBuf> {
     let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
         return Vec::new();
@@ -1682,7 +1689,70 @@ fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> 
     let Ok(client) = HerdrSocketClient::from_env() else {
         return Vec::new();
     };
-    client.worktree_paths(directory).unwrap_or_default()
+    let Ok((paths, refused)) = offered_worktrees(&client, directory) else {
+        return Vec::new();
+    };
+    if let Some(warning) = refused_worktree_warning(refused) {
+        eprintln!("{warning}");
+    }
+    paths
+}
+
+/// The reported worktrees Tether will offer, with the number it refused.
+///
+/// Herdr resolves the repository layout, but a reported path still has to be
+/// somewhere the user can work. `--separate-git-dir` and submodule layouts put
+/// a repository's Git directory outside its checkout, and a Git directory holds
+/// no `.git` entry of its own, so the filesystem separates the two. A path that
+/// cannot be confirmed is left out rather than offered.
+///
+/// A bare repository is left out without being counted. `git worktree list`
+/// reports one as a worktree of itself, so it arrives in an ordinary
+/// bare-clone-plus-worktrees layout and is not a mistake anybody needs telling
+/// about.
+///
+/// The probes are bounded. Confirming a path is two `stat` calls, and a `stat`
+/// on a wedged network mount blocks with no timeout of its own, which would
+/// hold the picker closed. The picker preference is worth a few milliseconds
+/// and nothing more, so a probe that overruns leaves the ordering alone.
+fn offered_worktrees(
+    client: &HerdrSocketClient,
+    directory: &Path,
+) -> Result<(Vec<PathBuf>, usize)> {
+    let worktrees = client.worktree_paths(directory)?;
+    let reported = worktrees.paths.len();
+    let confirmed = run_probe_with_timeout(WORKTREE_PROBE_TIMEOUT, move || {
+        let mut paths = Vec::with_capacity(worktrees.paths.len());
+        let mut ordinary = 0;
+        for path in worktrees.paths {
+            if crate::discovery::is_checkout_directory(&path) {
+                paths.push(path);
+            } else if crate::discovery::is_bare_repository(&path) {
+                ordinary += 1;
+            }
+        }
+        (paths, ordinary)
+    });
+    let Ok((paths, ordinary)) = confirmed else {
+        return Ok((Vec::new(), 0));
+    };
+    let refused = worktrees.rejected + reported - paths.len() - ordinary;
+    Ok((paths, refused))
+}
+
+/// The warning for worktree paths Tether refused, if there were any.
+fn refused_worktree_warning(rejected: usize) -> Option<String> {
+    if rejected == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: Herdr reported {rejected} worktree path(s) that Tether cannot use, so they were \
+         left out of the picker ordering. A path is left out when it is not absolute, when it \
+         names a Git directory rather than a checkout, when there is no readable checkout there, \
+         or when the repository reported more worktrees than Tether considers. \
+         `--separate-git-dir` and submodule layouts put a repository's Git directory outside its \
+         checkout, which is where a checkout and a Git directory get confused."
+    ))
 }
 
 /// Warns when Herdr does not recognize an explicit agent hint.
@@ -1891,7 +1961,7 @@ fn doctor_protocol_check() -> DoctorCheck {
     }
 
     let timeout = StdDuration::from_secs(3);
-    let snapshot = match run_doctor_probe_with_timeout(timeout, move || {
+    let snapshot = match run_probe_with_timeout(timeout, move || {
         HerdrSocketClient::new_with_timeout(socket_path, timeout).snapshot()
     }) {
         Ok(Ok(snapshot)) => snapshot,
@@ -1912,7 +1982,13 @@ fn doctor_protocol_check() -> DoctorCheck {
     check
 }
 
-fn run_doctor_probe_with_timeout<T, F>(
+/// Runs a blocking probe on another thread and gives up on it after `timeout`.
+///
+/// Used where a probe can block with no bound of its own — a socket that never
+/// answers, a `stat` on a wedged network mount — and the caller has something
+/// better to do than wait. The thread is left to finish on its own; there is no
+/// way to cancel a blocking syscall, and the abandoned answer is discarded.
+fn run_probe_with_timeout<T, F>(
     timeout: StdDuration,
     probe: F,
 ) -> std::result::Result<T, mpsc::RecvTimeoutError>
@@ -2287,12 +2363,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn doctor_probe_deadline_bounds_a_stalled_operation() {
-        let result = run_doctor_probe_with_timeout(StdDuration::from_millis(20), || {
+    fn a_probe_deadline_bounds_a_stalled_operation() {
+        let result = run_probe_with_timeout(StdDuration::from_millis(20), || {
             std::thread::sleep(StdDuration::from_secs(1));
         });
 
         assert!(matches!(result, Err(mpsc::RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn refused_worktree_paths_are_reported_rather_than_dropped_in_silence() {
+        // A shortened list is indistinguishable from a repository with fewer
+        // worktrees, so the picker would just order things oddly with no
+        // explanation. Nothing is said when nothing was refused, because an
+        // older Herdr that cannot answer at all is an ordinary state.
+        assert_eq!(refused_worktree_warning(0), None);
+        let warning = refused_worktree_warning(2).expect("a refusal is worth saying");
+        assert!(warning.starts_with("warning: Herdr reported 2 worktree path(s)"));
+        assert!(
+            warning.contains("--separate-git-dir") && warning.contains("submodule"),
+            "the message must name the layouts that produce the refused shape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reported_path_that_is_not_a_checkout_is_left_out_and_counted() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        // A `--separate-git-dir` checkout, and the Git directory it points at.
+        // Nothing about the second path says what it is, so only the filesystem
+        // can tell them apart.
+        let checkout = temp.path().join("app");
+        let separate = temp.path().join("gitdirs/app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&separate).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", separate.display()),
+        )
+        .unwrap();
+        // A submodule's Git directory, built as a real checkout-looking
+        // directory so that only its shape can be what refuses it.
+        let submodule_gitdir = temp.path().join(".git/modules/lib");
+        std::fs::create_dir_all(&submodule_gitdir).unwrap();
+        std::fs::write(submodule_gitdir.join(".git"), "gitdir: elsewhere\n").unwrap();
+        // A bare repository, which `git worktree list` reports as a worktree of
+        // itself. Not somewhere to work, and not a mistake either.
+        let bare = temp.path().join("proj.git");
+        std::fs::create_dir_all(bare.join("objects")).unwrap();
+        std::fs::create_dir_all(bare.join("refs")).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let socket = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reported = [
+            checkout.display().to_string(),
+            separate.display().to_string(),
+            submodule_gitdir.display().to_string(),
+            bare.display().to_string(),
+        ];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let worktrees: Vec<serde_json::Value> = reported
+                .iter()
+                .map(|path| serde_json::json!({"path": path}))
+                .collect();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "id": id,
+                    "result": {"type": "worktree_list", "worktrees": worktrees},
+                })
+            )
+            .unwrap();
+        });
+
+        let client = HerdrSocketClient::new(socket);
+        let (paths, refused) = offered_worktrees(&client, &checkout).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(paths, [checkout]);
+        assert_eq!(
+            refused, 2,
+            "the Git directory and the gitdir path, but not the bare repository"
+        );
     }
 
     #[test]

@@ -1,11 +1,15 @@
 use std::{fs, io::Write, path::Path, sync::Mutex, time::SystemTime};
 
+#[cfg(unix)]
+use std::io::BufRead;
+
 use chrono::{Duration, TimeZone, Utc};
 use herdr_tether::{
     backend::{CommandSpec, ProcessBinaries},
     config::{CommandPreset, Config, DiscoveryDefaults, HostConfig, RetentionDefaults, UiDefaults},
     discovery::{DiscoveryCompletion, DiscoveryMessage},
     herdr::{HerdrClient, HerdrContext, InvocationLocation, PaneTitle},
+    herdr_socket::HerdrSocketClient,
     lifecycle::{CloseOwnedError, PrunePreview, PruneService},
     model::{ExternalSessionName, OrchestrationGroupId, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -1119,6 +1123,187 @@ fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
     // Worktree paths are a preference over entries that already exist. An
     // unknown path must not appear, and must not change the ordering either.
     assert_eq!(with_worktrees, options);
+}
+
+/// Builds the two Git layouts that make worktree resolution hard, as real
+/// directories, and returns the checkout paths and the Git directories that
+/// belong to them.
+///
+/// `--separate-git-dir` puts the checkout's Git directory outside the checkout
+/// and leaves a `.git` file behind. A submodule does the same thing with a
+/// relative target inside the superproject's Git directory. In both cases the
+/// checkout and its Git directory are different places, and only the checkout
+/// is somewhere a user can work.
+fn git_layouts(root: &Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let checkout = root.join("app");
+    let sibling = root.join("app-feature");
+    let separate = root.join("gitdirs/app");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::create_dir_all(separate.join("worktrees/app-feature")).unwrap();
+    fs::write(separate.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", separate.display()),
+    )
+    .unwrap();
+    fs::write(
+        sibling.join(".git"),
+        format!("gitdir: {}/worktrees/app-feature\n", separate.display()),
+    )
+    .unwrap();
+
+    let superproject = root.join("super");
+    let submodule = superproject.join("lib");
+    let submodule_gitdir = superproject.join(".git/modules/lib");
+    fs::create_dir_all(&submodule).unwrap();
+    fs::create_dir_all(&submodule_gitdir).unwrap();
+    fs::write(submodule.join(".git"), "gitdir: ../.git/modules/lib\n").unwrap();
+
+    (
+        vec![checkout, sibling, submodule],
+        vec![separate.join("worktrees/app-feature"), submodule_gitdir],
+    )
+}
+
+#[cfg(unix)]
+fn serve_worktree_list(socket: &Path, reported: Vec<String>) -> std::thread::JoinHandle<()> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "worktree.list");
+        let id = request["id"].as_str().unwrap();
+        let worktrees: Vec<serde_json::Value> = reported
+            .iter()
+            .map(|path| serde_json::json!({"path": path}))
+            .collect();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "result": {"type": "worktree_list", "worktrees": worktrees},
+            })
+        )
+        .unwrap();
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reported_git_directory_is_refused_rather_than_offered_as_a_worktree() {
+    let temp = tempdir().unwrap();
+    let (checkouts, git_directories) = git_layouts(temp.path());
+    let socket = temp.path().join("herdr.sock");
+    // A resolver that read a repository's Git directory — `git rev-parse
+    // --git-dir`, or the `gitdir` file under `.git/worktrees/<name>` — instead
+    // of the checkout would report exactly this: the checkouts, and the Git
+    // directories of the linked worktree and the submodule.
+    let reported = checkouts
+        .iter()
+        .chain(git_directories.iter())
+        .map(|path| path.display().to_string())
+        .collect();
+    let server = serve_worktree_list(&socket, reported);
+
+    let worktrees = HerdrSocketClient::new(socket)
+        .worktree_paths(&checkouts[0])
+        .unwrap();
+    server.join().unwrap();
+
+    // A submodule's Git directory is refused on its shape alone, because it
+    // lives under the superproject's `.git`. The linked worktree's Git
+    // directory is not: `--separate-git-dir` moved it outside the checkout, so
+    // nothing about the path says what it is.
+    assert_eq!(
+        worktrees.paths,
+        checkouts
+            .iter()
+            .cloned()
+            .chain(std::iter::once(git_directories[0].clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(worktrees.rejected, 1);
+
+    // The shape test cannot separate them, so the filesystem does: a checkout
+    // holds a `.git` entry and a Git directory does not.
+    for checkout in &checkouts {
+        assert!(
+            herdr_tether::discovery::is_checkout_directory(checkout),
+            "{} is a checkout",
+            checkout.display()
+        );
+    }
+    for git_directory in &git_directories {
+        assert!(
+            !herdr_tether::discovery::is_checkout_directory(git_directory),
+            "{} is a Git directory, not a checkout",
+            git_directory.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_submodule_checkout_is_preferred_without_promoting_its_git_directory() {
+    let temp = tempdir().unwrap();
+    let (checkouts, git_directories) = git_layouts(temp.path());
+    let (submodule, submodule_gitdir) = (&checkouts[2], &git_directories[1]);
+    let (mut config, state) = picker_fixture();
+    // The Git directory is configured as a root as well, so the ordering below
+    // shows a refused path failing to promote an entry that does exist rather
+    // than merely failing to invent one.
+    config.hosts[0].roots = vec![
+        submodule.display().to_string(),
+        submodule_gitdir.display().to_string(),
+        checkouts[0].display().to_string(),
+    ];
+    let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let context = format!(r#"{{"focused_pane_cwd":"{}"}}"#, checkouts[0].display());
+    let preference = InvocationLocation::from_plugin_context_json(Some(&context));
+
+    let socket = temp.path().join("herdr.sock");
+    let reported = vec![
+        submodule.display().to_string(),
+        submodule_gitdir.display().to_string(),
+    ];
+    let server = serve_worktree_list(&socket, reported);
+    let worktrees = HerdrSocketClient::new(socket)
+        .worktree_paths(&checkouts[0])
+        .unwrap();
+    server.join().unwrap();
+
+    options.prefer_invocation_location_with_worktrees(
+        preference.as_ref(),
+        &state,
+        &worktrees.paths,
+    );
+
+    // The invoking checkout first, the submodule checkout pulled ahead of the
+    // rest, and the submodule's Git directory left where it was, behind the
+    // saved session directories it already sat behind.
+    assert_eq!(
+        options.hosts[0]
+            .directories
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            checkouts[0].display().to_string(),
+            submodule.display().to_string(),
+            "/srv/recent".to_owned(),
+            "/srv/shared".to_owned(),
+            submodule_gitdir.display().to_string(),
+        ]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+    );
 }
 
 #[test]
