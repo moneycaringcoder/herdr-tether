@@ -1672,9 +1672,11 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
 
 /// Lists the worktrees sharing a repository with the invoking pane.
 ///
-/// Purely a picker preference, so every failure path returns nothing: no Herdr
-/// socket, a directory outside a repository, or a rejected request all simply
-/// leave the ordering alone.
+/// Purely a picker preference, so an absent capability returns nothing: no
+/// Herdr socket, a directory outside a repository, or a rejected request all
+/// simply leave the ordering alone, and none of them is worth a warning on
+/// every picker open. An answer Tether refuses to use is different: something
+/// was reported and deliberately left out, so it is said out loud.
 fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> Vec<PathBuf> {
     let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
         return Vec::new();
@@ -1682,7 +1684,50 @@ fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> 
     let Ok(client) = HerdrSocketClient::from_env() else {
         return Vec::new();
     };
-    client.worktree_paths(directory).unwrap_or_default()
+    let Ok((paths, refused)) = offered_worktrees(&client, directory) else {
+        return Vec::new();
+    };
+    if let Some(warning) = refused_worktree_warning(refused) {
+        eprintln!("{warning}");
+    }
+    paths
+}
+
+/// The reported worktrees Tether will offer, with the number it refused.
+///
+/// Herdr resolves the repository layout, but a reported path still has to be
+/// somewhere the user can work. `--separate-git-dir` and submodule layouts put
+/// a repository's Git directory outside its checkout, and a Git directory holds
+/// no `.git` entry of its own, so the same test the scanner uses to recognize a
+/// repository separates the two. A path that cannot be confirmed is left out
+/// rather than offered.
+fn offered_worktrees(
+    client: &HerdrSocketClient,
+    directory: &Path,
+) -> Result<(Vec<PathBuf>, usize)> {
+    let worktrees = client.worktree_paths(directory)?;
+    let reported = worktrees.paths.len();
+    let paths: Vec<PathBuf> = worktrees
+        .paths
+        .into_iter()
+        .filter(|path| crate::discovery::is_checkout_directory(path))
+        .collect();
+    let refused = worktrees.rejected + (reported - paths.len());
+    Ok((paths, refused))
+}
+
+/// The warning for worktree paths Tether refused, if there were any.
+fn refused_worktree_warning(rejected: usize) -> Option<String> {
+    if rejected == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: Herdr reported {rejected} worktree path(s) that Tether cannot confirm as a \
+         checkout directory, so they were left out of the picker ordering. A path is left out \
+         when it is not absolute, when it names a Git directory rather than a checkout, or when \
+         there is no readable checkout there. `--separate-git-dir` and submodule layouts put a \
+         repository's Git directory outside its checkout, which is where the two get confused."
+    ))
 }
 
 /// Warns when Herdr does not recognize an explicit agent hint.
@@ -2293,6 +2338,80 @@ mod tests {
         });
 
         assert!(matches!(result, Err(mpsc::RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn refused_worktree_paths_are_reported_rather_than_dropped_in_silence() {
+        // A shortened list is indistinguishable from a repository with fewer
+        // worktrees, so the picker would just order things oddly with no
+        // explanation. Nothing is said when nothing was refused, because an
+        // older Herdr that cannot answer at all is an ordinary state.
+        assert_eq!(refused_worktree_warning(0), None);
+        let warning = refused_worktree_warning(2).expect("a refusal is worth saying");
+        assert!(warning.starts_with("warning: Herdr reported 2 worktree path(s)"));
+        assert!(
+            warning.contains("--separate-git-dir") && warning.contains("submodule"),
+            "the message must name the layouts that produce the refused shape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reported_path_that_is_not_a_checkout_is_left_out_and_counted() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        // A `--separate-git-dir` checkout, and the Git directory it points at.
+        // Nothing about the second path says what it is, so only the
+        // filesystem can tell them apart.
+        let checkout = temp.path().join("app");
+        let separate = temp.path().join("gitdirs/app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&separate).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", separate.display()),
+        )
+        .unwrap();
+
+        let socket = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reported = [
+            checkout.display().to_string(),
+            separate.display().to_string(),
+            // Refused on its shape alone, before the filesystem is consulted.
+            format!("{}/.git/modules/lib", temp.path().display()),
+        ];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let worktrees: Vec<serde_json::Value> = reported
+                .iter()
+                .map(|path| serde_json::json!({"path": path}))
+                .collect();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "id": id,
+                    "result": {"type": "worktree_list", "worktrees": worktrees},
+                })
+            )
+            .unwrap();
+        });
+
+        let client = HerdrSocketClient::new(socket);
+        let (paths, refused) = offered_worktrees(&client, &checkout).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(paths, [checkout]);
+        assert_eq!(refused, 2, "both the Git directory and the gitdir path");
     }
 
     #[test]

@@ -19,6 +19,13 @@
   bound is reported as a timeout rather than as an interrupted read. The
   remaining blocking calls on those paths are recorded with the reason each one
   propagates an interruption instead of retrying.
+- A worktree path reported for the picker is brought forward only when it is a
+  checkout the user could work in, and a path left out is reported rather than
+  dropped in silence. `--separate-git-dir` and submodule layouts keep a
+  repository's Git directory outside its checkout, so a resolver that reported a
+  Git directory in place of a worktree could have promoted a directory that is
+  not somewhere to work. Relative, traversing, and duplicate paths are refused
+  for the same reason: the picker compares them as paths.
 
 ## [0.7.2] - 2026-08-16
 

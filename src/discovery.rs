@@ -768,6 +768,23 @@ fn is_repository(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether a path is a Git checkout: a directory holding a `.git` entry.
+///
+/// The same test the local scan uses to recognize a repository, exposed because
+/// a reported worktree path has to be checked against it before the picker
+/// offers it. Anything unreadable answers `false`: a directory that cannot be
+/// inspected is not one to send a user into, and the caller's fallback is
+/// simply not reordering.
+///
+/// This says nothing about which repository the checkout belongs to. It
+/// separates a checkout from a Git directory, which is the distinction
+/// `--separate-git-dir` and submodule layouts blur, and it is deliberately not
+/// a claim that the checkout is a worktree of any particular repository.
+pub fn is_checkout_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && is_repository(path).unwrap_or(false)
+}
+
 fn scan_remote(
     location: &DiscoveryLocation,
     target: &str,

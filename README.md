@@ -150,7 +150,11 @@ up next, since they are the directories most likely wanted after it and their
 names often differ only by branch. The context is only a preference: malformed,
 unknown, or ambiguous paths change nothing, a worktree the picker has no entry
 for stays absent, and Tether never creates a host, path, command, or selection
-from it.
+from it. A reported path is also only brought forward when it is a checkout you
+could work in. `--separate-git-dir` and submodule layouts keep a repository's
+Git directory outside its checkout, and a Git directory is not somewhere to
+work, so a path Tether cannot confirm as a checkout is left out and said so on
+standard error.
 
 The picker keeps actions contextual:
 
