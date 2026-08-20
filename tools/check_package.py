@@ -65,6 +65,7 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "src/discovery.rs",
         "src/herdr.rs",
         "src/herdr_socket.rs",
+        "src/interrupt.rs",
         "src/lib.rs",
         "src/lifecycle.rs",
         "src/main.rs",

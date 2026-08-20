@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A signal arriving while a bounded `tmux` or SSH command is being polled no
+  longer ends the command as a transport failure. `Child::try_wait` reports an
+  interruption rather than repeating its `waitpid`, so a `SIGWINCH` that landed
+  in the poll could kill a child that was working and report a failed probe.
+
+### Changed
+
+- Interruption retries on the socket, `tmux`, and SSH paths are now defined in
+  one place, and each retry is bounded by the timeout or deadline its call site
+  already had. For a relative socket timeout the retries continue for at most
+  one further window measured from the first interruption, so repeated signals
+  extend a bounded wait by a bounded amount instead of indefinitely, and a spent
+  bound is reported as a timeout rather than as an interrupted read. The
+  remaining blocking calls on those paths are recorded with the reason each one
+  propagates an interruption instead of retrying.
+
 ## [0.7.2] - 2026-08-16
 
 ### Fixed
