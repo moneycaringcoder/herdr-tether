@@ -677,7 +677,8 @@ pub(crate) fn run_bounded(
         // `try_wait` polls with `WNOHANG` and, unlike `Child::wait`, reports an
         // interruption instead of repeating the `waitpid`. Treating that as a
         // failed probe killed a healthy child. The retry stays inside the
-        // deadline this loop already enforces.
+        // deadline this loop already enforces, and a signal that arrives with
+        // the deadline already due is reported as the timeout it is.
         let waited = interrupt::retry_interrupted(Budget::Until(deadline), || child.try_wait());
         match waited {
             Ok(Some(status)) => {
@@ -702,6 +703,15 @@ pub(crate) fn run_bounded(
                 return BoundedOutput::TimedOut;
             }
             Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+            // A poll whose retry budget was the command deadline reports
+            // `TimedOut` when that deadline is due, which is the same outcome as
+            // the arm above rather than an unexplained transport failure.
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                terminate_child(&mut child);
+                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
+                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
+                return BoundedOutput::TimedOut;
+            }
             Err(_) => {
                 terminate_child(&mut child);
                 return BoundedOutput::Error;

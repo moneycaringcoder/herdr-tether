@@ -20,8 +20,12 @@
 //! deadline. A relative socket timeout restarts on every call, so a loop that
 //! retries an interrupted read without limit turns a bounded wait into an
 //! unbounded one when signals keep arriving. [`Budget`] carries the bound the
-//! call site already had, and the retry stops when that bound is reached, with
-//! the interruption itself as the reported error.
+//! call site already had. For a relative timeout the retries continue for at
+//! most one further window, measured from the first interruption, so the worst
+//! case is the call's own window plus one more rather than one fresh window per
+//! signal. A spent bound is reported as `ErrorKind::TimedOut`, because that is
+//! what the wait elapsing means to the caller, with the interruption kept as the
+//! error's source.
 //!
 //! # Calls that retry through this module
 //!
@@ -35,11 +39,11 @@
 //! # Calls that deliberately do not retry
 //!
 //! - `UnixStream::connect`, in both the event subscription and the request
-//!   exchange. POSIX leaves an interrupted `connect` in progress, so calling it
-//!   again reports `EALREADY` or `EISCONN` rather than completing it. Retrying
-//!   here would be wrong rather than merely unnecessary; the subscription path
-//!   already reconnects on its own, and the exchange path classifies the failure
-//!   as a stopped Herdr.
+//!   exchange. After an interrupted `connect` the connection continues to be
+//!   established asynchronously and the socket's state is unspecified, so the
+//!   documented recovery is a fresh socket rather than a second `connect` on the
+//!   same one. Both call sites already do that: the subscription supervisor
+//!   reconnects, and the exchange classifies the failure as a stopped Herdr.
 //! - `write_all` on the socket. The standard library's `Write::write_all`
 //!   ignores `Interrupted` and resumes from the unwritten remainder, and
 //!   `UnixStream` does not override it.
@@ -57,15 +61,20 @@
 //! - `Command::output` in the `check` host probe and its SSH probe. The pipes
 //!   are drained with `read_to_end`, which ignores `Interrupted` by contract,
 //!   and the child is reaped with `Child::wait`.
-//! - `Command::status` for an interactive attach. The parent transfers no data
-//!   and reaps with `Child::wait`; the attach deliberately has no deadline, so
-//!   there is no bound for a retry to preserve either way.
+//! - `Command::status`, for an interactive attach and for the `herdr server
+//!   reload-config` call after a keybinding change. The parent transfers no data
+//!   and reaps with `Child::wait`; neither has a deadline, so there is no bound
+//!   for a retry to preserve either way.
 //!
-//! The `tmux`, discovery, lifecycle, and CLI callers of the bounded executor do
-//! no blocking I/O of their own: they hand a command to `status::run_bounded`
-//! and inherit its behaviour.
+//! The `tmux`, discovery, lifecycle, and CLI callers of `status::run_bounded` do
+//! no blocking I/O of their own: they hand it a command and inherit its
+//! behaviour.
+//!
+//! Terminal input is not one of these paths and was not audited here. The
+//! prompt read in `orchestration` does propagate an interruption; that is
+//! tracked separately rather than settled by this list.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufReader, Read};
 use std::time::{Duration, Instant};
 
 /// The bound an interruption retry must not exceed.
@@ -88,9 +97,11 @@ pub(crate) enum Budget {
 /// Repeats `operation` while it reports `ErrorKind::Interrupted`, within
 /// `budget`.
 ///
-/// Any other outcome, success or failure, is returned as it is. When the budget
-/// is spent the interruption is returned rather than swallowed, so a caller that
-/// classifies error kinds still sees what happened.
+/// Any other outcome, success or failure, is returned as it is. A spent budget
+/// is reported as `ErrorKind::TimedOut` with the interruption as its source: the
+/// wait the call site asked for has elapsed, which is what its callers already
+/// classify, and reporting `Interrupted` there would make a bounded wait look
+/// like a connection failure to code that has no reason to treat it as one.
 pub(crate) fn retry_interrupted<T>(
     budget: Budget,
     mut operation: impl FnMut() -> io::Result<T>,
@@ -111,7 +122,7 @@ pub(crate) fn retry_interrupted<T>(
             Budget::Until(deadline) => deadline,
         };
         if Instant::now() >= deadline {
-            return Err(interruption);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, interruption));
         }
     }
 }
@@ -121,16 +132,17 @@ pub(crate) fn retry_interrupted<T>(
 /// This lives here rather than at the call site because the buffer `fill_buf`
 /// returns borrows the reader, and that borrow cannot be carried out of a
 /// closure, so the retry cannot be expressed against `retry_interrupted`
-/// directly.
-pub(crate) fn fill_buf<R: BufRead>(reader: &mut R, budget: Budget) -> io::Result<&[u8]> {
+/// directly. It takes a [`BufReader`] rather than any [`BufRead`] because the
+/// second call below relies on the buffered contents being handed back without
+/// a further read, which `BufReader` guarantees and the trait does not.
+pub(crate) fn fill_buf<R: Read>(reader: &mut BufReader<R>, budget: Budget) -> io::Result<&[u8]> {
     let available = retry_interrupted(budget, || {
         reader.fill_buf().map(|available| available.len())
     })?;
     if available == 0 {
         // End of input: there is no buffered slice to hand back, and filling
         // again would issue a second read that could be interrupted outside the
-        // retry above. A non-empty buffer is returned from the reader's own
-        // buffer without touching the descriptor.
+        // retry above.
         return Ok(&[]);
     }
     reader.fill_buf()
@@ -169,18 +181,40 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_wait_stays_bounded_under_repeated_interruption() {
-        // Every retry restarts a relative socket timeout, so an unconditional
-        // loop here would wait forever while signals keep arriving.
+    fn an_already_spent_window_does_not_buy_another_wait() {
         let mut attempts = 0;
         let outcome = retry_interrupted(Budget::Within(Duration::ZERO), || {
             attempts += 1;
             Err::<(), _>(interrupted())
         });
-        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let error = outcome.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(
-            attempts, 1,
-            "an already-spent window must not buy another wait"
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::Interrupted),
+            "the interruption must survive as the source"
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn a_bounded_wait_ends_instead_of_restarting_its_window_per_signal() {
+        // This is the property the module exists for: a window granted per
+        // signal never closes while signals keep arriving, so the call would
+        // never return. The window is granted once, from the first
+        // interruption, and a short one is enough to prove it terminates.
+        let mut attempts = 0;
+        let outcome = retry_interrupted(Budget::Within(Duration::from_millis(20)), || {
+            attempts += 1;
+            Err::<(), _>(interrupted())
+        });
+        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            attempts > 1,
+            "the window must allow retries before it is spent"
         );
     }
 
@@ -191,8 +225,26 @@ mod tests {
             attempts += 1;
             Err::<(), _>(interrupted())
         });
-        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(attempts, 1, "a due deadline must not buy another wait");
+    }
+
+    #[test]
+    fn an_interrupted_poll_before_the_deadline_is_retried() {
+        // The shape of the `try_wait` poll in the bounded process executor: an
+        // interruption while the deadline is still live must not end the
+        // command, and the poll's own answer must be what the caller sees.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut attempts = 0;
+        let outcome = retry_interrupted(Budget::Until(deadline), || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(interrupted());
+            }
+            Ok::<Option<u8>, io::Error>(None)
+        });
+        assert_eq!(outcome.unwrap(), None);
+        assert_eq!(attempts, 2);
     }
 
     /// A reader that reports an interruption before each byte it yields.

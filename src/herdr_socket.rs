@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::Shutdown,
     path::{Path, PathBuf},
     sync::{
@@ -743,8 +743,8 @@ fn encode_request(id: &str, method: &str, params: Value) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
+fn read_bounded_line<R: Read>(
+    reader: &mut BufReader<R>,
     limit: usize,
     budget: Budget,
 ) -> Result<Option<Vec<u8>>> {
@@ -1337,16 +1337,24 @@ mod tests {
     }
 
     #[test]
-    fn bounded_line_stops_retrying_when_the_read_window_is_spent() {
-        // The socket sets a read timeout, and every retry restarts it. Under
-        // uninterrupted signals the retry must end and report the interruption
-        // rather than wait past the bound the caller asked for.
+    fn bounded_line_reports_a_spent_read_window_as_an_idle_timeout() {
+        // The socket sets a read timeout, and every retry restarts it, so a
+        // window granted per signal would never close while signals keep
+        // arriving. The read must end, and it must end as a kind the
+        // subscription loop already classifies as idle: reporting `Interrupted`
+        // here would tear the subscription down and reconnect, which is the
+        // behaviour v0.7.2 removed.
         let mut stalled = BufReader::new(AlwaysInterrupted);
-        let error =
-            read_bounded_line(&mut stalled, 16, Budget::Within(Duration::ZERO)).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::Interrupted)
+        let error = read_bounded_line(&mut stalled, 16, Budget::Within(Duration::from_millis(20)))
+            .unwrap_err();
+        let kind = error.downcast_ref::<io::Error>().map(io::Error::kind);
+        assert_eq!(kind, Some(io::ErrorKind::TimedOut));
+        assert!(
+            matches!(
+                kind,
+                Some(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            ),
+            "the subscription loop treats only these kinds as an idle poll"
         );
     }
 }
