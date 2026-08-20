@@ -33,6 +33,27 @@ gate runs without it.
 
 Do not commit credentials, host details, generated state, or build output. Describe which local, SSH, tmux, and Herdr paths you actually exercised; call out paths that were not verified. Changes to process invocation, quoting, persistence, session lifecycle, host handling, Agent metadata, or view restoration need boundary and failure-path tests.
 
+## Interrupted reads, writes, and waits
+
+A signal delivered while a thread is blocked in a read, a write, or a wait
+surfaces as `EINTR`. It describes no failure: the socket is still connected and
+the child is still running, and the call has to be made again. Herdr's own TUI
+raises `SIGWINCH` freely, so any blocking call on the socket, `tmux`, or SSH
+paths can span one.
+
+On those paths a bare `?` on a blocking read, write, or wait is a bug. Route the
+call through `crate::interrupt::retry_interrupted` instead, and give it the bound
+the call site already has: a relative socket timeout, the deadline of an
+enclosing loop, or nothing to bound when the descriptor is non-blocking. A retry
+loop with no bound turns a bounded wait into an unbounded one, because a relative
+timeout restarts on every call.
+
+A call that should propagate the interruption instead is a valid outcome, but an
+argued one. `crate::interrupt` lists every such call on those paths with the
+reason it does not retry, including the standard-library calls that already
+retry internally. Add to that list rather than leaving the reasoning in a commit
+message.
+
 ## Commit subjects
 
 Write the subject as a sentence describing what the change does, in the

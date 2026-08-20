@@ -16,6 +16,7 @@ use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 use crate::{
     backend::{CommandSpec, ProcessBinaries},
+    interrupt::{self, Budget},
     model::{ExternalSessionName, SessionId},
     tmux::TmuxBackend,
 };
@@ -673,7 +674,12 @@ pub(crate) fn run_bounded(
             let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
             return BoundedOutput::Cancelled;
         }
-        match child.try_wait() {
+        // `try_wait` polls with `WNOHANG` and, unlike `Child::wait`, reports an
+        // interruption instead of repeating the `waitpid`. Treating that as a
+        // failed probe killed a healthy child. The retry stays inside the
+        // deadline this loop already enforces.
+        let waited = interrupt::retry_interrupted(Budget::Until(deadline), || child.try_wait());
+        match waited {
             Ok(Some(status)) => {
                 // The direct child may have successfully forked descendants
                 // into its fresh process group. End them before returning so a
@@ -757,7 +763,9 @@ fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Resul
     let mut buffer = [0_u8; 8192];
     let mut drained = 0;
     loop {
-        match pipe.read(&mut buffer) {
+        // The pipes are non-blocking, so a retried read cannot wait; the
+        // interruption retry itself lives in `crate::interrupt`.
+        match interrupt::retry_interrupted(Budget::Immediate, || pipe.read(&mut buffer)) {
             Ok(0) => return Ok(()),
             Ok(length) => {
                 drained += length;
@@ -770,7 +778,6 @@ fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Resul
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
@@ -788,5 +795,58 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(service.workers, MAX_STATUS_WORKERS);
+    }
+
+    /// A child pipe that reports an interruption before the output it has, then
+    /// reports that it has nothing more for now, as a non-blocking pipe does.
+    struct InterruptedPipe {
+        remaining: &'static [u8],
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedPipe {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            if self.remaining.is_empty() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let length = buffer.len().min(self.remaining.len());
+            buffer[..length].copy_from_slice(&self.remaining[..length]);
+            self.remaining = &self.remaining[length..];
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn draining_a_pipe_retries_a_read_interrupted_by_a_signal() {
+        // A signal arriving while a bounded `tmux` or SSH command is being
+        // drained says nothing about the command. Reporting it discarded the
+        // output and killed a child that was working.
+        let mut pipe = InterruptedPipe {
+            remaining: b"session\n",
+            interrupted: false,
+        };
+        let mut capture = Capture::default();
+        drain_pipe(Some(&mut pipe), &mut capture).expect("an interruption is not a failure");
+        assert_eq!(capture.bytes, b"session\n");
+        assert!(!capture.truncated);
+    }
+
+    #[test]
+    fn draining_a_pipe_still_reports_a_real_read_failure() {
+        struct Broken;
+
+        impl Read for Broken {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+
+        let mut capture = Capture::default();
+        let error = drain_pipe(Some(&mut Broken), &mut capture).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 }

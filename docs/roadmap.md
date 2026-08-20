@@ -10,18 +10,6 @@ attach-only.
 
 ## Correctness
 
-### Finish the `EINTR` audit
-
-v0.7.2 fixed `read_bounded_line`, which called `fill_buf()?` with no
-`ErrorKind::Interrupted` retry, so a signal arriving during a blocking socket read
-surfaced as `Read rejected: Interrupted system call (os error 4)`. The same fix
-also repaired the Mission Control event-subscription loop, which had been tearing
-down and reconnecting on every interruption.
-
-Two callers were found by following one failure. The sweep was not exhaustive.
-Every blocking read and write in the socket, `tmux`, and SSH paths should be
-audited for the same shape, and the pattern documented so it is not reintroduced.
-
 ### Publish a compatibility matrix per release
 
 `doctor` already reports a protocol above the verified ceiling as "newer and not

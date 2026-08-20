@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use std::os::unix::net::UnixStream;
 use thiserror::Error;
 
+use crate::interrupt::{self, Budget};
+
 const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const RECONNECT_DELAY: Duration = Duration::from_millis(200);
@@ -630,8 +632,12 @@ fn run_subscription(
     stream.write_all(&request)?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
-    let acknowledgement = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)?
-        .context("Herdr event subscription closed before acknowledgement")?;
+    let acknowledgement = read_bounded_line(
+        &mut reader,
+        MAX_RESPONSE_BYTES,
+        Budget::Within(EVENT_READ_TIMEOUT),
+    )?
+    .context("Herdr event subscription closed before acknowledgement")?;
     let envelope: Value = serde_json::from_slice(&acknowledgement)
         .context("decode Herdr event subscription acknowledgement")?;
     if envelope.get("id").and_then(Value::as_str) != Some(id.as_str())
@@ -648,7 +654,11 @@ fn run_subscription(
         .send(EventSignal::Resnapshot { reconnected })
         .context("Mission Control event receiver closed")?;
     while !stop.load(Ordering::Acquire) {
-        match read_bounded_line(&mut reader, MAX_RESPONSE_BYTES) {
+        match read_bounded_line(
+            &mut reader,
+            MAX_RESPONSE_BYTES,
+            Budget::Within(EVENT_READ_TIMEOUT),
+        ) {
             Ok(Some(line)) => {
                 let event: Value =
                     serde_json::from_slice(&line).context("decode Herdr subscription event")?;
@@ -711,7 +721,7 @@ fn exchange(path: &Path, request: &[u8], timeout: Duration) -> Result<Vec<u8>> {
         .shutdown(Shutdown::Write)
         .context("finish Herdr socket request")?;
     let mut reader = BufReader::new(stream);
-    read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)?
+    read_bounded_line(&mut reader, MAX_RESPONSE_BYTES, Budget::Within(timeout))?
         .context("Herdr socket closed without a response")
 }
 
@@ -733,19 +743,21 @@ fn encode_request(id: &str, method: &str, params: Value) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<Option<Vec<u8>>> {
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+    budget: Budget,
+) -> Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
     loop {
         // A signal delivered while this read is blocked surfaces as `EINTR`,
         // which says nothing about the connection and must be retried rather
         // than reported. Herdr's own TUI raises `SIGWINCH` freely, so a
         // Mission Control read that happened to span a resize was rejected
-        // with `Interrupted system call (os error 4)`.
-        let available = match reader.fill_buf() {
-            Ok(available) => available,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        };
+        // with `Interrupted system call (os error 4)`. The retry, and the bound
+        // that keeps it from outlasting the stream's own read timeout, live in
+        // `crate::interrupt`.
+        let available = interrupt::fill_buf(reader, budget)?;
         if available.is_empty() {
             if output.is_empty() {
                 return Ok(None);
@@ -1247,17 +1259,21 @@ mod tests {
         }
     }
 
+    /// A read window wide enough that only a spent budget, never a slow test
+    /// machine, ends a retry loop.
+    const READ_BUDGET: Budget = Budget::Within(Duration::from_secs(30));
+
     #[test]
     fn bounded_line_rejects_oversize_and_partial_records() {
         let mut complete = BufReader::new(&b"ok\nrest"[..]);
         assert_eq!(
-            read_bounded_line(&mut complete, 3).unwrap(),
+            read_bounded_line(&mut complete, 3, READ_BUDGET).unwrap(),
             Some(b"ok\n".to_vec())
         );
         let mut oversized = BufReader::new(&b"toolong\n"[..]);
-        assert!(read_bounded_line(&mut oversized, 4).is_err());
+        assert!(read_bounded_line(&mut oversized, 4, READ_BUDGET).is_err());
         let mut partial = BufReader::new(&b"partial"[..]);
-        assert!(read_bounded_line(&mut partial, 16).is_err());
+        assert!(read_bounded_line(&mut partial, 16, READ_BUDGET).is_err());
     }
 
     /// A source interrupted by a signal before every byte it yields, wrapped
@@ -1294,7 +1310,7 @@ mod tests {
             interrupted: false,
         });
         assert_eq!(
-            read_bounded_line(&mut record, 16).unwrap(),
+            read_bounded_line(&mut record, 16, READ_BUDGET).unwrap(),
             Some(b"ok\n".to_vec())
         );
 
@@ -1304,7 +1320,34 @@ mod tests {
             remaining: b"",
             interrupted: false,
         });
-        assert_eq!(read_bounded_line(&mut closed, 16).unwrap(), None);
+        assert_eq!(
+            read_bounded_line(&mut closed, 16, READ_BUDGET).unwrap(),
+            None
+        );
+    }
+
+    /// A source that reports nothing but interruptions, standing in for a
+    /// signal arriving faster than the socket can complete a read.
+    struct AlwaysInterrupted;
+
+    impl io::Read for AlwaysInterrupted {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+    }
+
+    #[test]
+    fn bounded_line_stops_retrying_when_the_read_window_is_spent() {
+        // The socket sets a read timeout, and every retry restarts it. Under
+        // uninterrupted signals the retry must end and report the interruption
+        // rather than wait past the bound the caller asked for.
+        let mut stalled = BufReader::new(AlwaysInterrupted);
+        let error =
+            read_bounded_line(&mut stalled, 16, Budget::Within(Duration::ZERO)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::Interrupted)
+        );
     }
 }
 

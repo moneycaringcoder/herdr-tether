@@ -5,6 +5,7 @@ pub mod config;
 pub mod discovery;
 pub mod herdr;
 pub mod herdr_socket;
+mod interrupt;
 pub mod lifecycle;
 pub mod mission_control;
 pub mod model;
