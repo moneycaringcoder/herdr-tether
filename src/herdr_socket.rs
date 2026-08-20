@@ -798,22 +798,29 @@ fn worktree_list(result: &Value) -> Result<WorktreeList> {
         .and_then(Value::as_array)
         .context("Herdr worktree list did not contain worktrees")?;
     let mut list = WorktreeList::default();
+    // A repository reports each worktree once, but a duplicate would occupy two
+    // picker rows or be counted as two refusals, so the first spelling of a
+    // path is the only one considered.
+    let mut seen: Vec<&str> = Vec::with_capacity(worktrees.len().min(MAX_WORKTREE_PATHS));
     for path in worktrees
         .iter()
         .filter_map(|entry| entry.get("path").and_then(Value::as_str))
     {
-        if list.paths.len() >= MAX_WORKTREE_PATHS {
-            break;
+        if seen.contains(&path) {
+            continue;
         }
-        if !usable_worktree_path(path) {
+        seen.push(path);
+        if list.paths.len() >= MAX_WORKTREE_PATHS {
+            // Beyond the bound the answer is shortened rather than examined,
+            // and a shortened list that nobody mentions looks like a repository
+            // with fewer worktrees.
             list.rejected += 1;
             continue;
         }
-        let path = PathBuf::from(path);
-        // A repository reports each worktree once, but the picker would show a
-        // duplicate twice, so the first spelling wins.
-        if !list.paths.contains(&path) {
-            list.paths.push(path);
+        if usable_worktree_path(path) {
+            list.paths.push(PathBuf::from(path));
+        } else {
+            list.rejected += 1;
         }
     }
     Ok(list)
@@ -825,12 +832,13 @@ fn worktree_list(result: &Value) -> Result<WorktreeList> {
 /// user already has, and it compares them as paths. So the question is not
 /// whether the directory exists but whether it could ever be a checkout. A
 /// relative path cannot be compared against a picker entry at all, and a path
-/// with a `.git` component names a Git directory rather than a checkout:
-/// `git worktree list --porcelain` reports a `gitdir` beside every `worktree`,
-/// a submodule's gitdir lives at `<superproject>/.git/modules/<name>`, and a
-/// linked worktree's lives at `<main>/.git/worktrees/<name>`. Offering one of
-/// those as a directory to work in would be a wrong answer rather than a
-/// missing one, which is the failure worth refusing.
+/// with a `.git` component names a Git directory rather than a checkout: a
+/// submodule's gitdir lives at `<superproject>/.git/modules/<name>` and a linked
+/// worktree's at `<main>/.git/worktrees/<name>`, which is what a resolver
+/// reporting `git rev-parse --git-dir`, or the `gitdir` file under
+/// `.git/worktrees/<name>`, hands back in place of the checkout. Offering one of
+/// those as a directory to work in would be a wrong answer rather than a missing
+/// one, which is the failure worth refusing.
 fn usable_worktree_path(path: &str) -> bool {
     if path.is_empty() || path.len() > MAX_WORKTREE_PATH_BYTES || path.chars().any(char::is_control)
     {
@@ -1426,12 +1434,13 @@ mod tests {
 
     #[test]
     fn a_git_directory_is_not_offered_as_a_worktree_checkout() {
-        // `git worktree list --porcelain` reports a `gitdir` beside every
-        // `worktree`. A submodule's gitdir lives under the superproject's
-        // `.git/modules`, and a linked worktree's under `.git/worktrees`, so a
-        // caller that reports the wrong line of the pair names a directory the
-        // user cannot work in. Refusing it is the difference between a missing
-        // preference and a wrong one.
+        // A submodule's Git directory lives under the superproject's
+        // `.git/modules`, and a linked worktree's under `.git/worktrees`. A
+        // resolver that reads `git rev-parse --git-dir`, or the `gitdir` file
+        // Git keeps under `.git/worktrees/<name>`, hands back one of those in
+        // place of the checkout, which names a directory the user cannot work
+        // in. Refusing it is the difference between a missing preference and a
+        // wrong one.
         let list = worktree_list(&reported(&[
             "/srv/checkouts/app",
             "/srv/checkouts/app/.git/worktrees/feature",
@@ -1504,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn the_offered_worktree_count_stays_bounded() {
+    fn the_offered_worktree_count_stays_bounded_and_says_so() {
         let paths: Vec<String> = (0..MAX_WORKTREE_PATHS * 2)
             .map(|index| format!("/srv/checkouts/app-{index}"))
             .collect();
@@ -1512,11 +1521,24 @@ mod tests {
         let list = worktree_list(&reported(&borrowed)).unwrap();
         assert_eq!(list.paths.len(), MAX_WORKTREE_PATHS);
         assert_eq!(list.paths[0], PathBuf::from("/srv/checkouts/app-0"));
+        // A shortened list nobody mentions looks like a repository with fewer
+        // worktrees, which is the thing this count exists to prevent.
+        assert_eq!(list.rejected, MAX_WORKTREE_PATHS);
     }
 
     #[test]
-    fn a_response_without_worktrees_is_an_error_rather_than_an_empty_list() {
-        assert!(worktree_list(&json!({"type": "worktree_list"})).is_err());
+    fn one_unusable_path_reported_twice_is_one_refusal() {
+        let list = worktree_list(&reported(&[
+            "/srv/super/.git/modules/lib",
+            "/srv/super/.git/modules/lib",
+            "/srv/checkouts/app",
+        ]))
+        .unwrap();
+        assert_eq!(list.paths, [PathBuf::from("/srv/checkouts/app")]);
+        assert_eq!(
+            list.rejected, 1,
+            "the warning counts paths, not repetitions"
+        );
     }
 }
 

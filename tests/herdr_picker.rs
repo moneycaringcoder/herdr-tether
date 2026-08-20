@@ -1200,8 +1200,9 @@ fn a_reported_git_directory_is_refused_rather_than_offered_as_a_worktree() {
     let temp = tempdir().unwrap();
     let (checkouts, git_directories) = git_layouts(temp.path());
     let socket = temp.path().join("herdr.sock");
-    // A resolver that confused `git worktree list`'s `gitdir` line with its
-    // `worktree` line would report exactly this: the checkouts, and the Git
+    // A resolver that read a repository's Git directory — `git rev-parse
+    // --git-dir`, or the `gitdir` file under `.git/worktrees/<name>` — instead
+    // of the checkout would report exactly this: the checkouts, and the Git
     // directories of the linked worktree and the submodule.
     let reported = checkouts
         .iter()

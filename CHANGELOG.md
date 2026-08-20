@@ -25,7 +25,10 @@
   repository's Git directory outside its checkout, so a resolver that reported a
   Git directory in place of a worktree could have promoted a directory that is
   not somewhere to work. Relative, traversing, and duplicate paths are refused
-  for the same reason: the picker compares them as paths.
+  for the same reason: the picker compares them as paths. A bare repository is
+  left out without comment, because a bare clone reports itself among its own
+  worktrees, and the confirmation is bounded so a wedged network mount cannot
+  hold the picker closed.
 
 ## [0.7.2] - 2026-08-16
 

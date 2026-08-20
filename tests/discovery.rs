@@ -223,6 +223,47 @@ fn separate_git_dir_and_submodule_layouts_offer_checkouts_and_not_git_directorie
     assert!(!herdr_tether::discovery::is_checkout_directory(
         &root.join("missing")
     ));
+
+    // A checkout reached through a symlink, and a checkout whose `.git` is a
+    // symlink to a relocated Git store, are both somewhere a user can work.
+    // The scanner refuses a symlinked root because a scan can leave the root it
+    // was given; a single path handed over for comparison cannot.
+    #[cfg(unix)]
+    {
+        let linked_checkout = root.join("linked-app");
+        symlink(&checkout, &linked_checkout).unwrap();
+        assert!(herdr_tether::discovery::is_checkout_directory(
+            &linked_checkout
+        ));
+
+        let linked_git = root.join("linked-git");
+        fs::create_dir_all(&linked_git).unwrap();
+        symlink(&separate, linked_git.join(".git")).unwrap();
+        assert!(herdr_tether::discovery::is_checkout_directory(&linked_git));
+
+        // A symlink to a Git directory is still a Git directory.
+        let linked_separate = root.join("linked-separate");
+        symlink(&separate, &linked_separate).unwrap();
+        assert!(!herdr_tether::discovery::is_checkout_directory(
+            &linked_separate
+        ));
+    }
+
+    // `git worktree list` reports a bare repository as a worktree of itself. It
+    // is not a checkout, and it is not a mistake either.
+    let bare = root.join("proj.git");
+    fs::create_dir_all(bare.join("objects")).unwrap();
+    fs::create_dir_all(bare.join("refs")).unwrap();
+    fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert!(!herdr_tether::discovery::is_checkout_directory(&bare));
+    assert!(herdr_tether::discovery::is_bare_repository(&bare));
+    assert!(!herdr_tether::discovery::is_bare_repository(&checkout));
+    // A `--separate-git-dir` target is a Git directory but not a bare
+    // repository: nothing points at it as one, and it has no `refs` of a
+    // repository in its own right until Git puts them there.
+    assert!(!herdr_tether::discovery::is_bare_repository(
+        &root.join("missing")
+    ));
 }
 
 #[test]
