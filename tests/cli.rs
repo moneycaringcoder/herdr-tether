@@ -1478,6 +1478,152 @@ fn restarting_a_workload_that_failed_immediately_is_declined_with_the_wait() {
 }
 
 #[test]
+fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let now = chrono::Utc::now();
+    let legacy_id = "tether-0197f198000070008000000000000042";
+    let state = serde_json::json!({
+        "version": 4,
+        "sessions": [
+            {
+                "id": SESSION_ID,
+                "host": "local",
+                "target": "local",
+                "directory": "/srv/app",
+                "preset": null,
+                "command": "exec shell",
+                "tmux_session_id": 7,
+                "ownership_proof": "0197f198000070008000000000000091",
+                "status": "running",
+                "created_at": now.to_rfc3339(),
+                "last_used_at": now.to_rfc3339(),
+                "closed_at": null,
+                "exit_status": null
+            },
+            {
+                // A record from before ownership proofs. A group must not become
+                // a way to act on a workload Tether cannot prove is its own.
+                "id": legacy_id,
+                "host": "local",
+                "target": "local",
+                "directory": "/srv/legacy",
+                "preset": null,
+                "command": "exec shell",
+                "tmux_session_id": 8,
+                "ownership_proof": null,
+                "status": "running",
+                "created_at": now.to_rfc3339(),
+                "last_used_at": now.to_rfc3339(),
+                "closed_at": null,
+                "exit_status": null
+            }
+        ],
+        "orchestration_groups": [{
+            "id": "fleet",
+            "title": "Fleet",
+            "orchestrator_session_id": "tether-0197f198000070008000000000000009",
+            "workers": [
+                {
+                    "session_id": SESSION_ID,
+                    "membership_id": "0197f198000070008000000000000011",
+                    "capabilities": {"observe_output": true, "open_interactive": true}
+                },
+                {
+                    "session_id": legacy_id,
+                    "membership_id": "0197f198000070008000000000000012",
+                    "capabilities": {"observe_output": true, "open_interactive": true}
+                }
+            ]
+        }]
+    });
+    fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    let before = fs::read_to_string(sandbox.state_file()).unwrap();
+
+    // The plan names the legacy member as skipped and never offers to act on it.
+    sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "skip {legacy_id}: legacy record with no ownership proof"
+        )))
+        .stdout(predicate::str::contains(format!("stop {SESSION_ID}")));
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // Without a terminal there is nobody to ask, so it refuses rather than
+    // assuming consent for a multi-workload act.
+    sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("interactive confirmation"))
+        .stderr(predicate::str::contains("--yes"));
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // A group whose only eligible member is not restartable says so instead of
+    // asking to confirm an empty act.
+    sandbox
+        .command()
+        .args(["orchestration", "restart-workers", "fleet", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to restart"));
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // A member on a host that cannot be reached fails rather than being assumed
+    // gone. The summary must count only what it attempted: saying "the rest were
+    // stopped" would claim the legacy record it refused to touch was.
+    let mut unreachable = state.clone();
+    unreachable["sessions"][0]["target"] = serde_json::json!("unreachable.invalid");
+    fs::write(sandbox.state_file(), unreachable.to_string()).unwrap();
+    let before = fs::read_to_string(sandbox.state_file()).unwrap();
+    let failed = sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1 of 1 attempted"))
+        .stderr(predicate::str::contains("1 were skipped"))
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        !stderr.contains("the rest were"),
+        "a refusal is not an act: {stderr}"
+    );
+    // The failure names a cause rather than repeating the id, and carries none
+    // of the error's source chain, which holds directories and command text.
+    assert!(stderr.contains("could not prove whether"), "{stderr}");
+    assert!(!stderr.contains("/srv/app"), "{stderr}");
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // Back on a reachable host: the member's workload is already gone, so the
+    // group reconciles it and says so, and the legacy record stays untouched.
+    fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(already gone)"));
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sandbox.state_file()).unwrap()).unwrap();
+    assert_eq!(after["sessions"][0]["status"], "ended");
+    assert_eq!(
+        after["sessions"][1]["ownership_proof"],
+        serde_json::Value::Null,
+        "the legacy record survives untouched: {after}"
+    );
+    assert_eq!(
+        after["sessions"][1]["status"], "running",
+        "a group is not a way to end a workload Tether cannot prove it owns: {after}"
+    );
+}
+
+#[test]
 fn external_attach_is_exact_and_does_not_mutate_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
