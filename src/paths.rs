@@ -51,6 +51,11 @@ impl AppPaths {
     pub fn agent_view_file(&self) -> PathBuf {
         self.state_file.with_file_name("agent-view.json")
     }
+
+    /// The lifecycle audit trail, beside the state it describes.
+    pub fn audit_file(&self) -> PathBuf {
+        self.state_file.with_file_name("audit.json")
+    }
 }
 
 fn home_path(value: Option<OsString>) -> Option<PathBuf> {

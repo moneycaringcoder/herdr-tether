@@ -135,7 +135,13 @@ are sanitized before rendering.
 
 ### State and observation
 
-Durable lifecycle and group metadata remain authoritative in `state.json`.
+Durable lifecycle and group metadata remain authoritative in `state.json`. The
+transitions that produced it are appended to a bounded `audit.json` beside it,
+under the same private permissions and advisory lock discipline, with its own
+schema version, its own retention, and a ceiling on entries. It carries no host,
+target, directory, command, preset, or ownership proof, and a write that fails is
+dropped rather than failing the operation it describes.
+
 Mission Control adds a typed, bounded `HerdrSocketClient` for:
 
 - `session.snapshot` and reconnecting `events.subscribe`;

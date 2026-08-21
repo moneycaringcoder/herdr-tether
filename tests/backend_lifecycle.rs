@@ -9,6 +9,7 @@ use std::{
 use chrono::{Duration, TimeZone, Utc};
 use fs2::FileExt;
 use herdr_tether::{
+    audit::{AuditAction, AuditStore},
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     lifecycle::{
         CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, PruneError,
@@ -260,6 +261,60 @@ fn stop_fixture(line: &str) -> (tempfile::TempDir, StateStore, LifecycleService)
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
     (temp, store, service)
+}
+
+#[test]
+fn a_real_stop_leaves_both_of_its_transitions_in_the_trail() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // A dead pane reporting status 2: a stop is two transitions, and the record
+    // afterwards shows only the second one.
+    let (temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:1:2:0197f198000070008000000000000002",
+    );
+    let trail = AuditStore::new(temp.path().join("audit.json"), 30);
+    let service = service.with_audit(trail.clone());
+
+    service.stop_owned(id()).unwrap();
+
+    let entries = trail.entries().unwrap();
+    let actions: Vec<AuditAction> = entries.iter().map(|entry| entry.action).collect();
+    assert_eq!(
+        actions,
+        vec![AuditAction::Stop, AuditAction::Stopped],
+        "a stop passes through Stopping on its way to Ended: {entries:?}"
+    );
+    assert_eq!(entries[0].from, Some(SessionStatus::Running));
+    assert_eq!(entries[1].to, SessionStatus::Ended);
+    assert_eq!(
+        entries[1].exit_status,
+        Some(2),
+        "the trail keeps how it ended, not just that it ended"
+    );
+    assert_eq!(
+        entries[1].session,
+        store.load().unwrap().sessions[0].id,
+        "the trail names the same workload the state does"
+    );
+}
+
+#[test]
+fn a_trail_that_cannot_be_written_does_not_fail_the_stop() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let (temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002",
+    );
+    // A directory where the trail expects a file: recording cannot succeed.
+    let path = temp.path().join("audit.json");
+    fs::create_dir(&path).unwrap();
+    let service = service.with_audit(AuditStore::new(path, 30));
+
+    service
+        .stop_owned(id())
+        .expect("a record of the work is not a precondition for the work");
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
 }
 
 #[test]
@@ -1869,6 +1924,39 @@ fn prune_state_failures_are_typed_and_apply_does_not_rewrite_bad_state() {
 
     assert!(matches!(service.apply(&preview), Err(PruneError::State(_))));
     assert_eq!(fs::read(state_path).unwrap(), invalid);
+}
+
+#[test]
+fn re_observing_an_ended_workload_adds_nothing_to_the_trail() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // An empty catalog: the picker's status refresh reports every ended workload
+    // as missing, and it does this on every refresh.
+    let (temp, store, service, _) = lifecycle_fixture("\n");
+    let trail = AuditStore::new(temp.path().join("audit.json"), 30);
+    let service = service.with_audit(trail.clone());
+
+    service.observe_owned(id()).unwrap();
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
+    let after_first = trail.entries().unwrap();
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the reconciliation that ended it is worth a line: {after_first:?}"
+    );
+
+    for _ in 0..5 {
+        service.observe_owned(id()).unwrap();
+    }
+    assert_eq!(
+        trail.entries().unwrap(),
+        after_first,
+        "confirming what the record already said is not a transition; recording it \
+         would evict the real history through the entry ceiling"
+    );
+    drop(temp);
 }
 
 #[test]
