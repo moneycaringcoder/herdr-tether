@@ -1572,6 +1572,55 @@ fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone()
         .success()
         .stdout(predicate::str::contains("nothing to restart"));
     assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // A member on a host that cannot be reached fails rather than being assumed
+    // gone. The summary must count only what it attempted: saying "the rest were
+    // stopped" would claim the legacy record it refused to touch was.
+    let mut unreachable = state.clone();
+    unreachable["sessions"][0]["target"] = serde_json::json!("unreachable.invalid");
+    fs::write(sandbox.state_file(), unreachable.to_string()).unwrap();
+    let before = fs::read_to_string(sandbox.state_file()).unwrap();
+    let failed = sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1 of 1 attempted"))
+        .stderr(predicate::str::contains("1 were skipped"))
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        !stderr.contains("the rest were"),
+        "a refusal is not an act: {stderr}"
+    );
+    // The failure names a cause rather than repeating the id, and carries none
+    // of the error's source chain, which holds directories and command text.
+    assert!(stderr.contains("could not prove whether"), "{stderr}");
+    assert!(!stderr.contains("/srv/app"), "{stderr}");
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // Back on a reachable host: the member's workload is already gone, so the
+    // group reconciles it and says so, and the legacy record stays untouched.
+    fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    sandbox
+        .command()
+        .args(["orchestration", "stop-workers", "fleet", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(already gone)"));
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sandbox.state_file()).unwrap()).unwrap();
+    assert_eq!(after["sessions"][0]["status"], "ended");
+    assert_eq!(
+        after["sessions"][1]["ownership_proof"],
+        serde_json::Value::Null,
+        "the legacy record survives untouched: {after}"
+    );
+    assert_eq!(
+        after["sessions"][1]["status"], "running",
+        "a group is not a way to end a workload Tether cannot prove it owns: {after}"
+    );
 }
 
 #[test]

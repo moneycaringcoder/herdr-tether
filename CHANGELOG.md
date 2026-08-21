@@ -61,11 +61,14 @@
   Each workload acted on goes through the same path as `session stop` and
   `session restart`, so the ownership proof, the exact re-inspections, and the
   execution-time `tmux` guard all still apply, and a legacy record with no
-  ownership proof is skipped rather than acted on. A paced restart stays paced.
-  The command asks before acting and refuses to assume consent without a
-  terminal, `--yes` confirms in a script, only the confirmed plan is acted on so
-  a later group edit cannot enlarge it, and one member failing neither abandons
-  the rest nor reads as success.
+  ownership proof is skipped rather than acted on. The statuses it acts from are
+  the ones the single-workload path accepts, so a group can finish a stop it
+  started. A paced restart stays paced, and the pace is re-checked as each
+  workload's turn comes. The command asks before acting and refuses to assume
+  consent without a terminal, `--yes` confirms in a script, only the confirmed
+  plan is acted on so a later group edit cannot enlarge it, each result prints as
+  that workload finishes so an interrupted run still shows what it did, and the
+  exit status is non-zero if any member failed or if nothing was acted on.
 
 ### Changed
 

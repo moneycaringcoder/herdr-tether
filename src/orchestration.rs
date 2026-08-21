@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     io::{self, BufRead, Read, Write},
     sync::{
         Arc,
@@ -26,7 +27,7 @@ use crate::{
     config::{ConfigStore, NotificationDefaults},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
     herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient, NotificationSound},
-    lifecycle::{ClosedWorkload, LifecycleService},
+    lifecycle::{CloseOwnedError, ClosedWorkload, LifecycleService},
     mission_control::{
         MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
         label_materialized_member, resolve_binding,
@@ -84,6 +85,22 @@ impl GroupAction {
     }
 }
 
+/// How a record's status reads as a reason for leaving it alone.
+struct StatusReason(SessionStatus);
+
+impl fmt::Display for StatusReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self.0 {
+            SessionStatus::Creating => "still starting",
+            SessionStatus::Running => "still running; stop it first",
+            SessionStatus::Stopping => "already stopping",
+            SessionStatus::Ended => "already ended",
+            SessionStatus::Removed => "removed",
+        };
+        formatter.write_str(text)
+    }
+}
+
 /// Why a member is not part of the act.
 ///
 /// Each one is a refusal, not a failure: the workload is left exactly as it was,
@@ -95,10 +112,9 @@ pub enum GroupSkip {
     /// A legacy record with no private ownership proof. Tether cannot prove the
     /// workload is its own, so a group is not a way to act on it.
     NoOwnershipProof,
-    /// Not running, so there is nothing to stop.
-    NotRunning,
-    /// Not ended, so a restart would be a second incarnation of live work.
-    NotEnded,
+    /// A status this action cannot act from. The status is carried so the reason
+    /// names what the record actually is rather than what it is not.
+    WrongStatus { status: SessionStatus },
     /// Ended without a retained command, so there is nothing to restart.
     MissingCommand,
     /// Failed immediately, and its restart is still paced.
@@ -114,8 +130,7 @@ impl GroupSkip {
             Self::NoOwnershipProof => {
                 "legacy record with no ownership proof; recreate it to manage it".to_owned()
             }
-            Self::NotRunning => "not running".to_owned(),
-            Self::NotEnded => "still running; stop it first".to_owned(),
+            Self::WrongStatus { status } => format!("{}", StatusReason(status)),
             Self::MissingCommand => "no retained command".to_owned(),
             Self::RestartPaced { seconds } => {
                 format!("failed immediately; restart paced for {seconds}s")
@@ -231,29 +246,79 @@ fn plan_member(action: GroupAction, record: Option<&SessionRecord>) -> GroupDeci
         return GroupDecision::Skip(GroupSkip::NoOwnershipProof);
     }
     match action {
-        GroupAction::Stop if record.status == SessionStatus::Running => GroupDecision::Act,
-        GroupAction::Stop => GroupDecision::Skip(GroupSkip::NotRunning),
-        GroupAction::Restart if record.status != SessionStatus::Ended => {
-            GroupDecision::Skip(GroupSkip::NotEnded)
-        }
-        GroupAction::Restart if record.command.is_none() => {
-            GroupDecision::Skip(GroupSkip::MissingCommand)
-        }
-        GroupAction::Restart => match record.paced_restart_until() {
-            // The pace withholds an explicit single-workload restart, so a group
-            // must not become the way around it.
-            Some(until) => {
-                let remaining = until.signed_duration_since(Utc::now());
-                if remaining > chrono::TimeDelta::zero() {
-                    GroupDecision::Skip(GroupSkip::RestartPaced {
-                        seconds: remaining.num_seconds().max(1),
-                    })
-                } else {
-                    GroupDecision::Act
+        // The same statuses the single-workload stop accepts: `lookup_owned`
+        // refuses only an already closed or removed record, so a group that
+        // demanded exactly `Running` would decline work `session stop` can still
+        // finish - including the half-stopped members left by an interrupted
+        // group stop.
+        GroupAction::Stop => match record.status {
+            SessionStatus::Running | SessionStatus::Creating | SessionStatus::Stopping => {
+                GroupDecision::Act
+            }
+            status => GroupDecision::Skip(GroupSkip::WrongStatus { status }),
+        },
+        // `restart_owned` reserves a new incarnation from `Ended` or `Creating`.
+        GroupAction::Restart => match record.status {
+            SessionStatus::Ended | SessionStatus::Creating => {
+                if record.command.is_none() {
+                    return GroupDecision::Skip(GroupSkip::MissingCommand);
+                }
+                match paced_seconds(record) {
+                    // The pace withholds an explicit single-workload restart, so
+                    // a group must not become the way around it.
+                    Some(seconds) => GroupDecision::Skip(GroupSkip::RestartPaced { seconds }),
+                    None => GroupDecision::Act,
                 }
             }
-            None => GroupDecision::Act,
+            status => GroupDecision::Skip(GroupSkip::WrongStatus { status }),
         },
+    }
+}
+
+/// How long a record's restart is still paced, if it is.
+///
+/// The remainder rounds up, the way the single-workload command reports it, so
+/// it never names a number the user can beat by running it again immediately.
+fn paced_seconds(record: &SessionRecord) -> Option<i64> {
+    let until = record.paced_restart_until()?;
+    let remaining = until.signed_duration_since(Utc::now());
+    (remaining > chrono::TimeDelta::zero()).then(|| (remaining.num_milliseconds() + 999) / 1_000)
+}
+/// A member's failure in one fixed phrase.
+///
+/// The error's source chain is deliberately not printed: it carries directories
+/// and command text, which never travel into output. Each variant gets a
+/// hand-written phrase instead, so a reader can still tell an unreachable host
+/// from a changed identity from a state that would not save.
+fn close_failure_reason(error: &CloseOwnedError) -> String {
+    match error {
+        CloseOwnedError::UnknownSession(_) => "no record; it was removed".to_owned(),
+        CloseOwnedError::AlreadyClosed(_) => "already closed".to_owned(),
+        CloseOwnedError::WorkloadUnknown(_) => {
+            "could not prove whether the workload exists; nothing was changed".to_owned()
+        }
+        CloseOwnedError::ConcurrentModification(_) => {
+            "changed while it was being acted on; retry".to_owned()
+        }
+        CloseOwnedError::State(_) => "session state could not be read or written".to_owned(),
+        CloseOwnedError::BackendConfiguration { .. } => {
+            "its host or backend could not be configured".to_owned()
+        }
+        CloseOwnedError::Inspect { .. } => {
+            "its host could not be inspected; check the host, then retry".to_owned()
+        }
+        CloseOwnedError::Close { .. } => "the workload could not be ended; retry".to_owned(),
+        CloseOwnedError::Finalize { .. } => {
+            "it was ended but the final state could not be saved; retry to reconcile".to_owned()
+        }
+        CloseOwnedError::MissingOwnershipProof(_) => {
+            "no ownership proof; refusing to act on it".to_owned()
+        }
+        CloseOwnedError::MissingCommand(_) => "no retained command".to_owned(),
+        CloseOwnedError::InvalidStatus { status, .. } => format!("{}", StatusReason(*status)),
+        CloseOwnedError::Create { .. } => {
+            "a new incarnation could not be created; retry".to_owned()
+        }
     }
 }
 
@@ -527,7 +592,9 @@ impl OrchestrationService {
         group_id: &OrchestrationGroupId,
         action: GroupAction,
     ) -> Result<GroupPlan> {
-        let state = self.store.load()?;
+        // `--dry-run` promises to change nothing, and the migrating load would
+        // rewrite a pre-v4 file just by reading it.
+        let state = self.store.load_read_only()?;
         let group = state
             .orchestration_groups
             .iter()
@@ -567,54 +634,93 @@ impl OrchestrationService {
     /// Only members named in the plan are acted on, and only while their
     /// membership is unchanged, so a group edited after the confirmation cannot
     /// enlarge or redirect what was confirmed. One member's failure does not
-    /// abandon the rest; each result is reported on its own.
+    /// abandon the rest.
+    ///
+    /// Each outcome is handed to `report` the moment that member finishes, so a
+    /// caller can say what happened while it happens. This matters more than it
+    /// looks: a stop contacts a host per member, and a group that printed
+    /// nothing until the end would look hung and invite an interruption that
+    /// destroyed the record of the workloads it had already ended.
     pub fn apply_group_action(
         &self,
         plan: &GroupPlan,
         lifecycle: &LifecycleService,
-    ) -> Result<GroupActionReport> {
+        mut report: impl FnMut(&GroupOutcome),
+    ) -> GroupActionReport {
         let mut outcomes = Vec::with_capacity(plan.entries.len());
         for entry in &plan.entries {
-            let GroupDecision::Act = entry.decision else {
-                let GroupDecision::Skip(reason) = entry.decision else {
-                    unreachable!("a decision is either an action or a skip");
-                };
-                outcomes.push(GroupOutcome {
-                    session_id: entry.session_id,
-                    result: GroupMemberResult::Skipped(reason),
-                });
-                continue;
-            };
-            // A remove and re-add between the confirmation and here produces a
-            // new membership, which is a different authorization than the one
-            // that was confirmed.
-            if !self.membership_unchanged(&plan.group_id, entry)? {
-                outcomes.push(GroupOutcome {
-                    session_id: entry.session_id,
-                    result: GroupMemberResult::Skipped(GroupSkip::MembershipChanged),
-                });
-                continue;
-            }
-            let result = match plan.action {
-                GroupAction::Stop => lifecycle
-                    .stop_owned(entry.session_id)
-                    .map(|closed| GroupMemberResult::Stopped(closed.workload)),
-                GroupAction::Restart => lifecycle
-                    .restart_owned(entry.session_id)
-                    .map(|_| GroupMemberResult::Restarted),
-            };
-            outcomes.push(GroupOutcome {
+            let outcome = GroupOutcome {
                 session_id: entry.session_id,
-                result: result.unwrap_or_else(|error| {
-                    GroupMemberResult::Failed(sanitize_group_failure(&error.to_string()))
-                }),
-            });
+                result: self.act_on_member(plan, entry, lifecycle),
+            };
+            report(&outcome);
+            outcomes.push(outcome);
         }
-        Ok(GroupActionReport {
+        GroupActionReport {
             group_id: plan.group_id.clone(),
             action: plan.action,
             outcomes,
-        })
+        }
+    }
+
+    fn act_on_member(
+        &self,
+        plan: &GroupPlan,
+        entry: &GroupPlanEntry,
+        lifecycle: &LifecycleService,
+    ) -> GroupMemberResult {
+        if let GroupDecision::Skip(reason) = entry.decision {
+            return GroupMemberResult::Skipped(reason);
+        }
+        // A remove and re-add between the confirmation and here produces a new
+        // membership, which is a different authorization than the one that was
+        // confirmed. A state read that fails is this member's failure, not the
+        // group's: the members already acted on must still be reported.
+        match self.membership_unchanged(&plan.group_id, entry) {
+            Ok(true) => {}
+            Ok(false) => return GroupMemberResult::Skipped(GroupSkip::MembershipChanged),
+            Err(error) => {
+                return GroupMemberResult::Failed(sanitize_group_failure(&error.to_string()));
+            }
+        }
+        match plan.action {
+            GroupAction::Stop => match lifecycle.stop_owned(entry.session_id) {
+                Ok(closed) => GroupMemberResult::Stopped(closed.workload),
+                Err(error) => GroupMemberResult::Failed(close_failure_reason(&error)),
+            },
+            GroupAction::Restart => {
+                // The pace is a rule about the record as it is now, and another
+                // Tether invocation can have restarted this member since the
+                // plan. Re-reading it here is what keeps a group from being the
+                // way around a pace that appeared in between.
+                match self.paced_since_plan(entry.session_id) {
+                    Ok(Some(seconds)) => {
+                        return GroupMemberResult::Skipped(GroupSkip::RestartPaced { seconds });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return GroupMemberResult::Failed(sanitize_group_failure(
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                match lifecycle.restart_owned(entry.session_id) {
+                    Ok(_) => GroupMemberResult::Restarted,
+                    Err(error) => GroupMemberResult::Failed(close_failure_reason(&error)),
+                }
+            }
+        }
+    }
+
+    /// Whether this member's restart is paced as of now.
+    fn paced_since_plan(&self, session_id: SessionId) -> Result<Option<i64>> {
+        Ok(self
+            .store
+            .load_read_only()?
+            .sessions
+            .iter()
+            .find(|record| record.id == session_id)
+            .and_then(paced_seconds))
     }
 
     fn membership_unchanged(
@@ -3642,33 +3748,57 @@ mod tests {
             exit_status: Some(0),
             ..base.clone()
         };
-        // Failed inside the fast-failure window, so its restart is paced.
+        // Failed inside the fast-failure window, so its restart is paced. Both
+        // stamps come from one clock reading with an explicit gap, so the record
+        // is always a fast failure rather than sometimes a zero-length one.
+        let clock = Utc::now();
         let paced = SessionRecord {
             id: "tether-0197f198000070008000000000000005".parse().unwrap(),
             status: SessionStatus::Ended,
-            last_used_at: Utc::now(),
-            closed_at: Some(Utc::now()),
+            last_used_at: clock,
+            closed_at: Some(clock + chrono::TimeDelta::seconds(1)),
             exit_status: Some(1),
             ..base.clone()
         };
+        // Mid-transition records: the single-workload path still acts on these,
+        // so a group that refused them could not finish a stop it started.
+        let creating = SessionRecord {
+            id: "tether-0197f198000070008000000000000007".parse().unwrap(),
+            status: SessionStatus::Creating,
+            tmux_session_id: None,
+            ..base.clone()
+        };
+        let stopping = SessionRecord {
+            id: "tether-0197f198000070008000000000000008".parse().unwrap(),
+            status: SessionStatus::Stopping,
+            ..base.clone()
+        };
         let absent: SessionId = "tether-0197f198000070008000000000000006".parse().unwrap();
-        let members = [running.id, legacy.id, ended.id, paced.id, absent]
-            .into_iter()
-            .map(|session_id| OrchestrationMember {
-                session_id,
-                membership_id: OrchestrationMembershipId::new(),
-                title: None,
-                capabilities: OrchestrationCapabilities {
-                    observe_output: true,
-                    open_interactive: true,
-                    prompt_agent: false,
-                },
-            })
-            .collect();
+        let members = [
+            running.id,
+            legacy.id,
+            ended.id,
+            paced.id,
+            creating.id,
+            stopping.id,
+            absent,
+        ]
+        .into_iter()
+        .map(|session_id| OrchestrationMember {
+            session_id,
+            membership_id: OrchestrationMembershipId::new(),
+            title: None,
+            capabilities: OrchestrationCapabilities {
+                observe_output: true,
+                open_interactive: true,
+                prompt_agent: false,
+            },
+        })
+        .collect();
         (
             State {
                 version: State::CURRENT_VERSION,
-                sessions: vec![running, legacy, ended, paced],
+                sessions: vec![running, legacy, ended, paced, creating, stopping],
                 orchestration_groups: vec![OrchestrationGroup {
                     id: group_id.clone(),
                     title: "Group".parse().unwrap(),
@@ -3693,22 +3823,37 @@ mod tests {
         store.save(&state).unwrap();
         let service = OrchestrationService::new(store);
 
+        // Stop mirrors `lookup_owned`: a mid-transition record is still work the
+        // single-workload path can finish, so a group must not refuse it.
         let stop = service
             .plan_group_action(&group_id, GroupAction::Stop)
             .unwrap();
         let acting: Vec<_> = stop.acting().map(|entry| entry.session_id).collect();
         assert_eq!(
             acting,
-            vec![state.sessions[0].id],
-            "only the running exact-owned member may be stopped"
+            vec![
+                state.sessions[0].id,
+                state.sessions[4].id,
+                state.sessions[5].id
+            ],
+            "running, creating, and stopping members are all stoppable"
         );
-        let skipped: Vec<_> = stop.skipped().collect();
         assert_eq!(
-            skipped,
+            stop.skipped().collect::<Vec<_>>(),
             vec![
                 (state.sessions[1].id, GroupSkip::NoOwnershipProof),
-                (state.sessions[2].id, GroupSkip::NotRunning),
-                (state.sessions[3].id, GroupSkip::NotRunning),
+                (
+                    state.sessions[2].id,
+                    GroupSkip::WrongStatus {
+                        status: SessionStatus::Ended
+                    }
+                ),
+                (
+                    state.sessions[3].id,
+                    GroupSkip::WrongStatus {
+                        status: SessionStatus::Ended
+                    }
+                ),
                 (
                     "tether-0197f198000070008000000000000006".parse().unwrap(),
                     GroupSkip::MissingRecord
@@ -3716,30 +3861,44 @@ mod tests {
             ]
         );
 
+        // Restart mirrors `restart_owned`, which reserves from Ended or Creating.
         let restart = service
             .plan_group_action(&group_id, GroupAction::Restart)
             .unwrap();
         let acting: Vec<_> = restart.acting().map(|entry| entry.session_id).collect();
         assert_eq!(
             acting,
-            vec![state.sessions[2].id],
-            "a paced or running member is not restarted by a group"
+            vec![state.sessions[2].id, state.sessions[4].id],
+            "a paced, running, or stopping member is not restarted by a group"
         );
         let reasons: Vec<_> = restart.skipped().map(|(_, reason)| reason).collect();
         assert!(
             matches!(
                 reasons.as_slice(),
                 [
-                    GroupSkip::NotEnded,
+                    GroupSkip::WrongStatus {
+                        status: SessionStatus::Running
+                    },
                     GroupSkip::NoOwnershipProof,
-                    // The pace is measured from the recorded end, so the exact
-                    // remainder depends on the clock; that it is withheld at all
-                    // is the property.
+                    // Measured from the recorded end against the wall clock, so
+                    // the remainder is within a second of the full pace.
                     GroupSkip::RestartPaced { seconds },
+                    GroupSkip::WrongStatus {
+                        status: SessionStatus::Stopping
+                    },
                     GroupSkip::MissingRecord,
-                ] if (1..=30).contains(seconds)
+                ] if (30..=31).contains(seconds)
             ),
             "a legacy record is refused before its status is even considered: {reasons:?}"
+        );
+        // The wait rounds up, the way the single-workload command reports it, so
+        // it never names a number the user can beat by trying again at once.
+        assert!(
+            reasons.iter().any(|reason| matches!(
+                reason,
+                GroupSkip::RestartPaced { seconds } if *seconds >= 30
+            )),
+            "{reasons:?}"
         );
     }
 
@@ -3758,12 +3917,14 @@ mod tests {
             .unwrap();
 
         // A remove and re-add between the confirmation and the act is a new
-        // authorization, so the confirmed one no longer applies.
-        state.orchestration_groups[0].workers[0].membership_id = OrchestrationMembershipId::new();
+        // authorization, so the confirmed one no longer applies to any member.
+        for member in &mut state.orchestration_groups[0].workers {
+            member.membership_id = OrchestrationMembershipId::new();
+        }
         store.save(&state).unwrap();
 
         let lifecycle = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
-        let report = service.apply_group_action(&plan, &lifecycle).unwrap();
+        let report = service.apply_group_action(&plan, &lifecycle, |_| {});
         assert_eq!(report.acted(), 0);
         assert_eq!(report.failed(), 0);
         assert_eq!(
@@ -3777,7 +3938,58 @@ mod tests {
     }
 
     #[test]
-    fn a_group_action_reports_each_member_on_its_own() {
+    fn a_pace_that_appears_after_the_plan_still_withholds_the_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (mut state, group_id) = group_action_state(now);
+        store.save(&state).unwrap();
+        let service = OrchestrationService::new(store.clone());
+        let plan = service
+            .plan_group_action(&group_id, GroupAction::Restart)
+            .unwrap();
+        let eligible = state.sessions[2].id;
+        assert!(plan.acting().any(|entry| entry.session_id == eligible));
+
+        // Another Tether invocation restarted this member during the
+        // confirmation, and it failed immediately. The plan predates that, so a
+        // group that trusted the plan alone would be the way around the pace.
+        let clock = Utc::now();
+        state.sessions[2].last_used_at = clock;
+        state.sessions[2].closed_at = Some(clock + chrono::TimeDelta::seconds(1));
+        state.sessions[2].exit_status = Some(1);
+        store.save(&state).unwrap();
+
+        // Absent tools, so no member can reach a host: this test is about the
+        // refusal, and a real `tmux` here would create actual sessions.
+        let lifecycle = LifecycleService::new(
+            store,
+            ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+        );
+        let report = service.apply_group_action(&plan, &lifecycle, |_| {});
+        let outcome = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.session_id == eligible)
+            .map(|outcome| outcome.result.clone());
+        assert!(
+            matches!(
+                outcome,
+                Some(GroupMemberResult::Skipped(GroupSkip::RestartPaced { .. }))
+            ),
+            "a pace that appeared after the plan must still withhold: {outcome:?}"
+        );
+        assert_eq!(
+            report.acted(),
+            0,
+            "the paced member is the only one that could have been restarted"
+        );
+    }
+
+    #[test]
+    fn a_group_action_reports_each_member_as_it_finishes() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(temp.path().join("state.json"));
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
@@ -3789,28 +4001,48 @@ mod tests {
         let plan = service
             .plan_group_action(&group_id, GroupAction::Stop)
             .unwrap();
-        // No `tmux` here, so the one eligible member's stop fails in transport.
-        // The refusals around it are still reported, and one failure does not
-        // abandon the rest of the group.
+        // No `tmux` here, so every eligible member's stop fails in transport.
+        // The refusals around them are still reported, one failure does not
+        // abandon the rest, and each outcome is handed over as it happens rather
+        // than in one batch at the end.
         let lifecycle = LifecycleService::new(
             store,
             ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
         );
-        let report = service.apply_group_action(&plan, &lifecycle).unwrap();
-        assert_eq!(report.outcomes.len(), 5);
+        let mut streamed = Vec::new();
+        let report = service.apply_group_action(&plan, &lifecycle, |outcome| {
+            streamed.push((outcome.session_id, outcome.result.clone()));
+        });
+        assert_eq!(report.outcomes.len(), 7);
         assert_eq!(report.acted(), 0);
-        assert_eq!(report.failed(), 1);
+        assert_eq!(
+            report.failed(),
+            3,
+            "running, creating, and stopping members"
+        );
         assert_eq!(report.skipped(), 4);
+        assert_eq!(
+            streamed,
+            report
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.session_id, outcome.result.clone()))
+                .collect::<Vec<_>>(),
+            "every outcome is reported once, in order, as it finishes"
+        );
         let failure = report
             .outcomes
             .iter()
             .find(|outcome| matches!(outcome.result, GroupMemberResult::Failed(_)))
-            .expect("the eligible member reports its own failure");
+            .expect("an eligible member reports its own failure");
         assert_eq!(failure.session_id, state.sessions[0].id);
         let GroupMemberResult::Failed(text) = &failure.result else {
             unreachable!();
         };
-        assert!(!text.contains('\n'), "one bounded line: {text:?}");
+        // A named cause, not the session id twice, and none of the error's
+        // source chain - which carries directories and command text.
+        assert!(text.contains("host could not be inspected"), "{text:?}");
+        assert!(!text.contains('\n') && !text.contains("/tmp"), "{text:?}");
     }
 
     #[test]

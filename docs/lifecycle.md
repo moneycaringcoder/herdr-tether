@@ -64,12 +64,20 @@ skipped and says why.
 
 Because it covers more than one workload, it asks before acting, and without a
 terminal it refuses rather than assuming consent - pass `--yes` to confirm in a
-script. A restart that is paced after an immediate failure stays paced; the
-group reports the wait rather than working around it. Only the workloads named
-in the confirmed plan are acted on, so editing the group afterwards cannot
-enlarge what was confirmed. One workload failing does not abandon the rest: each
-result is reported on its own line and the command exits non-zero if any member
-failed.
+script. A restart that is paced after an immediate failure stays paced, and the
+pace is checked again as each workload's turn comes, so another restart during
+the wait cannot slip past it. Only the workloads named in the confirmed plan are
+acted on, so editing the group afterwards cannot enlarge what was confirmed.
+Each result is printed as that workload finishes rather than in one batch at the
+end, so an interrupted run still shows exactly what it had done. One workload
+failing does not abandon the rest, and the command exits non-zero if any member
+failed or if nothing was acted on after all.
+
+The orchestrator pane is not a worker and is left running; stop it with
+`herdr-tether session stop` if you want it gone. A group's orchestrator can be a
+worker of a *different* group, and acting on that group does act on it - it is
+still a Tether-owned workload, but it is worth knowing before running this
+against a group you did not build.
 
 ## States shown in the picker
 

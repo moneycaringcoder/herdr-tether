@@ -1757,8 +1757,10 @@ fn group_action(
 
     let store = StateStore::new(paths.state_file.clone());
     let lifecycle = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
-    let report = service.apply_group_action(&plan, &lifecycle)?;
-    for outcome in &report.outcomes {
+    // Each line is printed as its member finishes: a stop contacts a host per
+    // member, and a command that went silent for minutes would invite the
+    // interruption that loses the record of what it already ended.
+    let report = service.apply_group_action(&plan, &lifecycle, |outcome| {
         match &outcome.result {
             GroupMemberResult::Stopped(ClosedWorkload::Terminated) => {
                 println!("stopped {}", outcome.session_id);
@@ -1767,29 +1769,45 @@ fn group_action(
                 println!("stopped {} (already gone)", outcome.session_id);
             }
             GroupMemberResult::Restarted => println!("restarted {}", outcome.session_id),
-            // The plan already listed every refusal it knew about; repeating them
-            // here would bury the outcomes. A membership that changed after the
-            // confirmation is new information, so it is said.
-            GroupMemberResult::Skipped(GroupSkip::MembershipChanged) => {
-                println!(
-                    "skip {}: {}",
-                    outcome.session_id,
-                    GroupSkip::MembershipChanged.reason()
-                );
+            // The plan already listed every refusal it knew about; repeating
+            // them would bury the outcomes. A refusal decided here is new
+            // information, so it is said.
+            GroupMemberResult::Skipped(
+                reason @ (GroupSkip::MembershipChanged | GroupSkip::RestartPaced { .. }),
+            ) => {
+                println!("skip {}: {}", outcome.session_id, reason.reason());
             }
             GroupMemberResult::Skipped(_) => {}
             GroupMemberResult::Failed(error) => {
                 eprintln!("failed {}: {error}", outcome.session_id);
             }
         }
-    }
-    // A member that failed leaves the others done: the report says which, and a
-    // non-zero status keeps a script from reading a partial act as a clean one.
+        // Flushed per member so an interrupted group still shows exactly what it
+        // had done by then.
+        let _ = io::stdout().flush();
+    });
+
+    let attempted = report.acted() + report.failed();
     if report.failed() > 0 {
+        // A member that failed leaves the others done. The counts name only what
+        // was attempted, because saying "the rest were stopped" would claim the
+        // refusals were acted on.
         bail!(
-            "{} of {} members could not be {}; the rest were",
+            "{} of {attempted} attempted members could not be {}; {} were, and {} were skipped",
             report.failed(),
-            report.outcomes.len(),
+            match action {
+                GroupAction::Stop => "stopped",
+                GroupAction::Restart => "restarted",
+            },
+            report.acted(),
+            report.skipped()
+        );
+    }
+    // Every member the confirmation covered was refused at the last moment, so
+    // nothing happened. A script that read exit zero would believe otherwise.
+    if report.acted() == 0 {
+        bail!(
+            "nothing was {} in `{group}`: every confirmed member was skipped when it came to act",
             match action {
                 GroupAction::Stop => "stopped",
                 GroupAction::Restart => "restarted",
