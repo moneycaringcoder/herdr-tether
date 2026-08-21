@@ -8,17 +8,19 @@ release tag this file is that release's record; on `main` it describes `main`.
 
 ## Exercised
 
-| Platform | Herdr release | How it was exercised |
-| --- | --- | --- |
-| Ubuntu 24.04 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
-| macOS 14 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
+| Runner image | Architecture | Herdr release | How it was exercised |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 | x86_64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
+| macOS 14 | arm64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
+| Ubuntu 24.04 arm | aarch64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
 
 Every row is a real run: the gate downloads the official Herdr release asset for
 the runner's platform, verifies it against a pinned SHA-256, validates the
 socket API schema it reports, builds Tether from the locked manifest, and drives
-a workload through `tmux` end to end. A row names the runner image the gate
-uses, not every architecture of that operating system, and a row exists only for
-a platform the gate actually covers.
+a workload through `tmux` end to end. A row names the runner image and the
+architecture the gate ran on, and a row exists only for a platform the gate
+actually covers - so a row is what was exercised rather than what is expected to
+work.
 
 ## Socket protocol
 

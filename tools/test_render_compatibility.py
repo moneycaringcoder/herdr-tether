@@ -20,10 +20,12 @@ jobs:
         include:
           - os: ubuntu-24.04
             label: Ubuntu 24.04
+            arch: x86_64
             platform: linux
             herdr_version: "0.8.0"
           - os: macos-14
             label: macOS 14
+            arch: arm64
             platform: macos
             herdr_version: "0.9.1"
     runs-on: ${{ matrix.os }}
@@ -36,6 +38,7 @@ jobs:
         include:
           - os: ubuntu-22.04
             label: Ubuntu 22.04
+            arch: x86_64
             herdr_version: "0.6.0"
 """
 
@@ -73,8 +76,8 @@ class RenderCompatibilityTest(unittest.TestCase):
             root = Path(directory)
             write_tree(root)
             document = render_compatibility.render(root)
-        self.assertIn("| Ubuntu 24.04 | 0.8.0 |", document)
-        self.assertIn("| macOS 14 | 0.9.1 |", document)
+        self.assertIn("| Ubuntu 24.04 | x86_64 | 0.8.0 |", document)
+        self.assertIn("| macOS 14 | arm64 | 0.9.1 |", document)
         self.assertIn("this revision of Tether was exercised", document)
         # Both releases, not just the one the protocol floor names.
         self.assertIn("other than 0.8.0, 0.9.1 are not covered", document)
@@ -189,7 +192,7 @@ class RenderCompatibilityTest(unittest.TestCase):
             root = Path(directory)
             write_tree(root, gate=GATE.replace("label: Ubuntu 24.04", 'label: "Ubuntu 24.04" # LTS'))
             document = render_compatibility.render(root)
-        self.assertIn("| Ubuntu 24.04 | 0.8.0 |", document)
+        self.assertIn("| Ubuntu 24.04 | x86_64 | 0.8.0 |", document)
         self.assertNotIn("LTS", document)
 
     def test_a_label_that_would_break_the_table_is_an_error(self):
@@ -228,11 +231,57 @@ class RenderCompatibilityTest(unittest.TestCase):
         entries = render_compatibility.parse_stable_gate(gate)
         rows = [line for line in document.splitlines() if line.startswith("| ") and " | 0." in line]
         self.assertEqual(len(rows), len(entries))
-        for label, version in entries:
-            self.assertIn(f"| {label} | {version} |", document)
+        for label, arch, version in entries:
+            self.assertIn(f"| {label} | {arch} | {version} |", document)
         self.assertIn("Ubuntu 24.04", document)
         self.assertIn("macOS 14", document)
+        # Every architecture the gate names reaches the table, so a reader on one
+        # of them does not have to infer coverage from an operating system name.
+        for arch in {arch for _, arch, _ in entries}:
+            self.assertIn(f"| {arch} | ", document)
 
+
+    def test_every_asset_the_gate_can_select_is_reachable_by_a_job(self):
+        # The gate used to carry asset branches for architectures no job ran on,
+        # which made it read as broader coverage than it had. Pin the two lists
+        # against each other so a branch cannot outlive its runner, and a runner
+        # cannot be added without its asset.
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / render_compatibility.STABLE_GATE).read_text(encoding="utf-8")
+        entries = render_compatibility.parse_stable_gate(gate)
+        block = render_compatibility.job_block(gate, render_compatibility.STABLE_GATE_JOB)
+
+        selectable = set()
+        for line in block.splitlines():
+            stripped = line.strip()
+            if not stripped.endswith(")") or ":" not in stripped or stripped.startswith("#"):
+                continue
+            for candidate in stripped.removesuffix(")").split("|"):
+                parts = candidate.strip().split(":")
+                if len(parts) == 3 and parts[0][0].isdigit():
+                    selectable.add(tuple(parts))
+        self.assertTrue(selectable, "the asset selection was not found")
+
+        platforms = {}
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- os:") or stripped.startswith("platform:") or stripped.startswith("arch:") or stripped.startswith("herdr_version:"):
+                key, _, value = stripped.removeprefix("- ").partition(":")
+                platforms.setdefault(key.strip(), []).append(
+                    value.strip().strip('"')
+                )
+        reachable = {
+            (version, platform, arch)
+            for version, platform, arch in zip(
+                platforms["herdr_version"], platforms["platform"], platforms["arch"]
+            )
+        }
+        # `uname -m` reports arm64 on macOS and aarch64 on Linux, which is why
+        # each entry carries the architecture its runner actually reports. The two
+        # sets must match exactly: a branch with no runner claims coverage the
+        # gate does not have, and a runner with no branch fails the download.
+        self.assertEqual(selectable, reachable)
+        self.assertEqual(len(entries), len(reachable))
 
 if __name__ == "__main__":
     unittest.main()
