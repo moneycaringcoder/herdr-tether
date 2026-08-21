@@ -151,6 +151,17 @@
 
 ### Fixed
 
+- `herdr-tether host check` now runs its probes under the same bounded executor as
+  every other `tmux` and SSH probe, so a host that answers its connection while
+  the command never returns ends the check with a timeout naming the probe that
+  stalled, rather than waiting for as long as the command does. The local version
+  probe gets the three seconds `doctor` gives the identical command; a remote probe
+  gets thirty, which is above the ten-second connection timeout Tether asks OpenSSH
+  for and the same ceiling a `tmux` command travelling over SSH already had. A
+  probe that could not start, timed out, or answered with more output than is safe
+  to read is now distinguished from one that answered - so the optional Herdr probe
+  reports `herdr not found` only when the host actually said so.
+
 - A Stop no longer reports having stopped a workload it never found, and an
   inspection `tmux` refused is no longer read as a workload that ended. The exact
   inspection filters by session name and ownership proof, so a server that answers
