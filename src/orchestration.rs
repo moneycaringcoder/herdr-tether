@@ -2184,9 +2184,12 @@ const fn stale_reason_for(failure: BindingFailure) -> Option<StaleReason> {
     match failure {
         BindingFailure::StaleMembership => Some(StaleReason::EarlierMembership),
         BindingFailure::Ambiguous => Some(StaleReason::AmbiguousClaim),
-        BindingFailure::Replaced => Some(StaleReason::ReplacedOccupant),
-        // Not stale: these are the detached and unknown states.
-        BindingFailure::Detached
+        // `Replaced` is declared but never detected: nothing in the crate
+        // constructs it, so a changed occupant arrives as one of the others
+        // today. Naming a reason no path can produce would document a remedy no
+        // operator can be shown, so it maps to nothing until it is detected.
+        BindingFailure::Replaced
+        | BindingFailure::Detached
         | BindingFailure::UnknownAgent
         | BindingFailure::AgentKindMismatch => None,
     }

@@ -201,11 +201,6 @@ pub enum StaleReason {
     /// Nothing Tether can do settles which one is real, so the remedy is in
     /// Herdr: one of the two panes has to go.
     AmbiguousClaim,
-    /// The occupant of the materialized pane changed.
-    ///
-    /// Something took the pane. A resnapshot will keep reporting the same thing,
-    /// so the workload has to be opened again.
-    ReplacedOccupant,
     /// Mission Control lost the connection that was reporting this worker.
     Connection,
     /// The observed output could not be re-read, so what is shown is retained.
@@ -1355,19 +1350,14 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
                     ),
                     "STALE · two panes claim this worker · close one in Herdr".to_owned(),
                     "STALE · two panes claim it · close one in Herdr".to_owned(),
-                    format!("STALE · ambiguous claim · r {refresh_verb}"),
-                    format!("STALE · r {refresh_verb}"),
-                ],
-            ))
-        }
-        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::ReplacedOccupant) => {
-            Some(widest_that_fits(
-                inner_width,
-                &[
-                    "STALE · the pane occupant changed · reopen from the picker".to_owned(),
-                    "STALE · pane occupant changed · reopen from the picker".to_owned(),
-                    "STALE · occupant changed · reopen it".to_owned(),
-                    format!("STALE · r {refresh_verb}"),
+                    // Every rung keeps the action, because the retry the other
+                    // reasons fall back to is the one thing that cannot help
+                    // here: it reports the same two claims every time. A tile is
+                    // half the canvas as soon as there are two workers, so these
+                    // short rungs are what a real page shows.
+                    "STALE · two panes claim it · close one".to_owned(),
+                    "STALE · 2 panes claim it · close one".to_owned(),
+                    "STALE · 2 claims · close one".to_owned(),
                 ],
             ))
         }

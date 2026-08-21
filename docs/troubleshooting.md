@@ -149,15 +149,14 @@ could not be re-read is shown as retained, with the time it was last live. A los
 Mission Control connection shows the last known state, also dated, and comes back
 on its own once the connection does.
 
-A binding that is no longer exactly one recognized occupant is three different
+A binding that is no longer exactly one recognized occupant is two different
 problems, and the tile says which:
 
 - **The pane belongs to an earlier membership.** The group was edited while
   Mission Control was open, so the claim simply moved on. `r` is enough.
 - **Two Herdr panes claim this worker.** Nothing Tether does settles which one is
-  real. Close one in Herdr, then `r`.
-- **The pane occupant changed.** Something took the pane, and resnapshotting will
-  keep reporting the same thing. Reopen the worker from the picker.
+  real, and retrying reports the same two claims every time. Close one in Herdr,
+  then `r`. Closing a Herdr pane does not stop the workload.
 
 `UNREACHABLE` means nothing answered. When there is nothing retained the tile
 says so, because there is no remembered output to read; when Herdr is
