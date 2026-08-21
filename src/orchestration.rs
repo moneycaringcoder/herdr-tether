@@ -1067,6 +1067,10 @@ pub fn run_observer(
     let group = service.group(&group_id)?;
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
+    // The agent state each visible tile's output sample was taken for, so a
+    // sample is refreshed when Herdr says that worker changed rather than on a
+    // timer.
+    let mut sampled_states: HashMap<String, ObserverAgentState> = HashMap::new();
     let (capture_worker, observer_results) = CaptureWorker::spawn();
     // Herdr needs the pane ids up front, so the first refresh discovers the
     // group's panes and the event monitor subscribes afterwards.
@@ -1186,6 +1190,15 @@ pub fn run_observer(
             require_observer_authority(outcome)?;
             last_refresh = Instant::now();
         }
+        // After the metadata settles, so a sample is only taken for workers the
+        // refresh left visible and observable.
+        refresh_output_previews(
+            &store,
+            &group_id,
+            &mut observer,
+            mission_client.as_ref(),
+            &mut sampled_states,
+        );
         if agent_panes != subscribed_panes {
             // Members are opened and closed while Mission Control is running, so
             // the watched pane set has to follow. Herdr fixes a subscription's
@@ -1828,6 +1841,87 @@ fn capture_fingerprint(
     })
 }
 
+/// How many recent lines a tile samples to show what a workload is doing.
+///
+/// Small on purpose. A tile is a glance, not a log: four of them share a screen,
+/// and the sample is bounded again by the display caps before it is drawn. `v`
+/// remains the way to ask for more.
+const PREVIEW_LINES: u32 = 16;
+
+/// Takes a bounded output sample for the visible recognized agents that need one.
+///
+/// Recognized live agents are deliberately left out of the recurring `tmux`
+/// capture, which is why their tiles otherwise show nothing until someone
+/// presses `v`. This fills that gap without adding a poll: a sample is taken
+/// when a tile has none yet, or when Herdr has told us that worker's state
+/// changed. Cost is therefore proportional to what happened rather than to how
+/// long the surface stayed open, and it is capped at the visible page.
+///
+/// Presentation only. The sample is merged as capture content and is never read
+/// back to decide a state: agent state keeps coming from Herdr's typed snapshot
+/// and events.
+fn refresh_output_previews(
+    store: &StateStore,
+    group_id: &OrchestrationGroupId,
+    observer: &mut ObserverState,
+    client: Option<&HerdrSocketClient>,
+    sampled: &mut HashMap<String, ObserverAgentState>,
+) {
+    let Some(client) = client else {
+        return;
+    };
+    for (worker_id, state) in workers_needing_sample(observer, sampled) {
+        // Recorded before the attempt, so a worker whose read fails is not
+        // retried on every pass while its state stays the same.
+        sampled.insert(worker_id.clone(), state);
+        let sample = mission_targets(store, group_id, std::slice::from_ref(&worker_id)).and_then(
+            |targets| {
+                let mission = MissionControlService::new(store.clone(), client.clone());
+                let binding = mission.binding_for_observation(group_id, &targets[0])?;
+                client.agent_read(binding.target(), PREVIEW_LINES)
+            },
+        );
+        // A sample that could not be taken leaves the tile exactly as it was.
+        // It is a convenience, so it never becomes an error the user has to
+        // dismiss on every refresh.
+        if let Ok(read) = sample {
+            observer.merge_capture(
+                &worker_id,
+                ObserverCapture::Preview {
+                    text: read.text,
+                    lines: PREVIEW_LINES,
+                },
+            );
+        }
+    }
+}
+
+/// Which visible tiles need an output sample taken now.
+///
+/// A tile qualifies when it has never been sampled, or when the worker's state
+/// has changed since its last sample: those are the moments its output is worth
+/// looking at again. Anything else returns nothing, which is what keeps an idle
+/// Mission Control from reading output on a timer.
+///
+/// Only the visible page is considered, which is what bounds a pass: at most
+/// four tiles are on screen, so at most four samples can be taken from one.
+fn workers_needing_sample(
+    observer: &ObserverState,
+    sampled: &HashMap<String, ObserverAgentState>,
+) -> Vec<(String, ObserverAgentState)> {
+    observer
+        .visible_workers()
+        .iter()
+        .filter(|worker| worker.can_observe_agent())
+        .filter(|worker| {
+            sampled
+                .get(&worker.id)
+                .is_none_or(|state| *state != worker.agent_state)
+        })
+        .map(|worker| (worker.id.clone(), worker.agent_state))
+        .collect()
+}
+
 struct CaptureRequest {
     group: OrchestrationGroup,
     sessions: Vec<SessionRecord>,
@@ -1917,6 +2011,9 @@ fn observer_workers(
                 incarnation: record.and_then(|record| record.tmux_session_id),
                 latency_ms: live_agent.then_some(mission_latency_ms).flatten(),
                 capture: None,
+                // A metadata projection carries no output; the retained sample
+                // and its provenance are restored when the workers are merged.
+                preview_lines: None,
                 // In this projection the only way to be stale is a binding that
                 // is no longer exactly one recognized occupant; a lost
                 // connection reads as unreachable here and is named later.
@@ -2112,6 +2209,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::observer::WORKERS_PER_PAGE;
+
     use crate::observer::{ObserverAction, action_for_input};
 
     #[test]
@@ -2167,10 +2266,83 @@ mod tests {
             incarnation: None,
             latency_ms: None,
             capture: capture.map(str::to_owned),
+            preview_lines: None,
             stale_reason: None,
         }
     }
 
+    /// A recognized live agent whose output may be observed.
+    fn live_observable(id: &str) -> ObserverWorker {
+        ObserverWorker {
+            live_agent: true,
+            agent_state: ObserverAgentState::Working,
+            ..worker(id, ObserverLifecycle::Running, None)
+        }
+    }
+
+    #[test]
+    fn output_samples_follow_change_rather_than_a_timer() {
+        let mut observer = ObserverState::new(vec![live_observable("a"), live_observable("b")]);
+        let mut sampled = HashMap::new();
+
+        // Nothing sampled yet, so both visible tiles need one: a tile with no
+        // output tells a reader nothing about what its workload is doing.
+        let wanted = workers_needing_sample(&observer, &sampled);
+        assert_eq!(
+            wanted.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        for (id, state) in wanted {
+            sampled.insert(id, state);
+        }
+
+        // Nothing changed, so nothing is sampled. This is the whole cost story:
+        // an idle Mission Control does not read output on a timer.
+        assert!(
+            workers_needing_sample(&observer, &sampled).is_empty(),
+            "an unchanged tile must not be re-sampled"
+        );
+
+        // Herdr says one worker changed state, so that one is worth looking at
+        // again - and only that one.
+        observer.update_workers(vec![
+            ObserverWorker {
+                agent_state: ObserverAgentState::Blocked,
+                ..live_observable("a")
+            },
+            live_observable("b"),
+        ]);
+        assert_eq!(
+            workers_needing_sample(&observer, &sampled)
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn output_samples_stay_on_the_visible_page_and_skip_what_cannot_be_observed() {
+        // More workers than a page holds, plus one whose output is not
+        // authorized: a sample must never reach that one, and never reach a
+        // worker that is not on screen.
+        let mut workers: Vec<ObserverWorker> = (0..WORKERS_PER_PAGE + 2)
+            .map(|index| live_observable(&index.to_string()))
+            .collect();
+        workers[1].capabilities.observe_output = false;
+        let observer = ObserverState::new(workers);
+        let wanted = workers_needing_sample(&observer, &HashMap::new());
+        let ids: Vec<&str> = wanted.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["0", "2", "3"],
+            "only the authorized workers on the visible page"
+        );
+        assert!(
+            !ids.contains(&"4") && !ids.contains(&"5"),
+            "a worker off the page is not on screen and is not sampled: {ids:?}"
+        );
+    }
     fn exact_running_session(id: SessionId, tmux_id: &str) -> SessionRecord {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
             .unwrap()

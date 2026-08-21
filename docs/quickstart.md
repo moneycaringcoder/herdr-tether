@@ -195,6 +195,14 @@ recurring SSH capture; detached/non-agent workloads retain bounded `tmux`
 fallback. A connection loss retains last-known information as `STALE`, disables
 input, and never fabricates completion. Closing the view never stops a workload.
 
+Each tile also shows a bounded sample of recent output, so a page tells you what
+its workloads are doing without opening any of them. The sample is labelled
+`PREVIEW`, because it is deliberately not everything: press `v` for the fuller
+read. It is taken when a tile first appears and when Herdr reports that worker
+changed state, never on a timer, so an idle Mission Control reads no output at
+all. It is presentation only - agent state still comes from Herdr's typed
+snapshot and events, never from what the output says.
+
 Use **Edit workers** or **Change orchestrator** to update a group after another
 explicit review. Press `d` to delete group metadata only. The Agents sidebar
 actions can show the whole group, only `BLOCKED`/`DONE` agents needing

@@ -33,6 +33,7 @@ fn worker(id: &str) -> ObserverWorker {
         incarnation: None,
         latency_ms: None,
         capture: Some(format!("output-{id}")),
+        preview_lines: None,
         stale_reason: None,
     }
 }
@@ -45,6 +46,7 @@ fn session_worker(id: &str, title: &str) -> ObserverWorker {
     ObserverWorker {
         title: Some(title.to_owned()),
         capture: Some("output".to_owned()),
+        preview_lines: None,
         ..worker(id)
     }
 }
@@ -452,6 +454,72 @@ fn live_worker(id: &str, state: ObserverAgentState) -> ObserverWorker {
     }
 }
 
+#[test]
+fn a_sampled_tile_says_it_is_a_sample_and_an_explicit_read_clears_that() {
+    let mut observer = ObserverState::new(vec![live_worker("a", ObserverAgentState::Working)]);
+
+    // A bounded sample shows the output and says it is not everything, so the
+    // last few lines are not read as the whole story.
+    observer.merge_capture(
+        "a",
+        ObserverCapture::Preview {
+            text: "building step 3\ncompiling".to_owned(),
+            lines: 16,
+        },
+    );
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("compiling"), "{body}");
+    assert!(
+        body.contains("PREVIEW · last 16 lines · v for more"),
+        "{body}"
+    );
+    assert!(!body.contains("press v to read output"), "{body}");
+
+    // A metadata refresh carries no output. The sample and the fact that it is
+    // a sample both have to survive, or the tile flips back to saying nothing.
+    observer.update_workers(vec![ObserverWorker {
+        capture: None,
+        ..live_worker("a", ObserverAgentState::Working)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("compiling"), "{body}");
+    assert!(
+        body.contains("PREVIEW"),
+        "a retained sample is still a sample: {body}"
+    );
+
+    // An explicit read is everything Herdr offered, so the tile stops calling it
+    // a sample.
+    observer.merge_capture("a", ObserverCapture::Ready("the whole thing".to_owned()));
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("the whole thing"), "{body}");
+    assert!(
+        !body.contains("PREVIEW"),
+        "an explicit read is not a sample: {body}"
+    );
+}
+
+#[test]
+fn a_sample_never_costs_the_last_row_of_output() {
+    // A tile with one body row: the marker must not take the only row the output
+    // has.
+    let mut observer = ObserverState::new(vec![live_worker("a", ObserverAgentState::Working)]);
+    observer.merge_capture(
+        "a",
+        ObserverCapture::Preview {
+            text: "only line".to_owned(),
+            lines: 16,
+        },
+    );
+    // 70 columns keeps the controls on one row, so the canvas is three rows and
+    // the tile has exactly one body row between its borders.
+    let body = tile_body(&render_to_text(70, 5, &observer).unwrap());
+    assert!(
+        body.contains("only line"),
+        "the output the user came for wins on a short tile: {body}"
+    );
+}
+
 /// The tile body rows, without the border or the surrounding chrome.
 ///
 /// The controls footer carries its own `r retry`, and the border title carries
@@ -470,6 +538,7 @@ fn tile_body(rendered: &str) -> String {
 fn a_failed_reread_says_what_is_retained_and_when_it_was_live() {
     let mut observer = ObserverState::new(vec![ObserverWorker {
         capture: Some("previous output".to_owned()),
+        preview_lines: None,
         last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
         ..live_worker("a", ObserverAgentState::Working)
     }]);
@@ -510,6 +579,7 @@ fn an_unreachable_tile_never_claims_more_than_it_retained() {
     // contradicted by the rows underneath it.
     let observer = ObserverState::new(vec![ObserverWorker {
         capture: Some("captured anyway".to_owned()),
+        preview_lines: None,
         ..live_worker("a", ObserverAgentState::Unreachable)
     }]);
     let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
@@ -532,6 +602,7 @@ fn a_stale_binding_and_a_lost_connection_do_not_share_a_remedy() {
     // and where that is fixed, which is not this surface.
     let observer = ObserverState::new(vec![ObserverWorker {
         capture: Some("looks fine".to_owned()),
+        preview_lines: None,
         stale_reason: Some(StaleReason::Binding),
         ..live_worker("a", ObserverAgentState::Stale)
     }]);
@@ -548,6 +619,7 @@ fn a_stale_binding_and_a_lost_connection_do_not_share_a_remedy() {
     // the retry alone and it must not send anyone to reopen a healthy pane.
     let observer = ObserverState::new(vec![ObserverWorker {
         capture: Some("last known".to_owned()),
+        preview_lines: None,
         last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
         stale_reason: Some(StaleReason::Connection),
         ..live_worker("a", ObserverAgentState::Stale)
@@ -569,6 +641,7 @@ fn a_stale_tile_with_nothing_retained_offers_no_remembered_output() {
     observer.merge_capture("a", ObserverCapture::Loading);
     observer.update_workers(vec![ObserverWorker {
         capture: None,
+        preview_lines: None,
         ..live_worker("a", ObserverAgentState::Unreachable)
     }]);
     let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
@@ -587,6 +660,7 @@ fn a_stale_tile_with_nothing_retained_offers_no_remembered_output() {
             prompt_agent: false,
         },
         capture: None,
+        preview_lines: None,
         stale_reason: Some(StaleReason::Binding),
         ..live_worker("a", ObserverAgentState::Stale)
     }]);
@@ -604,6 +678,7 @@ fn a_narrow_tile_keeps_the_remedy_on_the_tile() {
     // remedy off the end first - and the retained wording is the longest one.
     let mut observer = ObserverState::new(vec![ObserverWorker {
         capture: Some("previous output".to_owned()),
+        preview_lines: None,
         last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
         ..live_worker("a", ObserverAgentState::Working)
     }]);
@@ -839,6 +914,7 @@ fn capture_merge_supports_loading_and_ready_to_unavailable_transitions() {
     observer.merge_capture("loading", ObserverCapture::Loading);
     observer.update_workers(vec![ObserverWorker {
         capture: Some(String::new()),
+        preview_lines: None,
         ..worker("loading")
     }]);
     let ready_empty = render_to_text(40, 8, &observer).unwrap();
