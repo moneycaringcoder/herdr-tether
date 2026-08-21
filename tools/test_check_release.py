@@ -125,6 +125,12 @@ cargo install --git https://example.invalid/repo --tag v0.3.0 --locked
             {str(path) for path in PUBLIC_RELEASE_FILES},
         )
 
+    def test_compatibility_matrix_is_a_checked_public_release_surface(self) -> None:
+        self.assertIn(
+            "docs/compatibility.md",
+            {str(path) for path in PUBLIC_RELEASE_FILES},
+        )
+
     def test_hermes_install_requires_stable_main_and_exact_sha_paths(self) -> None:
         base = "https://raw.githubusercontent.com/moneycaringcoder/herdr-tether"
         complete = f"""\

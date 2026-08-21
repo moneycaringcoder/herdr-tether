@@ -362,13 +362,24 @@ def check_compatibility_contract(root: Path, findings: Findings) -> None:
     already validates documentation — including the one that runs at a release
     tag — refuses a matrix that has drifted from the jobs producing the evidence.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    tools = str(Path(__file__).resolve().parent)
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
     try:
         import render_compatibility
     except ImportError:
         findings.add("compatibility-matrix", "docs/compatibility.md", "renderer is unavailable")
         return
     if not (root / render_compatibility.STABLE_GATE).is_file():
+        # A tree without the gate cannot verify the matrix. Staying silent would
+        # turn a renamed workflow into an unverified hand-maintained claim, so
+        # say so whenever there is a document whose evidence has gone missing.
+        if (root / render_compatibility.DOCUMENT).is_file():
+            findings.add(
+                "compatibility-matrix",
+                "docs/compatibility.md",
+                f"{render_compatibility.STABLE_GATE} is missing, so the matrix cannot be verified",
+            )
         return
     for finding in render_compatibility.check(root):
         findings.add("compatibility-matrix", "docs/compatibility.md", finding)
