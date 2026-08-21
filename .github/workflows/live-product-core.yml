@@ -41,11 +41,6 @@ jobs:
             arch: aarch64
             platform: linux
             herdr_version: "0.8.0"
-          - os: macos-13
-            label: macOS 13
-            arch: x86_64
-            platform: macos
-            herdr_version: "0.8.0"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
@@ -95,10 +90,6 @@ jobs:
             0.8.0:macos:arm64)
               asset="herdr-macos-aarch64"
               sha256="d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178"
-              ;;
-            0.8.0:macos:x86_64)
-              asset="herdr-macos-x86_64"
-              sha256="77cb5afd6c8fcaaaf3bc28e474ec01c209331ad08094e20d7f8aa9b0bb78d649"
               ;;
             *)
               echo "unsupported runner: Herdr ${HERDR_VERSION} ${HERDR_PLATFORM}/$(uname -m)" >&2

@@ -13,7 +13,6 @@ release tag this file is that release's record; on `main` it describes `main`.
 | Ubuntu 24.04 | x86_64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
 | macOS 14 | arm64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
 | Ubuntu 24.04 arm | aarch64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
-| macOS 13 | x86_64 | 0.8.0 | Official release asset, verified by SHA-256, then the live product smoke |
 
 Every row is a real run: the gate downloads the official Herdr release asset for
 the runner's platform, verifies it against a pinned SHA-256, validates the

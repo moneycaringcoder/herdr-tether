@@ -4,12 +4,13 @@
 
 ### Added
 
-- The live product gate now runs on Linux aarch64 and Intel macOS as well as Linux
-  x86_64 and Apple-silicon macOS, so the four Herdr assets it knows how to verify
-  are all actually exercised. `docs/compatibility.md` gains an architecture column
-  and names what each row ran on, rather than naming an operating system and
-  cautioning that the architecture may differ. The two existing job names are
-  unchanged, because they are required checks.
+- The live product gate now runs on Linux aarch64 as well as Linux x86_64 and
+  Apple-silicon macOS, so a user on ARM Linux reads a row rather than a caveat.
+  `docs/compatibility.md` gains an architecture column and names what each row ran
+  on, instead of naming an operating system and warning that the architecture may
+  differ. The two existing job names are unchanged, because they are required
+  checks. Intel macOS is not covered: the asset selection carried a branch for it
+  and now does not, because no Intel macOS runner was available to reach it.
 
 - A published Herdr compatibility matrix, `docs/compatibility.md`, listing the
   Herdr releases this version was exercised against on each platform, linked
