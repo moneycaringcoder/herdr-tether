@@ -30,7 +30,7 @@ use crate::{
     interrupt::{Budget, retry_interrupted},
     lifecycle::{CloseOwnedError, ClosedWorkload, LifecycleService},
     mission_control::{
-        MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
+        BindingFailure, MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
         label_materialized_member, resolve_binding,
     },
     model::{
@@ -2113,29 +2113,36 @@ fn observer_workers(
                 Some(SessionStatus::Removed) => ObserverLifecycle::Removed,
                 None => ObserverLifecycle::Missing,
             };
-            let (agent_state, last_observed, live_agent) = if let Some(snapshot) = snapshot {
-                let target = MemberTarget {
-                    session_id: member.session_id,
-                    membership_id: member.membership_id,
+            let (agent_state, last_observed, live_agent, binding_failure) =
+                if let Some(snapshot) = snapshot {
+                    let target = MemberTarget {
+                        session_id: member.session_id,
+                        membership_id: member.membership_id,
+                    };
+                    match crate::mission_control::binding_expectation(state, &group.id, &target) {
+                        Ok(expectation) => match resolve_binding(snapshot, &expectation) {
+                            Ok(binding) => (
+                                observer_agent_state(binding.status.into()),
+                                Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                                true,
+                                None,
+                            ),
+                            Err(failure) => (
+                                observer_agent_state(failure.state()),
+                                None,
+                                false,
+                                Some(failure),
+                            ),
+                        },
+                        Err(_) => (ObserverAgentState::Unknown, None, false, None),
+                    }
+                } else if mission_unreachable
+                    && record.is_some_and(|record| record.herdr_agent.is_some())
+                {
+                    (ObserverAgentState::Unreachable, None, false, None)
+                } else {
+                    (ObserverAgentState::Detached, None, false, None)
                 };
-                match crate::mission_control::binding_expectation(state, &group.id, &target) {
-                    Ok(expectation) => match resolve_binding(snapshot, &expectation) {
-                        Ok(binding) => (
-                            observer_agent_state(binding.status.into()),
-                            Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-                            true,
-                        ),
-                        Err(failure) => (observer_agent_state(failure.state()), None, false),
-                    },
-                    Err(_) => (ObserverAgentState::Unknown, None, false),
-                }
-            } else if mission_unreachable
-                && record.is_some_and(|record| record.herdr_agent.is_some())
-            {
-                (ObserverAgentState::Unreachable, None, false)
-            } else {
-                (ObserverAgentState::Detached, None, false)
-            };
             ObserverWorker {
                 id: member.session_id.to_string(),
                 title: member.title.as_ref().map(|title| title.as_str().to_owned()),
@@ -2156,13 +2163,33 @@ fn observer_workers(
                 // and its provenance are put back where the capture is.
                 sampled: false,
                 // In this projection the only way to be stale is a binding that
-                // is no longer exactly one recognized occupant; a lost
-                // connection reads as unreachable here and is named later.
-                stale_reason: (agent_state == ObserverAgentState::Stale)
-                    .then_some(StaleReason::Binding),
+                // is no longer exactly one recognized occupant, and which of the
+                // three ways that happened decides what a reader should do about
+                // it. A lost connection reads as unreachable here and is named
+                // later.
+                stale_reason: binding_failure.and_then(stale_reason_for),
             }
         })
         .collect()
+}
+
+/// Which stale reason a binding failure is, when it is one.
+///
+/// The binding diagnostics already tell these apart, and they need different
+/// things from a reader: a membership that moved on comes back with a resnapshot,
+/// two panes claiming one worker is a decision only the operator can make in
+/// Herdr, and a pane something else took has to be opened again. Collapsing them
+/// would leave the tile saying only that something is wrong.
+const fn stale_reason_for(failure: BindingFailure) -> Option<StaleReason> {
+    match failure {
+        BindingFailure::StaleMembership => Some(StaleReason::EarlierMembership),
+        BindingFailure::Ambiguous => Some(StaleReason::AmbiguousClaim),
+        BindingFailure::Replaced => Some(StaleReason::ReplacedOccupant),
+        // Not stale: these are the detached and unknown states.
+        BindingFailure::Detached
+        | BindingFailure::UnknownAgent
+        | BindingFailure::AgentKindMismatch => None,
+    }
 }
 
 const fn observer_agent_state(state: MissionAgentState) -> ObserverAgentState {
@@ -2775,6 +2802,45 @@ mod tests {
             assert_eq!(refreshed[0].agent_state, expected);
             assert!(refreshed[0].uses_live_agent());
         }
+
+        // Each binding failure must reach the projection as its own reason, or
+        // the tile arms that explain them are unreachable and the remedy a reader
+        // is given is the wrong one.
+        let membership_of = |snapshot: &HerdrSessionSnapshot| {
+            observer_workers(
+                &state.orchestration_groups[0],
+                &state,
+                Some(snapshot),
+                false,
+                Some(17),
+            )[0]
+            .stale_reason
+        };
+
+        // Two panes claim the same membership.
+        let mut ambiguous = snapshot.clone();
+        ambiguous.agents.push(agent(
+            local_id,
+            local_membership,
+            "w1:p9",
+            AgentStatus::Idle,
+        ));
+        assert_eq!(
+            membership_of(&ambiguous),
+            Some(StaleReason::AmbiguousClaim),
+            "two claims on one worker is not the same problem as a stale one"
+        );
+
+        // The pane answering carries a membership this group no longer has.
+        let mut earlier = snapshot.clone();
+        earlier.agents[0].tokens.insert(
+            MEMBERSHIP_TOKEN.to_owned(),
+            "0197f198000070008000000000009999".to_owned(),
+        );
+        assert_eq!(
+            membership_of(&earlier),
+            Some(StaleReason::EarlierMembership)
+        );
     }
 
     #[test]

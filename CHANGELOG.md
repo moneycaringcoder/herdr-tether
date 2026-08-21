@@ -119,6 +119,16 @@
 
 ### Changed
 
+- A Mission Control tile that reads `STALE` because its Herdr binding is no longer
+  exactly one recognized occupant now says which of the three ways that happened,
+  and offers the remedy that matches. A pane belonging to an earlier membership is
+  a claim that moved on, so `r` is enough; two panes claiming one worker is a
+  decision only the operator can make, so the tile says to close one in Herdr; a
+  pane whose occupant changed has to be reopened from the picker, because
+  resnapshotting will keep reporting the same thing. The three were already
+  distinguished where the binding is checked and were collapsed on the way to the
+  tile, which sent every reader to the same retry.
+
 - Interruption retries on the socket, `tmux`, and SSH paths are now defined in
   one place, and each retry is bounded by the timeout or deadline its call site
   already had. For a relative socket timeout the retries continue for at most

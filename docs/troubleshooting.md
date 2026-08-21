@@ -144,13 +144,20 @@ Control while disconnected still leaves every Tether workload running.
 it is and what to do about it on the tile itself, so this page is a reference
 rather than a requirement.
 
-`STALE` has three reasons, and the tile names the one that applies. Output that
-could not be re-read is shown as retained, with the time it was last live.
-A lost Mission Control connection shows the last known state, also dated, and
-comes back on its own once the connection does. A binding that is no longer
-exactly one recognized occupant is different: `r` resnapshots, but if the pane
-really moved or was replaced, the worker has to be reopened from the picker
-rather than worked around.
+`STALE` names the reason that applies, and each has its own remedy. Output that
+could not be re-read is shown as retained, with the time it was last live. A lost
+Mission Control connection shows the last known state, also dated, and comes back
+on its own once the connection does.
+
+A binding that is no longer exactly one recognized occupant is three different
+problems, and the tile says which:
+
+- **The pane belongs to an earlier membership.** The group was edited while
+  Mission Control was open, so the claim simply moved on. `r` is enough.
+- **Two Herdr panes claim this worker.** Nothing Tether does settles which one is
+  real. Close one in Herdr, then `r`.
+- **The pane occupant changed.** Something took the pane, and resnapshotting will
+  keep reporting the same thing. Reopen the worker from the picker.
 
 `UNREACHABLE` means nothing answered. When there is nothing retained the tile
 says so, because there is no remembered output to read; when Herdr is
