@@ -160,39 +160,62 @@ implied pass.
 
 ### Sharing a preset
 
-Send the TOML. A `[[hosts.presets]]` block is the whole preset - the ones shown
-above are complete - and a recipient adopts one by pasting it into their own
-configuration.
+Send the `[[hosts.presets]]` block. A preset does not name its own host, so where
+it is pasted decides which machine the code runs on: TOML attaches the block to
+the `[[hosts]]` entry above it, and a block dropped at the end of a file lands on
+whichever host happens to be last.
 
-There is deliberately no `preset import`, no export format, no bundle, and
-nothing that fetches. That is a decision rather than a gap, for three reasons.
+A host entry Tether wrote already reads `presets = []`. Replace that line with the
+block, under the host you mean:
 
-A preset is code. Tether starts a login `/bin/sh` on the selected machine and
-runs the command through `/bin/sh -c`; a `health_command` is a second such
-program, run on every status refresh. Adopting someone else's preset is running
-their program as your login user, in your directory, on your machine or on a host
-you can reach.
+```toml
+[[hosts]]
+name = "build"
+target = "build.example.net"
+roots = ["/srv/repos"]
 
-Text is the safest way to carry code that will be trusted, because the artifact
-transferred and the thing reviewed are the same bytes. Any import command would
-replace "read the command" with "answer a prompt Tether wrote about the command",
-which puts a rendering step between the code and the person reading it - one that
-has to fit two payloads and arbitrary shell text into a confirmation - and moves
-the decision from editing your own shell configuration to dismissing a dialog.
-The convenience is real, and it is convenience in exactly the place where the
-friction is the feature.
+[[hosts.presets]]
+name = "tests"
+command = "cargo test"
+```
 
-Tether takes nothing from off the machine and runs it. `ssh` reaches hosts you
-selected, Herdr answers over a local socket, and everything else Tether reads -
-session catalogues, `tmux` output, SSH aliases - is validated, bounded, or
-display-only. Preset text would be the first input that arrives from elsewhere
-and executes, which is why `SECURITY.md` can list "user-controlled Tether
-configuration and command presets" inside the trusted computing base: that
-sentence is true because you wrote them.
+Adding the block while `presets = []` is still there is a duplicate key, and TOML
+rejects the whole file rather than that one line. The same is true of a preset
+whose name the host already uses, and of a field from a newer Tether that this one
+does not know: adopting one block can leave the entire configuration unusable
+until it is removed. `doctor` reports it as `unusable` and names the line.
 
-So share the TOML, read what you are given the way you would read a shell script
-from the same person, and keep write access to the configuration as narrow as
-write access to `~/.profile`.
+Read what you are given the way you would read a shell script from the same
+person. A preset is code: `command`, and `health_command` when there is one, each
+run through `/bin/sh -c` on that host, as your login user there.
+
+`herdr-tether host add NAME TARGET --preset NAME=COMMAND` avoids hand-editing when
+the host is being added at the same time. It cannot carry `health_command` or
+`herdr_agent`, which is why the TOML is the general answer.
+
+### Why there is no import command
+
+There is no `preset import`, no export format, and nothing that fetches. That is
+a judgment about cost, not a claim that importing could not be done safely: a
+command that printed the exact `command` and `health_command`, said which host
+and directory they would bind to, and required typed confirmation would show a
+recipient everything reading the block shows them, and would get the host binding
+right rather than leaving it to where the paste landed.
+
+It loses on what it costs. It is a permanent surface, a file format, and a second
+way to add a preset, in exchange for a paste - and it would make preset text
+something Tether itself takes from elsewhere and then executes. Tether's own
+intake is otherwise deliberately narrow: hosts are ones you selected, Herdr
+answers over a local socket, and session catalogues, `tmux` output, and SSH
+aliases are validated, bounded, or display-only.
+
+Configuration you did not write can already reach a shell, but through OpenSSH
+rather than through Tether: an inherited `~/.ssh/config` can carry `ProxyCommand`
+or `Match exec`, which is why `SECURITY.md` places OpenSSH configuration and
+proxies inside the trusted computing base. A preset is the same kind of trust,
+which is why that document places user-controlled presets there too. Keep write
+access to the configuration as narrow as write access to `~/.profile` on every
+host it names.
 
 ### Mission Control prompt capability
 

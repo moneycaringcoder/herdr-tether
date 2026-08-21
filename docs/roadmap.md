@@ -8,6 +8,10 @@ provide remote Herdr federation or pane streaming**, and **only Tether-owned
 workloads can be stopped or removed**. Discovered external `tmux` sessions stay
 attach-only.
 
+One idea has been closed rather than deferred: **preset sharing**. Presets are
+shared by sending the TOML, and [Configuration](configuration.md) records both how
+and why there is no import command.
+
 ## Correctness
 
 ### Publish a compatibility matrix per release
@@ -69,21 +73,21 @@ make that reconstruction possible.
 Where the backend can supply it. Answers "which of these twenty is eating the
 machine", which is otherwise a manual hunt.
 
-### Preset sharing — decided against
+### Preset sharing — closed
 
-Presets already share: a `[[hosts.presets]]` block is the whole preset, and
-sending it is a form of sharing where the artifact transferred and the thing
-reviewed are the same bytes. A preset is also code — a `command` and possibly a
-`health_command`, each run through `/bin/sh -c` on the selected machine — so the
-requirement that adoption show the exact command is met most completely by the
-mechanism that has no code in it at all.
+Presets already share: sending the `[[hosts.presets]]` block is the mechanism,
+and [Configuration](configuration.md) documents it, including which host a pasted
+block binds to and what a rejected one costs.
 
-An import command would have replaced reading the command with answering a prompt
-written about it, and would have made preset text the first input Tether takes
-from off the machine and executes. `SECURITY.md` places "user-controlled Tether
-configuration and command presets" in the trusted computing base, and that
-sentence is true because the user wrote them.
+An import command was considered and declined on cost rather than on safety. One
+that printed the exact `command` and `health_command`, named the host and
+directory they would bind to, and required typed confirmation would show a
+recipient what reading the block shows them. It would also be a permanent
+surface, a file format, and a second way to add a preset, in exchange for a
+paste — and it would make preset text something Tether itself takes from
+elsewhere and then executes, which is the one intake boundary worth not moving
+for convenience.
 
-The reasoning is in [Configuration](configuration.md). What remains worth doing
-is unrelated to sharing: Tether does not show a preset's command before running
-it, even for presets the user already has.
+What remains worth doing is unrelated to sharing and is tracked as issue #110:
+showing a preset's command before it runs, for every preset rather than only for
+adopted ones.

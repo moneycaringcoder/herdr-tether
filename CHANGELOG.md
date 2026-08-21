@@ -139,12 +139,15 @@
   documented promise that host, directory, and command never travel was not
   being kept. The tile still shows the friendly title.
 - Documented how presets are shared, and that there will be no command for it.
-  Sending a `[[hosts.presets]]` block is the mechanism: a preset is a `command`
-  and possibly a `health_command`, each run through `/bin/sh -c` on the selected
-  machine, and text is the only form in which the thing transferred and the thing
-  reviewed are the same bytes. An import path would have replaced reading the
-  command with answering a prompt written about it, and would have made preset
-  text the first input Tether takes from off the machine and executes.
+  Sending a `[[hosts.presets]]` block is the mechanism, and the documentation now
+  says which host a pasted block binds to - the one above it, so a block dropped
+  at the end of a file lands on whichever host is last - and that adopting one
+  block can leave the whole configuration unusable, because a duplicate key, a
+  repeated preset name, and a field from a newer Tether are each rejected for the
+  file rather than for the block. An import command was declined on cost rather
+  than on safety: it would be a permanent surface, a file format, and a second
+  way to add a preset, and it would make preset text something Tether itself
+  takes from elsewhere and then executes.
 
 ### Fixed
 
