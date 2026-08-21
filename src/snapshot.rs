@@ -19,7 +19,7 @@ use crate::{
     state::{SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
         ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
-        StatusRequest, StatusRun, StatusService, WorkloadStatus,
+        StatusRequest, StatusRun, StatusService, StatusWorkload, WorkloadStatus,
     },
     tui::{PickerHostOrigin, PickerOptions},
 };
@@ -159,7 +159,13 @@ pub fn collect(
                         && record.target == effective_target(host.target.as_deref())
                         && record.status == SessionStatus::Running
                 })
-                .map(|record| record.id)
+                // The snapshot reports what it observed; it runs no health
+                // command, so it asks for none.
+                .map(|record| StatusWorkload {
+                    id: record.id,
+                    directory: record.directory.clone(),
+                    health_command: None,
+                })
                 .collect(),
         })
         .collect();
@@ -567,6 +573,10 @@ fn apply_status(
                 result.workloads.insert(id, status);
             }
         }
+        // The snapshot requests no health command, so it never receives a
+        // health result. Its JSON reports what Tether observed, not what a
+        // workload's own probe says.
+        StatusMessage::Health { .. } => {}
         StatusMessage::Catalog {
             host,
             status,

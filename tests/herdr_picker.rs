@@ -14,8 +14,8 @@ use herdr_tether::{
     model::{ExternalSessionName, OrchestrationGroupId, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS,
-        StatusMessage, StatusRequestError, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability,
+        MAX_STATUS_WORKLOADS, StatusMessage, StatusRequestError, StatusService, WorkloadStatus,
     },
     tui::{
         PickerCloseAction, PickerCloseModal, PickerCloseResult, PickerEvent, PickerHostOrigin,
@@ -902,6 +902,7 @@ fn picker_fixture() -> (Config, State) {
                 herdr_agent: None,
                 name: "agent".into(),
                 command: "exec codex".into(),
+                health_command: None,
             }],
         }],
         discovery: DiscoveryDefaults {
@@ -2186,6 +2187,69 @@ fn status_updates_progressively_and_refresh_rejects_stale_generation() {
     assert_eq!(
         explorer.host_label("build-box"),
         Some("[timeout] build-box · tmux missing; install it")
+    );
+}
+
+#[test]
+fn a_configured_health_command_reads_beside_liveness_and_only_where_configured() {
+    let (mut config, state) = picker_fixture();
+    config.hosts[0].presets[0].health_command = Some("curl -fsS localhost:8080/healthz".into());
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    // The `agent` preset carries the probe; the second workload has no preset,
+    // so nothing about serving is knowable for it.
+    let probed: SessionId = "tether-0197f198000070008000000000000001".parse().unwrap();
+    let unprobed: SessionId = "tether-0197f198000070008000000000000002".parse().unwrap();
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(1);
+
+    for id in [probed, unprobed] {
+        assert!(picker.apply_status(StatusMessage::Workload {
+            generation: 1,
+            id,
+            status: WorkloadStatus::Running { attached: 0 },
+            checked_at: SystemTime::UNIX_EPOCH,
+        }));
+    }
+    // Liveness answered, health still outstanding: the row says so rather than
+    // implying the workload is serving.
+    assert!(
+        picker
+            .workload_label(probed)
+            .unwrap()
+            .starts_with("[loading] [running]"),
+        "{:?}",
+        picker.workload_label(probed)
+    );
+
+    assert!(picker.apply_status(StatusMessage::Health {
+        generation: 1,
+        id: probed,
+        status: HealthStatus::NotServing {
+            exit_status: Some(7)
+        },
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    assert!(
+        picker
+            .workload_label(probed)
+            .unwrap()
+            .starts_with("[not serving · exit 7] [running]"),
+        "{:?}",
+        picker.workload_label(probed)
+    );
+
+    // A workload with no probe has no health cell, so a health result for it is
+    // not applied and its row never claims a verdict.
+    assert!(!picker.apply_status(StatusMessage::Health {
+        generation: 1,
+        id: unprobed,
+        status: HealthStatus::Serving,
+        checked_at: SystemTime::UNIX_EPOCH,
+    }));
+    let unprobed_label = picker.workload_label(unprobed).unwrap();
+    assert!(
+        unprobed_label.starts_with("[running]") && !unprobed_label.contains("serving"),
+        "{unprobed_label:?}"
     );
 }
 

@@ -28,6 +28,15 @@
   restarts anything itself; the pace is a wait and an explanation, not an
   action, and it is derived from the recorded end rather than from any new
   stored history.
+- An optional per-workload health command. A preset may carry a
+  `health_command`, which runs in the workload's directory on each status
+  refresh and reports whether the workload is serving, beside - not instead of -
+  whether its process is alive. Exit zero reads `serving`, any other status
+  reads `not serving` with the status, and a probe that times out, cannot start,
+  or cannot enter the directory reads `health unknown`, which is never a pass. A
+  workload with no configured probe reports nothing about serving. Results are
+  display-only: nothing is persisted, no lifecycle action is unlocked or
+  withheld, and no probe runs on a schedule.
 
 ### Changed
 

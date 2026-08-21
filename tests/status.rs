@@ -8,11 +8,21 @@ use herdr_tether::{
     backend::ProcessBinaries,
     model::{ExternalSessionName, SessionId},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, MAX_STATUS_WORKLOADS, StatusHost,
-        StatusMessage, StatusRequest, StatusRequestError, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability,
+        MAX_STATUS_WORKLOADS, StatusHost, StatusMessage, StatusRequest, StatusRequestError,
+        StatusService, StatusWorkload, WorkloadStatus,
     },
 };
 use tempfile::tempdir;
+
+/// A workload to probe for liveness, with no health command configured.
+fn probe(id: SessionId) -> StatusWorkload {
+    StatusWorkload {
+        id,
+        directory: "/srv/app".to_owned(),
+        health_command: None,
+    }
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -57,12 +67,12 @@ fn fast_host_publishes_before_slow_host_times_out() {
                 StatusHost {
                     name: "slow".into(),
                     target: Some("slow".into()),
-                    workloads: vec![slow_id],
+                    workloads: vec![probe(slow_id)],
                 },
                 StatusHost {
                     name: "fast".into(),
                     target: Some("fast".into()),
-                    workloads: vec![fast_id],
+                    workloads: vec![probe(fast_id)],
                 },
             ],
         })
@@ -137,7 +147,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
             hosts: vec![StatusHost {
                 name: "dev".into(),
                 target: Some("dev".into()),
-                workloads: vec![owned],
+                workloads: vec![probe(owned)],
             }],
         })
         .unwrap();
@@ -216,12 +226,12 @@ esac
                 StatusHost {
                     name: "duplicate".into(),
                     target: Some("duplicate".into()),
-                    workloads: vec![duplicate_id],
+                    workloads: vec![probe(duplicate_id)],
                 },
                 StatusHost {
                     name: "unsafe".into(),
                     target: Some("unsafe".into()),
-                    workloads: vec![unsafe_id],
+                    workloads: vec![probe(unsafe_id)],
                 },
             ],
         })
@@ -294,7 +304,7 @@ fn cancelled_generation_does_not_publish_late_results() {
             hosts: vec![StatusHost {
                 name: "slow".into(),
                 target: Some("slow".into()),
-                workloads: vec![workload],
+                workloads: vec![probe(workload)],
             }],
         })
         .unwrap();
@@ -346,17 +356,17 @@ esac
                 StatusHost {
                     name: "offline".into(),
                     target: Some("offline".into()),
-                    workloads: vec![offline_id],
+                    workloads: vec![probe(offline_id)],
                 },
                 StatusHost {
                     name: "empty".into(),
                     target: Some("empty".into()),
-                    workloads: vec![empty_id],
+                    workloads: vec![probe(empty_id)],
                 },
                 StatusHost {
                     name: "malformed".into(),
                     target: Some("malformed".into()),
-                    workloads: vec![malformed_id],
+                    workloads: vec![probe(malformed_id)],
                 },
             ],
         })
@@ -456,6 +466,72 @@ fn local_spawn_error_includes_actionable_tool_locations() {
     assert!(detail.contains("could not start tmux"));
     assert!(detail.contains("/opt/homebrew/bin"));
     assert!(detail.contains("/usr/local/bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_configured_health_command_is_probed_after_liveness() {
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    // A `tmux` that lists nothing, so the workload reads as missing while the
+    // health command still runs: the two answers are independent.
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(10),
+        1,
+    );
+    let serving = id("tether-0197f198000070008000000000000001");
+    let failing = id("tether-0197f198000070008000000000000002");
+    let run = service
+        .try_start(StatusRequest {
+            generation: 11,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: vec![
+                    StatusWorkload {
+                        id: serving,
+                        directory: "/".to_owned(),
+                        health_command: Some("exit 0".to_owned()),
+                    },
+                    StatusWorkload {
+                        id: failing,
+                        directory: "/".to_owned(),
+                        health_command: Some("exit 4".to_owned()),
+                    },
+                    // No probe configured, so no health result may appear.
+                    probe(id("tether-0197f198000070008000000000000003")),
+                ],
+            }],
+        })
+        .unwrap();
+
+    let mut health = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if let StatusMessage::Health { id, status, .. } = message {
+            health.push((id, status));
+        }
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(
+        health,
+        vec![
+            (serving, HealthStatus::Serving),
+            (
+                failing,
+                HealthStatus::NotServing {
+                    exit_status: Some(4)
+                }
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -626,7 +702,7 @@ fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
-                workloads: vec![workload; MAX_STATUS_WORKLOADS + 1],
+                workloads: vec![probe(workload); MAX_STATUS_WORKLOADS + 1],
             }],
         })
         .unwrap_err();
@@ -646,7 +722,7 @@ fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
-                workloads: vec![workload; MAX_STATUS_WORKLOADS],
+                workloads: vec![probe(workload); MAX_STATUS_WORKLOADS],
             }],
         })
         .expect("the exact workload boundary must remain valid");
@@ -690,7 +766,7 @@ fn duplicate_heavy_status_request_probes_and_reports_each_exact_target_once() {
     let duplicate = StatusHost {
         name: "local".into(),
         target: None,
-        workloads: vec![second, first, second, first],
+        workloads: vec![probe(second), probe(first), probe(second), probe(first)],
     };
     let run = service
         .try_start(StatusRequest {

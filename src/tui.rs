@@ -27,7 +27,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    config::Config,
+    config::{CommandPreset, Config},
     discovery::{
         DiscoveryCompletion, DiscoveryLocation, DiscoveryMessage, DiscoveryRequest, DiscoveryRun,
         DiscoveryService,
@@ -36,8 +36,9 @@ use crate::{
     model::{ExternalSessionName, HerdrAgentKind, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
-        ExternalCatalogStatus, ExternalSession, HostReachability, StatusHost, StatusMessage,
-        StatusRequest, StatusRequestError, StatusRun, StatusService, WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability, StatusHost,
+        StatusMessage, StatusRequest, StatusRequestError, StatusRun, StatusService, StatusWorkload,
+        WorkloadStatus,
     },
 };
 
@@ -92,6 +93,12 @@ pub struct PickerWorkload {
     /// When this workload was last active: when it ended, or when it was last
     /// started or opened if it has not. Used for ordering only.
     pub activity_at: chrono::DateTime<chrono::Utc>,
+    /// The workload's directory, so a health command runs where it runs.
+    pub directory: String,
+    /// The health command configured for this workload's preset, when it has
+    /// one. Resolved from configuration at build time rather than stored, so
+    /// editing the preset changes the probe.
+    pub health_command: Option<String>,
     /// When a restart of this workload stops being paced.
     ///
     /// Set only for a workload that failed almost as soon as it started, which
@@ -166,7 +173,9 @@ impl PickerOptions {
                 directories,
                 scan_roots,
                 commands: vec![PickerCommand::Shell],
-                workloads: owned_workloads(state, "local", "local"),
+                // The local host has no configured presets, so no health
+                // command is configurable for its workloads yet.
+                workloads: owned_workloads(state, "local", "local", &[]),
                 allow_existing: true,
                 allow_create: true,
             });
@@ -200,7 +209,7 @@ impl PickerOptions {
                 directories,
                 scan_roots,
                 commands,
-                workloads: owned_workloads(state, &host.name, &host.target),
+                workloads: owned_workloads(state, &host.name, &host.target, &host.presets),
                 allow_existing: true,
                 allow_create: true,
             });
@@ -221,7 +230,9 @@ impl PickerOptions {
             let directories = recent_directories(state, &name, &target);
             hosts.push(PickerHost {
                 label: format!("{name} · retained · {target}"),
-                workloads: owned_workloads(state, &name, &target),
+                // A retained group's host is gone from configuration, so its
+                // presets are too, and with them any health command.
+                workloads: owned_workloads(state, &name, &target, &[]),
                 name,
                 target: (target != "local").then_some(target),
                 origin: PickerHostOrigin::Retained,
@@ -351,7 +362,12 @@ fn recent_directories(state: &State, host: &str, target: &str) -> Vec<String> {
     }
     directories
 }
-fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkload> {
+fn owned_workloads(
+    state: &State,
+    host: &str,
+    target: &str,
+    presets: &[CommandPreset],
+) -> Vec<PickerWorkload> {
     let mut sessions: Vec<&SessionRecord> = state
         .sessions
         .iter()
@@ -378,6 +394,13 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
                 status: session.status,
                 legacy: session.ownership_proof.is_none(),
                 activity_at: session.activity_at(),
+                directory: session.directory.clone(),
+                health_command: session.preset.as_deref().and_then(|name| {
+                    presets
+                        .iter()
+                        .find(|preset| preset.name == name)
+                        .and_then(|preset| preset.health_command.clone())
+                }),
                 paced_until: paced_restart_until(session),
                 base_label: label.clone(),
                 label,
@@ -750,6 +773,22 @@ fn workload_status_text(status: &WorkloadStatus) -> String {
     }
 }
 
+/// How a health verdict reads on a row.
+///
+/// `serving` is the only word that means the workload answered its own probe.
+/// A probe that could not run says `health unknown`, which is deliberately not
+/// a pass and deliberately not the same word as a liveness `unknown`.
+fn health_status_text(status: &HealthStatus) -> String {
+    match status {
+        HealthStatus::Serving => "serving".to_owned(),
+        HealthStatus::NotServing {
+            exit_status: Some(exit_status),
+        } => format!("not serving · exit {exit_status}"),
+        HealthStatus::NotServing { exit_status: None } => "not serving".to_owned(),
+        HealthStatus::Unknown => "health unknown".to_owned(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PickerState {
     options: PickerOptions,
@@ -766,6 +805,12 @@ pub struct PickerState {
     host_status: HashMap<String, StatusCell<HostReachability>>,
     host_error_details: HashMap<String, String>,
     workload_status: HashMap<SessionId, StatusCell<WorkloadStatus>>,
+    /// What each workload's own health command last reported, when it has one.
+    ///
+    /// A separate axis from liveness on purpose: a live process that is not
+    /// serving is a real state, and so is a serving workload Tether could not
+    /// confirm is alive.
+    workload_health: HashMap<SessionId, StatusCell<HealthStatus>>,
     catalogs: HashMap<String, CatalogCell>,
     discovery_generation: u64,
     base_directories: HashMap<String, Vec<String>>,
@@ -824,6 +869,7 @@ impl PickerState {
             host_status: HashMap::new(),
             host_error_details: HashMap::new(),
             workload_status: HashMap::new(),
+            workload_health: HashMap::new(),
             catalogs: HashMap::new(),
             discovery_generation: 0,
             base_directories,
@@ -1130,6 +1176,15 @@ impl PickerState {
     fn reconcile_owned_record(&mut self, record: &SessionRecord) {
         let selected_host = self.selected_host_identity();
         let selected_resource = self.current_resource_identity();
+        // A reconciled row is rebuilt from the record, which does not carry the
+        // configured probe, so keep the one this workload's row already had.
+        let existing_health_command = self
+            .options
+            .hosts
+            .iter()
+            .flat_map(|host| &host.workloads)
+            .find(|workload| workload.id == record.id)
+            .and_then(|workload| workload.health_command.clone());
         for host in &mut self.options.hosts {
             host.workloads.retain(|workload| workload.id != record.id);
         }
@@ -1182,6 +1237,10 @@ impl PickerState {
                     status: record.status,
                     legacy: record.ownership_proof.is_none(),
                     activity_at: record.activity_at(),
+                    directory: record.directory.clone(),
+                    // A reconciled row keeps whatever probe its group already
+                    // resolved for this workload, if the row existed before.
+                    health_command: existing_health_command,
                     paced_until: paced_restart_until(record),
                     base_label: label.clone(),
                     label,
@@ -1362,6 +1421,15 @@ impl PickerState {
                     .entry(workload.id)
                     .or_default()
                     .begin_refresh();
+                // Only a workload with a configured probe gets a health cell,
+                // so a workload without one shows nothing about serving rather
+                // than an empty verdict.
+                if workload.health_command.is_some() {
+                    self.workload_health
+                        .entry(workload.id)
+                        .or_default()
+                        .begin_refresh();
+                }
             }
             if host.allow_existing {
                 self.catalogs
@@ -1465,6 +1533,15 @@ impl PickerState {
                 cell.apply(status, sessions, hidden_reserved, hidden_unsafe);
                 true
             }),
+            StatusMessage::Health {
+                id,
+                status,
+                checked_at,
+                ..
+            } => self.workload_health.get_mut(&id).is_some_and(|cell| {
+                cell.apply(status, checked_at);
+                true
+            }),
             StatusMessage::Finished { .. } => false,
         };
         if applied {
@@ -1545,7 +1622,11 @@ impl PickerState {
                         .filter(|workload| {
                             workload.status == SessionStatus::Running && !workload.legacy
                         })
-                        .map(|workload| workload.id)
+                        .map(|workload| StatusWorkload {
+                            id: workload.id,
+                            directory: workload.directory.clone(),
+                            health_command: workload.health_command.clone(),
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -1680,11 +1761,19 @@ impl PickerState {
             }
             for workload in &mut host.workloads {
                 workload.label = if workload.status == SessionStatus::Running {
-                    format_status_label(
+                    let liveness = format_status_label(
                         &workload.base_label,
                         self.workload_status.get(&workload.id),
                         workload_status_text,
-                    )
+                    );
+                    // The health verdict sits beside liveness rather than
+                    // replacing it, because they answer different questions.
+                    match self.workload_health.get(&workload.id) {
+                        Some(cell) => {
+                            format_status_label(&liveness, Some(cell), health_status_text)
+                        }
+                        None => liveness,
+                    }
                 } else {
                     workload.base_label.clone()
                 };
@@ -3650,6 +3739,8 @@ mod close_render_tests {
                     legacy: false,
                     activity_at: chrono::Utc::now(),
                     paced_until: None,
+                    directory: "/srv/app".to_owned(),
+                    health_command: None,
                     label,
                 }],
                 allow_existing: true,
