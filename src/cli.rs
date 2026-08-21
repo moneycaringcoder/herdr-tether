@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::{
     agent_view::AgentViewService,
@@ -666,36 +667,171 @@ fn list_hosts(paths: &AppPaths, config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The local probe runs a version flag on a binary that is already installed, so
+/// it gets what `doctor` gives the identical command.
+const LOCAL_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+
+/// A remote probe has to survive its own connection setup. Tether asks OpenSSH for
+/// `ConnectTimeout=10`, so a deadline under that would fail hosts that were about
+/// to answer; this is the same ceiling a `tmux` command that travels over SSH
+/// already gets, and it ends a wedged remote command before OpenSSH's own
+/// keepalive teardown would.
+const REMOTE_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// Set when the user interrupts a probe.
+///
+/// The bounded executor puts each probe in its own process group, which is what
+/// lets a deadline kill a command and everything it started. It also means a
+/// terminal interrupt no longer reaches the probe on its own: `Ctrl+C` signals
+/// the foreground group, and the probe is not in it. A probe that goes quiet is
+/// exactly what someone interrupts, so the signal is turned into the
+/// cancellation the executor already understands, and the process it started is
+/// reaped rather than left behind holding a connection.
+static PROBE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn note_probe_interrupt(_signal: libc::c_int) {
+    // Async-signal-safe: one relaxed-ordering store on a lock-free atomic, and
+    // nothing else. No allocation, no locks, no formatting.
+    PROBE_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Routes interrupts to the probe for as long as one is running.
+struct ProbeInterrupts;
+
+impl ProbeInterrupts {
+    #[cfg(unix)]
+    fn install() -> Self {
+        PROBE_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `note_probe_interrupt` only stores to a static atomic, which is
+        // permitted in a signal handler. The previous disposition is restored on
+        // drop, so nothing outside a probe observes this handler.
+        unsafe {
+            let handler: extern "C" fn(libc::c_int) = note_probe_interrupt;
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+        }
+        Self
+    }
+
+    #[cfg(not(unix))]
+    fn install() -> Self {
+        Self
+    }
+}
+
+impl Drop for ProbeInterrupts {
+    fn drop(&mut self) {
+        // Cleared as well as restored: the flag outlives any one check, and a
+        // stale interrupt would cancel the next probe before it started.
+        PROBE_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(unix)]
+        // SAFETY: restoring the default disposition for the same signal.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+    }
+}
+
 fn check_host(name: &str, target: &str) -> Result<()> {
-    let binaries = ProcessBinaries::new("ssh", "tmux");
+    check_host_bounded(
+        name,
+        target,
+        &ProcessBinaries::new("ssh", "tmux"),
+        LOCAL_PROBE_TIMEOUT,
+        REMOTE_PROBE_TIMEOUT,
+    )
+}
+
+fn check_host_bounded(
+    name: &str,
+    target: &str,
+    binaries: &ProcessBinaries,
+    local_timeout: StdDuration,
+    remote_timeout: StdDuration,
+) -> Result<()> {
+    let _interrupts = ProbeInterrupts::install();
     if target == "local" {
-        let output = Command::new(binaries.tmux())
-            .arg("-V")
-            .output()
-            .context("run local tmux version probe")?;
-        require_probe_success("tmux", &output)?;
-        print!("{}", String::from_utf8_lossy(&output.stdout));
+        let spec = CommandSpec::new(binaries.tmux().to_path_buf(), vec!["-V".to_owned()]);
+        let output = bounded_probe("local tmux", &spec, local_timeout)?;
+        print!("{}", String::from_utf8_lossy(&output));
         return Ok(());
     }
 
-    let tmux = ssh_probe(binaries.ssh(), target, "tmux -V")?;
-    require_probe_success("remote tmux", &tmux)?;
-    print!("{}", String::from_utf8_lossy(&tmux.stdout));
+    let spec = ssh_probe_spec(binaries.ssh(), target, "tmux -V")?;
+    let tmux = bounded_probe("remote tmux", &spec, remote_timeout)?;
+    print!("{}", String::from_utf8_lossy(&tmux));
 
-    let herdr = ssh_probe(
+    let spec = ssh_probe_spec(
         binaries.ssh(),
         target,
         "command -v herdr >/dev/null 2>&1 && herdr --version",
     )?;
-    if herdr.status.success() {
-        print!("{}", String::from_utf8_lossy(&herdr.stdout));
-    } else {
-        println!("herdr not found on {name} (optional)");
+    // Herdr is optional, so its absence is reported rather than raised - but a
+    // probe that could not finish is still a failure to look, not an absence.
+    match bounded_probe("remote herdr", &spec, remote_timeout) {
+        Ok(herdr) => print!("{}", String::from_utf8_lossy(&herdr)),
+        Err(error) if error.downcast_ref::<ProbeFailed>().is_some() => {
+            println!("herdr not found on {name} (optional)");
+        }
+        Err(error) => return Err(error),
     }
     Ok(())
 }
 
-fn ssh_probe(ssh: &Path, target: &str, remote_command: &str) -> Result<std::process::Output> {
+/// A probe that ran and answered with a failing status.
+///
+/// Distinguished from every other outcome so an optional probe can treat "it
+/// answered, and said no" as an answer without also swallowing a timeout, a
+/// binary that is missing, or output that was truncated.
+#[derive(Debug, Error)]
+#[error("{name} probe failed with status {status}: {detail}")]
+struct ProbeFailed {
+    name: &'static str,
+    status: String,
+    detail: String,
+}
+
+/// Runs one probe under the shared bounded executor and returns its stdout.
+fn bounded_probe(name: &'static str, spec: &CommandSpec, timeout: StdDuration) -> Result<Vec<u8>> {
+    match run_bounded(spec, timeout, &PROBE_INTERRUPTED) {
+        BoundedOutput::Completed {
+            status,
+            stdout,
+            stdout_truncated,
+            stderr,
+            ..
+        } => {
+            if !status.success() {
+                return Err(ProbeFailed {
+                    name,
+                    status: status.to_string(),
+                    detail: String::from_utf8_lossy(&stderr).trim().to_owned(),
+                }
+                .into());
+            }
+            if stdout_truncated {
+                bail!("{name} probe answered with more output than is safe to read");
+            }
+            Ok(stdout)
+        }
+        BoundedOutput::TimedOut => bail!(
+            "{name} probe did not finish within {} seconds and was ended; the host may be unreachable, or the command may never return",
+            timeout.as_secs()
+        ),
+        BoundedOutput::SpawnError(kind) => {
+            bail!(
+                "{name} probe could not start `{}`: {kind}",
+                spec.program.display()
+            )
+        }
+        BoundedOutput::Cancelled => {
+            bail!("{name} probe was interrupted; the command it started was ended too")
+        }
+        BoundedOutput::Error => bail!("{name} probe could not be run"),
+    }
+}
+
+fn ssh_probe_spec(ssh: &Path, target: &str, remote_command: &str) -> Result<CommandSpec> {
     let parsed = openssh_target(target)?;
     let mut arguments = openssh_connection_args(false);
     if let Some(port) = parsed.port {
@@ -706,22 +842,7 @@ fn ssh_probe(ssh: &Path, target: &str, remote_command: &str) -> Result<std::proc
         parsed.destination,
         remote_command.to_owned(),
     ]);
-    Command::new(ssh)
-        .args(arguments)
-        .output()
-        .with_context(|| format!("probe SSH target `{target}`"))
-}
-
-fn require_probe_success(name: &str, output: &std::process::Output) -> Result<()> {
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = String::from_utf8_lossy(&output.stderr);
-    bail!(
-        "{name} probe failed with status {}: {}",
-        output.status,
-        detail.trim()
-    )
+    Ok(CommandSpec::new(ssh.to_path_buf(), arguments))
 }
 
 fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
@@ -2673,6 +2794,220 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes an executable script that never returns, so a probe run against it
+    /// can only end on its deadline.
+    #[cfg(unix)]
+    fn wedged_script(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Proves which timeout reached which probe: a remote probe run with a
+    /// millisecond deadline must be the thing that times out, named as such.
+    #[cfg(unix)]
+    #[test]
+    fn the_remote_deadline_reaches_the_remote_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join("ssh");
+        wedged_script(&ssh);
+        let binaries = ProcessBinaries::new(ssh, temp.path().join("unused-tmux"));
+
+        let error = check_host_bounded(
+            "build-box",
+            "builder@example.test",
+            &binaries,
+            StdDuration::from_secs(30),
+            StdDuration::from_millis(250),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote tmux probe did not finish"),
+            "the remote timeout has to be the one the remote probe uses: {error}"
+        );
+    }
+
+    /// The local probe likewise gets the local deadline, not the remote one.
+    #[cfg(unix)]
+    #[test]
+    fn the_local_deadline_reaches_the_local_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let tmux = temp.path().join("tmux");
+        wedged_script(&tmux);
+        let binaries = ProcessBinaries::new(temp.path().join("unused-ssh"), tmux);
+
+        let error = check_host_bounded(
+            "local",
+            "local",
+            &binaries,
+            StdDuration::from_millis(250),
+            StdDuration::from_secs(30),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("local tmux probe did not finish"),
+            "{error}"
+        );
+    }
+
+    /// A host with no Herdr is a successful check. A host that never answered the
+    /// optional probe is not, because absence was never established.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_herdr_passes_the_check_and_an_unfinished_probe_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+
+        let answering = temp.path().join("ssh-answering");
+        std::fs::write(
+            &answering,
+            "#!/bin/sh\ncase \"$*\" in\n  *tmux*) printf 'tmux 3.4\\n'; exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&answering, std::fs::Permissions::from_mode(0o700)).unwrap();
+        check_host_bounded(
+            "build-box",
+            "builder@example.test",
+            &ProcessBinaries::new(answering, temp.path().join("unused-tmux")),
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(3),
+        )
+        .expect("a host without Herdr still passes its check");
+
+        let stalling = temp.path().join("ssh-stalling");
+        std::fs::write(
+            &stalling,
+            "#!/bin/sh\ncase \"$*\" in\n  *tmux*) printf 'tmux 3.4\\n'; exit 0 ;;\n  *) sleep 30 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stalling, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = check_host_bounded(
+            "build-box",
+            "builder@example.test",
+            &ProcessBinaries::new(stalling, temp.path().join("unused-tmux")),
+            StdDuration::from_secs(3),
+            StdDuration::from_millis(250),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("remote herdr probe did not finish"),
+            "a probe that never answered did not prove Herdr is absent: {error}"
+        );
+    }
+
+    /// The bounded executor puts a probe in its own process group, so a terminal
+    /// interrupt no longer reaches it. This is the wiring that turns the signal
+    /// into the cancellation the executor understands; without it, an interrupted
+    /// check leaves the command it started running.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_cancels_the_probe_instead_of_leaving_it_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let wedged = temp.path().join("wedged");
+        wedged_script(&wedged);
+        let spec = CommandSpec::new(wedged, Vec::new());
+
+        let interrupts = ProbeInterrupts::install();
+        // SAFETY: the handler installed above is in place for this signal, so this
+        // sets the flag rather than ending the test process.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        let started = std::time::Instant::now();
+        let error = bounded_probe("remote tmux", &spec, StdDuration::from_secs(30)).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(interrupts);
+
+        assert!(
+            error.to_string().contains("was interrupted"),
+            "an interrupt is reported as one, not as a timeout: {error}"
+        );
+        assert!(
+            elapsed < StdDuration::from_secs(5),
+            "the probe ended on the interrupt rather than waiting out its deadline: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_probe_ends_on_its_deadline_and_says_which_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let wedged = temp.path().join("wedged");
+        wedged_script(&wedged);
+
+        // The remote probe: a connection that stays up while the command never
+        // returns. Before this was bounded, the check waited for as long as the
+        // command did.
+        let spec = CommandSpec::new(wedged.clone(), Vec::new());
+        let started = std::time::Instant::now();
+        let error = bounded_probe("remote tmux", &spec, StdDuration::from_millis(250)).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote tmux probe did not finish"),
+            "the message names the probe that timed out: {error}"
+        );
+        assert!(
+            elapsed < StdDuration::from_secs(5),
+            "the probe ended on its own deadline rather than the command's: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_cannot_start_is_not_a_probe_that_answered() {
+        let spec = CommandSpec::new(
+            std::path::PathBuf::from("tether-probe-binary-that-does-not-exist"),
+            vec!["-V".to_owned()],
+        );
+        let error = bounded_probe("local tmux", &spec, StdDuration::from_secs(3)).unwrap_err();
+        assert!(error.to_string().contains("could not start"), "{error}");
+        assert!(
+            error.downcast_ref::<ProbeFailed>().is_none(),
+            "a binary that is missing has not failed a check, it has prevented one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_optional_probe_treats_only_a_real_answer_as_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        // Answered, and said no: that is the optional-probe case.
+        let refusing = temp.path().join("refusing");
+        std::fs::write(&refusing, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let spec = CommandSpec::new(refusing, Vec::new());
+        let error = bounded_probe("remote herdr", &spec, StdDuration::from_secs(3)).unwrap_err();
+        assert!(
+            error.downcast_ref::<ProbeFailed>().is_some(),
+            "a failing status is an answer: {error}"
+        );
+
+        // Wedged: not an answer, so `check_host` must not read it as "not found".
+        let wedged = temp.path().join("wedged");
+        wedged_script(&wedged);
+        let spec = CommandSpec::new(wedged, Vec::new());
+        let error =
+            bounded_probe("remote herdr", &spec, StdDuration::from_millis(250)).unwrap_err();
+        assert!(
+            error.downcast_ref::<ProbeFailed>().is_none(),
+            "a probe that never finished did not report an absence: {error}"
+        );
+    }
 
     #[test]
     fn a_probe_deadline_bounds_a_stalled_operation() {
