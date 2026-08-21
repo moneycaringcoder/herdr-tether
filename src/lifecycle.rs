@@ -418,6 +418,15 @@ impl LifecycleService {
                 // like one that arrived the instant the workload started.
                 record.closed_at = Some(now);
                 record.exit_status = exit_status;
+                // The same judgement `mark_ended` makes: the record now
+                // describes the end that just happened, so it can say whether
+                // that end was another immediate failure. Any other shape of end
+                // means the run is over.
+                if record.failed_immediately() {
+                    record.note_immediate_failure();
+                } else {
+                    record.immediate_failures.clear();
+                }
                 #[cfg(test)]
                 if FAIL_FINAL_SAVE.with(|fail| fail.replace(false)) {
                     return Err(anyhow!("injected final save failure"));
@@ -525,6 +534,9 @@ impl LifecycleService {
                             current.tmux_session_id = Some(identity);
                             current.closed_at = None;
                             current.exit_status = None;
+                            // Kept for the same reason a promotion keeps it: a
+                            // workload observed running has not yet shown it will
+                            // stay running.
                             Ok(())
                         })
                         .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
@@ -836,6 +848,15 @@ impl LifecycleService {
                 current.tmux_session_id = identity.or(current.tmux_session_id);
                 current.closed_at.get_or_insert(now);
                 current.exit_status = exit_status;
+                // The record now describes the end that just happened, so it can
+                // answer whether that end was another immediate failure. An end
+                // of any other shape is not part of a loop, so the history is
+                // cleared rather than left to lengthen a later wait.
+                if current.failed_immediately() {
+                    current.note_immediate_failure();
+                } else {
+                    current.immediate_failures.clear();
+                }
                 Ok(())
             })
             .map(|()| true)
@@ -861,6 +882,11 @@ impl LifecycleService {
                 current.tmux_session_id = Some(identity);
                 current.closed_at = None;
                 current.exit_status = None;
+                // The history is deliberately kept here. A workload in a loop
+                // starts successfully every time - that is what a loop is - so
+                // treating a start as proof the loop ended would hold the count
+                // at one forever. What ends a run is an end of a different
+                // shape, or an hour passing.
                 current.last_used_at = Utc::now();
                 Ok(())
             })
@@ -1238,6 +1264,7 @@ mod tests {
                     last_used_at: timestamp,
                     closed_at: None,
                     exit_status: None,
+                    immediate_failures: Vec::new(),
                 }],
                 orchestration_groups: Vec::new(),
             })

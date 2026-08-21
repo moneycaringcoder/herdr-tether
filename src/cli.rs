@@ -1331,6 +1331,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         last_used_at: now,
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     };
     let store = StateStore::new(paths.state_file.clone());
     store.update(|state| {
@@ -1452,9 +1453,19 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
         // number the user can beat by pressing the key again immediately.
         if remaining > chrono::TimeDelta::zero() {
             let seconds = (remaining.num_milliseconds() + 999) / 1_000;
+            // A third failure in a row is a different situation from a first, and
+            // the wait that grew with it needs the count beside it or it reads as
+            // Tether making the workload harder to restart for no reason.
+            let run = record.immediate_failure_run();
+            let times = if run > 1 {
+                format!(" {run} times in a row")
+            } else {
+                String::new()
+            };
             bail!(
-                "session `{id}` failed immediately; retry `herdr-tether session restart {id}` \
-                 in {seconds}s, or fix the command first with `herdr-tether open`"
+                "session `{id}` failed immediately{times}; retry \
+                 `herdr-tether session restart {id}` in {seconds}s, or fix the command \
+                 first with `herdr-tether open`"
             );
         }
     }
@@ -1676,7 +1687,10 @@ fn session_status_text(session: &SessionRecord) -> String {
     match (session.status, session.exit_status) {
         (SessionStatus::Ended, Some(exit_status)) if exit_status != 0 => {
             if session.failed_immediately() {
-                format!("Failed immediately (exit {exit_status})")
+                match session.immediate_failure_run() {
+                    0 | 1 => format!("Failed immediately (exit {exit_status})"),
+                    run => format!("Failed immediately {run} times (exit {exit_status})"),
+                }
             } else {
                 format!("Failed (exit {exit_status})")
             }
@@ -3035,6 +3049,7 @@ mod tests {
             last_used_at: Utc::now() - chrono::Duration::minutes(20),
             closed_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             exit_status: Some(2),
+            immediate_failures: Vec::new(),
         };
         // Ran for fifteen minutes, then failed: an ordinary failure.
         assert_eq!(session_status_text(&record), "Failed (exit 2)");
@@ -3043,6 +3058,18 @@ mod tests {
         // and the paced restart do.
         record.last_used_at = record.closed_at.unwrap() - chrono::Duration::milliseconds(400);
         assert_eq!(session_status_text(&record), "Failed immediately (exit 2)");
+
+        // The third in a row is a different situation from the first, and the
+        // listing is one of the places a user is looking when they wonder why the
+        // wait keeps growing.
+        record.immediate_failures = (1..=3)
+            .map(|index| record.closed_at.unwrap() - chrono::Duration::seconds(index))
+            .collect();
+        assert_eq!(
+            session_status_text(&record),
+            "Failed immediately 3 times (exit 2)"
+        );
+        record.immediate_failures.clear();
         record.last_used_at = Utc::now() - chrono::Duration::minutes(20);
 
         record.exit_status = Some(0);
@@ -3213,6 +3240,7 @@ mod tests {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+            immediate_failures: Vec::new(),
         };
 
         assert_eq!(

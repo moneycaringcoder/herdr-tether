@@ -4,6 +4,24 @@
 
 ### Added
 
+- Repeated immediate failures are counted, and the wait grows with them. A
+  workload that fails within ten seconds of starting was paced for thirty seconds
+  however many times it had already done so, because nothing survived a restart to
+  count. The record now keeps the timestamps of recent immediate failures, so the
+  wait doubles per repeat - thirty seconds, a minute, two, four - and stops at five
+  minutes; the picker footer, `session restart`, `session list`, and a group's skip
+  reason all say how many failures in a row are behind the wait. Starting again
+  does not end the run, because a workload in a loop starts successfully every
+  time; what ends it is an end of a different shape or an hour passing, since only
+  failures from the last hour count. The history is timestamps only and holds at
+  most sixteen. Tether still never restarts anything itself: a longer wait is a
+  longer refusal to offer the action, with the reason attached.
+- **State schema version 5.** The failure history is a new field on each session
+  record, so a version 4 file is migrated on load. A migrated record starts with an
+  empty history rather than one inferred from the end it already recorded: a single
+  failure is not a run of them. An empty history is omitted from the document, so a
+  record that has never failed immediately keeps the shape it had.
+
 - The live product gate now runs on Linux aarch64 as well as Linux x86_64 and
   Apple-silicon macOS, so a user on ARM Linux reads a row rather than a caveat.
   `docs/compatibility.md` gains an architecture column and names what each row ran

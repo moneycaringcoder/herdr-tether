@@ -28,7 +28,23 @@ Press `Enter` on an ended workload to choose **Restart**. Tether recreates its o
 
 A command that exits with a failing status within ten seconds of starting will do the same thing if it is restarted unchanged, which is the loop worth interrupting. Tether names that end apart from an ordinary failure and paces the next Restart for thirty seconds from it, saying in the picker how long is left and that it never restarts anything itself. `herdr-tether session restart` declines for the same window and names the wait. Remove stays available throughout, and nothing about the pace changes what a restart does when it runs: waiting is the whole of it.
 
-The pace comes from the last end alone, not from a tally of previous ones. A workload that fails immediately, is restarted after the wait, and fails immediately again is paced again, because each end is judged on its own; Tether keeps no history of the incarnation a restart replaced.
+Repeats count. A workload that fails immediately, is restarted, and fails
+immediately again is in a loop rather than having bad luck, so the wait doubles
+each time: thirty seconds, then a minute, then two, then four, stopping at five
+minutes however many failures follow. Every surface that mentions the wait says
+how many failures in a row are behind it, because a wait that grows without
+saying why reads as Tether making the workload harder to restart.
+
+The count is kept on the record as timestamps, so it survives the restart it
+exists to describe. Starting again does not end the run: a workload in a loop
+starts successfully every time, so treating a start as recovery would hold the
+count at one and the wait would never grow. What ends a run is an end of a
+different shape - a clean exit, or a failure that arrives after the workload had
+been running for a while - or simply time, since only failures from the last hour
+are counted. A workload that fails immediately today does not inherit a wait from
+failures last week, and the history holds at most sixteen entries. Nothing about
+the pace changes what Tether does: it never restarts anything itself, so a longer
+wait is a longer refusal to offer the action, with the reason attached.
 
 ### Remove
 
@@ -86,7 +102,7 @@ against a group you did not build.
 | **Running** | The exact owned workload was observed alive. | Open or Stop |
 | **Ended** | The owned command exited cleanly, or with an outcome `tmux` could not report. | Restart or Remove |
 | **Failed** | The owned command exited with a failing status, which is shown as `[failed]` in the picker and `FAILED` on a Mission Control tile. | Restart or Remove |
-| **Failed immediately** | The command exited with a failing status within ten seconds of starting. Restart waits thirty seconds from that end, and the picker says how long is left. | Remove now, Restart when the wait ends |
+| **Failed immediately** | The command exited with a failing status within ten seconds of starting. Restart waits thirty seconds from that end, doubling for each repeat up to five minutes, and the picker says how long is left and how many failures in a row. | Remove now, Restart when the wait ends |
 | **Stopping** | A confirmed Stop is in progress or needs safe reconciliation after interruption. | Wait or retry the visible operation |
 | **Unreachable** | Tether cannot currently prove whether the workload is running. | Retry or back out |
 | **Removed** | The ended record was finalized and is no longer an active picker item. | None |
