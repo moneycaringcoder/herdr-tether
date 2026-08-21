@@ -41,12 +41,20 @@ the child is still running, and the call has to be made again. Herdr's own TUI
 raises `SIGWINCH` freely, so any blocking call on the socket, `tmux`, or SSH
 paths can span one.
 
+Terminal input is covered too, on narrower grounds. No handler in the process is
+known to interrupt a terminal read today - reads happen in canonical mode, and the
+handlers currently installed carry `SA_RESTART`, so the kernel restarts the read -
+but that is a property of today's handlers rather than a guarantee, and a read
+whose loss cannot be recovered, such as a line someone is typing, should not
+depend on it. `crate::interrupt` lists the terminal reads that are already safe by
+contract, which are most of them.
+
 On those paths a bare `?` on a blocking read, write, or wait is a bug. Route the
 call through `crate::interrupt::retry_interrupted` instead, and give it the bound
 the call site already has: a relative socket timeout, the deadline of an
-enclosing loop, or nothing to bound when the descriptor is non-blocking. A retry
-loop with no bound turns a bounded wait into an unbounded one, because a relative
-timeout restarts on every call.
+enclosing loop, or nothing to bound when the descriptor is non-blocking or the
+wait is for a person to type. A retry loop with no bound turns a bounded wait into
+an unbounded one, because a relative timeout restarts on every call.
 
 A call that should propagate the interruption instead is a valid outcome, but an
 argued one. `crate::interrupt` lists every such call on those paths with the

@@ -27,6 +27,7 @@ use crate::{
     config::{ConfigStore, NotificationDefaults},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
     herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient, NotificationSound},
+    interrupt::{Budget, retry_interrupted},
     lifecycle::{CloseOwnedError, ClosedWorkload, LifecycleService},
     mission_control::{
         MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
@@ -909,16 +910,37 @@ fn handle_observer_open(
 }
 
 const MAX_REVIEWED_PROMPT_BYTES: usize = 16 * 1024;
+
 fn read_bounded_prompt_line() -> Result<Option<String>> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
+    read_bounded_prompt_from(&mut input)
+}
+
+/// Reads one reviewed prompt line, retrying an interruption.
+///
+/// `Read::read` has no interruption handling of its own - unlike `read_line`,
+/// which absorbs it by contract - so this loop is the one place on the prompt
+/// path where an `EINTR` would reach the caller, and what it would cost is a
+/// line someone was halfway through writing.
+///
+/// No handler in the process is known to interrupt this today: the terminal read
+/// runs in canonical mode, and the `SIGWINCH` handler crossterm installs comes
+/// through signal-hook, which sets `SA_RESTART`, so the kernel restarts the read
+/// instead of failing it. That is a property of every handler currently in the
+/// process rather than a guarantee about the call, and it is not one worth
+/// depending on for a typed line: a handler added later, here or in a dependency,
+/// only has to omit that flag. The retry costs one syscall in a case that does
+/// not otherwise arise.
+///
+/// There is no deadline to protect, because the wait is a person typing.
+fn read_bounded_prompt_from(input: &mut impl Read) -> Result<Option<String>> {
     let mut bytes = Vec::with_capacity(MAX_REVIEWED_PROMPT_BYTES.min(1024));
     let mut byte = [0_u8; 1];
     let mut saw_input = false;
     let mut overflow = false;
     loop {
-        let read = input
-            .read(&mut byte)
+        let read = retry_interrupted(Budget::Immediate, || input.read(&mut byte))
             .context("read Mission Control prompt")?;
         if read == 0 {
             break;
@@ -2329,6 +2351,88 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::observer::WORKERS_PER_PAGE;
+
+    /// A reader that reports an interruption partway through a line, the way a
+    /// terminal read does when a signal arrives while someone is typing.
+    ///
+    /// Yields one byte per call, because that is how the prompt reader asks.
+    struct InterruptedTyping {
+        events: VecDeque<Option<u8>>,
+    }
+
+    impl InterruptedTyping {
+        /// `text` with an interruption at each of `at` byte offsets.
+        fn new(text: &str, at: &[usize]) -> Self {
+            let mut events = VecDeque::new();
+            for (index, byte) in text.bytes().enumerate() {
+                for _ in 0..at.iter().filter(|offset| **offset == index).count() {
+                    events.push_back(None);
+                }
+                events.push_back(Some(byte));
+            }
+            for _ in 0..at.iter().filter(|offset| **offset >= text.len()).count() {
+                events.push_back(None);
+            }
+            Self { events }
+        }
+    }
+
+    impl Read for InterruptedTyping {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.events.pop_front() {
+                Some(Some(byte)) => {
+                    buffer[0] = byte;
+                    Ok(1)
+                }
+                Some(None) => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn an_interruption_while_typing_does_not_discard_the_prompt() {
+        // Mission Control leaves its screen to read this, so the user is typing
+        // at a terminal while a TUI that raises SIGWINCH on resize is still the
+        // surrounding process. Resizing mid-line is an ordinary thing to do.
+        // Interruptions after "deploy", inside " the", and twice in a row.
+        let mut input = InterruptedTyping::new("deploy the build\n", &[6, 9, 12, 12]);
+
+        let prompt =
+            read_bounded_prompt_from(&mut input).expect("an interruption is not a failure");
+        assert_eq!(prompt.as_deref(), Some("deploy the build"));
+    }
+
+    #[test]
+    fn an_interruption_before_the_first_byte_is_not_an_empty_prompt() {
+        let mut input = InterruptedTyping::new("go\n", &[0]);
+        assert_eq!(
+            read_bounded_prompt_from(&mut input).unwrap().as_deref(),
+            Some("go")
+        );
+    }
+
+    #[test]
+    fn a_prompt_nobody_typed_is_still_no_prompt() {
+        // End of input with nothing typed is a cancellation, and stays one.
+        let mut input = InterruptedTyping::new("", &[0]);
+        assert_eq!(read_bounded_prompt_from(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn a_real_read_failure_still_surfaces() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        let error = read_bounded_prompt_from(&mut Broken).unwrap_err();
+        assert!(
+            error.to_string().contains("read Mission Control prompt"),
+            "{error:#}"
+        );
+    }
 
     use crate::observer::{ObserverAction, action_for_input};
 

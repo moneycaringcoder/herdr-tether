@@ -151,6 +151,19 @@
 
 ### Fixed
 
+- An interruption while the reviewed Mission Control prompt is being typed no
+  longer discards the line. The prompt is read a byte at a time, and `Read::read`
+  has no interruption handling of its own - unlike `read_line`, which absorbs one
+  by contract - so it was the only call on that path where an `EINTR` would have
+  reached the user, costing a line they were halfway through writing. No handler
+  in the process is known to produce one there today, because the handlers
+  currently installed carry `SA_RESTART` and the kernel restarts the read; the
+  retry is there so that a handler added later, here or in a dependency, cannot
+  take the line. It goes through the shared interruption helper rather than a
+  second hand-rolled loop, and the convention is recorded as covering terminal
+  input, with the reads that are already safe by contract listed rather than left
+  to be re-derived.
+
 - A workload that ends on its own stops reading as running without anyone acting
   on it. `remain-on-exit` keeps a finished workload's session listed, so the broad
   status probe reported it as present and every surface rendered that as running
