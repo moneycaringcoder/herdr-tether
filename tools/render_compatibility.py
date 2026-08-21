@@ -112,14 +112,16 @@ def parse_stable_gate(text: str) -> list[tuple[str, str]]:
     platforms: list[tuple[str, str]] = []
     for entry in matrix_entries(job_block(text, STABLE_GATE_JOB)):
         label, version = entry.get("label"), entry.get("herdr_version")
-        if not label or not version:
+        arch = entry.get("arch")
+        if not label or not version or not arch:
             raise CompatibilityError(
-                "stable gate matrix entry is missing a label or a herdr_version: "
+                "stable gate matrix entry is missing a label, an arch, or a herdr_version: "
                 f"{sorted(entry)}"
             )
-        if "|" in label:
-            raise CompatibilityError(f"stable gate label {label!r} cannot appear in a table")
-        platforms.append((label, version))
+        for value in (label, arch):
+            if "|" in value:
+                raise CompatibilityError(f"stable gate value {value!r} cannot appear in a table")
+        platforms.append((label, arch, version))
     return platforms
 
 
@@ -154,13 +156,16 @@ def render(root: Path) -> str:
         )
     platforms = parse_stable_gate(read_bounded(root, STABLE_GATE))
     verify_canary(read_bounded(root, CANARY_GATE))
-    exercised = ", ".join(sorted({version for _, version in platforms}))
+    exercised = ", ".join(sorted({version for _, _, version in platforms}))
 
-    table = ["| Platform | Herdr release | How it was exercised |", "| --- | --- | --- |"]
+    table = [
+        "| Runner image | Architecture | Herdr release | How it was exercised |",
+        "| --- | --- | --- | --- |",
+    ]
     table.extend(
-        f"| {label} | {version} | Official release asset, verified by SHA-256, "
-        "then the live product smoke |"
-        for label, version in platforms
+        f"| {label} | {arch} | {version} | Official release asset, verified by "
+        "SHA-256, then the live product smoke |"
+        for label, arch, version in platforms
     )
 
     paragraphs: list[str] = [
@@ -176,8 +181,9 @@ def render(root: Path) -> str:
         " asset for the runner's platform, verifies it against a pinned SHA-256,"
         " validates the socket API schema it reports, builds Tether from the locked"
         " manifest, and drives a workload through `tmux` end to end. A row names"
-        " the runner image the gate uses, not every architecture of that operating"
-        " system, and a row exists only for a platform the gate actually covers.",
+        " the runner image and the architecture the gate ran on, and a row exists"
+        " only for a platform the gate actually covers - so a row is what was"
+        " exercised rather than what is expected to work.",
         "## Socket protocol",
         f"Tether speaks Herdr's socket API from protocol {protocols['minimum']},"
         f" which Herdr {protocols['minimum_label']} ships. Its checks audit through"

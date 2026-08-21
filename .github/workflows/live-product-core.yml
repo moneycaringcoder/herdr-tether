@@ -23,12 +23,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The existing two job names are required checks, so their labels are
+          # left exactly as they are. The architecture travels in its own field,
+          # which is what the published matrix reads.
           - os: ubuntu-24.04
             label: Ubuntu 24.04
+            arch: x86_64
             platform: linux
             herdr_version: "0.8.0"
           - os: macos-14
             label: macOS 14
+            arch: arm64
+            platform: macos
+            herdr_version: "0.8.0"
+          - os: ubuntu-24.04-arm
+            label: Ubuntu 24.04 arm
+            arch: aarch64
+            platform: linux
+            herdr_version: "0.8.0"
+          - os: macos-13
+            label: macOS 13
+            arch: x86_64
             platform: macos
             herdr_version: "0.8.0"
     runs-on: ${{ matrix.os }}
@@ -69,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           case "${HERDR_VERSION}:${HERDR_PLATFORM}:$(uname -m)" in
-            0.8.0:linux:aarch64|0.8.0:linux:arm64)
+            0.8.0:linux:aarch64)
               asset="herdr-linux-aarch64"
               sha256="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87"
               ;;
