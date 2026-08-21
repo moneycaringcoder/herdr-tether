@@ -352,6 +352,37 @@ def check_canonical(root: Path, findings: Findings) -> None:
                 findings.add(category, relative, f"minimum must be {label} {value} or newer")
     check_config_contract(root, findings)
     check_capability_contract(root, findings)
+    check_compatibility_contract(root, findings)
+
+
+def check_compatibility_contract(root: Path, findings: Findings) -> None:
+    """The published Herdr matrix must still match the gates it is derived from.
+
+    Checked here rather than in its own workflow step so that every gate which
+    already validates documentation — including the one that runs at a release
+    tag — refuses a matrix that has drifted from the jobs producing the evidence.
+    """
+    tools = str(Path(__file__).resolve().parent)
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    try:
+        import render_compatibility
+    except ImportError:
+        findings.add("compatibility-matrix", "docs/compatibility.md", "renderer is unavailable")
+        return
+    if not (root / render_compatibility.STABLE_GATE).is_file():
+        # A tree without the gate cannot verify the matrix. Staying silent would
+        # turn a renamed workflow into an unverified hand-maintained claim, so
+        # say so whenever there is a document whose evidence has gone missing.
+        if (root / render_compatibility.DOCUMENT).is_file():
+            findings.add(
+                "compatibility-matrix",
+                "docs/compatibility.md",
+                f"{render_compatibility.STABLE_GATE} is missing, so the matrix cannot be verified",
+            )
+        return
+    for finding in render_compatibility.check(root):
+        findings.add("compatibility-matrix", "docs/compatibility.md", finding)
 
 
 def check_config_contract(root: Path, findings: Findings) -> None:
