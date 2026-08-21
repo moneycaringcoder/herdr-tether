@@ -2597,6 +2597,66 @@ fn a_workload_that_ended_with_a_failing_status_reads_apart_from_a_clean_end() {
 }
 
 #[test]
+fn a_workload_that_failed_immediately_paces_its_restart_and_says_why() {
+    let (config, mut state) = picker_fixture();
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    // The first workload's command died 400ms after it started; the second ran
+    // for a quarter of an hour before failing.
+    state.sessions[0].status = SessionStatus::Ended;
+    state.sessions[0].last_used_at = now - Duration::seconds(30);
+    state.sessions[0].closed_at = Some(now - Duration::seconds(30) + Duration::milliseconds(400));
+    state.sessions[0].exit_status = Some(1);
+    state.sessions[1].status = SessionStatus::Ended;
+    state.sessions[1].last_used_at = now - Duration::minutes(20);
+    state.sessions[1].closed_at = Some(now - Duration::minutes(5));
+    state.sessions[1].exit_status = Some(1);
+
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let labels: Vec<&str> = options.hosts[0]
+        .workloads
+        .iter()
+        .map(|workload| workload.label.as_str())
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[failed immediately] Tether · Restart")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[failed] Tether · Restart")),
+        "a failure that took its time is not a loop: {labels:?}"
+    );
+
+    let mut picker = PickerState::new(options).unwrap();
+    picker.begin_refresh(7);
+    assert!(picker.apply_status(StatusMessage::Host {
+        generation: 7,
+        host: "build-box".into(),
+        status: HostReachability::Reachable,
+        detail: None,
+        checked_at: SystemTime::now(),
+    }));
+    picker.handle(PickerEvent::Confirm);
+
+    // While the pace lasts, Restart is not offered and the footer explains it.
+    let paced = picker.footer_text_at(now);
+    assert!(paced.contains("Failed immediately"), "{paced}");
+    assert!(paced.contains("Restart paced"), "{paced}");
+    assert!(paced.contains("never restarts on its own"), "{paced}");
+    assert!(!paced.contains("Enter Restart"), "{paced}");
+    // Metadata removal stays available, so the row is not a dead end.
+    assert!(paced.contains("x Remove"), "{paced}");
+
+    // Once it has elapsed the action returns, unchanged.
+    let after = picker.footer_text_at(now + Duration::minutes(1));
+    assert!(after.contains("Enter Restart"), "{after}");
+    assert!(!after.contains("Restart paced"), "{after}");
+}
+
+#[test]
 fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
     let (config, mut state) = picker_fixture();
     let record = state.sessions.remove(0);

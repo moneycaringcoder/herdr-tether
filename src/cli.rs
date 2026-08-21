@@ -1214,6 +1214,19 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
     let record = service
         .owned_record(id)?
         .with_context(|| format!("unknown Tether session `{id}`"))?;
+    // A workload that failed as soon as it started will fail the same way if it
+    // is restarted unchanged, so the restart waits. It is declined rather than
+    // deferred: Tether never runs a workload the user did not ask for at the
+    // moment they asked for it.
+    if let Some(until) = record.paced_restart_until() {
+        let remaining = until.signed_duration_since(Utc::now()).num_seconds();
+        if remaining > 0 {
+            bail!(
+                "session `{id}` failed immediately; retry `herdr-tether session restart {id}` \
+                 in {remaining}s, or fix the command first with `herdr-tether open`"
+            );
+        }
+    }
     match record.status {
         SessionStatus::Ended | SessionStatus::Creating => {
             service
@@ -1434,7 +1447,11 @@ fn confirm_replacement(client: &HerdrClient) -> Result<()> {
 fn session_status_text(session: &SessionRecord) -> String {
     match (session.status, session.exit_status) {
         (SessionStatus::Ended, Some(exit_status)) if exit_status != 0 => {
-            format!("Failed (exit {exit_status})")
+            if session.failed_immediately() {
+                format!("Failed immediately (exit {exit_status})")
+            } else {
+                format!("Failed (exit {exit_status})")
+            }
         }
         (status, _) => format!("{status:?}"),
     }
@@ -2399,12 +2416,19 @@ mod tests {
             tmux_session_id: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
-            created_at: Utc::now(),
-            last_used_at: Utc::now(),
-            closed_at: Some(Utc::now()),
+            created_at: Utc::now() - chrono::Duration::minutes(30),
+            last_used_at: Utc::now() - chrono::Duration::minutes(20),
+            closed_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             exit_status: Some(2),
         };
+        // Ran for fifteen minutes, then failed: an ordinary failure.
         assert_eq!(session_status_text(&record), "Failed (exit 2)");
+
+        // Failed as soon as it started: the listing says so, the way the picker
+        // and the paced restart do.
+        record.last_used_at = record.closed_at.unwrap() - chrono::Duration::milliseconds(400);
+        assert_eq!(session_status_text(&record), "Failed immediately (exit 2)");
+        record.last_used_at = Utc::now() - chrono::Duration::minutes(20);
 
         record.exit_status = Some(0);
         assert_eq!(session_status_text(&record), "Ended");

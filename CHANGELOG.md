@@ -20,6 +20,14 @@
   setting existed keeps that default rather than reading as off. An end whose
   status `tmux` could not report stays `ended`, because an unknown outcome is
   not a failure.
+- A workload whose command fails within ten seconds of starting is named apart
+  from an ordinary failure — `[failed immediately]` in the picker — and its next
+  Restart is paced for thirty seconds from that end, with the picker saying how
+  long is left and `herdr-tether session restart` declining for the same window
+  and naming the wait. Remove stays available throughout. Tether still never
+  restarts anything itself; the pace is a wait and an explanation, not an
+  action, and it is derived from the recorded end rather than from any new
+  stored history.
 
 ### Changed
 
