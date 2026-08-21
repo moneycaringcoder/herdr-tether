@@ -334,7 +334,10 @@ impl LifecycleService {
                 }
                 let now = Utc::now();
                 record.status = SessionStatus::Ended;
-                record.last_used_at = now;
+                // `last_used_at` keeps the moment this incarnation started, so
+                // the difference from `closed_at` is how long the workload ran.
+                // Overwriting it here erased that, and made every failure look
+                // like one that arrived the instant the workload started.
                 record.closed_at = Some(now);
                 record.exit_status = exit_status;
                 #[cfg(test)]
@@ -670,7 +673,6 @@ impl LifecycleService {
                 let now = Utc::now();
                 current.status = SessionStatus::Ended;
                 current.tmux_session_id = identity.or(current.tmux_session_id);
-                current.last_used_at = now;
                 current.closed_at.get_or_insert(now);
                 current.exit_status = exit_status;
                 Ok(())
@@ -1101,7 +1103,10 @@ mod tests {
         );
         let terminal = store.load().unwrap().sessions.remove(0);
         assert_eq!(terminal.status, SessionStatus::Ended);
-        assert_eq!(terminal.closed_at, Some(terminal.last_used_at));
+        // The end is recorded without disturbing the start stamp, so the record
+        // still says how long this incarnation ran.
+        assert!(terminal.closed_at.unwrap() > terminal.last_used_at);
+        assert_eq!(terminal.last_used_at, stopping.last_used_at);
         assert_eq!(terminal.tmux_session_id, Some("$7".parse().unwrap()));
         assert_eq!(fs::read_to_string(&kills).unwrap().lines().count(), 1);
         assert!(matches!(

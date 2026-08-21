@@ -1397,7 +1397,7 @@ fn session_lists_name_a_failing_exit_in_text_and_keep_the_status_in_json() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
     let state = r#"{"version":4,"sessions":[
-{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/failed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z","exit_status":2},
+{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/failed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-04T00:00:00Z","exit_status":2},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/clean","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-03T00:00:00Z","exit_status":0}
 ],"orchestration_groups":[]}"#;
     fs::write(sandbox.state_file(), state).unwrap();
@@ -1433,6 +1433,48 @@ fn session_lists_name_a_failing_exit_in_text_and_keep_the_status_in_json() {
     assert_eq!(records[0]["exit_status"], 2);
     assert_eq!(records[1]["exit_status"], 0);
     assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), state);
+}
+
+#[test]
+fn restarting_a_workload_that_failed_immediately_is_declined_with_the_wait() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let now = chrono::Utc::now();
+    let closed_at = now - chrono::Duration::seconds(2);
+    let state = serde_json::json!({
+        "version": 4,
+        "sessions": [{
+            "id": SESSION_ID,
+            "host": "local",
+            "target": "local",
+            "directory": "/srv/app",
+            "preset": null,
+            "command": "exec shell",
+            "tmux_session_id": 7,
+            "ownership_proof": "0197f198000070008000000000000091",
+            "status": "ended",
+            "created_at": (now - chrono::Duration::minutes(5)).to_rfc3339(),
+            "last_used_at": (closed_at - chrono::Duration::milliseconds(400)).to_rfc3339(),
+            "closed_at": closed_at.to_rfc3339(),
+            "exit_status": 1
+        }],
+        "orchestration_groups": []
+    });
+    fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    let before = fs::read_to_string(sandbox.state_file()).unwrap();
+
+    // The command is declined rather than deferred, the wait it reports is the
+    // real remainder rather than a rounded-down zero, and it names what else to
+    // do. Nothing is restarted, and the record is untouched.
+    sandbox
+        .command()
+        .args(["session", "restart", SESSION_ID])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed immediately"))
+        .stderr(predicate::str::contains("in 28s").or(predicate::str::contains("in 27s")))
+        .stderr(predicate::str::contains("herdr-tether open"));
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
 }
 
 #[test]

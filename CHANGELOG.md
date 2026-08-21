@@ -20,6 +20,14 @@
   setting existed keeps that default rather than reading as off. An end whose
   status `tmux` could not report stays `ended`, because an unknown outcome is
   not a failure.
+- A workload whose command fails within ten seconds of starting is named apart
+  from an ordinary failure — `[failed immediately]` in the picker — and its next
+  Restart is paced for thirty seconds from that end, with the picker saying how
+  long is left and `herdr-tether session restart` declining for the same window
+  and naming the wait. Remove stays available throughout. Tether still never
+  restarts anything itself; the pace is a wait and an explanation, not an
+  action, and it is derived from the recorded end rather than from any new
+  stored history.
 
 ### Changed
 
@@ -41,6 +49,10 @@
   left out without comment, because a bare clone reports itself among its own
   worktrees, and the confirmation is bounded so a wedged network mount cannot
   hold the picker closed.
+- A workload's recorded end no longer overwrites the moment it started, so a
+  record says how long its last incarnation ran. Ordering now uses the end where
+  there is one, which keeps the picker, `session list`, and the snapshot in the
+  order they were already in.
 - Herdr toasts now name a workload by a short reference rather than by its tile
   title. The title is generated from the workload's host, repository name, and
   preset, and a notification leaves the surface that produced it, so the

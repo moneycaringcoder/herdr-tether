@@ -89,7 +89,16 @@ pub struct PickerWorkload {
     pub id: SessionId,
     pub status: SessionStatus,
     pub legacy: bool,
-    pub last_used_at: chrono::DateTime<chrono::Utc>,
+    /// When this workload was last active: when it ended, or when it was last
+    /// started or opened if it has not. Used for ordering only.
+    pub activity_at: chrono::DateTime<chrono::Utc>,
+    /// When a restart of this workload stops being paced.
+    ///
+    /// Set only for a workload that failed almost as soon as it started, which
+    /// is the shape of a restart loop. Restarting again immediately would
+    /// reproduce the failure, so the action waits; Tether never restarts
+    /// anything itself, so waiting is all the pacing there is.
+    pub paced_until: Option<chrono::DateTime<chrono::Utc>>,
     pub base_label: String,
     pub label: String,
 }
@@ -329,10 +338,10 @@ fn recent_directories(state: &State, host: &str, target: &str) -> Vec<String> {
     sessions.sort_by(|left, right| {
         compare_normal_sessions(
             left.status,
-            left.last_used_at,
+            left.activity_at(),
             (left.directory.as_str(), left.id),
             right.status,
-            right.last_used_at,
+            right.activity_at(),
             (right.directory.as_str(), right.id),
         )
     });
@@ -353,14 +362,13 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
     sessions.sort_by(|left, right| {
         compare_normal_sessions(
             left.status,
-            left.last_used_at,
+            left.activity_at(),
             left.id,
             right.status,
-            right.last_used_at,
+            right.activity_at(),
             right.id,
         )
     });
-
     sessions
         .into_iter()
         .map(|session| {
@@ -369,12 +377,35 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
                 id: session.id,
                 status: session.status,
                 legacy: session.ownership_proof.is_none(),
-                last_used_at: session.last_used_at,
+                activity_at: session.activity_at(),
+                paced_until: paced_restart_until(session),
                 base_label: label.clone(),
                 label,
             }
         })
         .collect()
+}
+
+/// Whether a workload failed immediately, and until when its restart is paced.
+///
+/// The rule lives on the record so the picker and the `session restart` command
+/// cannot disagree about what a paced workload is.
+fn paced_restart_until(session: &SessionRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    session.paced_restart_until()
+}
+
+fn failed_exit(session: &SessionRecord) -> bool {
+    session.exit_status.is_some_and(|status| status != 0)
+}
+
+/// How much of a workload's restart pace is left, if any.
+fn paced_remaining(
+    workload: &PickerWorkload,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::TimeDelta> {
+    let until = workload.paced_until?;
+    let remaining = until.signed_duration_since(now);
+    (remaining > chrono::TimeDelta::zero()).then_some(remaining)
 }
 
 fn workload_label(session: &SessionRecord) -> String {
@@ -388,16 +419,18 @@ fn workload_label(session: &SessionRecord) -> String {
         );
     }
     // A failing end and a clean one are the two outcomes worth telling apart at
-    // a glance, and the action for both is still an explicit Restart. An end
-    // whose status `tmux` could not report stays `ended`: unknown is not
-    // failure.
-    let failed = session.status == SessionStatus::Ended
-        && session.exit_status.is_some_and(|status| status != 0);
+    // a glance, and a failure that arrived at once is worth telling apart from
+    // both, because restarting it unchanged reproduces it. The action stays an
+    // explicit Restart in every case. An end whose status `tmux` could not
+    // report stays `ended`: unknown is not failure.
     let (lifecycle, action) = match session.status {
         SessionStatus::Creating => ("creating", "Pending"),
         SessionStatus::Running => ("running", "Open"),
         SessionStatus::Stopping => ("stopping", "Pending"),
-        SessionStatus::Ended if failed => ("failed", "Restart"),
+        SessionStatus::Ended if paced_restart_until(session).is_some() => {
+            ("failed immediately", "Restart")
+        }
+        SessionStatus::Ended if failed_exit(session) => ("failed", "Restart"),
         SessionStatus::Ended => ("ended", "Restart"),
         SessionStatus::Removed => ("removed", "Metadata"),
     };
@@ -1148,7 +1181,8 @@ impl PickerState {
                     id: record.id,
                     status: record.status,
                     legacy: record.ownership_proof.is_none(),
-                    last_used_at: record.last_used_at,
+                    activity_at: record.activity_at(),
+                    paced_until: paced_restart_until(record),
                     base_label: label.clone(),
                     label,
                 });
@@ -1157,10 +1191,10 @@ impl PickerState {
                 .sort_by(|left, right| {
                     compare_normal_sessions(
                         left.status,
-                        left.last_used_at,
+                        left.activity_at,
                         left.id,
                         right.status,
-                        right.last_used_at,
+                        right.activity_at,
                         right.id,
                     )
                 });
@@ -1570,6 +1604,19 @@ impl PickerState {
             .map(|workload| workload.id)
     }
     fn current_owned_action(&self) -> Option<(SessionId, bool)> {
+        self.current_owned_action_at(chrono::Utc::now())
+    }
+
+    /// The action available on the selected owned workload, as of `now`.
+    ///
+    /// A restart paced after an immediate failure is absent for as long as the
+    /// pace lasts, the way an unreachable host's actions are absent: the footer
+    /// says why rather than the key doing something surprising. Remove stays
+    /// available throughout, because it touches metadata rather than work.
+    fn current_owned_action_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(SessionId, bool)> {
         if self.stage != PickerStage::Resource || !self.current_host_reachable() {
             return None;
         }
@@ -1584,6 +1631,7 @@ impl PickerState {
             return None;
         }
         match workload.status {
+            SessionStatus::Ended if paced_remaining(workload, now).is_some() => None,
             SessionStatus::Ended => Some((id, true)),
             SessionStatus::Running
                 if self.workload_status.get(&id).is_some_and(|cell| {
@@ -1596,6 +1644,27 @@ impl PickerState {
         }
     }
 
+    /// The selected workload when its restart is paced, so `x` still removes it.
+    ///
+    /// Reported as a restart-shaped action because Remove is what `x` offers on
+    /// an ended workload; the restart itself stays withheld by
+    /// [`Self::current_owned_action_at`].
+    fn paced_owned_target(&self) -> Option<(SessionId, bool)> {
+        if self.stage != PickerStage::Resource || !self.current_host_reachable() {
+            return None;
+        }
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        let workload = self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| workload.id == id)?;
+        (!workload.legacy
+            && workload.status == SessionStatus::Ended
+            && paced_remaining(workload, chrono::Utc::now()).is_some())
+        .then_some((id, true))
+    }
     fn rebuild_status_labels(&mut self) {
         for host in &mut self.options.hosts {
             if host.origin == PickerHostOrigin::Effective {
@@ -1789,7 +1858,13 @@ impl PickerState {
             self.close_modal = Some(PickerCloseModal::Confirm { id });
             return PickerOutcome::Continue;
         }
-        let Some((id, restart)) = self.current_owned_action() else {
+        // The pace withholds a restart, not the row. Remove touches metadata
+        // rather than work, so it stays available while a workload waits — a
+        // paced row with two inert keys would read as Tether being broken.
+        let Some((id, restart)) = self
+            .current_owned_action()
+            .or_else(|| self.paced_owned_target())
+        else {
             return PickerOutcome::Continue;
         };
         self.close_modal_action = Some(if restart {
@@ -2260,7 +2335,40 @@ impl PickerState {
         }
     }
 
+    /// How much pace is left on the selected workload, if it is paced.
+    fn paced_remaining_selected(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::TimeDelta> {
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        let workload = self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| workload.id == id)?;
+        paced_remaining(workload, now)
+    }
+
+    /// The sentence shown while a restart is paced.
+    ///
+    /// It says what happened, what Tether is doing about it, and when the action
+    /// returns, because an action that has silently vanished is worse than one
+    /// that explains itself.
+    fn paced_notice(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let remaining = self.paced_remaining_selected(now)?;
+        let seconds = remaining.num_seconds().max(1);
+        Some(format!(
+            "Failed immediately · Restart paced {seconds}s to avoid a loop · Tether never restarts on its own"
+        ))
+    }
+
     pub fn footer_text(&self) -> String {
+        self.footer_text_at(chrono::Utc::now())
+    }
+
+    /// The footer as of `now`, so a paced countdown is testable without waiting.
+    pub fn footer_text_at(&self, now: chrono::DateTime<chrono::Utc>) -> String {
         if let Some((id, _)) = self.pending_close {
             return format!("Applying confirmed action · wait for result · {id} · ↑/↓ navigate");
         }
@@ -2307,11 +2415,16 @@ impl PickerState {
                 {
                     parts.push(label);
                 }
+                if self.stage == PickerStage::Resource
+                    && let Some(waiting) = self.paced_notice(now)
+                {
+                    parts.push(waiting);
+                }
                 let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
                     if self.current_legacy_id().is_some() {
                         ("", " · x Remove")
                     } else {
-                        match self.current_owned_action() {
+                        match self.current_owned_action_at(now) {
                             Some((_, false)) => ("Enter Open", " · x Stop"),
                             Some((_, true)) => ("Enter Restart", " · x Remove"),
                             None => match self.current_resource_identity() {
@@ -2320,6 +2433,11 @@ impl PickerState {
                                     if !self.current_host_unreachable() =>
                                 {
                                     ("Enter select", "")
+                                }
+                                // A paced workload keeps its metadata action, so
+                                // the row is not a dead end while it waits.
+                                _ if self.paced_remaining_selected(now).is_some() => {
+                                    ("", " · x Remove")
                                 }
                                 _ => ("", ""),
                             },
@@ -2563,6 +2681,9 @@ fn run_terminal_picker(
     let mut status_run = start_status_run(state, status_service, generation)?;
     let mut discovery_run = start_discovery_run(state, discovery_service, generation);
     let mut dirty = true;
+    // Whether the last frame showed a paced restart, so the frame after it ends
+    // is drawn once more and the action visibly returns.
+    let mut paced_frame = false;
     let (close_sender, close_receiver) = mpsc::channel::<PickerCloseResult>();
     let (prune_preview_sender, prune_preview_receiver) = mpsc::channel::<PickerPruneResult>();
     let (prune_apply_sender, prune_apply_receiver) = mpsc::channel::<PickerPruneResult>();
@@ -2614,6 +2735,12 @@ fn run_terminal_picker(
             dirty = false;
         }
         if !event::poll(Duration::from_millis(50)).context("poll terminal picker input")? {
+            // A paced restart is the only footer content that changes without an
+            // event, so an idle picker would otherwise show a frozen countdown
+            // and keep saying the restart is paced after it became available.
+            let paced_now = state.paced_remaining_selected(chrono::Utc::now()).is_some();
+            dirty = paced_now || paced_frame;
+            paced_frame = paced_now;
             continue;
         }
         let Event::Key(key) = event::read().context("read terminal picker input")? else {
@@ -3521,7 +3648,8 @@ mod close_render_tests {
                     base_label: label.clone(),
                     status: SessionStatus::Running,
                     legacy: false,
-                    last_used_at: chrono::Utc::now(),
+                    activity_at: chrono::Utc::now(),
+                    paced_until: None,
                     label,
                 }],
                 allow_existing: true,

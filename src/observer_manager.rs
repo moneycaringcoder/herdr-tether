@@ -171,10 +171,10 @@ impl ObserverManagerState {
                 .expect("candidate session exists");
             compare_normal_sessions(
                 left_record.status,
-                left_record.last_used_at,
+                left_record.activity_at(),
                 left_record.id,
                 right_record.status,
-                right_record.last_used_at,
+                right_record.activity_at(),
                 right_record.id,
             )
         });

@@ -214,7 +214,9 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
     let state = store.load().unwrap();
     let record = &state.sessions[0];
     assert_eq!(record.status, SessionStatus::Ended);
-    assert_eq!(record.closed_at, Some(record.last_used_at));
+    // The end is recorded without moving the start stamp, so the record still
+    // says how long this incarnation ran.
+    assert!(record.closed_at.unwrap() > record.last_used_at);
     assert_eq!(
         read_argv(&log),
         [
@@ -297,6 +299,34 @@ fn stopping_a_running_workload_records_no_exit_status() {
     let state = store.load().unwrap();
     assert_eq!(state.sessions[0].status, SessionStatus::Ended);
     assert_eq!(state.sessions[0].exit_status, None);
+}
+
+#[test]
+fn a_recorded_end_keeps_the_lifetime_the_pace_rule_reads() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // The pace rule asks how long the last incarnation ran, which is the
+    // difference between the start stamp and the recorded end. A terminal write
+    // that moved the start stamp to the end instant would make every failure
+    // look like it arrived the instant the workload started.
+    let (_temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:1:2:0197f198000070008000000000000002",
+    );
+    let started = store.load().unwrap().sessions[0].last_used_at;
+
+    service.stop_owned(id()).unwrap();
+
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.last_used_at, started, "the start stamp must survive");
+    assert!(record.closed_at.unwrap() > started);
+    // The fixture's workload starts in the recorded past, so this end reads as a
+    // long run rather than an immediate failure. What matters is that the
+    // lifetime is readable at all: a terminal write that moved the start stamp
+    // to the end instant would make every failure look immediate, and this
+    // record would then be paced.
+    assert!(!record.failed_immediately(), "a long run is not a loop");
+    let mut failed_at_once = record.clone();
+    failed_at_once.last_used_at = record.closed_at.unwrap() - chrono::Duration::milliseconds(400);
+    assert!(failed_at_once.failed_immediately());
 }
 
 #[test]
@@ -1859,7 +1889,7 @@ fn ended_observation_persists_exit_context_and_exact_identity() {
     assert_eq!(record.status, SessionStatus::Ended);
     assert_eq!(record.tmux_session_id, Some("$7".parse().unwrap()));
     assert_eq!(record.exit_status, Some(130));
-    assert_eq!(record.closed_at, Some(record.last_used_at));
+    assert!(record.closed_at.unwrap() > record.last_used_at);
     drop(temp);
 }
 

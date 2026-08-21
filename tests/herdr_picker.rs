@@ -2597,6 +2597,89 @@ fn a_workload_that_ended_with_a_failing_status_reads_apart_from_a_clean_end() {
 }
 
 #[test]
+fn a_workload_that_failed_immediately_paces_its_restart_and_says_why() {
+    // Anchored to real time, because the keys consult the clock: the pace has to
+    // be genuinely live while the test presses them.
+    let live = Utc::now();
+    let paced_picker = |ended_ago: Duration| {
+        let (config, mut state) = picker_fixture();
+        let closed_at = live - ended_ago;
+        state.sessions[0].status = SessionStatus::Ended;
+        state.sessions[0].last_used_at = closed_at - Duration::milliseconds(400);
+        state.sessions[0].closed_at = Some(closed_at);
+        state.sessions[0].exit_status = Some(1);
+        // A second workload that ran for a quarter of an hour before failing.
+        state.sessions[1].status = SessionStatus::Ended;
+        state.sessions[1].last_used_at = live - Duration::minutes(20);
+        state.sessions[1].closed_at = Some(live - Duration::minutes(5));
+        state.sessions[1].exit_status = Some(1);
+        let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+        let labels: Vec<String> = options.hosts[0]
+            .workloads
+            .iter()
+            .map(|workload| workload.label.clone())
+            .collect();
+        let mut picker = PickerState::new(options).unwrap();
+        picker.begin_refresh(7);
+        picker.apply_status(StatusMessage::Host {
+            generation: 7,
+            host: "build-box".into(),
+            status: HostReachability::Reachable,
+            detail: None,
+            checked_at: SystemTime::now(),
+        });
+        picker.handle(PickerEvent::Confirm);
+        (picker, labels)
+    };
+
+    let (mut picker, labels) = paced_picker(Duration::seconds(2));
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[failed immediately] Tether · Restart")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[failed] Tether · Restart")),
+        "a failure that took its time is not a loop: {labels:?}"
+    );
+
+    let paced = picker.footer_text_at(Utc::now());
+    assert!(paced.contains("Failed immediately"), "{paced}");
+    assert!(paced.contains("Restart paced"), "{paced}");
+    assert!(paced.contains("never restarts on its own"), "{paced}");
+    assert!(!paced.contains("Enter Restart"), "{paced}");
+    assert!(paced.contains("x Remove"), "{paced}");
+
+    // The key itself must not restart, not merely the hint be absent.
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+    assert_eq!(picker.handle(PickerEvent::Confirm), PickerOutcome::Continue);
+
+    // Remove still works, so a paced row is not a dead end.
+    assert_eq!(picker.handle(PickerEvent::Close), PickerOutcome::Continue);
+    assert!(matches!(
+        picker.close_modal(),
+        Some(&PickerCloseModal::Confirm { .. })
+    ));
+
+    // A workload whose pace has elapsed restarts exactly as before.
+    let (mut elapsed, _) = paced_picker(Duration::minutes(1));
+    let footer = elapsed.footer_text_at(Utc::now());
+    assert!(footer.contains("Enter Restart"), "{footer}");
+    assert!(!footer.contains("Restart paced"), "{footer}");
+    assert_eq!(
+        elapsed.handle(PickerEvent::Confirm),
+        PickerOutcome::Continue
+    );
+    assert!(matches!(
+        elapsed.handle(PickerEvent::Confirm),
+        PickerOutcome::Selected(PickerSelection::Restart { .. })
+    ));
+}
+
+#[test]
 fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
     let (config, mut state) = picker_fixture();
     let record = state.sessions.remove(0);
