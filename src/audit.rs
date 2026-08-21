@@ -56,13 +56,13 @@ pub const MAX_AUDIT_BYTES: usize = 2 * 1024 * 1024;
 pub enum AuditAction {
     /// A workload was reserved before its backend was asked to create it.
     Create,
-    /// A created workload was confirmed live.
+    /// A reservation, from a create or a restart, was confirmed live.
     Activate,
     /// A confirmed Stop began.
     Stop,
     /// A stop finished and the workload's end was recorded.
     Stopped,
-    /// A restart reserved a new incarnation.
+    /// A restart reserved a new incarnation, before it was asked for.
     Restart,
     /// An observation found the workload alive.
     Observed,
@@ -197,16 +197,36 @@ impl AuditStore {
     /// Records one transition as of `now`, so retention is testable.
     pub fn record_at(&self, entry: AuditEntry, now: DateTime<Utc>) -> Result<()> {
         with_advisory_lock(&self.path, |path| {
-            let mut trail = load_trail(path)?;
+            // A trail that cannot be read is set aside rather than allowed to
+            // stop recording. Every caller drops this error, so returning here
+            // would end recording permanently and silently: one unparseable file,
+            // or one file written by a newer schema, and an installation would go
+            // on reporting successful stops and restarts while keeping no record
+            // of any of them. The unreadable file is kept next to the new one so
+            // it can still be looked at.
+            let mut trail = match load_trail(path) {
+                Ok(trail) => trail,
+                Err(_) => {
+                    let _ = std::fs::rename(path, path.with_extension("json.unreadable"));
+                    AuditTrail::default()
+                }
+            };
             trail.entries.push(entry.clone());
             retain_bounded(&mut trail.entries, self.retention_days, now);
             save_trail(path, &trail)
         })
     }
 
-    /// The trail, oldest first.
+    /// The trail, oldest first, without what retention says it no longer shows.
+    ///
+    /// Reading does not rewrite the file - a read that mutates would be a
+    /// surprise - so the window is applied to what is returned. Otherwise a
+    /// quiet installation, which is exactly the one recording nothing new, would
+    /// keep showing transitions the retention window says are gone.
     pub fn entries(&self) -> Result<Vec<AuditEntry>> {
-        Ok(with_advisory_lock(&self.path, load_trail)?.entries)
+        let mut entries = with_advisory_lock(&self.path, load_trail)?.entries;
+        retain_bounded(&mut entries, self.retention_days, Utc::now());
+        Ok(entries)
     }
 }
 
@@ -390,6 +410,39 @@ mod tests {
             entries.last(),
             Some(&newest),
             "the newest transition is the one kept"
+        );
+    }
+
+    #[test]
+    fn a_read_does_not_show_what_retention_says_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AuditStore::new(temp.path().join("audit.json"), 7);
+        let now = Utc::now();
+        // Recorded when it was current; nothing has been recorded since, so no
+        // write has had the chance to prune it.
+        store.record_at(entry(1, now), now).unwrap();
+        let stale = AuditStore::new(temp.path().join("audit.json"), 0);
+        assert!(
+            stale.entries().unwrap().is_empty(),
+            "a quiet installation still honours its window"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_trail_is_set_aside_rather_than_ending_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audit.json");
+        std::fs::write(&path, "{ this is not the trail }\n").unwrap();
+        let store = AuditStore::new(path.clone(), 30);
+        let now = Utc::now();
+
+        store
+            .record_at(entry(1, now), now)
+            .expect("one bad file must not end recording for good");
+        assert_eq!(store.entries().unwrap().len(), 1);
+        assert!(
+            temp.path().join("audit.json.unreadable").exists(),
+            "what could not be read is kept, not deleted"
         );
     }
 

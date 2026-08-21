@@ -145,6 +145,13 @@ impl LifecycleService {
 
     /// Notes one transition, if a trail is being kept.
     ///
+    /// A transition that did not change the status is not recorded. The picker
+    /// reconciles every ended workload against `tmux` on every refresh, and each
+    /// of those confirms what the record already said; recording them would fill
+    /// the trail with lines about nothing happening and evict the creates, stops,
+    /// and restarts through the entry ceiling, leaving a file that looks complete
+    /// and has lost exactly the history it exists to keep.
+    ///
     /// A failure to write is deliberately dropped rather than surfaced: the
     /// transition already happened, and turning a bookkeeping failure into an
     /// operation failure would be worse than a missing line. The error text is
@@ -156,6 +163,9 @@ impl LifecycleService {
         from: SessionStatus,
         to: SessionStatus,
     ) {
+        if from == to {
+            return;
+        }
         if let Some(audit) = self.audit.as_ref() {
             let _ = audit.record(AuditEntry {
                 at: Utc::now(),
@@ -198,8 +208,15 @@ impl LifecycleService {
             WorkloadState::Unknown => unreachable!("handled above"),
         };
         self.ensure_stopping(&record, identity)?;
+        // `ensure_stopping` fills in an incarnation the snapshot lacked, which is
+        // the case for a `Creating` workload whose pane turns out to be alive.
+        // The trail must carry what was written, not what was read.
+        let stopping = SessionRecord {
+            tmux_session_id: identity.or(record.tmux_session_id),
+            ..record.clone()
+        };
         self.note(
-            &record,
+            &stopping,
             AuditAction::Stop,
             record.status,
             SessionStatus::Stopping,
@@ -238,7 +255,7 @@ impl LifecycleService {
         self.note(
             &SessionRecord {
                 exit_status: observed_exit_status,
-                ..record.clone()
+                ..stopping
             },
             AuditAction::Stopped,
             SessionStatus::Stopping,
@@ -509,6 +526,18 @@ impl LifecycleService {
                             Ok(())
                         })
                         .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+                    // The same promotion a restart's verification records, on the
+                    // path the picker actually takes.
+                    self.note(
+                        &SessionRecord {
+                            tmux_session_id: Some(identity),
+                            exit_status: None,
+                            ..record.clone()
+                        },
+                        AuditAction::Observed,
+                        record.status,
+                        SessionStatus::Running,
+                    );
                 }
             }
             WorkloadState::Ended {
@@ -521,26 +550,33 @@ impl LifecycleService {
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                self.mark_ended(&record, Some(identity), exit_status)?;
-                self.note(
-                    &SessionRecord {
-                        tmux_session_id: Some(identity),
-                        exit_status,
-                        ..record.clone()
-                    },
-                    AuditAction::Reconciled,
-                    record.status,
-                    SessionStatus::Ended,
-                );
+                if self.mark_ended(&record, Some(identity), exit_status)? {
+                    self.note(
+                        &SessionRecord {
+                            tmux_session_id: Some(identity),
+                            exit_status,
+                            ..record.clone()
+                        },
+                        AuditAction::Reconciled,
+                        record.status,
+                        SessionStatus::Ended,
+                    );
+                }
             }
             WorkloadState::Missing => {
-                self.mark_ended(&record, None, None)?;
-                self.note(
-                    &record,
-                    AuditAction::Reconciled,
-                    record.status,
-                    SessionStatus::Ended,
-                );
+                // `mark_ended` clears the exit status, so the entry must not
+                // carry the one the previous incarnation ended with.
+                if self.mark_ended(&record, None, None)? {
+                    self.note(
+                        &SessionRecord {
+                            exit_status: None,
+                            ..record.clone()
+                        },
+                        AuditAction::Reconciled,
+                        record.status,
+                        SessionStatus::Ended,
+                    );
+                }
             }
         }
         Ok(observed)
@@ -640,6 +676,16 @@ impl LifecycleService {
         let reservation = self
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
+        // Recorded before the backend is asked, the way a create is: a
+        // reservation whose creation fails is exactly the state someone
+        // reconstructs afterwards, and a trail that only recorded successes
+        // would say the restart never began.
+        self.note(
+            &reservation,
+            AuditAction::Restart,
+            record.status,
+            SessionStatus::Creating,
+        );
         let identity = backend
             .create(&LaunchSpec {
                 id,
@@ -655,7 +701,7 @@ impl LifecycleService {
                 exit_status: None,
                 ..reservation.clone()
             },
-            AuditAction::Restart,
+            AuditAction::Activate,
             SessionStatus::Creating,
             SessionStatus::Running,
         );
@@ -760,14 +806,18 @@ impl LifecycleService {
         Ok(RemoveOwnedResult { id, workload })
     }
 
+    /// Records an end, and reports whether there was one to record.
+    ///
+    /// A workload whose metadata was already removed is left alone, so a caller
+    /// keeping a trail must not claim a transition that did not happen.
     fn mark_ended(
         &self,
         snapshot: &SessionRecord,
         identity: Option<TmuxSessionId>,
         exit_status: Option<i32>,
-    ) -> Result<(), CloseOwnedError> {
+    ) -> Result<bool, CloseOwnedError> {
         if snapshot.status == SessionStatus::Removed {
-            return Ok(());
+            return Ok(false);
         }
         self.store
             .update(|state| {
@@ -786,6 +836,7 @@ impl LifecycleService {
                 current.exit_status = exit_status;
                 Ok(())
             })
+            .map(|()| true)
             .map_err(|_| CloseOwnedError::ConcurrentModification(snapshot.id))
     }
 

@@ -1927,6 +1927,39 @@ fn prune_state_failures_are_typed_and_apply_does_not_rewrite_bad_state() {
 }
 
 #[test]
+fn re_observing_an_ended_workload_adds_nothing_to_the_trail() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // An empty catalog: the picker's status refresh reports every ended workload
+    // as missing, and it does this on every refresh.
+    let (temp, store, service, _) = lifecycle_fixture("\n");
+    let trail = AuditStore::new(temp.path().join("audit.json"), 30);
+    let service = service.with_audit(trail.clone());
+
+    service.observe_owned(id()).unwrap();
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
+    let after_first = trail.entries().unwrap();
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the reconciliation that ended it is worth a line: {after_first:?}"
+    );
+
+    for _ in 0..5 {
+        service.observe_owned(id()).unwrap();
+    }
+    assert_eq!(
+        trail.entries().unwrap(),
+        after_first,
+        "confirming what the record already said is not a transition; recording it \
+         would evict the real history through the entry ceiling"
+    );
+    drop(temp);
+}
+
+#[test]
 fn ended_observation_persists_exit_context_and_exact_identity() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     let (temp, store, service, _) = lifecycle_fixture(
