@@ -641,9 +641,18 @@ fn metadata_name(status: SessionStatus) -> &'static str {
         SessionStatus::Removed => "removed",
     }
 }
+/// The public name of an observed workload state.
+///
+/// These are consumer-facing values in `owned_sessions[].workload_status`. The set
+/// grows when Tether can observe something it could not before; a consumer that
+/// does not recognise a value must read it as an unknown result rather than as an
+/// absent workload, which is what `integrations/hermes/SKILL.md` requires.
 fn workload_name(status: WorkloadStatus) -> &'static str {
     match status {
         WorkloadStatus::Running { .. } => "running",
+        // Distinct from the metadata `ended`: this is what the host reported now,
+        // not what the record was told earlier.
+        WorkloadStatus::Ended { .. } => "exited",
         WorkloadStatus::Missing => "missing",
         WorkloadStatus::Unknown => "unknown",
         WorkloadStatus::TimedOut => "timed_out",

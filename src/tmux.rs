@@ -366,12 +366,18 @@ impl TmuxBackend {
         )
     }
 
+    /// Asks one host what it is running, and whether each pane is still alive.
+    ///
+    /// `remain-on-exit` keeps a session listed after its command exits, so
+    /// presence alone says nothing about whether the work is still going. The
+    /// pane fields are the same two the exact inspection already asks for, and
+    /// they cost nothing extra: this is one `list-sessions` per host either way.
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
         self.tmux_spec(
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_attached}".to_owned(),
+                "#{session_name}:#{session_attached}:#{pane_dead}:#{pane_dead_status}".to_owned(),
             ],
             false,
         )

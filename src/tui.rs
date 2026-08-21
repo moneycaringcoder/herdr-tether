@@ -786,6 +786,12 @@ fn workload_status_text(status: &WorkloadStatus) -> String {
     match status {
         WorkloadStatus::Running { attached: 0 } => "running".to_owned(),
         WorkloadStatus::Running { attached } => format!("running · {attached} attached"),
+        // A row reaches this only in the moment between the refresh that saw the
+        // end and the reconciliation that records it.
+        WorkloadStatus::Ended {
+            exit_status: Some(status),
+        } if *status != 0 => format!("exited · {status}"),
+        WorkloadStatus::Ended { .. } => "exited".to_owned(),
         WorkloadStatus::Missing => "missing".to_owned(),
         WorkloadStatus::Unknown => "unknown".to_owned(),
         WorkloadStatus::TimedOut => "timeout".to_owned(),
@@ -1600,8 +1606,15 @@ impl PickerState {
                 checked_at,
                 ..
             } => {
-                if status == WorkloadStatus::Missing {
-                    self.mark_workload_ended(id);
+                // Both are ways of learning the workload is not running any
+                // more: its session is gone, or its session is still listed with
+                // a dead pane. Neither waits for the user to act.
+                match status {
+                    WorkloadStatus::Missing => self.mark_workload_ended(id, None),
+                    WorkloadStatus::Ended { exit_status } => {
+                        self.mark_workload_ended(id, exit_status);
+                    }
+                    _ => {}
                 }
                 self.workload_status.get_mut(&id).is_some_and(|cell| {
                     cell.apply(status, checked_at);
@@ -1746,7 +1759,13 @@ impl PickerState {
         }
     }
 
-    fn mark_workload_ended(&mut self, id: SessionId) {
+    /// Turns a row for a workload that is no longer running into an ended row.
+    ///
+    /// `exit_status` is what the host reported, when it reported one. A failing
+    /// status has to travel with the transition: a workload that failed reads
+    /// `[failed]` everywhere else, and relabelling it `[ended]` here would put the
+    /// distinction back where it was before failing exits were named.
+    fn mark_workload_ended(&mut self, id: SessionId, exit_status: Option<i32>) {
         for workload in self
             .options
             .hosts
@@ -1755,9 +1774,16 @@ impl PickerState {
             .filter(|workload| workload.id == id)
         {
             workload.status = SessionStatus::Ended;
+            // The record was running until this refresh, so the observation is the
+            // only exit status there is.
+            let ended = if exit_status.is_some_and(|status| status != 0) {
+                "[failed]"
+            } else {
+                "[ended]"
+            };
             workload.base_label = workload
                 .base_label
-                .replacen("[running]", "[ended]", 1)
+                .replacen("[running]", ended, 1)
                 .replacen(" · Open ", " · Restart ", 1);
         }
     }

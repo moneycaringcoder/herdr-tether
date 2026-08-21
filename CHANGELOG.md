@@ -151,6 +151,20 @@
 
 ### Fixed
 
+- A workload that ends on its own stops reading as running without anyone acting
+  on it. `remain-on-exit` keeps a finished workload's session listed, so the broad
+  status probe reported it as present and every surface rendered that as running
+  until a Stop, Restart, or Open happened to inspect it. The probe now asks whether
+  each pane is alive and what it exited with, in the same `list-sessions` it
+  already ran: one call per host, two more fields, no per-workload inspection
+  added. A picker row becomes `[ended]`, or `[failed]` when the command exited with
+  a failing status, and offers Restart. `snapshot` reports a new
+  `workload_status` value, `exited`, for a listed session whose command finished;
+  the document shape is unchanged, so `schema_version` stays `1`, and the consumer
+  contract now says to read an unrecognised status as an unknown result rather than
+  as an absent workload. The observation does not rewrite the record, which is
+  still reconciled by the next operation that acts on the workload.
+
 - `herdr-tether host check` now runs its probes under the same bounded executor as
   every other `tmux` and SSH probe, so a probe that never returns is ended and the
   process it started is reaped, rather than waited on for as long as the command

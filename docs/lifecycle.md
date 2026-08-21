@@ -113,6 +113,25 @@ Tether can see is the server its own invocation reaches. A workload started unde
 a different `TMUX_TMPDIR` is not visible to a Tether run without it, and reads as
 ended. Recording the socket a workload was created on would close that gap.
 
+## Noticing an end nobody asked about
+
+A workload that finishes on its own is noticed by the next ordinary refresh,
+without anyone acting on it. `remain-on-exit` keeps a finished workload's session
+listed, so presence alone proves nothing; the same `list-sessions` a refresh
+already runs now also asks whether each pane is still alive and what status it
+exited with. A row that was `[running]` becomes `[ended]`, or `[failed]` when the
+command exited with a failing status, and its action becomes Restart.
+
+The cost is nothing extra: one `list-sessions` per host, as before, with two more
+fields in the same format string. A host with twenty workloads costs the same as a
+host with one, and no per-workload inspection is added to any refresh.
+
+This is an observation, not a record. The refresh reports what the host said; the
+record is reconciled by the next operation that acts on the workload, which is
+what keeps observation and persistence separate. In the `snapshot` JSON such a
+workload reads `workload_status: "exited"` while its metadata status may still
+read `running` until that reconciliation happens.
+
 ## Serving is a different question from running
 
 Every state above answers whether the workload's process is alive. Whether the

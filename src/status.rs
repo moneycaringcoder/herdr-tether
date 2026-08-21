@@ -40,7 +40,18 @@ pub enum HostReachability {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadStatus {
-    Running { attached: u32 },
+    Running {
+        attached: u32,
+    },
+    /// The session is still listed, and the command inside it has exited.
+    ///
+    /// `remain-on-exit` keeps a workload's session after its command finishes, so
+    /// this is what an ordinary refresh sees when a workload ends on its own
+    /// rather than because someone stopped it. The exit status is whatever `tmux`
+    /// retained, which is absent when it had none to report.
+    Ended {
+        exit_status: Option<i32>,
+    },
     Missing,
     Unknown,
     TimedOut,
@@ -932,8 +943,13 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                     .map(|workload| {
                         let status = catalog.owned.get(&workload.id).map_or(
                             WorkloadStatus::Missing,
-                            |attached| WorkloadStatus::Running {
-                                attached: *attached,
+                            |observed| match observed.ended {
+                                // Listed, and its command has exited: the ordinary
+                                // refresh now sees an end nobody asked about.
+                                Some(exit_status) => WorkloadStatus::Ended { exit_status },
+                                None => WorkloadStatus::Running {
+                                    attached: observed.attached,
+                                },
                             },
                         );
                         (workload.id, status)
@@ -1136,8 +1152,16 @@ fn uniform_workloads(
         .collect()
 }
 
+/// What one host reported about one owned workload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedObservation {
+    attached: u32,
+    /// `Some` when the pane has exited, carrying whatever status `tmux` kept.
+    ended: Option<Option<i32>>,
+}
+
 struct ParsedSessions {
-    owned: HashMap<SessionId, u32>,
+    owned: HashMap<SessionId, OwnedObservation>,
     external: Vec<ExternalSession>,
     hidden_reserved: usize,
     unsafe_names: usize,
@@ -1156,19 +1180,34 @@ fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
         if names.len() >= MAX_SESSIONS {
             return None;
         }
-        let (name, attached) = line.rsplit_once(':')?;
-        if attached.contains(':') || !names.insert(name.to_owned()) {
+        // Split from the right, so a session whose name contains a colon keeps it
+        // and is judged by the name rules below rather than shifting the fields.
+        let (head, exit_status) = line.rsplit_once(':')?;
+        let (head, pane_dead) = head.rsplit_once(':')?;
+        let (name, attached) = head.rsplit_once(':')?;
+        if !names.insert(name.to_owned()) {
             return None;
         }
         let attached = attached.parse::<u32>().ok()?;
+        let ended = match pane_dead {
+            "0" => None,
+            "1" => Some(if exit_status.is_empty() {
+                None
+            } else {
+                Some(exit_status.parse::<i32>().ok()?)
+            }),
+            _ => return None,
+        };
         if name.starts_with("tether-") {
             if let Ok(id) = name.parse::<SessionId>() {
-                owned.insert(id, attached);
+                owned.insert(id, OwnedObservation { attached, ended });
             } else {
                 hidden_reserved += 1;
             }
             continue;
         }
+        // An external session is attach-only, so whether its pane has exited is
+        // not Tether's to report.
         match name.parse() {
             Ok(name) => external.push(ExternalSession { name, attached }),
             Err(_) => unsafe_names += 1,

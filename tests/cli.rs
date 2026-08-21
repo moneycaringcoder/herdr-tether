@@ -895,7 +895,7 @@ case "$command" in
     case "$*" in
       *TETHER_OWNERSHIP_PROOF*) if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi ;;
       *'#{{session_id}}'*) if [ -n "$id" ]; then printf '%s:$7' "$id"; fi ;;
-      *) if [ -n "$id" ]; then printf '%s:0' "$id"; fi ;;
+      *) if [ -n "$id" ]; then printf '%s:0:0:' "$id"; fi ;;
     esac
     ;;
   if-shell)
