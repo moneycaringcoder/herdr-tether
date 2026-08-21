@@ -1285,12 +1285,14 @@ fn group_agent_panes(
     panes
 }
 
-/// Sends one advisory Herdr toast per newly attention-worthy agent.
+/// Asks Herdr to show a toast for each newly attention-worthy worker.
 ///
 /// Delivery is best effort: the Observer tile is the authoritative view, so a
 /// disabled or refused toast changes nothing and is never surfaced as an error.
-/// Only the worker's already-sanitized display label travels in the body; host,
-/// directory, command, and prompt text never do.
+/// The body carries a workload reference and either a state or an exit status.
+/// Host, directory, command, capture, and prompt text never travel, which is why
+/// it is not the tile's display title: that title is generated from the host,
+/// repository name, and preset.
 fn notify_attention(
     mission_client: Option<&HerdrSocketClient>,
     notifications: NotificationDefaults,
@@ -1300,25 +1302,30 @@ fn notify_attention(
         return;
     };
     for event in attention {
+        // The body names the workload rather than describing it. A display title
+        // is generated from host, repository name, and preset, and a toast leaves
+        // the surface that produced it, so the reference travels and the title
+        // stays on the tile. The exit status is a small integer `tmux` reported,
+        // not output, and it is the one detail that makes the toast actionable.
         let (enabled, sound, body) = match event.reason {
             AttentionReason::Agent(state @ ObserverAgentState::Blocked) => (
                 notifications.agent_blocked,
                 NotificationSound::Request,
-                format!("{} is {}", event.label, state.label()),
+                format!("Workload {} is {}", event.reference, state.label()),
             ),
             AttentionReason::Agent(state @ ObserverAgentState::Done) => (
                 notifications.agent_done,
                 NotificationSound::Done,
-                format!("{} is {}", event.label, state.label()),
+                format!("Workload {} is {}", event.reference, state.label()),
             ),
             AttentionReason::Agent(_) => continue,
-            // The exit status is a small integer `tmux` reported, not output, so
-            // it carries none of what the privacy contract excludes, and it is
-            // the one detail that makes the toast actionable.
             AttentionReason::Failed { exit_status } => (
                 notifications.workload_failed,
                 NotificationSound::Request,
-                format!("{} exited with status {exit_status}", event.label),
+                format!(
+                    "Workload {} exited with status {exit_status}",
+                    event.reference
+                ),
             ),
         };
         if !enabled {
@@ -2012,8 +2019,8 @@ mod tests {
     fn each_attention_reason_notifies_with_its_own_sound_and_wording() {
         let temp = tempfile::tempdir().unwrap();
         let attention = |reason| WorkerAttention {
-            worker_id: "w".to_owned(),
-            label: "Worker w".to_owned(),
+            worker_id: "tether-0197f198000070008000000000000001".to_owned(),
+            reference: "…00000001".to_owned(),
             reason,
         };
         let cases = [
@@ -2021,19 +2028,19 @@ mod tests {
                 "blocked",
                 AttentionReason::Agent(ObserverAgentState::Blocked),
                 "request",
-                "Worker w is BLOCKED",
+                "Workload …00000001 is BLOCKED",
             ),
             (
                 "done",
                 AttentionReason::Agent(ObserverAgentState::Done),
                 "done",
-                "Worker w is DONE",
+                "Workload …00000001 is DONE",
             ),
             (
                 "failed",
                 AttentionReason::Failed { exit_status: 2 },
                 "request",
-                "Worker w exited with status 2",
+                "Workload …00000001 exited with status 2",
             ),
         ];
         for (name, reason, sound, body) in cases {
@@ -2100,7 +2107,7 @@ mod tests {
                     notifications,
                     WorkerAttention {
                         worker_id: "w".to_owned(),
-                        label: "Worker w".to_owned(),
+                        reference: "…00000001".to_owned(),
                         reason,
                     },
                 )

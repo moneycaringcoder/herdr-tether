@@ -140,9 +140,27 @@ struct PreviousWorkerState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerAttention {
     pub worker_id: String,
-    /// Already-sanitized display label. Never a host, directory, or command.
-    pub label: String,
+    /// How the workload is named outside Tether's own surfaces.
+    ///
+    /// Deliberately not the tile's display title. That title is generated from
+    /// the workload's host, repository name, and preset, and a notification
+    /// leaves the surface that produced it, so it carries a reference to the
+    /// work instead of a description of it. The tile beside it still shows the
+    /// friendly title.
+    pub reference: String,
     pub reason: AttentionReason,
+}
+
+/// A workload reference that identifies the work without describing it.
+///
+/// The tail of the session id is enough for a person to match a notification to
+/// the row or tile in front of them, and it says nothing about where the work
+/// runs or what it does.
+fn workload_reference(worker_id: &str) -> String {
+    match worker_id.char_indices().rev().nth(7) {
+        Some((index, _)) if index > 0 => format!("…{}", &worker_id[index..]),
+        _ => worker_id.to_owned(),
+    }
 }
 
 /// Why a worker wants attention.
@@ -559,7 +577,7 @@ impl ObserverState {
             })
             .map(|worker| WorkerAttention {
                 worker_id: worker.id.clone(),
-                label: worker.display_title(),
+                reference: workload_reference(&worker.id),
                 reason: AttentionReason::Agent(worker.agent_state),
             });
         // A failing end is reported once per incarnation. A worker seen for the
@@ -583,7 +601,7 @@ impl ObserverState {
             })
             .map(|(worker, exit_status)| WorkerAttention {
                 worker_id: worker.id.clone(),
-                label: worker.display_title(),
+                reference: workload_reference(&worker.id),
                 reason: AttentionReason::Failed { exit_status },
             });
         let attention: Vec<WorkerAttention> = agents.chain(failures).collect();

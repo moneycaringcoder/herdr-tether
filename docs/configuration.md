@@ -185,11 +185,13 @@ its own `ui.toast.delivery` setting, which ships as `off`, and it may decline
 while another surface owns the screen. Tether treats either outcome as normal:
 the Mission Control tile remains the authoritative view.
 
-Notification text carries only the worker's already-sanitized display label and
-either its state or the exit status `tmux` reported. Host, directory, command,
-capture, and prompt text are never included. Tether notifies only while a
-Mission Control surface is open; nothing observes a workload or an agent when no
-Tether surface is running.
+Notification text carries a short workload reference and either the agent's state
+or the exit status `tmux` reported. It is deliberately not the tile's display
+title, because that title is generated from the workload's host, repository name,
+and preset, and a notification leaves the surface that produced it. Host,
+directory, command, capture, and prompt text are never included. Tether notifies
+only while a Mission Control surface is open; nothing observes a workload or an
+agent when no Tether surface is running.
 
 ### Retention
 

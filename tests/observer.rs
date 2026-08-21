@@ -594,23 +594,30 @@ fn attention_ignores_states_and_workers_that_are_not_waiting_on_a_person() {
 }
 
 #[test]
-fn attention_labels_never_carry_host_directory_or_command_text() {
+fn attention_references_never_carry_host_directory_or_command_text() {
     let mut observer = ObserverState::new(Vec::new());
     let secret = ObserverWorker {
         live_agent: true,
         agent_state: ObserverAgentState::Blocked,
         title: Some("builder@example.test /srv/secret exec deploy --token abc".to_owned()),
-        ..worker("w")
+        ..worker("tether-0197f198000070008000000000000001")
     };
     let attention = observer.update_workers(vec![secret]);
     assert_eq!(attention.len(), 1);
-    // The label is the same sanitized, bounded display title the tile renders.
-    // Whatever it contains came from the group's own worker title, never from
-    // Tether joining in a host, directory, or command.
-    assert_eq!(
-        attention[0].label,
-        observer.workers()[0].title.clone().unwrap()
-    );
+
+    // The tile shows the friendly title; a notification leaves the surface that
+    // produced it, so it carries a reference to the work rather than a
+    // description of it. The title here is what the Observer manager generates:
+    // host, repository name, and preset.
+    assert_eq!(attention[0].reference, "…00000001");
+    let title = observer.workers()[0].title.clone().unwrap();
+    assert_ne!(attention[0].reference, title);
+    for fragment in ["builder@example.test", "/srv/secret", "deploy", "token"] {
+        assert!(
+            !attention[0].reference.contains(fragment),
+            "{fragment} must not reach a notification"
+        );
+    }
 }
 
 #[test]
