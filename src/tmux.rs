@@ -366,12 +366,26 @@ impl TmuxBackend {
         )
     }
 
+    /// Asks one host what it is running, and whether each workload's own pane is
+    /// still alive.
+    ///
+    /// `remain-on-exit` keeps a session listed after its command exits, so
+    /// presence alone says nothing about whether the work is still going. The pane
+    /// fields are the same two the exact inspection already asks for, and they
+    /// cost nothing extra: this is one `list-sessions` per host either way.
+    ///
+    /// The window and pane counts come along because `#{pane_dead}` on a session
+    /// describes its *active* pane, not the pane Tether launched. Someone attached
+    /// to a workload can split it, and a dead split would otherwise read as the
+    /// workload having ended. Tether launches exactly one window with one pane, so
+    /// those counts are what say whether the active pane is still the workload's.
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
         self.tmux_spec(
             vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_attached}".to_owned(),
+                "#{session_name}:#{session_attached}:#{session_windows}:#{window_panes}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}"
+                    .to_owned(),
             ],
             false,
         )

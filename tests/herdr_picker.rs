@@ -2254,6 +2254,49 @@ fn a_configured_health_command_reads_beside_liveness_and_only_where_configured()
 }
 
 #[test]
+fn a_workload_that_exits_while_nobody_asked_stops_reading_as_running() {
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    let clean = options.hosts[0].workloads[0].id;
+    let failed = options.hosts[0].workloads[1].id;
+    let mut picker = PickerState::new(options).unwrap();
+    assert!(
+        picker.workload_label(clean).unwrap().contains("[running]"),
+        "it starts as a running row: {:?}",
+        picker.workload_label(clean)
+    );
+
+    picker.begin_refresh(1);
+    // The refresh nobody asked for: `remain-on-exit` keeps the sessions listed,
+    // and the pane fields say the commands are over.
+    for (id, exit_status) in [(clean, Some(0)), (failed, Some(2))] {
+        assert!(picker.apply_status(StatusMessage::Workload {
+            generation: 1,
+            id,
+            status: WorkloadStatus::Ended { exit_status },
+            checked_at: SystemTime::UNIX_EPOCH,
+        }));
+    }
+
+    let clean_label = picker.workload_label(clean).unwrap().to_owned();
+    let failed_label = picker.workload_label(failed).unwrap().to_owned();
+    assert!(
+        clean_label.contains("[ended] Tether · Restart"),
+        "a clean end reads as one: {clean_label}"
+    );
+    assert!(
+        failed_label.contains("[failed] Tether · Restart"),
+        "a failing end is still named a failure when nobody asked: {failed_label}"
+    );
+    for label in [&clean_label, &failed_label] {
+        assert!(
+            !label.contains("[running]"),
+            "neither still reads as running: {label}"
+        );
+    }
+}
+
+#[test]
 fn fresh_missing_workload_cannot_be_resumed() {
     let (config, state) = picker_fixture();
     let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);

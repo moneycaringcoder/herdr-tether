@@ -31,7 +31,7 @@ fn write_fake_ssh(path: &Path, fast_id: SessionId) {
     let script = format!(
         r#"#!/bin/sh
 case " $* " in
-  *" fast "*) printf '%s:2\n' '{fast_id}' ;;
+  *" fast "*) printf '%s:2:1:1:0::\n' '{fast_id}' ;;
   *" slow "*) sleep 5 ;;
   *) exit 99 ;;
 esac
@@ -123,6 +123,156 @@ fn fast_host_publishes_before_slow_host_times_out() {
 }
 
 #[test]
+fn an_ordinary_refresh_sees_a_workload_that_ended_on_its_own() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let clean = id("tether-0197f198000070008000000000000001");
+    let failed = id("tether-0197f198000070008000000000000002");
+    let unreadable = id("tether-0197f198000070008000000000000003");
+    let signalled = id("tether-0197f198000070008000000000000005");
+    let alive = id("tether-0197f198000070008000000000000004");
+    // `remain-on-exit` keeps a session listed after its command exits, so every
+    // one of these is still present. Only the pane fields tell them apart.
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s:0:1:1:1:0:\\n%s:0:1:1:1:2:\\n%s:0:1:1:1::\\n%s:0:1:1:1::9\\n%s:1:1:1:0::\\n' '{clean}' '{failed}' '{unreadable}' '{signalled}' '{alive}'\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let run = service
+        .try_start(StatusRequest {
+            generation: 3,
+            resources: false,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![
+                    probe(clean),
+                    probe(failed),
+                    probe(unreadable),
+                    probe(signalled),
+                    probe(alive),
+                ],
+            }],
+        })
+        .unwrap();
+    let mut statuses = std::collections::HashMap::new();
+    loop {
+        match run.receiver.recv_timeout(Duration::from_secs(15)).unwrap() {
+            StatusMessage::Workload { id, status, .. } => {
+                statuses.insert(id, status);
+            }
+            StatusMessage::Finished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        statuses.get(&clean),
+        Some(&WorkloadStatus::Ended {
+            exit_status: Some(0)
+        }),
+        "a workload whose command exited is not running: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.get(&failed),
+        Some(&WorkloadStatus::Ended {
+            exit_status: Some(2)
+        })
+    );
+    assert_eq!(
+        statuses.get(&unreadable),
+        Some(&WorkloadStatus::Ended { exit_status: None }),
+        "an end whose status tmux could not report is still an end"
+    );
+    assert_eq!(
+        statuses.get(&signalled),
+        Some(&WorkloadStatus::Ended {
+            exit_status: Some(137)
+        }),
+        "a workload the kernel killed is a failure, not a clean end: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.get(&alive),
+        Some(&WorkloadStatus::Running { attached: 1 }),
+        "a live pane is untouched by this"
+    );
+}
+
+#[test]
+fn a_pane_someone_added_is_not_the_workload_ending() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let split = id("tether-0197f198000070008000000000000001");
+    let windowed = id("tether-0197f198000070008000000000000002");
+    let alone = id("tether-0197f198000070008000000000000003");
+    // `#{pane_dead}` on a session describes its active pane. Someone attached to a
+    // workload can split it and let the split exit, which is what the first two
+    // lines are: a dead active pane in a session that still holds live work.
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s:1:1:2:1:7:\\n%s:1:2:1:1:7:\\n%s:0:1:1:1:7:\\n' '{split}' '{windowed}' '{alone}'\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let run = service
+        .try_start(StatusRequest {
+            generation: 4,
+            resources: false,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![probe(split), probe(windowed), probe(alone)],
+            }],
+        })
+        .unwrap();
+    let mut statuses = std::collections::HashMap::new();
+    loop {
+        match run.receiver.recv_timeout(Duration::from_secs(15)).unwrap() {
+            StatusMessage::Workload { id, status, .. } => {
+                statuses.insert(id, status);
+            }
+            StatusMessage::Finished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        statuses.get(&split),
+        Some(&WorkloadStatus::Running { attached: 1 }),
+        "a dead split is not the workload ending: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.get(&windowed),
+        Some(&WorkloadStatus::Running { attached: 1 }),
+        "nor is a dead pane in one of several windows: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.get(&alone),
+        Some(&WorkloadStatus::Ended {
+            exit_status: Some(7)
+        }),
+        "the workload's own pane, alone as Tether launched it, is the one that counts"
+    );
+}
+
+#[test]
 fn catalog_publishes_only_safe_non_tether_sessions() {
     let temp = tempdir().unwrap();
     let ssh = temp.path().join("ssh");
@@ -131,7 +281,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nprintf '%s:0\\n%s:2\\n%s:0\\ntether-malformed:0\\n' 'work box' '{owned}' '{collision}'\n"
+            "#!/bin/sh\nprintf '%s:0:1:1:0::\\n%s:2:1:1:0::\\n%s:0:1:1:1:7:\\ntether-malformed:0:1:1:0::\\n' 'work box' '{owned}' '{collision}'\n"
         ),
     )
     .unwrap();
@@ -205,8 +355,8 @@ for argument do
   case "$argument" in duplicate|unsafe) target=$argument ;; esac
 done
 case "$target" in
-  duplicate) printf 'work:0\nwork:1\n' ;;
-  unsafe) printf 'good:0\nbad:name:0\n' ;;
+  duplicate) printf 'work:0:1:1:0::\nwork:1:1:1:0::\n' ;;
+  unsafe) printf 'good:0:1:1:1:7:\nbad:name:0:1:1:0::\n' ;;
   *) exit 99 ;;
 esac
 "#,
@@ -337,7 +487,7 @@ done
 case "$target" in
   offline) exit 255 ;;
   empty) exit 1 ;;
-  malformed) printf 'tether-not-an-id:0\n' ;;
+  malformed) printf 'tether-not-an-id:0:1:1:0::\n' ;;
   *) exit 99 ;;
 esac
 "#,
@@ -691,7 +841,7 @@ fn resource_figures_are_reported_per_workload_and_absence_is_explicit() {
         &ssh,
         format!(
             "#!/bin/sh\ncase \" $* \" in\n\
-             *list-sessions*) printf '%s:1\\n%s:0\\n' '{busy}' '{idle}' ;;\n\
+             *list-sessions*) printf '%s:1:1:1:0::\\n%s:0:1:1:0::\\n' '{busy}' '{idle}' ;;\n\
              *list-panes*) printf '%s:100\\n%s:200\\n' '{busy}' '{idle}' ;;\n\
              *ps*) printf '100 1 00:10 4096\\n101 100 00:00 1048576\\n200 1 00:05 8192\\ntether-sample\\n100 00:10\\n101 00:01\\n200 00:05\\n' ;;\n\
              *) exit 99 ;;\n\
@@ -868,7 +1018,7 @@ fn a_caller_that_does_not_ask_for_usage_does_not_pay_for_it() {
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s:1\\n' '{workload}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s:1:1:1:0::\\n' '{workload}'\n",
             argv.display()
         ),
     )

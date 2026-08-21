@@ -217,7 +217,7 @@ closed_days = 30
     fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();
     let argv = sandbox.path("tmux.argv");
     sandbox.install("tmux", &format!(
-        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external:0\\ntether-0197f198000070008000000000000001:2\\na-external:1\\n'",
+        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external:0:1:1:0::\\ntether-0197f198000070008000000000000001:2:1:1:0::\\na-external:1:1:1:0::\\n'",
         argv.display()
     ));
 
@@ -537,5 +537,50 @@ fn snapshot_surfaces_status_workload_limit_as_typed_partial_data() {
             .owned_sessions
             .iter()
             .all(|session| session.workload_status == "error")
+    );
+}
+
+#[test]
+fn snapshot_reports_a_workload_that_exited_rather_than_calling_it_running() {
+    let sandbox = Sandbox::new();
+    let config = "version = 3\nhosts = []\n\n[ui]\nplacement = \"split-right\"\n\n[notifications]\nagent_blocked = true\nagent_done = true\nworkload_failed = true\n\n[discovery]\nlocal_roots = []\nmax_depth = 4\nmax_entries = 4096\nmax_results = 64\ntimeout_seconds = 3\nworkers = 4\n\n[retention]\nclosed_days = 30\n";
+    let state = r#"{"version":2,"sessions":[
+{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/active","preset":null,"status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null}
+]}"#;
+    fs::create_dir_all(sandbox.path("xdg-config/herdr-tether")).unwrap();
+    fs::create_dir_all(sandbox.path("xdg-state/herdr-tether")).unwrap();
+    fs::write(sandbox.path("xdg-config/herdr-tether/config.toml"), config).unwrap();
+    fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();
+    // Listed, and its command exited with a failing status.
+    sandbox.install(
+        "tmux",
+        "printf 'tether-0197f198000070008000000000000001:0:1:1:1:3:\n'",
+    );
+
+    let value: Value = serde_json::from_slice(
+        &sandbox
+            .command()
+            .args(["snapshot"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+
+    let owned = &value["hosts"][0]["owned_sessions"][0];
+    assert_eq!(
+        owned["workload_status"], "exited",
+        "a listed session whose command finished is not running: {value}"
+    );
+    assert_eq!(
+        value["schema_version"], 1,
+        "the document shape did not change, so consumers keep the version they check"
+    );
+    // The record is untouched: the snapshot reports what was observed and does
+    // not reconcile.
+    assert_eq!(
+        fs::read_to_string(sandbox.path("xdg-state/herdr-tether/state.json")).unwrap(),
+        state
     );
 }

@@ -40,7 +40,18 @@ pub enum HostReachability {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadStatus {
-    Running { attached: u32 },
+    Running {
+        attached: u32,
+    },
+    /// The session is still listed, and the command inside it has exited.
+    ///
+    /// `remain-on-exit` keeps a workload's session after its command finishes, so
+    /// this is what an ordinary refresh sees when a workload ends on its own
+    /// rather than because someone stopped it. The exit status is whatever `tmux`
+    /// retained, which is absent when it had none to report.
+    Ended {
+        exit_status: Option<i32>,
+    },
     Missing,
     Unknown,
     TimedOut,
@@ -932,8 +943,13 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                     .map(|workload| {
                         let status = catalog.owned.get(&workload.id).map_or(
                             WorkloadStatus::Missing,
-                            |attached| WorkloadStatus::Running {
-                                attached: *attached,
+                            |observed| match observed.ended {
+                                // Listed, and its command has exited: the ordinary
+                                // refresh now sees an end nobody asked about.
+                                Some(exit_status) => WorkloadStatus::Ended { exit_status },
+                                None => WorkloadStatus::Running {
+                                    attached: observed.attached,
+                                },
                             },
                         );
                         (workload.id, status)
@@ -1136,11 +1152,39 @@ fn uniform_workloads(
         .collect()
 }
 
+/// What one host reported about one owned workload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedObservation {
+    attached: u32,
+    /// `Some` when the pane has exited, carrying whatever status `tmux` kept.
+    ended: Option<Option<i32>>,
+}
+
 struct ParsedSessions {
-    owned: HashMap<SessionId, u32>,
+    owned: HashMap<SessionId, OwnedObservation>,
     external: Vec<ExternalSession>,
     hidden_reserved: usize,
     unsafe_names: usize,
+}
+
+/// How a dead pane ended, as one number.
+///
+/// `tmux` reports an exit status for a command that returned, and a signal number
+/// instead for one that was killed - by the OOM killer, or by anything else that
+/// signals it. A signalled end is a failure, so it is encoded the way a shell
+/// encodes one: 128 plus the signal. Without that, a workload the kernel killed
+/// would read exactly like a command that succeeded.
+///
+/// `None` is reserved for an end `tmux` could not describe at all, which is an
+/// unknown outcome rather than a clean one.
+fn dead_pane_status(exit_status: &str, signal: &str) -> Option<Option<i32>> {
+    if !exit_status.is_empty() {
+        return Some(Some(exit_status.parse::<i32>().ok()?));
+    }
+    if !signal.is_empty() {
+        return Some(Some(128i32.saturating_add(signal.parse::<i32>().ok()?)));
+    }
+    Some(None)
 }
 
 fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
@@ -1156,19 +1200,41 @@ fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
         if names.len() >= MAX_SESSIONS {
             return None;
         }
-        let (name, attached) = line.rsplit_once(':')?;
-        if attached.contains(':') || !names.insert(name.to_owned()) {
+        // Split from the right, so a session whose name contains a colon keeps it
+        // and is judged by the name rules below rather than shifting the fields.
+        let (head, signal) = line.rsplit_once(':')?;
+        let (head, exit_status) = head.rsplit_once(':')?;
+        let (head, pane_dead) = head.rsplit_once(':')?;
+        let (head, panes) = head.rsplit_once(':')?;
+        let (head, windows) = head.rsplit_once(':')?;
+        let (name, attached) = head.rsplit_once(':')?;
+        if !names.insert(name.to_owned()) {
             return None;
         }
         let attached = attached.parse::<u32>().ok()?;
+        let windows = windows.parse::<u32>().ok()?;
+        let panes = panes.parse::<u32>().ok()?;
+        // `#{pane_dead}` describes the session's active pane. Tether launches one
+        // window holding one pane, so while that is still the shape, the active
+        // pane is the workload's. Once someone has split it or opened another
+        // window, a dead active pane says nothing about the work, and claiming an
+        // end would be worse than saying nothing.
+        let single_pane = windows == 1 && panes == 1;
+        let ended = match pane_dead {
+            "1" if single_pane => Some(dead_pane_status(exit_status, signal)?),
+            "0" | "1" => None,
+            _ => return None,
+        };
         if name.starts_with("tether-") {
             if let Ok(id) = name.parse::<SessionId>() {
-                owned.insert(id, attached);
+                owned.insert(id, OwnedObservation { attached, ended });
             } else {
                 hidden_reserved += 1;
             }
             continue;
         }
+        // An external session is attach-only, so whether its pane has exited is
+        // not Tether's to report.
         match name.parse() {
             Ok(name) => external.push(ExternalSession { name, attached }),
             Err(_) => unsafe_names += 1,
