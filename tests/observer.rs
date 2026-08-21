@@ -625,24 +625,68 @@ fn an_unreachable_tile_never_claims_more_than_it_retained() {
 }
 
 #[test]
-fn a_stale_binding_and_a_lost_connection_do_not_share_a_remedy() {
-    // A binding that is no longer exactly one recognized occupant. The output
-    // may still read fine, so the tile has to say the claim is what went bad,
-    // and where that is fixed, which is not this surface.
-    let observer = ObserverState::new(vec![ObserverWorker {
-        capture: Some("looks fine".to_owned()),
-        sampled: false,
-        stale_reason: Some(StaleReason::Binding),
-        ..live_worker("a", ObserverAgentState::Stale)
-    }]);
-    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
-    assert!(body.contains("STALE · binding no longer exact"), "{body}");
-    assert!(body.contains("reopen from the picker"), "{body}");
-    assert!(body.contains("looks fine"), "{body}");
-    assert!(
-        !body.contains("retained, not current"),
-        "a binding failure is not a failed reread: {body}"
-    );
+fn each_binding_failure_names_itself_and_its_own_remedy() {
+    // The two ways a binding stops being exactly one recognized occupant need
+    // different things from a reader, so a tile that said only "binding" sent
+    // everyone to the same retry.
+    for (reason, expected, forbidden) in [
+        // The group was edited while Mission Control was open: the claim moved
+        // on, and a resnapshot is genuinely enough.
+        (
+            StaleReason::EarlierMembership,
+            "earlier membership",
+            "close one",
+        ),
+        // Two panes claim one worker. Only the operator can settle that, and not
+        // from this surface, so the tile must name the action rather than a retry
+        // that reports the same two claims every time.
+        (StaleReason::AmbiguousClaim, "close one in Herdr", "reopen"),
+    ] {
+        let observer = ObserverState::new(vec![ObserverWorker {
+            capture: Some("looks fine".to_owned()),
+            sampled: false,
+            stale_reason: Some(reason),
+            ..live_worker("a", ObserverAgentState::Stale)
+        }]);
+        let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+        assert!(body.contains("STALE"), "{reason:?}: {body}");
+        assert!(body.contains(expected), "{reason:?}: {body}");
+        assert!(
+            !body.contains(forbidden),
+            "{reason:?} must not offer the wrong remedy: {body}"
+        );
+        // The output may still read fine; what went bad is the claim.
+        assert!(body.contains("looks fine"), "{reason:?}: {body}");
+        assert!(
+            !body.contains("retained, not current"),
+            "a binding failure is not a failed reread: {body}"
+        );
+    }
+
+    // A tile is half the canvas once there are two workers, so the rung a real
+    // Mission Control page picks is much shorter than a single-tile test sees.
+    // The action has to survive to the narrowest width, because the retry the
+    // other reasons fall back to reports the same two claims every time.
+    for width in [64, 80, 96, 120] {
+        let observer = ObserverState::new(vec![
+            ObserverWorker {
+                capture: None,
+                sampled: false,
+                stale_reason: Some(StaleReason::AmbiguousClaim),
+                ..live_worker("a", ObserverAgentState::Stale)
+            },
+            live_worker("b", ObserverAgentState::Working),
+        ]);
+        let body = tile_body(&render_to_text(width, 14, &observer).unwrap());
+        assert!(
+            body.contains("claim"),
+            "width {width} must still say the claim is the problem: {body}"
+        );
+        assert!(
+            body.contains("close"),
+            "width {width} must still name the action: {body}"
+        );
+    }
 
     // A lost Mission Control connection comes back on its own, so its remedy is
     // the retry alone and it must not send anyone to reopen a healthy pane.
@@ -690,7 +734,7 @@ fn a_stale_tile_with_nothing_retained_offers_no_remembered_output() {
         },
         capture: None,
         sampled: false,
-        stale_reason: Some(StaleReason::Binding),
+        stale_reason: Some(StaleReason::AmbiguousClaim),
         ..live_worker("a", ObserverAgentState::Stale)
     }]);
     let body = tile_body(&render_to_text(96, 12, &observer).unwrap());

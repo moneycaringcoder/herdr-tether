@@ -191,8 +191,16 @@ pub enum AttentionReason {
 /// exact does not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaleReason {
-    /// The Herdr claim is no longer exactly one recognized occupant.
-    Binding,
+    /// The pane that answered belongs to an earlier membership of this worker.
+    ///
+    /// Usually the group was edited while Mission Control was open, so the claim
+    /// simply moved on and a resnapshot is genuinely enough.
+    EarlierMembership,
+    /// More than one Herdr pane claims this worker's membership.
+    ///
+    /// Nothing Tether can do settles which one is real, so the remedy is in
+    /// Herdr: one of the two panes has to go.
+    AmbiguousClaim,
     /// Mission Control lost the connection that was reporting this worker.
     Connection,
     /// The observed output could not be re-read, so what is shown is retained.
@@ -574,15 +582,10 @@ impl ObserverState {
                     if lost_live_agent {
                         worker.live_agent = true;
                     }
-                    // A worker that arrives already stale was made stale
-                    // upstream, by a binding that is no longer exactly one
-                    // recognized occupant. Anything demoted here is stale for a
-                    // reason this loop knows.
-                    if worker.agent_state == ObserverAgentState::Stale
-                        && worker.stale_reason.is_none()
-                    {
-                        worker.stale_reason = Some(StaleReason::Binding);
-                    }
+                    // A worker that arrives stale carries the reason it was made
+                    // stale for, when there is one: the projection names which
+                    // binding failure it was. Nothing is invented here, because a
+                    // guessed reason would send a reader to the wrong remedy.
                     if lost_live_agent
                         || (worker.capture.is_some()
                             && matches!(
@@ -1321,19 +1324,40 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
                 format!("UNREACHABLE · r {refresh_verb}"),
             ],
         )),
-        // Retrying resnapshots, but a pane that really moved or was replaced has
-        // to be reopened, which is a picker operation rather than anything this
-        // surface can do.
-        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::Binding) => {
+        // Each of these is a different problem with a different remedy, and the
+        // source already tells them apart: a membership that moved on comes back
+        // with a resnapshot, two panes claiming one worker is a decision only the
+        // operator can make in Herdr, and a pane something else took has to be
+        // opened again.
+        ObserverAgentState::Stale
+            if worker.stale_reason == Some(StaleReason::EarlierMembership) =>
+        {
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    format!("STALE · pane belongs to an earlier membership · r {refresh_verb}"),
+                    format!("STALE · earlier membership · r {refresh_verb}"),
+                    format!("STALE · r {refresh_verb}"),
+                ],
+            ))
+        }
+        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::AmbiguousClaim) => {
             Some(widest_that_fits(
                 inner_width,
                 &[
                     format!(
-                        "STALE · binding no longer exact · r {refresh_verb}, or reopen from the picker"
+                        "STALE · two Herdr panes claim this worker · close one in Herdr, then r {refresh_verb}"
                     ),
-                    format!("STALE · binding no longer exact · r {refresh_verb}"),
-                    format!("STALE · binding · r {refresh_verb}"),
-                    format!("STALE · r {refresh_verb}"),
+                    "STALE · two panes claim this worker · close one in Herdr".to_owned(),
+                    "STALE · two panes claim it · close one in Herdr".to_owned(),
+                    // Every rung keeps the action, because the retry the other
+                    // reasons fall back to is the one thing that cannot help
+                    // here: it reports the same two claims every time. A tile is
+                    // half the canvas as soon as there are two workers, so these
+                    // short rungs are what a real page shows.
+                    "STALE · two panes claim it · close one".to_owned(),
+                    "STALE · 2 panes claim it · close one".to_owned(),
+                    "STALE · 2 claims · close one".to_owned(),
                 ],
             ))
         }
