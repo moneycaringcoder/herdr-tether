@@ -53,6 +53,19 @@
   naming a failure it already had rather than implying the wait is the fix, and a
   host whose check failed says why open, restart, and stop are withheld, in the
   same word the row shows.
+- Group-level stop and restart: `herdr-tether orchestration stop-workers GROUP`
+  and `restart-workers GROUP`. Membership is metadata and can name a workload
+  that has ended, lost its ownership proof, or been removed, so every member is
+  resolved against the records first and the plan is printed before anything is
+  acted on, with a reason for each workload left alone; `--dry-run` stops there.
+  Each workload acted on goes through the same path as `session stop` and
+  `session restart`, so the ownership proof, the exact re-inspections, and the
+  execution-time `tmux` guard all still apply, and a legacy record with no
+  ownership proof is skipped rather than acted on. A paced restart stays paced.
+  The command asks before acting and refuses to assume consent without a
+  terminal, `--yes` confirms in a script, only the confirmed plan is acted on so
+  a later group edit cannot enlarge it, and one member failing neither abandons
+  the rest nor reads as success.
 
 ### Changed
 

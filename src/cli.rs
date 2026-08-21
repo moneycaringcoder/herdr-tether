@@ -1,6 +1,6 @@
 use std::{
     env,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{atomic::AtomicBool, mpsc},
@@ -27,13 +27,16 @@ use crate::{
     herdr_socket::{
         HerdrSocketClient, MAX_AUDITED_HERDR_PROTOCOL, MIN_HERDR_PROTOCOL, ProtocolConfidence,
     },
-    lifecycle::{LifecycleService, PruneError, PruneService},
+    lifecycle::{ClosedWorkload, LifecycleService, PruneError, PruneService},
     model::{
         ExternalSessionName, HerdrAgentKind, OrchestrationGroupId, OrchestrationTitle,
         OwnershipProof, Placement, SessionId,
     },
     observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
-    orchestration::{MANAGER_STALE_GROUP_ERROR, OrchestrationService, companion_placement},
+    orchestration::{
+        GroupAction, GroupMemberResult, GroupSkip, MANAGER_STALE_GROUP_ERROR, OrchestrationService,
+        companion_placement,
+    },
     paths::AppPaths,
     snapshot::collect as collect_snapshot,
     sshcfg::{discover_aliases, openssh_connection_args, openssh_target},
@@ -277,6 +280,18 @@ enum OrchestrationCommand {
         group: OrchestrationGroupId,
         session: SessionId,
     },
+    /// Stop every running exact-owned worker in one orchestration group.
+    StopWorkers {
+        group: OrchestrationGroupId,
+        #[command(flatten)]
+        args: GroupActionArgs,
+    },
+    /// Restart every ended exact-owned worker in one orchestration group.
+    RestartWorkers {
+        group: OrchestrationGroupId,
+        #[command(flatten)]
+        args: GroupActionArgs,
+    },
     /// Launch one read-only Observer pane for an orchestration group.
     Observe {
         group: OrchestrationGroupId,
@@ -296,6 +311,15 @@ enum OrchestrationCommand {
     },
 }
 
+#[derive(Clone, Debug, Args)]
+struct GroupActionArgs {
+    /// Print what would be acted on and skipped, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm without a prompt. Required when stdin is not a terminal.
+    #[arg(long)]
+    yes: bool,
+}
 #[derive(Clone, Debug, Args)]
 struct DoctorArgs {
     /// Emit bounded, redacted, schema-versioned JSON instead of human output.
@@ -1660,6 +1684,12 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
             println!("removed {session} from {group}");
             Ok(())
         }
+        OrchestrationCommand::StopWorkers { group, args } => {
+            group_action(paths, &service, &group, GroupAction::Stop, &args)
+        }
+        OrchestrationCommand::RestartWorkers { group, args } => {
+            group_action(paths, &service, &group, GroupAction::Restart, &args)
+        }
         OrchestrationCommand::Observe { group, placement } => {
             let persisted = service.group(&group)?;
             let context = HerdrContext::from_env()
@@ -1688,6 +1718,124 @@ fn orchestration_command(paths: &AppPaths, command: OrchestrationCommand) -> Res
             },
         ),
     }
+}
+
+/// Runs a group-wide stop or restart behind an explicit confirmation.
+///
+/// A group is a list of workloads to ask about, not an authority: the plan is
+/// resolved against the records first, so the confirmation states the real size
+/// of the act and names every member it will leave alone. Each member it does
+/// act on goes through the same lifecycle operation `session stop` and
+/// `session restart` use, so the ownership proof, the exact re-inspections, and
+/// the execution-time `tmux` guard all still apply.
+fn group_action(
+    paths: &AppPaths,
+    service: &OrchestrationService,
+    group: &OrchestrationGroupId,
+    action: GroupAction,
+    args: &GroupActionArgs,
+) -> Result<()> {
+    let plan = service.plan_group_action(group, action)?;
+    let acting: Vec<_> = plan.acting().map(|entry| entry.session_id).collect();
+    for (session_id, reason) in plan.skipped() {
+        println!("skip {session_id}: {}", reason.reason());
+    }
+    for session_id in &acting {
+        println!("{} {session_id}", action.verb());
+    }
+    if args.dry_run {
+        return Ok(());
+    }
+    if acting.is_empty() {
+        println!(
+            "nothing to {} in {group}: no member is eligible",
+            action.verb()
+        );
+        return Ok(());
+    }
+    confirm_group_action(action, group, acting.len(), args.yes)?;
+
+    let store = StateStore::new(paths.state_file.clone());
+    let lifecycle = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
+    let report = service.apply_group_action(&plan, &lifecycle)?;
+    for outcome in &report.outcomes {
+        match &outcome.result {
+            GroupMemberResult::Stopped(ClosedWorkload::Terminated) => {
+                println!("stopped {}", outcome.session_id);
+            }
+            GroupMemberResult::Stopped(ClosedWorkload::Missing) => {
+                println!("stopped {} (already gone)", outcome.session_id);
+            }
+            GroupMemberResult::Restarted => println!("restarted {}", outcome.session_id),
+            // The plan already listed every refusal it knew about; repeating them
+            // here would bury the outcomes. A membership that changed after the
+            // confirmation is new information, so it is said.
+            GroupMemberResult::Skipped(GroupSkip::MembershipChanged) => {
+                println!(
+                    "skip {}: {}",
+                    outcome.session_id,
+                    GroupSkip::MembershipChanged.reason()
+                );
+            }
+            GroupMemberResult::Skipped(_) => {}
+            GroupMemberResult::Failed(error) => {
+                eprintln!("failed {}: {error}", outcome.session_id);
+            }
+        }
+    }
+    // A member that failed leaves the others done: the report says which, and a
+    // non-zero status keeps a script from reading a partial act as a clean one.
+    if report.failed() > 0 {
+        bail!(
+            "{} of {} members could not be {}; the rest were",
+            report.failed(),
+            report.outcomes.len(),
+            match action {
+                GroupAction::Stop => "stopped",
+                GroupAction::Restart => "restarted",
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Asks before acting on more than one workload at once.
+///
+/// The single-workload picker path confirms one exact id; a group act has to
+/// say how many workloads it covers. Without a terminal there is nobody to ask,
+/// so it refuses rather than assuming consent.
+fn confirm_group_action(
+    action: GroupAction,
+    group: &OrchestrationGroupId,
+    count: usize,
+    assumed: bool,
+) -> Result<()> {
+    if assumed {
+        return Ok(());
+    }
+    let noun = if count == 1 { "workload" } else { "workloads" };
+    if !io::stdin().is_terminal() {
+        bail!(
+            "{} {count} {noun} in `{group}` needs an interactive confirmation; pass --yes to confirm without one, or --dry-run to see the plan",
+            action.verb()
+        );
+    }
+    print!(
+        "{} {count} {noun} in `{group}`. Continue? [y/N] ",
+        action.verb()
+    );
+    io::stdout().flush().context("show group confirmation")?;
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .context("read group confirmation")?;
+    if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!(
+            "{} in `{group}` was cancelled; nothing was changed",
+            action.verb()
+        );
+    }
+    Ok(())
 }
 
 fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result<()> {

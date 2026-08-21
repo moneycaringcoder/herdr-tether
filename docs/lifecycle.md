@@ -38,6 +38,39 @@ Press `x` on an ended workload to remove its retained history. Remove only chang
 
 When a host, SSH connection, or backend cannot be inspected, Tether shows the workload as **Unreachable**. Press `r` to retry observation. Destructive actions stay unavailable until Tether can establish the exact state.
 
+### Acting on a whole group
+
+An orchestration group can be stopped or restarted in one command:
+
+```sh
+herdr-tether orchestration stop-workers fleet --dry-run
+herdr-tether orchestration stop-workers fleet
+herdr-tether orchestration restart-workers fleet
+```
+
+A group is a list of workloads to ask about, not an authority of its own.
+Membership is metadata, so it can name a workload that has since ended, lost its
+ownership proof, or been removed entirely. Every member is therefore resolved
+against the records first, and the command prints the plan before it acts: which
+workloads it would touch, and which it would leave alone with the reason for
+each. `--dry-run` stops after the plan.
+
+Each workload it does act on goes through exactly the same path as
+`herdr-tether session stop` and `herdr-tether session restart`, so the private
+ownership proof, the exact re-inspections, and the `tmux` guard that checks
+identity at execution time all still apply per workload. A group containing a
+legacy record with no ownership proof is not a way to act on it: that member is
+skipped and says why.
+
+Because it covers more than one workload, it asks before acting, and without a
+terminal it refuses rather than assuming consent - pass `--yes` to confirm in a
+script. A restart that is paced after an immediate failure stays paced; the
+group reports the wait rather than working around it. Only the workloads named
+in the confirmed plan are acted on, so editing the group afterwards cannot
+enlarge what was confirmed. One workload failing does not abandon the rest: each
+result is reported on its own line and the command exits non-zero if any member
+failed.
+
 ## States shown in the picker
 
 | State | Meaning | Safe actions |

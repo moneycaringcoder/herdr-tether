@@ -26,7 +26,7 @@ use crate::{
     config::{ConfigStore, NotificationDefaults},
     herdr::{HerdrClient, HerdrContext, PaneTitle},
     herdr_socket::{HerdrSessionSnapshot, HerdrSocketClient, NotificationSound},
-    lifecycle::LifecycleService,
+    lifecycle::{ClosedWorkload, LifecycleService},
     mission_control::{
         MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
         label_materialized_member, resolve_binding,
@@ -66,6 +66,205 @@ enum ObserverAuthorityOutcome {
     Authorized,
     RecoverableFailure,
     GroupDeleted,
+}
+
+/// A lifecycle action asked of every worker in a group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupAction {
+    Stop,
+    Restart,
+}
+
+impl GroupAction {
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+/// Why a member is not part of the act.
+///
+/// Each one is a refusal, not a failure: the workload is left exactly as it was,
+/// and the reason says what would have to change first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupSkip {
+    /// No record: the workload was removed or never existed.
+    MissingRecord,
+    /// A legacy record with no private ownership proof. Tether cannot prove the
+    /// workload is its own, so a group is not a way to act on it.
+    NoOwnershipProof,
+    /// Not running, so there is nothing to stop.
+    NotRunning,
+    /// Not ended, so a restart would be a second incarnation of live work.
+    NotEnded,
+    /// Ended without a retained command, so there is nothing to restart.
+    MissingCommand,
+    /// Failed immediately, and its restart is still paced.
+    RestartPaced { seconds: i64 },
+    /// The membership changed between the plan and the act.
+    MembershipChanged,
+}
+
+impl GroupSkip {
+    pub fn reason(self) -> String {
+        match self {
+            Self::MissingRecord => "no record; it was removed".to_owned(),
+            Self::NoOwnershipProof => {
+                "legacy record with no ownership proof; recreate it to manage it".to_owned()
+            }
+            Self::NotRunning => "not running".to_owned(),
+            Self::NotEnded => "still running; stop it first".to_owned(),
+            Self::MissingCommand => "no retained command".to_owned(),
+            Self::RestartPaced { seconds } => {
+                format!("failed immediately; restart paced for {seconds}s")
+            }
+            Self::MembershipChanged => "membership changed since the plan".to_owned(),
+        }
+    }
+}
+
+/// Whether a member is in the act or out of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupDecision {
+    Act,
+    Skip(GroupSkip),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupPlanEntry {
+    pub session_id: SessionId,
+    /// The membership this decision was made for, so a remove and re-add
+    /// between the plan and the act is caught rather than obeyed.
+    pub membership_id: OrchestrationMembershipId,
+    pub decision: GroupDecision,
+}
+
+/// What a group action would do, resolved against the records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupPlan {
+    pub group_id: OrchestrationGroupId,
+    pub action: GroupAction,
+    pub entries: Vec<GroupPlanEntry>,
+}
+
+impl GroupPlan {
+    /// The members the act would touch.
+    pub fn acting(&self) -> impl Iterator<Item = &GroupPlanEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.decision == GroupDecision::Act)
+    }
+
+    /// The members it would leave alone, with the reason for each.
+    pub fn skipped(&self) -> impl Iterator<Item = (SessionId, GroupSkip)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry.decision {
+                GroupDecision::Skip(reason) => Some((entry.session_id, reason)),
+                GroupDecision::Act => None,
+            })
+    }
+}
+
+/// What happened to one member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupMemberResult {
+    Stopped(ClosedWorkload),
+    Restarted,
+    Skipped(GroupSkip),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupOutcome {
+    pub session_id: SessionId,
+    pub result: GroupMemberResult,
+}
+
+/// What a confirmed group action actually did, member by member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupActionReport {
+    pub group_id: OrchestrationGroupId,
+    pub action: GroupAction,
+    pub outcomes: Vec<GroupOutcome>,
+}
+
+impl GroupActionReport {
+    pub fn acted(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome.result,
+                    GroupMemberResult::Stopped(_) | GroupMemberResult::Restarted
+                )
+            })
+            .count()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.result, GroupMemberResult::Failed(_)))
+            .count()
+    }
+
+    pub fn skipped(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.result, GroupMemberResult::Skipped(_)))
+            .count()
+    }
+}
+
+/// Whether one member is eligible for the action, from its record alone.
+fn plan_member(action: GroupAction, record: Option<&SessionRecord>) -> GroupDecision {
+    let Some(record) = record else {
+        return GroupDecision::Skip(GroupSkip::MissingRecord);
+    };
+    // The single-workload path refuses a proofless record before any transport;
+    // saying so here keeps the confirmation honest instead of promising an act
+    // that would be refused.
+    if record.ownership_proof.is_none() {
+        return GroupDecision::Skip(GroupSkip::NoOwnershipProof);
+    }
+    match action {
+        GroupAction::Stop if record.status == SessionStatus::Running => GroupDecision::Act,
+        GroupAction::Stop => GroupDecision::Skip(GroupSkip::NotRunning),
+        GroupAction::Restart if record.status != SessionStatus::Ended => {
+            GroupDecision::Skip(GroupSkip::NotEnded)
+        }
+        GroupAction::Restart if record.command.is_none() => {
+            GroupDecision::Skip(GroupSkip::MissingCommand)
+        }
+        GroupAction::Restart => match record.paced_restart_until() {
+            // The pace withholds an explicit single-workload restart, so a group
+            // must not become the way around it.
+            Some(until) => {
+                let remaining = until.signed_duration_since(Utc::now());
+                if remaining > chrono::TimeDelta::zero() {
+                    GroupDecision::Skip(GroupSkip::RestartPaced {
+                        seconds: remaining.num_seconds().max(1),
+                    })
+                } else {
+                    GroupDecision::Act
+                }
+            }
+            None => GroupDecision::Act,
+        },
+    }
+}
+
+/// Keeps a member's failure text to one bounded, terminal-safe line.
+fn sanitize_group_failure(error: &str) -> String {
+    let collapsed = error
+        .split_whitespace()
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed.chars().take(240).collect()
 }
 
 /// State-only management for opt-in orchestration groups.
@@ -314,6 +513,127 @@ impl OrchestrationService {
                 })?;
             Ok(group.workers.remove(index))
         })
+    }
+
+    /// What a group-wide stop or restart would do, without contacting a host.
+    ///
+    /// Membership is metadata: a group can hold a reference to a workload that
+    /// has since ended, lost its ownership proof, or disappeared entirely, and
+    /// state validation deliberately does not join the two. So a plan resolves
+    /// every member against the records first and says which ones it would act
+    /// on, which keeps the confirmation honest about the size of the act.
+    pub fn plan_group_action(
+        &self,
+        group_id: &OrchestrationGroupId,
+        action: GroupAction,
+    ) -> Result<GroupPlan> {
+        let state = self.store.load()?;
+        let group = state
+            .orchestration_groups
+            .iter()
+            .find(|group| &group.id == group_id)
+            .with_context(|| format!("unknown orchestration group `{group_id}`"))?;
+        let entries = group
+            .workers
+            .iter()
+            .map(|member| {
+                let record = state
+                    .sessions
+                    .iter()
+                    .find(|record| record.id == member.session_id);
+                GroupPlanEntry {
+                    session_id: member.session_id,
+                    membership_id: member.membership_id,
+                    decision: plan_member(action, record),
+                }
+            })
+            .collect();
+        Ok(GroupPlan {
+            group_id: group_id.clone(),
+            action,
+            entries,
+        })
+    }
+
+    /// Runs a confirmed plan, one member at a time, through the single-workload
+    /// path.
+    ///
+    /// Every ownership decision stays where it already lives: this calls the
+    /// same [`LifecycleService`] operations the picker and `session` commands
+    /// call, so the proof requirement, the exact re-inspections, and the
+    /// execution-time `tmux` guard all apply per member. A group is a list of
+    /// workloads to ask about, never an authority of its own.
+    ///
+    /// Only members named in the plan are acted on, and only while their
+    /// membership is unchanged, so a group edited after the confirmation cannot
+    /// enlarge or redirect what was confirmed. One member's failure does not
+    /// abandon the rest; each result is reported on its own.
+    pub fn apply_group_action(
+        &self,
+        plan: &GroupPlan,
+        lifecycle: &LifecycleService,
+    ) -> Result<GroupActionReport> {
+        let mut outcomes = Vec::with_capacity(plan.entries.len());
+        for entry in &plan.entries {
+            let GroupDecision::Act = entry.decision else {
+                let GroupDecision::Skip(reason) = entry.decision else {
+                    unreachable!("a decision is either an action or a skip");
+                };
+                outcomes.push(GroupOutcome {
+                    session_id: entry.session_id,
+                    result: GroupMemberResult::Skipped(reason),
+                });
+                continue;
+            };
+            // A remove and re-add between the confirmation and here produces a
+            // new membership, which is a different authorization than the one
+            // that was confirmed.
+            if !self.membership_unchanged(&plan.group_id, entry)? {
+                outcomes.push(GroupOutcome {
+                    session_id: entry.session_id,
+                    result: GroupMemberResult::Skipped(GroupSkip::MembershipChanged),
+                });
+                continue;
+            }
+            let result = match plan.action {
+                GroupAction::Stop => lifecycle
+                    .stop_owned(entry.session_id)
+                    .map(|closed| GroupMemberResult::Stopped(closed.workload)),
+                GroupAction::Restart => lifecycle
+                    .restart_owned(entry.session_id)
+                    .map(|_| GroupMemberResult::Restarted),
+            };
+            outcomes.push(GroupOutcome {
+                session_id: entry.session_id,
+                result: result.unwrap_or_else(|error| {
+                    GroupMemberResult::Failed(sanitize_group_failure(&error.to_string()))
+                }),
+            });
+        }
+        Ok(GroupActionReport {
+            group_id: plan.group_id.clone(),
+            action: plan.action,
+            outcomes,
+        })
+    }
+
+    fn membership_unchanged(
+        &self,
+        group_id: &OrchestrationGroupId,
+        entry: &GroupPlanEntry,
+    ) -> Result<bool> {
+        Ok(self
+            .store
+            .load()?
+            .orchestration_groups
+            .iter()
+            .find(|group| &group.id == group_id)
+            .is_some_and(|group| {
+                group.workers.iter().any(|member| {
+                    member.session_id == entry.session_id
+                        && member.membership_id == entry.membership_id
+                })
+            }))
     }
 }
 
@@ -3286,6 +3606,211 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("no longer a member"), "{error}");
+    }
+
+    /// A group with one member per interesting record shape.
+    fn group_action_state(now: chrono::DateTime<Utc>) -> (State, OrchestrationGroupId) {
+        let group_id: OrchestrationGroupId = "group".parse().unwrap();
+        let base = SessionRecord {
+            herdr_agent: None,
+            id: "tether-0197f198000070008000000000000002".parse().unwrap(),
+            host: "local".to_owned(),
+            target: "local".to_owned(),
+            directory: "/tmp".to_owned(),
+            preset: None,
+            command: Some("exec true".to_owned()),
+            tmux_session_id: Some("$7".parse().unwrap()),
+            ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
+            status: SessionStatus::Running,
+            created_at: now,
+            last_used_at: now,
+            closed_at: None,
+            exit_status: None,
+        };
+        let running = base.clone();
+        let legacy = SessionRecord {
+            id: "tether-0197f198000070008000000000000003".parse().unwrap(),
+            // A record from before ownership proofs. Tether cannot prove the
+            // workload is its own, so nothing destructive may reach it.
+            ownership_proof: None,
+            ..base.clone()
+        };
+        let ended = SessionRecord {
+            id: "tether-0197f198000070008000000000000004".parse().unwrap(),
+            status: SessionStatus::Ended,
+            closed_at: Some(now),
+            exit_status: Some(0),
+            ..base.clone()
+        };
+        // Failed inside the fast-failure window, so its restart is paced.
+        let paced = SessionRecord {
+            id: "tether-0197f198000070008000000000000005".parse().unwrap(),
+            status: SessionStatus::Ended,
+            last_used_at: Utc::now(),
+            closed_at: Some(Utc::now()),
+            exit_status: Some(1),
+            ..base.clone()
+        };
+        let absent: SessionId = "tether-0197f198000070008000000000000006".parse().unwrap();
+        let members = [running.id, legacy.id, ended.id, paced.id, absent]
+            .into_iter()
+            .map(|session_id| OrchestrationMember {
+                session_id,
+                membership_id: OrchestrationMembershipId::new(),
+                title: None,
+                capabilities: OrchestrationCapabilities {
+                    observe_output: true,
+                    open_interactive: true,
+                    prompt_agent: false,
+                },
+            })
+            .collect();
+        (
+            State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![running, legacy, ended, paced],
+                orchestration_groups: vec![OrchestrationGroup {
+                    id: group_id.clone(),
+                    title: "Group".parse().unwrap(),
+                    orchestrator_session_id: "tether-0197f198000070008000000000000001"
+                        .parse()
+                        .unwrap(),
+                    workers: members,
+                }],
+            },
+            group_id,
+        )
+    }
+
+    #[test]
+    fn a_group_plan_never_offers_to_act_on_a_workload_tether_cannot_prove_it_owns() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (state, group_id) = group_action_state(now);
+        store.save(&state).unwrap();
+        let service = OrchestrationService::new(store);
+
+        let stop = service
+            .plan_group_action(&group_id, GroupAction::Stop)
+            .unwrap();
+        let acting: Vec<_> = stop.acting().map(|entry| entry.session_id).collect();
+        assert_eq!(
+            acting,
+            vec![state.sessions[0].id],
+            "only the running exact-owned member may be stopped"
+        );
+        let skipped: Vec<_> = stop.skipped().collect();
+        assert_eq!(
+            skipped,
+            vec![
+                (state.sessions[1].id, GroupSkip::NoOwnershipProof),
+                (state.sessions[2].id, GroupSkip::NotRunning),
+                (state.sessions[3].id, GroupSkip::NotRunning),
+                (
+                    "tether-0197f198000070008000000000000006".parse().unwrap(),
+                    GroupSkip::MissingRecord
+                ),
+            ]
+        );
+
+        let restart = service
+            .plan_group_action(&group_id, GroupAction::Restart)
+            .unwrap();
+        let acting: Vec<_> = restart.acting().map(|entry| entry.session_id).collect();
+        assert_eq!(
+            acting,
+            vec![state.sessions[2].id],
+            "a paced or running member is not restarted by a group"
+        );
+        let reasons: Vec<_> = restart.skipped().map(|(_, reason)| reason).collect();
+        assert!(
+            matches!(
+                reasons.as_slice(),
+                [
+                    GroupSkip::NotEnded,
+                    GroupSkip::NoOwnershipProof,
+                    // The pace is measured from the recorded end, so the exact
+                    // remainder depends on the clock; that it is withheld at all
+                    // is the property.
+                    GroupSkip::RestartPaced { seconds },
+                    GroupSkip::MissingRecord,
+                ] if (1..=30).contains(seconds)
+            ),
+            "a legacy record is refused before its status is even considered: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn applying_a_group_plan_skips_a_membership_that_changed_since_the_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (mut state, group_id) = group_action_state(now);
+        store.save(&state).unwrap();
+        let service = OrchestrationService::new(store.clone());
+        let plan = service
+            .plan_group_action(&group_id, GroupAction::Stop)
+            .unwrap();
+
+        // A remove and re-add between the confirmation and the act is a new
+        // authorization, so the confirmed one no longer applies.
+        state.orchestration_groups[0].workers[0].membership_id = OrchestrationMembershipId::new();
+        store.save(&state).unwrap();
+
+        let lifecycle = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
+        let report = service.apply_group_action(&plan, &lifecycle).unwrap();
+        assert_eq!(report.acted(), 0);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.session_id == state.sessions[0].id)
+                .map(|outcome| outcome.result.clone()),
+            Some(GroupMemberResult::Skipped(GroupSkip::MembershipChanged))
+        );
+    }
+
+    #[test]
+    fn a_group_action_reports_each_member_on_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(temp.path().join("state.json"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (state, group_id) = group_action_state(now);
+        store.save(&state).unwrap();
+        let service = OrchestrationService::new(store.clone());
+        let plan = service
+            .plan_group_action(&group_id, GroupAction::Stop)
+            .unwrap();
+        // No `tmux` here, so the one eligible member's stop fails in transport.
+        // The refusals around it are still reported, and one failure does not
+        // abandon the rest of the group.
+        let lifecycle = LifecycleService::new(
+            store,
+            ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+        );
+        let report = service.apply_group_action(&plan, &lifecycle).unwrap();
+        assert_eq!(report.outcomes.len(), 5);
+        assert_eq!(report.acted(), 0);
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.skipped(), 4);
+        let failure = report
+            .outcomes
+            .iter()
+            .find(|outcome| matches!(outcome.result, GroupMemberResult::Failed(_)))
+            .expect("the eligible member reports its own failure");
+        assert_eq!(failure.session_id, state.sessions[0].id);
+        let GroupMemberResult::Failed(text) = &failure.result else {
+            unreachable!();
+        };
+        assert!(!text.contains('\n'), "one bounded line: {text:?}");
     }
 
     #[test]
