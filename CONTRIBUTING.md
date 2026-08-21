@@ -98,3 +98,11 @@ documentation.
 ## Public documentation boundary
 
 README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep temporary planning, release coordination, test-machine details, review transcripts, local usernames, and local paths out of tracked product documentation. Use pull requests or untracked working notes for temporary coordination.
+
+`docs/roadmap.md` holds settled boundaries, decisions taken against building
+something, and ideas that have not been built. An entry is retired in the change
+that ships it, in the same pull request, so the file never describes a property
+the code already has as though it were a plan. A change that delivers a roadmap
+entry and leaves the entry in place is incomplete: a reader cannot tell the two
+apart, and every stale entry makes the settled boundaries beside them read as
+provisional too.
