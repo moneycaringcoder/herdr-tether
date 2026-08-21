@@ -69,6 +69,21 @@
   plan is acted on so a later group edit cannot enlarge it, each result prints as
   that workload finishes so an interrupted run still shows what it did, and the
   exit status is non-zero if any member failed or if nothing was acted on.
+- A bounded output preview per Mission Control tile. A recognized agent's tile
+  previously showed nothing until someone pressed `v`, so a page of four agents
+  said nothing about what any of them was doing; each tile now carries a sample of
+  recent output, marked `PREVIEW` in both the body and the border title so a
+  narrow or short tile cannot present a sample as a complete read. Herdr's
+  truncation flag is carried through, so a clipped sample says both that it is a
+  sample and that rows were dropped. Samples are taken on their own thread - a
+  slow Herdr delays a sample rather than freezing the surface - and are requested
+  when a tile first appears, when Herdr reports that worker changed state, or when
+  the sample on screen has aged out, never on the refresh timer; `r` takes fresh
+  ones. It is presentation only: subject to the existing sanitization and display
+  bounds, never persisted, and never read back to derive agent state, which still
+  comes from Herdr's typed snapshot and events. Every line above the output now
+  earns its row and none may take the last one, so a short tile still shows
+  output rather than only labels.
 
 ### Changed
 

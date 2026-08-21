@@ -159,6 +159,20 @@ agent input is disabled, and destructive actions remain absent. A successful
 resnapshot restores the live state. Closing the view drops only the presentation
 and event subscription; durable Tether workloads continue running.
 
+A recognized agent's tile also carries a bounded output sample, fetched through
+the same typed `agent.read` request the explicit read uses, with a small line
+count. It is taken on its own thread, so a slow socket delays a sample instead of
+blocking the surface, and it is requested when a tile first appears, when Herdr
+reports that worker's state changed, or when the sample on screen has aged past a
+fixed window - never on the refresh timer. Cost is therefore proportional to
+reported change and capped by the visible page. A sample is marked as one in both
+the tile body and the border title, so a narrow or short tile cannot present it as
+a complete read; Herdr's `truncated` flag is carried through so a clipped sample
+says both things. It is subject to the same sanitization and display bounds as any
+capture, is never persisted, and is never read back to derive state: the agent
+state on a tile comes from the typed snapshot and the event stream, never from
+terminal output.
+
 Fallback capture still requires the exact membership epoch, `observe_output`,
 running status, ownership proof, and exact internal `tmux` identity. Tether
 captures only the visible fallback workers, checks the complete authorization

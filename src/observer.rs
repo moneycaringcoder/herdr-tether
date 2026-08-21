@@ -114,6 +114,17 @@ pub enum ObserverCapture {
     /// it omitted scrollback. Keeping this distinct from [`Self::Ready`] stops
     /// a clipped capture from reading as the worker's complete output.
     Truncated(String),
+    /// A bounded sample of recent output, taken to show what a workload is
+    /// doing at a glance.
+    ///
+    /// Distinct from [`Self::Ready`] because it is deliberately not everything:
+    /// a tile showing a sample must say so, or a reader will take the last few
+    /// lines for the whole story.
+    Preview {
+        text: String,
+        /// Whether Herdr reported it dropped older rows from the sample.
+        truncated: bool,
+    },
     Unavailable,
 }
 
@@ -128,6 +139,7 @@ enum CaptureStatus {
 
 struct PreviousWorkerState {
     capture: Option<String>,
+    sampled: bool,
     last_observed: Option<String>,
     latency_ms: Option<u64>,
     live_agent: bool,
@@ -206,6 +218,12 @@ pub struct ObserverWorker {
     pub incarnation: Option<TmuxSessionId>,
     /// Untrusted capture content. Rendering sanitizes and bounds it before display.
     pub capture: Option<String>,
+    /// Whether the capture is a bounded sample rather than everything Herdr has.
+    ///
+    /// A tile that showed a sample as if it were the whole output would invite a
+    /// reader to conclude nothing else happened, so this follows the text
+    /// everywhere the text goes.
+    pub sampled: bool,
     /// Why this worker is `STALE`, when it is.
     ///
     /// The reasons have different remedies, and the capture status cannot tell
@@ -505,6 +523,7 @@ impl ObserverState {
                     worker.id,
                     PreviousWorkerState {
                         capture: worker.capture,
+                        sampled: worker.sampled,
                         last_observed: worker.last_observed,
                         live_agent: worker.live_agent,
                         latency_ms: worker.latency_ms,
@@ -534,7 +553,11 @@ impl ObserverState {
                     if matches!(status, CaptureStatus::Ready | CaptureStatus::Stale)
                         && let Some(previous) = previous
                     {
+                        // A metadata refresh carries no capture, so the retained
+                        // one is kept - along with whether it was a sample, or
+                        // the next refresh would present it as everything.
                         worker.capture.clone_from(&previous.capture);
+                        worker.sampled = previous.sampled;
                     }
                     if worker.last_observed.is_none()
                         && let Some(previous) = previous
@@ -696,15 +719,29 @@ impl ObserverState {
         let status = match capture {
             ObserverCapture::Loading => {
                 worker.capture = None;
+                worker.sampled = false;
                 CaptureStatus::Loading
             }
+            // An explicit read is everything Herdr offered, so it clears any
+            // sample marker the tile was carrying.
             ObserverCapture::Ready(capture) => {
                 worker.capture = Some(sanitize_capture(&capture));
+                worker.sampled = false;
                 CaptureStatus::Ready
             }
             ObserverCapture::Truncated(capture) => {
                 worker.capture = Some(sanitize_capture(&capture));
+                worker.sampled = false;
                 CaptureStatus::Truncated
+            }
+            ObserverCapture::Preview { text, truncated } => {
+                worker.capture = Some(sanitize_capture(&text));
+                worker.sampled = true;
+                if truncated {
+                    CaptureStatus::Truncated
+                } else {
+                    CaptureStatus::Ready
+                }
             }
             ObserverCapture::Unavailable
                 if worker.capture.is_some() && worker.last_observed.is_some() =>
@@ -1238,8 +1275,12 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
         .latency_ms
         .map(|latency| format!(" · {latency}ms"))
         .unwrap_or_default();
+    // The body marker is the first thing a short or narrow tile drops, and an
+    // unlabelled sample reads as the whole output. The title is the fallback: it
+    // costs no body row and is clipped last.
+    let sampled = if worker.sampled { " · PREVIEW" } else { "" };
     let title = format!(
-        "{marker}{} · {}{latency}{eligibility}",
+        "{marker}{} · {}{latency}{sampled}{eligibility}",
         display_title,
         worker.status_label()
     );
@@ -1365,29 +1406,49 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
                     .as_deref()
                     .map(sanitize_capture)
                     .unwrap_or_default();
+                // A retained sample is still a sample, so the marker travels with
+                // it even when the tile is no longer current.
+                let sampled = if worker.sampled { " · PREVIEW" } else { "" };
                 let explanation = state_line.unwrap_or_else(|| "STALE".to_owned());
-                format!("{explanation}\n{capture}")
+                format!("{explanation}{sampled}\n{capture}")
             }
             status @ (CaptureStatus::Ready | CaptureStatus::Truncated) => {
-                // Herdr reports truncation when it dropped older rows. Spend one
-                // row saying so rather than presenting a clipped capture as the
-                // worker's complete output.
-                let truncated = status == CaptureStatus::Truncated;
-                let mut reserved = if truncated { 3 } else { 2 };
-                // The explanation costs a row of capture, but never the last one:
-                // on a tile too short to hold both, the output the user came for
-                // wins and the state stays legible in the border title.
-                let explained = state_line
-                    .filter(|_| area.height > reserved + 1)
-                    .inspect(|_| reserved += 1);
-                let prefix = [
-                    explained.as_deref(),
-                    truncated.then_some("TRUNCATED · older output dropped by Herdr"),
+                // A sample says so, without naming a line count: what is shown is
+                // whatever survived Herdr's answer, the display bounds, and the
+                // rows this tile has, so a number here would overstate it.
+                let sampled = worker.sampled.then(|| {
+                    widest_that_fits(
+                        inner_width,
+                        &[
+                            "PREVIEW · recent output · v for more".to_owned(),
+                            "PREVIEW · v for more".to_owned(),
+                            "PREVIEW".to_owned(),
+                        ],
+                    )
+                });
+                // Every line above the output costs a row of it, and none may cost
+                // the last one: on a tile too short to hold both, the output wins.
+                // Offered in order of what has no fallback elsewhere: truncation is
+                // only ever said here, while the state and the sample are both in
+                // the border title as well.
+                let mut reserved = 2;
+                let mut prefix_lines = Vec::new();
+                for line in [
+                    (status == CaptureStatus::Truncated)
+                        .then(|| "TRUNCATED · older output dropped by Herdr".to_owned()),
+                    sampled,
+                    state_line,
                 ]
                 .into_iter()
                 .flatten()
-                .collect::<Vec<_>>()
-                .join("\n");
+                {
+                    if area.height <= reserved + 1 {
+                        break;
+                    }
+                    reserved += 1;
+                    prefix_lines.push(line);
+                }
+                let prefix = prefix_lines.join("\n");
                 worker
                     .capture
                     .as_deref()
