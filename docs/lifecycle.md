@@ -118,19 +118,26 @@ ended. Recording the socket a workload was created on would close that gap.
 A workload that finishes on its own is noticed by the next ordinary refresh,
 without anyone acting on it. `remain-on-exit` keeps a finished workload's session
 listed, so presence alone proves nothing; the same `list-sessions` a refresh
-already runs now also asks whether each pane is still alive and what status it
-exited with. A row that was `[running]` becomes `[ended]`, or `[failed]` when the
-command exited with a failing status, and its action becomes Restart.
+already runs now also reports the session's active pane - whether it is dead, and
+the status or signal it ended with. A row that was `[running]` becomes `[ended]`,
+or `[failed]` when the command exited with a failing status or was killed by a
+signal, and its action becomes Restart. The record is reconciled at the same time,
+so the action the row offers is one the record accepts.
 
-The cost is nothing extra: one `list-sessions` per host, as before, with two more
+The cost is nothing extra: one `list-sessions` per host, as before, with more
 fields in the same format string. A host with twenty workloads costs the same as a
 host with one, and no per-workload inspection is added to any refresh.
 
-This is an observation, not a record. The refresh reports what the host said; the
-record is reconciled by the next operation that acts on the workload, which is
-what keeps observation and persistence separate. In the `snapshot` JSON such a
-workload reads `workload_status: "exited"` while its metadata status may still
-read `running` until that reconciliation happens.
+There is a limit, and it comes from what `tmux` can report about a session. The
+pane fields describe the session's *active* pane, and Tether launches exactly one
+window holding one pane - so while a workload still has that shape, its active
+pane is its work. Once someone attaches and splits it, or opens a second window,
+a dead active pane says nothing about the workload's own command: a split that
+exited would otherwise read as the workload ending. Tether says nothing in that
+case rather than guessing, so a workload that has been split keeps reading as
+running until an operation inspects it exactly.
+
+In the `snapshot` JSON such a workload reads `workload_status: "exited"`.
 
 ## Serving is a different question from running
 

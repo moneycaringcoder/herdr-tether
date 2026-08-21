@@ -217,7 +217,7 @@ closed_days = 30
     fs::write(sandbox.path("xdg-state/herdr-tether/state.json"), state).unwrap();
     let argv = sandbox.path("tmux.argv");
     sandbox.install("tmux", &format!(
-        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external:0:0:\\ntether-0197f198000070008000000000000001:2:0:\\na-external:1:0:\\n'",
+        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'z-external:0:1:1:0::\\ntether-0197f198000070008000000000000001:2:1:1:0::\\na-external:1:1:1:0::\\n'",
         argv.display()
     ));
 
@@ -554,7 +554,7 @@ fn snapshot_reports_a_workload_that_exited_rather_than_calling_it_running() {
     // Listed, and its command exited with a failing status.
     sandbox.install(
         "tmux",
-        "printf 'tether-0197f198000070008000000000000001:0:1:3\n'",
+        "printf 'tether-0197f198000070008000000000000001:0:1:1:1:3:\n'",
     );
 
     let value: Value = serde_json::from_slice(

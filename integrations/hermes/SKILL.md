@@ -81,7 +81,7 @@ Keep these distinctions:
 - `external_catalog.sessions` are visible but unowned. Never stop, remove, restart, or otherwise mutate them.
 - A host with `origin: "state"` preserves historical owned metadata but is not necessarily a currently configured launch target.
 - `not_collected`, `unreachable`, timeout, limit, and error statuses are unknown/degraded results, never proof that no workload exists.
-- `workload_status: "exited"` means the workload's session is still listed and its command has finished. It is an observation, not a lifecycle record: the metadata status may still read `running` until Tether next reconciles it, and the exit status is deliberately not in the snapshot.
+- `workload_status: "exited"` means the workload's session is still listed and the command in it has finished. Tether reconciles the record when it sees this, so `metadata_status` normally follows; a snapshot taken in between may still show `running` metadata beside it. The exit status is deliberately not in the snapshot. Tether reports this only while the session is still the single window and pane it launched, so a workload someone has split may keep reading `running` until an operation inspects it.
 - The workload status vocabulary grows when Tether can observe something it previously could not. Treat a value this skill does not recognise as an unknown result rather than as an absent workload; that is the safe direction, because a status Tether cannot name is never a claim that the work is still going.
 
 Do not seek excluded data. Snapshot intentionally omits command bodies, ownership proofs, backend identifiers, terminal output, credentials, raw backend errors, and Tether's private storage paths.

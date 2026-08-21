@@ -1167,6 +1167,26 @@ struct ParsedSessions {
     unsafe_names: usize,
 }
 
+/// How a dead pane ended, as one number.
+///
+/// `tmux` reports an exit status for a command that returned, and a signal number
+/// instead for one that was killed - by the OOM killer, or by anything else that
+/// signals it. A signalled end is a failure, so it is encoded the way a shell
+/// encodes one: 128 plus the signal. Without that, a workload the kernel killed
+/// would read exactly like a command that succeeded.
+///
+/// `None` is reserved for an end `tmux` could not describe at all, which is an
+/// unknown outcome rather than a clean one.
+fn dead_pane_status(exit_status: &str, signal: &str) -> Option<Option<i32>> {
+    if !exit_status.is_empty() {
+        return Some(Some(exit_status.parse::<i32>().ok()?));
+    }
+    if !signal.is_empty() {
+        return Some(Some(128i32.saturating_add(signal.parse::<i32>().ok()?)));
+    }
+    Some(None)
+}
+
 fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
     const MAX_SESSIONS: usize = 256;
 
@@ -1182,20 +1202,27 @@ fn parse_sessions(stdout: &[u8]) -> Option<ParsedSessions> {
         }
         // Split from the right, so a session whose name contains a colon keeps it
         // and is judged by the name rules below rather than shifting the fields.
-        let (head, exit_status) = line.rsplit_once(':')?;
+        let (head, signal) = line.rsplit_once(':')?;
+        let (head, exit_status) = head.rsplit_once(':')?;
         let (head, pane_dead) = head.rsplit_once(':')?;
+        let (head, panes) = head.rsplit_once(':')?;
+        let (head, windows) = head.rsplit_once(':')?;
         let (name, attached) = head.rsplit_once(':')?;
         if !names.insert(name.to_owned()) {
             return None;
         }
         let attached = attached.parse::<u32>().ok()?;
+        let windows = windows.parse::<u32>().ok()?;
+        let panes = panes.parse::<u32>().ok()?;
+        // `#{pane_dead}` describes the session's active pane. Tether launches one
+        // window holding one pane, so while that is still the shape, the active
+        // pane is the workload's. Once someone has split it or opened another
+        // window, a dead active pane says nothing about the work, and claiming an
+        // end would be worse than saying nothing.
+        let single_pane = windows == 1 && panes == 1;
         let ended = match pane_dead {
-            "0" => None,
-            "1" => Some(if exit_status.is_empty() {
-                None
-            } else {
-                Some(exit_status.parse::<i32>().ok()?)
-            }),
+            "1" if single_pane => Some(dead_pane_status(exit_status, signal)?),
+            "0" | "1" => None,
             _ => return None,
         };
         if name.starts_with("tether-") {

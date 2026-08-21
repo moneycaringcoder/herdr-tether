@@ -786,11 +786,9 @@ fn workload_status_text(status: &WorkloadStatus) -> String {
     match status {
         WorkloadStatus::Running { attached: 0 } => "running".to_owned(),
         WorkloadStatus::Running { attached } => format!("running · {attached} attached"),
-        // A row reaches this only in the moment between the refresh that saw the
-        // end and the reconciliation that records it.
-        WorkloadStatus::Ended {
-            exit_status: Some(status),
-        } if *status != 0 => format!("exited · {status}"),
+        // A row is relabelled ended the moment this is observed, and only running
+        // rows show a liveness word, so this is here for exhaustiveness rather
+        // than because a row displays it.
         WorkloadStatus::Ended { .. } => "exited".to_owned(),
         WorkloadStatus::Missing => "missing".to_owned(),
         WorkloadStatus::Unknown => "unknown".to_owned(),
@@ -2981,16 +2979,19 @@ fn run_terminal_picker(
 
     loop {
         while let Ok(message) = status_run.receiver.try_recv() {
-            let missing_id = match &message {
+            // Both mean the workload is no longer running, so both are worth
+            // reconciling: a row that says Restart while the record still says
+            // Running advertises an action the record refuses.
+            let ended_id = match &message {
                 StatusMessage::Workload {
                     id,
-                    status: WorkloadStatus::Missing,
+                    status: WorkloadStatus::Missing | WorkloadStatus::Ended { .. },
                     ..
                 } => Some(*id),
                 _ => None,
             };
             dirty |= state.apply_status(message);
-            if let Some(id) = missing_id
+            if let Some(id) = ended_id
                 && lifecycle_service.observe_owned(id).is_ok()
                 && let Ok(Some(record)) = lifecycle_service.owned_record(id)
             {
