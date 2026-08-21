@@ -69,9 +69,21 @@ make that reconstruction possible.
 Where the backend can supply it. Answers "which of these twenty is eating the
 machine", which is otherwise a manual hunt.
 
-### Preset sharing
+### Preset sharing — decided against
 
-Presets are trusted code: Tether starts a login shell and runs the command
-through it, and does not sandbox anything. Any sharing mechanism has to lead with
-that, show the exact command before it is adopted, and never fetch a preset
-implicitly.
+Presets already share: a `[[hosts.presets]]` block is the whole preset, and
+sending it is a form of sharing where the artifact transferred and the thing
+reviewed are the same bytes. A preset is also code — a `command` and possibly a
+`health_command`, each run through `/bin/sh -c` on the selected machine — so the
+requirement that adoption show the exact command is met most completely by the
+mechanism that has no code in it at all.
+
+An import command would have replaced reading the command with answering a prompt
+written about it, and would have made preset text the first input Tether takes
+from off the machine and executes. `SECURITY.md` places "user-controlled Tether
+configuration and command presets" in the trusted computing base, and that
+sentence is true because the user wrote them.
+
+The reasoning is in [Configuration](configuration.md). What remains worth doing
+is unrelated to sharing: Tether does not show a preset's command before running
+it, even for presets the user already has.

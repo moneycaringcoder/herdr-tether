@@ -138,6 +138,13 @@
   preset, and a notification leaves the surface that produced it, so the
   documented promise that host, directory, and command never travel was not
   being kept. The tile still shows the friendly title.
+- Documented how presets are shared, and that there will be no command for it.
+  Sending a `[[hosts.presets]]` block is the mechanism: a preset is a `command`
+  and possibly a `health_command`, each run through `/bin/sh -c` on the selected
+  machine, and text is the only form in which the thing transferred and the thing
+  reviewed are the same bytes. An import path would have replaced reading the
+  command with answering a prompt written about it, and would have made preset
+  text the first input Tether takes from off the machine and executes.
 
 ### Fixed
 

@@ -158,6 +158,42 @@ workload's lifecycle. A workload whose preset has no health command, or which
 was created without a preset, reports nothing about serving rather than an
 implied pass.
 
+### Sharing a preset
+
+Send the TOML. A `[[hosts.presets]]` block is the whole preset - the ones shown
+above are complete - and a recipient adopts one by pasting it into their own
+configuration.
+
+There is deliberately no `preset import`, no export format, no bundle, and
+nothing that fetches. That is a decision rather than a gap, for three reasons.
+
+A preset is code. Tether starts a login `/bin/sh` on the selected machine and
+runs the command through `/bin/sh -c`; a `health_command` is a second such
+program, run on every status refresh. Adopting someone else's preset is running
+their program as your login user, in your directory, on your machine or on a host
+you can reach.
+
+Text is the safest way to carry code that will be trusted, because the artifact
+transferred and the thing reviewed are the same bytes. Any import command would
+replace "read the command" with "answer a prompt Tether wrote about the command",
+which puts a rendering step between the code and the person reading it - one that
+has to fit two payloads and arbitrary shell text into a confirmation - and moves
+the decision from editing your own shell configuration to dismissing a dialog.
+The convenience is real, and it is convenience in exactly the place where the
+friction is the feature.
+
+Tether takes nothing from off the machine and runs it. `ssh` reaches hosts you
+selected, Herdr answers over a local socket, and everything else Tether reads -
+session catalogues, `tmux` output, SSH aliases - is validated, bounded, or
+display-only. Preset text would be the first input that arrives from elsewhere
+and executes, which is why `SECURITY.md` can list "user-controlled Tether
+configuration and command presets" inside the trusted computing base: that
+sentence is true because you wrote them.
+
+So share the TOML, read what you are given the way you would read a shell script
+from the same person, and keep write access to the configuration as narrow as
+write access to `~/.profile`.
+
 ### Mission Control prompt capability
 
 Each orchestration worker stores independent `observe_output`,
