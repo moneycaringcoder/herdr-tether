@@ -39,9 +39,15 @@ A signal delivered while a thread is blocked in a read, a write, or a wait
 surfaces as `EINTR`. It describes no failure: the socket is still connected and
 the child is still running, and the call has to be made again. Herdr's own TUI
 raises `SIGWINCH` freely, so any blocking call on the socket, `tmux`, or SSH
-paths can span one - and so can a read of terminal input, because Mission Control
-leaves its screen to read the reviewed prompt while that TUI is still the
-surrounding process. An interruption there would throw away a half-written line.
+paths can span one.
+
+Terminal input is covered too, on narrower grounds. No handler in the process is
+known to interrupt a terminal read today - reads happen in canonical mode, and the
+handlers currently installed carry `SA_RESTART`, so the kernel restarts the read -
+but that is a property of today's handlers rather than a guarantee, and a read
+whose loss cannot be recovered, such as a line someone is typing, should not
+depend on it. `crate::interrupt` lists the terminal reads that are already safe by
+contract, which are most of them.
 
 On those paths a bare `?` on a blocking read, write, or wait is a bug. Route the
 call through `crate::interrupt::retry_interrupted` instead, and give it the bound

@@ -60,25 +60,34 @@
 //!   library repeats an interrupted `waitpid` here, so the child is still
 //!   reaped. `Child::try_wait` does not repeat it, which is why the poll in
 //!   `status::run_bounded` goes through this module.
-//! - `Command::output` in the `check` host probe and its SSH probe. The pipes
-//!   are drained with `read_to_end`, which ignores `Interrupted` by contract,
-//!   and the child is reaped with `Child::wait`.
+//! - `Command::output`, which no longer has a production caller: the host
+//!   `check` probes that used it now run through the bounded executor, and so
+//!   retry through this module.
 //! - `Command::status`, for an interactive attach and for the `herdr server
 //!   reload-config` call after a keybinding change. The parent transfers no data
 //!   and reaps with `Child::wait`; neither has a deadline, so there is no bound
 //!   for a retry to preserve either way.
+//! - `read_line` on stdin: the `SEND` confirmation beside the reviewed prompt,
+//!   and the two interactive confirmations in `cli`. `BufRead::read_line` is
+//!   defined in terms of `read_until`, which ignores `Interrupted` and resumes,
+//!   so the line survives without help from here.
+//! - `crossterm::event::{poll, read}`, in Mission Control, the Observer manager,
+//!   and the picker. Crossterm retries `EINTR` inside its own poll loop, so an
+//!   interrupted wait for a key returns no event rather than an error.
 //!
 //! The `tmux`, discovery, lifecycle, and CLI callers of `status::run_bounded` do
 //! no blocking I/O of their own: they hand it a command and inherit its
 //! behaviour.
 //!
-//! Terminal input is on these paths too. It reads from a terminal rather than a
-//! socket or a pipe, but it is exposed for exactly the same reason: Mission
-//! Control leaves its screen to read the reviewed prompt, so someone is typing
-//! while a TUI that raises `SIGWINCH` on resize is still the surrounding process,
-//! and an interruption there would throw away a half-written line. A blocking
-//! read of terminal input therefore goes through this module as well, and a bare
-//! `?` on one is a bug on the same terms.
+//! Terminal input is on these paths too, on narrower grounds. Nothing in the
+//! process is known to interrupt a terminal read today: reads happen in canonical
+//! mode, and the `SIGWINCH` handler crossterm installs comes through signal-hook,
+//! which sets `SA_RESTART`, so the kernel restarts the read rather than failing
+//! it. That is a property of the handlers currently installed, not a guarantee
+//! about the call, and a handler added later - here or in a dependency - only has
+//! to omit the flag. So a blocking terminal read whose loss cannot be recovered
+//! goes through this module as well, and the terminal reads that are already safe
+//! by contract are listed above rather than left for a reader to re-derive.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::time::{Duration, Instant};

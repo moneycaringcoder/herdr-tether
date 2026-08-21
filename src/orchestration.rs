@@ -919,11 +919,21 @@ fn read_bounded_prompt_line() -> Result<Option<String>> {
 
 /// Reads one reviewed prompt line, retrying an interruption.
 ///
-/// The user types this at an ordinary terminal, with the Mission Control TUI
-/// still the surrounding process - and that TUI raises `SIGWINCH` on every
-/// resize. Propagating the interruption would throw away a line someone was
-/// halfway through writing and report `os error 4` for it. There is no deadline
-/// to protect here, because the wait is a person typing.
+/// `Read::read` has no interruption handling of its own - unlike `read_line`,
+/// which absorbs it by contract - so this loop is the one place on the prompt
+/// path where an `EINTR` would reach the caller, and what it would cost is a
+/// line someone was halfway through writing.
+///
+/// No handler in the process is known to interrupt this today: the terminal read
+/// runs in canonical mode, and the `SIGWINCH` handler crossterm installs comes
+/// through signal-hook, which sets `SA_RESTART`, so the kernel restarts the read
+/// instead of failing it. That is a property of every handler currently in the
+/// process rather than a guarantee about the call, and it is not one worth
+/// depending on for a typed line: a handler added later, here or in a dependency,
+/// only has to omit that flag. The retry costs one syscall in a case that does
+/// not otherwise arise.
+///
+/// There is no deadline to protect, because the wait is a person typing.
 fn read_bounded_prompt_from(input: &mut impl Read) -> Result<Option<String>> {
     let mut bytes = Vec::with_capacity(MAX_REVIEWED_PROMPT_BYTES.min(1024));
     let mut byte = [0_u8; 1];
