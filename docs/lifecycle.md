@@ -40,11 +40,13 @@ exists to describe. Starting again does not end the run: a workload in a loop
 starts successfully every time, so treating a start as recovery would hold the
 count at one and the wait would never grow. What ends a run is an end of a
 different shape - a clean exit, or a failure that arrives after the workload had
-been running for a while - or simply time, since only failures from the last hour
-are counted. A workload that fails immediately today does not inherit a wait from
-failures last week, and the history holds at most sixteen entries. Nothing about
-the pace changes what Tether does: it never restarts anything itself, so a longer
-wait is a longer refusal to offer the action, with the reason attached.
+been running for a while - or simply time: only failures from the last hour count,
+so a workload that fails immediately today does not inherit a wait from failures
+last week, and a run that has ended stops being reported rather than lingering as
+a number with no wait behind it. The history holds at most
+sixteen entries. Nothing about the pace changes what Tether does: it never
+restarts anything itself, so a longer wait is a longer refusal to offer the
+action, with the reason attached.
 
 ### Remove
 

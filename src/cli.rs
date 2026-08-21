@@ -1689,7 +1689,7 @@ fn session_status_text(session: &SessionRecord) -> String {
             if session.failed_immediately() {
                 match session.immediate_failure_run() {
                     0 | 1 => format!("Failed immediately (exit {exit_status})"),
-                    run => format!("Failed immediately {run} times (exit {exit_status})"),
+                    run => format!("Failed immediately {run} times in a row (exit {exit_status})"),
                 }
             } else {
                 format!("Failed (exit {exit_status})")
@@ -3067,7 +3067,7 @@ mod tests {
             .collect();
         assert_eq!(
             session_status_text(&record),
-            "Failed immediately 3 times (exit 2)"
+            "Failed immediately 3 times in a row (exit 2)"
         );
         record.immediate_failures.clear();
         record.last_used_at = Utc::now() - chrono::Duration::minutes(20);

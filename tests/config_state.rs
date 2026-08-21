@@ -1123,6 +1123,24 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     session_count_over.sessions.push(session());
     cases.push(("state sessions", session_count, session_count_over));
 
+    let mut history_at = session();
+    history_at.immediate_failures = vec![now; SessionRecord::MAX_IMMEDIATE_FAILURES];
+    let mut history_over = session();
+    history_over.immediate_failures = vec![now; SessionRecord::MAX_IMMEDIATE_FAILURES + 1];
+    cases.push((
+        "immediate failures",
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![history_at],
+            orchestration_groups: Vec::new(),
+        },
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![history_over],
+            orchestration_groups: Vec::new(),
+        },
+    ));
+
     for field in [
         "session host",
         "session target",
@@ -1310,7 +1328,7 @@ fn oversized_state_input_is_rejected_before_json_parsing() {
 }
 
 #[test]
-fn state_v4_rejects_unsafe_orchestration_json() {
+fn state_v5_rejects_unsafe_orchestration_json() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
     let store = StateStore::new(path.clone());
@@ -1360,6 +1378,10 @@ fn every_state_schema_rejects_unknown_fields() {
         r#"{"version":3,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
+        // Version 4 is a frozen decode path now, so it needs its own case rather
+        // than being retargeted to the current version.
+        r#"{"version":4,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
+        r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
         r#"{"version":5,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
         r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
         r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),

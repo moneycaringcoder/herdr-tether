@@ -93,8 +93,10 @@ pub struct SessionRecord {
     /// happening now, and the vector is capped at
     /// [`SessionRecord::MAX_IMMEDIATE_FAILURES`].
     ///
-    /// Preserved across a restart, which is the whole point of it, and cleared
-    /// the moment a workload is confirmed running or ends any other way.
+    /// Preserved across a restart, and across a confirmed start, which is the
+    /// whole point of it: a workload in a loop starts successfully every time, so
+    /// clearing it there would hold the count at one. Cleared when the workload
+    /// ends any other way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub immediate_failures: Vec<DateTime<Utc>>,
 }
@@ -144,25 +146,31 @@ impl SessionRecord {
     /// How many times in a row this workload has failed as soon as it started.
     ///
     /// Counted from the recorded history, and only within
-    /// [`IMMEDIATE_FAILURE_MEMORY`] of the most recent entry, so a run that
-    /// stopped an hour ago does not lengthen today's wait.
+    /// [`IMMEDIATE_FAILURE_MEMORY`] of now, so a run that stopped an hour ago
+    /// neither lengthens today's wait nor keeps being reported once it is over.
+    /// Anchoring on the newest entry instead would leave a finished run counted
+    /// forever: the number would sit at four with no wait in force, and drop to
+    /// one the moment another failure arrived, which reads as the count falling
+    /// after a failure.
     ///
     /// A record whose current end failed at once always counts at least one, even
     /// with no history: a record written before the history existed still shows
     /// the failure in front of it, and reporting zero there would say a workload
     /// nobody can restart yet has not failed.
     pub fn immediate_failure_run(&self) -> usize {
-        let recorded = match self.immediate_failures.last() {
-            Some(latest) => {
-                let cutoff = *latest - IMMEDIATE_FAILURE_MEMORY;
-                self.immediate_failures
-                    .iter()
-                    .filter(|at| **at >= cutoff)
-                    .count()
-            }
-            None => 0,
-        };
+        let recorded = self.recent_immediate_failures(Utc::now());
         recorded.max(usize::from(self.ended_immediately()))
+    }
+
+    /// How many recorded failures are still inside the memory window at `now`.
+    fn recent_immediate_failures(&self, now: DateTime<Utc>) -> usize {
+        let Some(cutoff) = now.checked_sub_signed(IMMEDIATE_FAILURE_MEMORY) else {
+            return self.immediate_failures.len();
+        };
+        self.immediate_failures
+            .iter()
+            .filter(|at| **at >= cutoff)
+            .count()
     }
 
     /// Whether the end this record describes arrived as soon as it started.
@@ -223,11 +231,16 @@ impl SessionRecord {
     /// keeps the newest entries when the ceiling is reached: the wait is decided
     /// by how many failures are recent, and the oldest are the ones that stop
     /// counting first.
+    ///
+    /// Pruning uses the same window the count reads through, measured from now
+    /// rather than from the end being recorded, so a persisted timestamp is never
+    /// the thing arithmetic is done against and one definition covers both.
     pub fn note_immediate_failure(&mut self) {
-        let at = self.closed_at.unwrap_or_else(Utc::now);
-        let cutoff = at - IMMEDIATE_FAILURE_MEMORY;
-        self.immediate_failures.retain(|entry| *entry >= cutoff);
-        self.immediate_failures.push(at);
+        let now = Utc::now();
+        if let Some(cutoff) = now.checked_sub_signed(IMMEDIATE_FAILURE_MEMORY) {
+            self.immediate_failures.retain(|entry| *entry >= cutoff);
+        }
+        self.immediate_failures.push(self.closed_at.unwrap_or(now));
         let excess = self
             .immediate_failures
             .len()
@@ -285,6 +298,35 @@ mod pace_tests {
     }
 
     #[test]
+    fn a_finished_run_stops_being_counted_once_the_window_passes() {
+        // Four failures, the last of them two hours ago, and the record's own end
+        // is an ordinary failure. Counting relative to the newest entry would
+        // report four forever, with no wait in force to explain the number, and
+        // then report one as soon as another failure arrived - a count that falls
+        // after a failure.
+        let mut record = ended(TimeDelta::minutes(5), Some(2));
+        let long_ago = Utc::now() - TimeDelta::hours(2);
+        record.immediate_failures = (0..4)
+            .map(|index| long_ago + TimeDelta::seconds(index))
+            .collect();
+
+        assert_eq!(record.immediate_failure_run(), 0);
+        assert_eq!(record.paced_restart_until(), None);
+
+        // A failure now is the first of a new run, not the fifth of the old one.
+        record.last_used_at = Utc::now() - TimeDelta::seconds(1);
+        record.closed_at = Some(Utc::now());
+        record.note_immediate_failure();
+        assert_eq!(
+            record.immediate_failures.len(),
+            1,
+            "the stale run is pruned"
+        );
+        assert_eq!(record.immediate_failure_run(), 1);
+        assert_eq!(record.restart_pace(), RESTART_PACE);
+    }
+
+    #[test]
     fn the_history_is_capped_and_keeps_the_newest() {
         let mut record = ended(TimeDelta::seconds(1), Some(2));
         for _ in 0..SessionRecord::MAX_IMMEDIATE_FAILURES + 8 {
@@ -293,7 +335,7 @@ mod pace_tests {
         assert_eq!(
             record.immediate_failures.len(),
             SessionRecord::MAX_IMMEDIATE_FAILURES,
-            "a workload in a loop for a week cannot grow its own record"
+            "a long loop cannot grow its own record without limit"
         );
         // Capping must not lose the pace: the run is still at the ceiling.
         assert_eq!(
@@ -319,10 +361,13 @@ mod pace_tests {
         assert_eq!(ran.paced_restart_until(), None);
     }
 
+    /// A record whose end is `ran_for` after its start, and whose end is now.
+    ///
+    /// Relative to the present deliberately: the memory window is measured from
+    /// now, so a fixture pinned to a fixed date in the past would describe a run
+    /// that has already been forgotten.
     fn ended(ran_for: TimeDelta, exit_status: Option<i32>) -> SessionRecord {
-        let started = DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let started = Utc::now() - ran_for;
         SessionRecord {
             herdr_agent: None,
             id: "tether-0197f198000070008000000000000001".parse().unwrap(),
