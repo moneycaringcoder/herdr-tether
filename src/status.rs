@@ -179,8 +179,11 @@ impl StatusService {
     }
 
     fn start_validated(&self, request: StatusRequest) -> StatusRun {
+        // Two messages per workload now: liveness and, where configured, health.
+        // Sized so a worker's send never blocks, because a blocked send stops
+        // observing the cancellation flag.
         let (sender, receiver) =
-            mpsc::sync_channel(MAX_STATUS_WORKLOADS + MAX_STATUS_HOSTS * 2 + 1);
+            mpsc::sync_channel(MAX_STATUS_WORKLOADS * 2 + MAX_STATUS_HOSTS * 2 + 1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let jobs = Arc::new(Mutex::new(VecDeque::from(request.hosts)));
         let worker_count = self
@@ -372,7 +375,14 @@ fn probe_host(
             return;
         }
     }
-    probe_health(generation, &host, sender, cancelled, binaries, timeout);
+    // A host Tether could not reach cannot answer a probe either, and the
+    // liveness attempt just proved it: retrying per workload would spend the
+    // whole refresh re-learning the same failure.
+    if classified.reachability == HostReachability::Reachable {
+        probe_health(generation, &host, sender, cancelled, binaries, timeout);
+    } else {
+        report_unknown_health(generation, &host, sender, cancelled);
+    }
 }
 
 /// How long a health command may take before its result is unknown.
@@ -396,6 +406,10 @@ fn probe_health(
     timeout: Duration,
 ) {
     let health_timeout = HEALTH_TIMEOUT.min(timeout);
+    // One deadline for the whole phase, so a host's cost stays bounded however
+    // many workloads it has. A probe that does not fit reports unknown rather
+    // than holding a worker while other hosts wait on it.
+    let deadline = Instant::now() + health_timeout;
     for workload in &host.workloads {
         let Some(command) = workload.health_command.as_deref() else {
             continue;
@@ -403,15 +417,23 @@ fn probe_health(
         if cancelled.load(Ordering::Acquire) {
             return;
         }
-        let spec = health_spec(
-            host.target.as_deref(),
-            &workload.directory,
-            command,
-            binaries,
-        );
-        let status = match spec {
-            Ok(spec) => classify_health(run_bounded(&spec, health_timeout, cancelled)),
-            Err(()) => HealthStatus::Unknown,
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let status = if remaining.is_zero() {
+            // The phase's budget is spent, so this probe never ran.
+            HealthStatus::Unknown
+        } else {
+            match health_spec(
+                host.target.as_deref(),
+                &workload.directory,
+                command,
+                binaries,
+            ) {
+                Ok(spec) => classify_health(
+                    run_bounded(&spec, remaining, cancelled),
+                    host.target.is_some(),
+                ),
+                Err(()) => HealthStatus::Unknown,
+            }
         };
         if matches!(status, HealthStatus::Unknown) && cancelled.load(Ordering::Acquire) {
             return;
@@ -421,6 +443,38 @@ fn probe_health(
                 generation,
                 id: workload.id,
                 status,
+                checked_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Reports every configured probe as unknown without running any of them.
+///
+/// For a host Tether could not reach: the workloads may well be serving, and
+/// saying so either way would be a claim about the workload drawn from a fact
+/// about the host.
+fn report_unknown_health(
+    generation: u64,
+    host: &StatusHost,
+    sender: &SyncSender<StatusMessage>,
+    cancelled: &AtomicBool,
+) {
+    for workload in &host.workloads {
+        if workload.health_command.is_none() {
+            continue;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if sender
+            .send(StatusMessage::Health {
+                generation,
+                id: workload.id,
+                status: HealthStatus::Unknown,
                 checked_at: SystemTime::now(),
             })
             .is_err()
@@ -451,21 +505,36 @@ fn health_spec(
         .map_err(|_| ())
 }
 
-fn classify_health(result: BoundedOutput) -> HealthStatus {
+/// The status `ssh` reserves for its own transport failures.
+const SSH_FAILURE: i32 = 255;
+
+/// What a finished probe said about the workload, if anything.
+///
+/// `remote` is needed because the answer travels over SSH, and SSH reserves
+/// `255` for its own transport failures. Reading that as the workload's verdict
+/// would report a service as down when Tether never reached the machine.
+fn classify_health(result: BoundedOutput, remote: bool) -> HealthStatus {
     match result {
         BoundedOutput::Completed { status, .. } if status.success() => HealthStatus::Serving,
-        // A probe that could not be executed, or whose command was not found,
-        // has observed nothing. Reporting "not serving" there would be an
-        // inference about the workload from a fact about the probe.
+        // A probe that could not be executed, whose command was not found, or
+        // whose transport failed has observed nothing. Reporting "not serving"
+        // there would be an inference about the workload from a fact about the
+        // probe.
         BoundedOutput::Completed { status, .. }
-            if status
-                .code()
-                .is_some_and(|code| crate::tmux::HEALTH_UNRUNNABLE.contains(&code)) =>
+            if status.code().is_some_and(|code| {
+                crate::tmux::HEALTH_UNRUNNABLE.contains(&code) || (remote && code == SSH_FAILURE)
+            }) =>
         {
             HealthStatus::Unknown
         }
-        BoundedOutput::Completed { status, .. } => HealthStatus::NotServing {
-            exit_status: status.code(),
+        // A probe killed by a signal never reported either. `None` here means
+        // something outside Tether reaped it, since a probe over its own
+        // deadline arrives as `TimedOut`.
+        BoundedOutput::Completed { status, .. } => match status.code() {
+            Some(exit_status) => HealthStatus::NotServing {
+                exit_status: Some(exit_status),
+            },
+            None => HealthStatus::Unknown,
         },
         // A probe that did not finish or could not start says nothing either.
         BoundedOutput::TimedOut
@@ -553,7 +622,7 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             hidden_unsafe: 0,
         },
         BoundedOutput::Completed { status, stderr, .. }
-            if host.target.is_some() && status.code() == Some(255) =>
+            if host.target.is_some() && status.code() == Some(SSH_FAILURE) =>
         {
             with_detail(
                 classified_failure(
@@ -1039,6 +1108,41 @@ mod tests {
         );
     }
 
+    /// A finished probe carrying an exact exit status.
+    #[cfg(unix)]
+    fn completed_with(code: i32) -> BoundedOutput {
+        let status = Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+            .unwrap();
+        BoundedOutput::Completed {
+            status,
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
+    /// A probe reaped by a signal, which reports no exit code on Unix.
+    #[cfg(unix)]
+    fn killed_by_signal() -> BoundedOutput {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.code().is_none(), "{status:?}");
+        BoundedOutput::Completed {
+            status,
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_health_command_that_cannot_run_is_unknown_rather_than_a_pass() {
@@ -1048,17 +1152,30 @@ mod tests {
             health_result("exit 0", "/definitely/not/a/directory"),
             HealthStatus::Unknown,
         );
+        for result in [
+            BoundedOutput::TimedOut,
+            BoundedOutput::SpawnError(io::ErrorKind::NotFound),
+            BoundedOutput::Error,
+            BoundedOutput::Cancelled,
+        ] {
+            assert_eq!(classify_health(result, false), HealthStatus::Unknown);
+        }
+
+        // SSH reserves 255 for its own failures, so a remote probe that exits
+        // 255 never reached the workload. The same status from a local probe is
+        // the command's own answer.
+        let transport = completed_with(SSH_FAILURE);
+        assert_eq!(classify_health(transport, true), HealthStatus::Unknown);
         assert_eq!(
-            classify_health(BoundedOutput::TimedOut),
-            HealthStatus::Unknown
+            classify_health(completed_with(SSH_FAILURE), false),
+            HealthStatus::NotServing {
+                exit_status: Some(SSH_FAILURE)
+            }
         );
+
+        // A probe reaped by something outside Tether reported nothing at all.
         assert_eq!(
-            classify_health(BoundedOutput::SpawnError(io::ErrorKind::NotFound)),
-            HealthStatus::Unknown
-        );
-        assert_eq!(classify_health(BoundedOutput::Error), HealthStatus::Unknown);
-        assert_eq!(
-            classify_health(BoundedOutput::Cancelled),
+            classify_health(killed_by_signal(), false),
             HealthStatus::Unknown
         );
     }

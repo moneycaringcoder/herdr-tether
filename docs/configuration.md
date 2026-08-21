@@ -133,11 +133,22 @@ health_command = "curl -fsS localhost:8080/healthz"
 
 The probe runs in the workload's directory, on the workload's host, after each
 liveness check, and it never enters the workload's own pane. Exit zero reads
-`serving`; any other status reads `not serving` with the status. A probe that
-times out, cannot be started, or cannot enter the directory reads
-`health unknown`, which is deliberately not a pass: Tether reports what it could
-not establish rather than assuming the workload is fine. Exit statuses `126` and
-`127` mean the probe itself could not run, so they read as unknown too.
+`serving`; any other status reads `not serving` with the status.
+
+Anything that stops the probe from reporting reads `health unknown`, which is
+deliberately not a pass and not a failure: Tether states what it could not
+establish rather than assuming the workload is fine or broken. That covers a
+probe that timed out, could not be started, was killed by something outside
+Tether, could not enter the directory, exited `126` or `127` because it could
+not be executed, or ran over SSH to a host that could not be reached - for a
+remote host, `255` is SSH's own transport failure rather than the workload's
+answer, and it is read as such. A host that is unreachable is not probed at all;
+its workloads report unknown once, rather than the refresh re-attempting a
+connection the liveness check just proved dead.
+
+All of a host's probes share one budget of at most five seconds, so a host's
+status refresh costs the same whether it has one probed workload or fifty. A
+probe that does not fit reports unknown.
 
 A health command is trusted code on the same terms as `command`, and it is
 subject to the same length limit. It runs only while a Tether surface is

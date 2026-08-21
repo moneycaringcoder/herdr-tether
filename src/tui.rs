@@ -1059,6 +1059,7 @@ impl PickerState {
                 });
                 for id in &removed_ids {
                     self.workload_status.remove(id);
+                    self.workload_health.remove(id);
                     self.close_failed.remove(id);
                 }
                 self.restore_selection(selected_host, selected_resource);
@@ -1085,6 +1086,7 @@ impl PickerState {
                 host.origin == PickerHostOrigin::Effective || !host.workloads.is_empty()
             });
             self.workload_status.remove(&result.id);
+            self.workload_health.remove(&result.id);
             self.close_failed.remove(&result.id);
             self.restore_selection(selected_host, selected_resource);
         }

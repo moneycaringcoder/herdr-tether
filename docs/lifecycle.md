@@ -61,7 +61,8 @@ if you configure a `health_command` on the preset the workload was created from
 (see [Configuration](configuration.md)). Each status refresh then runs that
 command in the workload's directory and shows the verdict beside the state:
 `serving`, `not serving` with the exit status, or `health unknown` when the
-probe could not run or did not finish.
+probe could not run, did not finish, or could not reach the host - Tether never
+turns "I could not check" into a verdict either way.
 
 The two axes stay independent on purpose. A live process that is not serving is
 a real condition worth seeing, and so is a workload that answers its probe while

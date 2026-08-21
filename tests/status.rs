@@ -509,17 +509,26 @@ fn a_configured_health_command_is_probed_after_liveness() {
         .unwrap();
 
     let mut health = Vec::new();
+    let mut liveness_after_health = 0;
     loop {
         let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
         let finished = matches!(message, StatusMessage::Finished { .. });
-        if let StatusMessage::Health { id, status, .. } = message {
-            health.push((id, status));
+        match message {
+            StatusMessage::Health { id, status, .. } => health.push((id, status)),
+            // Liveness must land first: a workload observed as missing is taken
+            // off the row before a verdict about it could be drawn.
+            StatusMessage::Workload { .. } if !health.is_empty() => liveness_after_health += 1,
+            _ => {}
         }
         if finished {
             break;
         }
     }
 
+    assert_eq!(
+        liveness_after_health, 0,
+        "every liveness result must precede the first health result"
+    );
     assert_eq!(
         health,
         vec![
@@ -531,6 +540,130 @@ fn a_configured_health_command_is_probed_after_liveness() {
                 }
             ),
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreachable_host_reports_unknown_health_without_probing() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    // The status `ssh` reserves for its own transport failures. A probe that
+    // never reached the machine must not claim the workload is not serving.
+    let marker = temp.path().join("attempts");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf 'x' >> '{}'\nexit 255\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let workload = id("tether-0197f198000070008000000000000001");
+    let run = service
+        .try_start(StatusRequest {
+            generation: 12,
+            hosts: vec![StatusHost {
+                name: "offline".into(),
+                target: Some("offline".into()),
+                workloads: vec![StatusWorkload {
+                    id: workload,
+                    directory: "/srv/app".to_owned(),
+                    health_command: Some("exit 0".to_owned()),
+                }],
+            }],
+        })
+        .unwrap();
+
+    let mut health = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if let StatusMessage::Health { id, status, .. } = message {
+            health.push((id, status));
+        }
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(health, vec![(workload, HealthStatus::Unknown)]);
+    // The liveness attempt already proved the host cannot answer, so the probe
+    // is not retried per workload.
+    assert_eq!(
+        fs::read(&marker).unwrap().len(),
+        1,
+        "an unreachable host must be contacted once, not once per probe"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_health_phase_stays_bounded_however_many_workloads_are_probed() {
+    let temp = tempdir().unwrap();
+    let tmux = temp.path().join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(temp.path().join("ssh"), &tmux),
+        Duration::from_secs(1),
+        1,
+    );
+    // Enough probes that a per-probe budget would cost eight seconds, while one
+    // shared phase budget costs one however many there are.
+    let ids: Vec<_> = (1..=8)
+        .map(|index| id(&format!("tether-0197f19800007000800000000000000{index}")))
+        .collect();
+    let started = Instant::now();
+    let run = service
+        .try_start(StatusRequest {
+            generation: 13,
+            hosts: vec![StatusHost {
+                name: "local".into(),
+                target: None,
+                workloads: ids
+                    .iter()
+                    .map(|id| StatusWorkload {
+                        id: *id,
+                        directory: "/".to_owned(),
+                        // A probe that never answers, so the phase's own budget
+                        // is what has to stop it.
+                        health_command: Some("sleep 30".to_owned()),
+                    })
+                    .collect(),
+            }],
+        })
+        .unwrap();
+
+    let mut health = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if let StatusMessage::Health { id, status, .. } = message {
+            health.push((id, status));
+        }
+        if finished {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        health,
+        ids.iter()
+            .map(|id| (*id, HealthStatus::Unknown))
+            .collect::<Vec<_>>(),
+        "a probe that does not fit the phase reports unknown"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the health phase must not grow with workload count: {elapsed:?}"
     );
 }
 
