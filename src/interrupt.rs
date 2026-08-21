@@ -35,6 +35,8 @@
 //!   non-blocking descriptors ([`Budget::Immediate`]).
 //! - `status::run_bounded`, polling the child with `try_wait`, bounded by the
 //!   command deadline it already enforces ([`Budget::Until`]).
+//! - `orchestration::read_bounded_prompt_from`, reading the reviewed Mission
+//!   Control prompt from the terminal a byte at a time ([`Budget::Immediate`]).
 //!
 //! # Calls that deliberately do not retry
 //!
@@ -70,9 +72,13 @@
 //! no blocking I/O of their own: they hand it a command and inherit its
 //! behaviour.
 //!
-//! Terminal input is not one of these paths and was not audited here. The
-//! prompt read in `orchestration` does propagate an interruption; that is
-//! tracked separately rather than settled by this list.
+//! Terminal input is on these paths too. It reads from a terminal rather than a
+//! socket or a pipe, but it is exposed for exactly the same reason: Mission
+//! Control leaves its screen to read the reviewed prompt, so someone is typing
+//! while a TUI that raises `SIGWINCH` on resize is still the surrounding process,
+//! and an interruption there would throw away a half-written line. A blocking
+//! read of terminal input therefore goes through this module as well, and a bare
+//! `?` on one is a bug on the same terms.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::time::{Duration, Instant};
@@ -80,9 +86,13 @@ use std::time::{Duration, Instant};
 /// The bound an interruption retry must not exceed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Budget {
-    /// The call cannot block: the descriptor is non-blocking, or the wait is a
-    /// `WNOHANG` poll. A retry costs one more syscall and no waiting, so there
-    /// is no bound to preserve and no reason to read the clock.
+    /// There is no bound for a retry to preserve, so nothing reads the clock.
+    ///
+    /// Two kinds of call qualify. One cannot block at all - a non-blocking
+    /// descriptor, or a `WNOHANG` poll - so a retry costs one more syscall and no
+    /// waiting. The other blocks with no deadline by design: terminal input waits
+    /// for a person to type, and no retry can make that wait longer than it
+    /// already is.
     Immediate,
     /// The call blocks under a relative timeout, such as a socket's
     /// `SO_RCVTIMEO`, which every retry restarts. Retries are allowed for one

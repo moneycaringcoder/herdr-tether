@@ -39,14 +39,16 @@ A signal delivered while a thread is blocked in a read, a write, or a wait
 surfaces as `EINTR`. It describes no failure: the socket is still connected and
 the child is still running, and the call has to be made again. Herdr's own TUI
 raises `SIGWINCH` freely, so any blocking call on the socket, `tmux`, or SSH
-paths can span one.
+paths can span one - and so can a read of terminal input, because Mission Control
+leaves its screen to read the reviewed prompt while that TUI is still the
+surrounding process. An interruption there would throw away a half-written line.
 
 On those paths a bare `?` on a blocking read, write, or wait is a bug. Route the
 call through `crate::interrupt::retry_interrupted` instead, and give it the bound
 the call site already has: a relative socket timeout, the deadline of an
-enclosing loop, or nothing to bound when the descriptor is non-blocking. A retry
-loop with no bound turns a bounded wait into an unbounded one, because a relative
-timeout restarts on every call.
+enclosing loop, or nothing to bound when the descriptor is non-blocking or the
+wait is for a person to type. A retry loop with no bound turns a bounded wait into
+an unbounded one, because a relative timeout restarts on every call.
 
 A call that should propagate the interruption instead is a valid outcome, but an
 argued one. `crate::interrupt` lists every such call on those paths with the
