@@ -342,6 +342,7 @@ impl TmuxBackend {
             ownership_proof,
             output.status.code(),
             &output.stdout,
+            &output.stderr,
             stdout_truncated,
         )
     }
@@ -352,9 +353,17 @@ impl TmuxBackend {
         ownership_proof: &OwnershipProof,
         exit_code: Option<i32>,
         stdout: &[u8],
+        stderr: &[u8],
         stdout_truncated: bool,
     ) -> WorkloadState {
-        classify_exact_inspect(id, ownership_proof, exit_code, stdout, stdout_truncated)
+        classify_exact_inspect(
+            id,
+            ownership_proof,
+            exit_code,
+            stdout,
+            stderr,
+            stdout_truncated,
+        )
     }
 
     pub(crate) fn status_spec(&self) -> Result<CommandSpec> {
@@ -716,6 +725,7 @@ fn classify_exact_inspect(
     ownership_proof: &OwnershipProof,
     exit_code: Option<i32>,
     stdout: &[u8],
+    stderr: &[u8],
     stdout_truncated: bool,
 ) -> WorkloadState {
     if exit_code == Some(0) {
@@ -771,11 +781,40 @@ fn classify_exact_inspect(
             }
             _ => WorkloadState::Unknown,
         }
-    } else if exit_code == Some(1) {
+    } else if exit_code == Some(1) && stderr_reports_no_server(stderr) {
+        // No server is running on the socket this invocation uses, so there is no
+        // session of any kind for it to act on. That is the ordinary state of a
+        // host whose last session ended - `tmux` exits with its final session -
+        // and reading it as anything else would leave every record on a rebooted
+        // machine impossible to stop, restart, remove, or prune.
+        //
+        // The socket depends on the environment, so this is absence on the socket
+        // Tether can see rather than proof about every server on the host. Closing
+        // that gap needs the socket recorded when the workload is created.
         WorkloadState::Missing
     } else {
+        // Exit 1 for any other reason is a failure to ask, not an answer: a
+        // rejected option, a socket that cannot be read, a `tmux` too old for the
+        // filter this query needs. A reachable server answers 0 with an empty list
+        // when it holds no matching session, so nothing here is evidence that the
+        // workload has gone.
         WorkloadState::Unknown
     }
+}
+
+/// Whether `tmux` said it could not reach a server at all.
+///
+/// `tmux` reports this as `no server running on <socket>` when the socket is
+/// absent, and `error connecting to <socket> (...)` when it exists but nothing is
+/// listening. Matched on the stable part of each phrase; an empty stderr counts,
+/// because a exit-1 with nothing said is the same non-answer.
+fn stderr_reports_no_server(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    stderr.is_empty()
+        || stderr.contains("no server running")
+        || stderr.contains("error connecting to")
+        || stderr.contains("failed to connect to server")
 }
 
 fn validate_tmux_id(value: &str, sigil: char, kind: &str) -> Result<String> {
@@ -964,6 +1003,7 @@ mod tests {
                 &proof,
                 Some(0),
                 b"tether-0197f198000070008000000000000001:$7:2:0::0197f198000070008000000000000002\n",
+                b"",
                 false,
             ),
             WorkloadState::Running {
@@ -977,6 +1017,7 @@ mod tests {
                 &proof,
                 Some(0),
                 b"tether-0197f198000070008000000000000001:$7:0:1:130:0197f198000070008000000000000002\n",
+                b"",
                 false,
             ),
             WorkloadState::Ended {

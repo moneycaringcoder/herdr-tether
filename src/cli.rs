@@ -1652,14 +1652,23 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             })
         }
         SessionCommand::Stop { id } => {
-            audited_lifecycle(paths, store.clone())
+            let result = audited_lifecycle(paths, store.clone())
                 .close_owned(id)
                 .with_context(|| {
                     format!(
                         "stop session `{id}`; retry `herdr-tether session stop {id}` after resolving the reported error"
                     )
                 })?;
-            println!("stopped {id}");
+            // A record that was already gone was not stopped by this command.
+            // Saying "stopped" for it claims an act that did not happen, and hides
+            // that nothing was found where Tether looked - which is the one thing
+            // worth knowing if the workload is elsewhere.
+            match result.workload {
+                ClosedWorkload::Terminated => println!("stopped {id}"),
+                ClosedWorkload::Missing => {
+                    println!("no workload found for {id}; recorded as ended");
+                }
+            }
             Ok(())
         }
         SessionCommand::Remove { id } => {

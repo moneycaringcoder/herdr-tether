@@ -94,6 +94,25 @@ against a group you did not build.
 
 Observation and persistence are deliberately separate. A refresh may update what the picker knows, but it cannot silently authorize Stop or Remove. Confirmation and error dialogs stay active until their own operation finishes or you explicitly cancel them.
 
+Tether separates an answer from a failure to ask. An answer is a `tmux` that ran
+and reported on the socket it uses: either the session with that name and
+ownership proof, or no such session, or no server running there at all. All three
+are evidence, and the last two end the record - a host whose last session ended
+has no server, because `tmux` exits with its final session, so treating that as
+unproven would leave every record on a rebooted machine impossible to stop,
+restart, or remove.
+
+A failure to ask is not evidence, and Stop, Restart, Remove, and group actions all
+refuse it and change nothing: a `tmux` that is not installed, one that cannot be
+executed, one that rejected the query, or one whose output could not be trusted.
+A `tmux` too old for the inspection Tether needs falls here, and reads as a
+workload whose state cannot be proven rather than as one that ended.
+
+The limit worth knowing: `tmux` chooses its socket from the environment, so what
+Tether can see is the server its own invocation reaches. A workload started under
+a different `TMUX_TMPDIR` is not visible to a Tether run without it, and reads as
+ended. Recording the socket a workload was created on would close that gap.
+
 ## Serving is a different question from running
 
 Every state above answers whether the workload's process is alive. Whether the

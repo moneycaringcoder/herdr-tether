@@ -151,6 +151,19 @@
 
 ### Fixed
 
+- A Stop no longer reports having stopped a workload it never found, and an
+  inspection `tmux` refused is no longer read as a workload that ended. The exact
+  inspection filters by session name and ownership proof, so a server that answers
+  reports an empty list when it holds no such session; no server on the socket at
+  all is also an answer, because `tmux` exits with its last session, and a host
+  that has rebooted must stay actionable. What was being read as absence too
+  broadly is every other exit-1: a rejected query, a socket that cannot be read, a
+  `tmux` too old for the filter this inspection needs. Those now read as a state
+  Tether could not prove, and Stop, Restart, Remove, and group actions refuse and
+  change nothing. A Stop that found nothing now says `no workload found for <id>;
+  recorded as ended` rather than `stopped <id>`, because the record was already
+  gone and nothing was killed. A missing or non-executable `tmux` already refused;
+  that behaviour now has tests at the lifecycle boundary.
 - Stopping a workload whose command had already exited no longer discards the
   exit status `tmux` reported for it. The pane was already dead, so reaping it
   was destroying the only record of how the work ended, and the workload then

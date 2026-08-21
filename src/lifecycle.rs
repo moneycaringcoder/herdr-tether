@@ -283,12 +283,14 @@ impl LifecycleService {
                 status,
                 stdout,
                 stdout_truncated,
+                stderr,
                 ..
             } => Ok(backend.classify_exact_inspect_parts(
                 id,
                 ownership_proof,
                 status.code(),
                 &stdout,
+                &stderr,
                 stdout_truncated,
             )),
             output => Err(CloseOwnedError::Inspect {
