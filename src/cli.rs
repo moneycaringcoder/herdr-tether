@@ -555,6 +555,9 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
                         herdr_agent: None,
                         name: preset.name,
                         command: preset.command,
+                        // `host add` takes a command; a health command is
+                        // configured in the file, where its trust is documented.
+                        health_command: None,
                     })
                     .collect(),
             };

@@ -47,6 +47,23 @@ pub enum WorkloadStatus {
     Error,
 }
 
+/// Whether a workload is serving, as its own health command reported.
+///
+/// Kept apart from [`WorkloadStatus`], which answers whether the workload's
+/// process is there. A live process that is not serving and a serving workload
+/// whose liveness could not be confirmed are both real, and collapsing them
+/// would lose the distinction the health command exists to make.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthStatus {
+    /// The health command exited zero.
+    Serving,
+    /// The health command ran and reported a failure.
+    NotServing { exit_status: Option<i32> },
+    /// The health command could not be run, did not finish, or its result
+    /// cannot be trusted. Never a pass.
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalCatalogStatus {
     Available,
@@ -62,11 +79,20 @@ pub struct ExternalSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusWorkload {
+    pub id: SessionId,
+    /// The workload's directory, so a health command runs where it runs.
+    pub directory: String,
+    /// The configured health command, when the workload has one.
+    pub health_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusHost {
     pub name: String,
     /// `None` means the local host; `Some` is a validated OpenSSH target.
     pub target: Option<String>,
-    pub workloads: Vec<SessionId>,
+    pub workloads: Vec<StatusWorkload>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +133,12 @@ pub enum StatusMessage {
         hidden_unsafe: usize,
         checked_at: SystemTime,
     },
+    Health {
+        generation: u64,
+        id: SessionId,
+        status: HealthStatus,
+        checked_at: SystemTime,
+    },
     Finished {
         generation: u64,
     },
@@ -118,6 +150,7 @@ impl StatusMessage {
             Self::Host { generation, .. }
             | Self::Workload { generation, .. }
             | Self::Catalog { generation, .. }
+            | Self::Health { generation, .. }
             | Self::Finished { generation } => *generation,
         }
     }
@@ -146,8 +179,11 @@ impl StatusService {
     }
 
     fn start_validated(&self, request: StatusRequest) -> StatusRun {
+        // Two messages per workload now: liveness and, where configured, health.
+        // Sized so a worker's send never blocks, because a blocked send stops
+        // observing the cancellation flag.
         let (sender, receiver) =
-            mpsc::sync_channel(MAX_STATUS_WORKLOADS + MAX_STATUS_HOSTS * 2 + 1);
+            mpsc::sync_channel(MAX_STATUS_WORKLOADS * 2 + MAX_STATUS_HOSTS * 2 + 1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let jobs = Arc::new(Mutex::new(VecDeque::from(request.hosts)));
         let worker_count = self
@@ -227,7 +263,7 @@ fn normalize_status_hosts(hosts: Vec<StatusHost>) -> Vec<StatusHost> {
             }
         };
         for workload in host.workloads {
-            if workload_sets[index].insert(workload) {
+            if workload_sets[index].insert(workload.id) {
                 normalized[index].workloads.push(workload);
             }
         }
@@ -312,7 +348,7 @@ fn probe_host(
         || sender
             .send(StatusMessage::Catalog {
                 generation,
-                host: host.name,
+                host: host.name.clone(),
                 status: classified.catalog_status,
                 sessions: classified.external,
                 hidden_reserved: classified.hidden_reserved,
@@ -339,6 +375,173 @@ fn probe_host(
             return;
         }
     }
+    // A host Tether could not reach cannot answer a probe either, and the
+    // liveness attempt just proved it: retrying per workload would spend the
+    // whole refresh re-learning the same failure.
+    if classified.reachability == HostReachability::Reachable {
+        probe_health(generation, &host, sender, cancelled, binaries, timeout);
+    } else {
+        report_unknown_health(generation, &host, sender, cancelled);
+    }
+}
+
+/// How long a health command may take before its result is unknown.
+///
+/// Short on purpose: a probe is answering "is this serving right now", and the
+/// picker is waiting on it. A probe that needs longer has not answered.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs each configured health command and reports what it said.
+///
+/// Only for workloads that have one, so this costs nothing for the workloads
+/// that do not. The result is never derived from liveness: a workload whose
+/// process is missing still reports whatever its own probe says, and a probe
+/// that cannot run reports unknown rather than borrowing the process's answer.
+fn probe_health(
+    generation: u64,
+    host: &StatusHost,
+    sender: &SyncSender<StatusMessage>,
+    cancelled: &AtomicBool,
+    binaries: &ProcessBinaries,
+    timeout: Duration,
+) {
+    let health_timeout = HEALTH_TIMEOUT.min(timeout);
+    // One deadline for the whole phase, so a host's cost stays bounded however
+    // many workloads it has. A probe that does not fit reports unknown rather
+    // than holding a worker while other hosts wait on it.
+    let deadline = Instant::now() + health_timeout;
+    for workload in &host.workloads {
+        let Some(command) = workload.health_command.as_deref() else {
+            continue;
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let status = if remaining.is_zero() {
+            // The phase's budget is spent, so this probe never ran.
+            HealthStatus::Unknown
+        } else {
+            match health_spec(
+                host.target.as_deref(),
+                &workload.directory,
+                command,
+                binaries,
+            ) {
+                Ok(spec) => classify_health(
+                    run_bounded(&spec, remaining, cancelled),
+                    host.target.is_some(),
+                ),
+                Err(()) => HealthStatus::Unknown,
+            }
+        };
+        if matches!(status, HealthStatus::Unknown) && cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if sender
+            .send(StatusMessage::Health {
+                generation,
+                id: workload.id,
+                status,
+                checked_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Reports every configured probe as unknown without running any of them.
+///
+/// For a host Tether could not reach: the workloads may well be serving, and
+/// saying so either way would be a claim about the workload drawn from a fact
+/// about the host.
+fn report_unknown_health(
+    generation: u64,
+    host: &StatusHost,
+    sender: &SyncSender<StatusMessage>,
+    cancelled: &AtomicBool,
+) {
+    for workload in &host.workloads {
+        if workload.health_command.is_none() {
+            continue;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if sender
+            .send(StatusMessage::Health {
+                generation,
+                id: workload.id,
+                status: HealthStatus::Unknown,
+                checked_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The command that runs a workload's health check where the workload runs.
+///
+/// The same shape the workload itself was launched with: a login shell that
+/// enters the directory and runs the configured command, locally or over the
+/// host's existing SSH connection. It does not run inside the workload's own
+/// pane, so it cannot disturb the work it is asking about.
+fn health_spec(
+    target: Option<&str>,
+    directory: &str,
+    command: &str,
+    binaries: &ProcessBinaries,
+) -> Result<CommandSpec, ()> {
+    let backend = match target {
+        Some(target) => TmuxBackend::remote(target.to_owned(), binaries.clone()).map_err(|_| ())?,
+        None => TmuxBackend::local(binaries.clone()),
+    };
+    backend
+        .directory_shell_spec(directory, command)
+        .map_err(|_| ())
+}
+
+/// The status `ssh` reserves for its own transport failures.
+const SSH_FAILURE: i32 = 255;
+
+/// What a finished probe said about the workload, if anything.
+///
+/// `remote` is needed because the answer travels over SSH, and SSH reserves
+/// `255` for its own transport failures. Reading that as the workload's verdict
+/// would report a service as down when Tether never reached the machine.
+fn classify_health(result: BoundedOutput, remote: bool) -> HealthStatus {
+    match result {
+        BoundedOutput::Completed { status, .. } if status.success() => HealthStatus::Serving,
+        // A probe that could not be executed, whose command was not found, or
+        // whose transport failed has observed nothing. Reporting "not serving"
+        // there would be an inference about the workload from a fact about the
+        // probe.
+        BoundedOutput::Completed { status, .. }
+            if status.code().is_some_and(|code| {
+                crate::tmux::HEALTH_UNRUNNABLE.contains(&code) || (remote && code == SSH_FAILURE)
+            }) =>
+        {
+            HealthStatus::Unknown
+        }
+        // A probe killed by a signal never reported either. `None` here means
+        // something outside Tether reaped it, since a probe over its own
+        // deadline arrives as `TimedOut`.
+        BoundedOutput::Completed { status, .. } => match status.code() {
+            Some(exit_status) => HealthStatus::NotServing {
+                exit_status: Some(exit_status),
+            },
+            None => HealthStatus::Unknown,
+        },
+        // A probe that did not finish or could not start says nothing either.
+        BoundedOutput::TimedOut
+        | BoundedOutput::Cancelled
+        | BoundedOutput::SpawnError(_)
+        | BoundedOutput::Error => HealthStatus::Unknown,
+    }
 }
 
 struct ClassifiedResult {
@@ -352,7 +555,11 @@ struct ClassifiedResult {
 }
 
 fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult {
-    let requested = host.workloads.iter().copied().collect::<HashSet<_>>();
+    let requested = host
+        .workloads
+        .iter()
+        .map(|workload| workload.id)
+        .collect::<HashSet<_>>();
     match result {
         BoundedOutput::Completed {
             status,
@@ -366,17 +573,14 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
                 workloads: host
                     .workloads
                     .iter()
-                    .map(|id| {
-                        let status =
-                            catalog
-                                .owned
-                                .get(id)
-                                .map_or(WorkloadStatus::Missing, |attached| {
-                                    WorkloadStatus::Running {
-                                        attached: *attached,
-                                    }
-                                });
-                        (*id, status)
+                    .map(|workload| {
+                        let status = catalog.owned.get(&workload.id).map_or(
+                            WorkloadStatus::Missing,
+                            |attached| WorkloadStatus::Running {
+                                attached: *attached,
+                            },
+                        );
+                        (workload.id, status)
                     })
                     .collect(),
                 catalog_status: ExternalCatalogStatus::Available,
@@ -418,7 +622,7 @@ fn classify_result(host: &StatusHost, result: BoundedOutput) -> ClassifiedResult
             hidden_unsafe: 0,
         },
         BoundedOutput::Completed { status, stderr, .. }
-            if host.target.is_some() && status.code() == Some(255) =>
+            if host.target.is_some() && status.code() == Some(SSH_FAILURE) =>
         {
             with_detail(
                 classified_failure(
@@ -567,10 +771,13 @@ fn with_detail(mut classified: ClassifiedResult, detail: String) -> ClassifiedRe
 }
 
 fn uniform_workloads(
-    workloads: &[SessionId],
+    workloads: &[StatusWorkload],
     status: WorkloadStatus,
 ) -> Vec<(SessionId, WorkloadStatus)> {
-    workloads.iter().map(|id| (*id, status)).collect()
+    workloads
+        .iter()
+        .map(|workload| (workload.id, status))
+        .collect()
 }
 
 struct ParsedSessions {
@@ -858,5 +1065,148 @@ mod tests {
         let mut capture = Capture::default();
         let error = drain_pipe(Some(&mut Broken), &mut capture).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[cfg(unix)]
+    fn health_result(command: &str, directory: &str) -> HealthStatus {
+        let temp = tempfile::tempdir().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let cancelled = AtomicBool::new(false);
+        let host = StatusHost {
+            name: "local".to_owned(),
+            target: None,
+            workloads: vec![StatusWorkload {
+                id: "tether-0197f198000070008000000000000001".parse().unwrap(),
+                directory: directory.to_owned(),
+                health_command: Some(command.to_owned()),
+            }],
+        };
+        probe_health(
+            7,
+            &host,
+            &sender,
+            &cancelled,
+            &ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+            Duration::from_secs(5),
+        );
+        drop(sender);
+        match receiver.recv().expect("a configured probe always reports") {
+            StatusMessage::Health { status, .. } => status,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_health_command_answers_with_its_exit_status() {
+        assert_eq!(health_result("exit 0", "/"), HealthStatus::Serving);
+        assert_eq!(
+            health_result("exit 3", "/"),
+            HealthStatus::NotServing {
+                exit_status: Some(3)
+            }
+        );
+    }
+
+    /// A finished probe carrying an exact exit status.
+    #[cfg(unix)]
+    fn completed_with(code: i32) -> BoundedOutput {
+        let status = Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+            .unwrap();
+        BoundedOutput::Completed {
+            status,
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
+    /// A probe reaped by a signal, which reports no exit code on Unix.
+    #[cfg(unix)]
+    fn killed_by_signal() -> BoundedOutput {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.code().is_none(), "{status:?}");
+        BoundedOutput::Completed {
+            status,
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_health_command_that_cannot_run_is_unknown_rather_than_a_pass() {
+        // A probe that cannot reach its directory has not observed anything, and
+        // "I could not look" must never read as "it is serving".
+        assert_eq!(
+            health_result("exit 0", "/definitely/not/a/directory"),
+            HealthStatus::Unknown,
+        );
+        for result in [
+            BoundedOutput::TimedOut,
+            BoundedOutput::SpawnError(io::ErrorKind::NotFound),
+            BoundedOutput::Error,
+            BoundedOutput::Cancelled,
+        ] {
+            assert_eq!(classify_health(result, false), HealthStatus::Unknown);
+        }
+
+        // SSH reserves 255 for its own failures, so a remote probe that exits
+        // 255 never reached the workload. The same status from a local probe is
+        // the command's own answer.
+        let transport = completed_with(SSH_FAILURE);
+        assert_eq!(classify_health(transport, true), HealthStatus::Unknown);
+        assert_eq!(
+            classify_health(completed_with(SSH_FAILURE), false),
+            HealthStatus::NotServing {
+                exit_status: Some(SSH_FAILURE)
+            }
+        );
+
+        // A probe reaped by something outside Tether reported nothing at all.
+        assert_eq!(
+            classify_health(killed_by_signal(), false),
+            HealthStatus::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workload_without_a_health_command_is_never_probed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let cancelled = AtomicBool::new(false);
+        let host = StatusHost {
+            name: "local".to_owned(),
+            target: None,
+            workloads: vec![StatusWorkload {
+                id: "tether-0197f198000070008000000000000001".parse().unwrap(),
+                directory: "/".to_owned(),
+                health_command: None,
+            }],
+        };
+        probe_health(
+            7,
+            &host,
+            &sender,
+            &cancelled,
+            &ProcessBinaries::new(temp.path().join("ssh"), temp.path().join("tmux")),
+            Duration::from_secs(5),
+        );
+        drop(sender);
+        assert!(
+            receiver.recv().is_err(),
+            "a workload with no probe must report nothing about serving"
+        );
     }
 }

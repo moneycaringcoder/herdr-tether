@@ -259,6 +259,19 @@ pub struct CommandPreset {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub herdr_agent: Option<HerdrAgentKind>,
+    /// Optional command that reports whether the workload is serving.
+    ///
+    /// "The process is alive" and "the thing is actually serving" are different
+    /// facts, and for a dev server or a watcher the second is the one that
+    /// matters. Absent, Tether says nothing about serving rather than guessing
+    /// from liveness.
+    ///
+    /// Trusted code, exactly like `command`: it runs through `/bin/sh -c` on the
+    /// workload's host, in the workload's directory. Exit zero means serving;
+    /// any other exit means not serving; a probe that cannot run or does not
+    /// finish is unknown, never a pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_command: Option<String>,
 }
 
 impl CommandPreset {
@@ -512,6 +525,23 @@ impl Config {
                     CommandPreset::MAX_COMMAND_BYTES,
                     "preset command",
                 )?;
+                if let Some(health_command) = &preset.health_command {
+                    // Held to the same standard as the command it checks: an
+                    // empty or oversized probe is a configuration mistake, not
+                    // a workload that cannot be checked.
+                    require_nonempty(
+                        health_command,
+                        &format!(
+                            "preset `{}` for host `{}` health command",
+                            preset.name, host.name
+                        ),
+                    )?;
+                    require_max_bytes(
+                        health_command,
+                        CommandPreset::MAX_COMMAND_BYTES,
+                        "preset health command",
+                    )?;
+                }
             }
         }
         Ok(())

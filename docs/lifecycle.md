@@ -53,6 +53,25 @@ When a host, SSH connection, or backend cannot be inspected, Tether shows the wo
 
 Observation and persistence are deliberately separate. A refresh may update what the picker knows, but it cannot silently authorize Stop or Remove. Confirmation and error dialogs stay active until their own operation finishes or you explicitly cancel them.
 
+## Serving is a different question from running
+
+Every state above answers whether the workload's process is alive. Whether the
+thing it runs is actually serving is a separate fact, and Tether only knows it
+if you configure a `health_command` on the preset the workload was created from
+(see [Configuration](configuration.md)). Each status refresh then runs that
+command in the workload's directory and shows the verdict beside the state:
+`serving`, `not serving` with the exit status, or `health unknown` when the
+probe could not run, did not finish, or could not reach the host - Tether never
+turns "I could not check" into a verdict either way.
+
+The two axes stay independent on purpose. A live process that is not serving is
+a real condition worth seeing, and so is a workload that answers its probe while
+Tether cannot confirm the pane is alive. A health result never changes a
+workload's state, never unlocks or blocks Stop, Restart, or Remove, and is never
+persisted; it is display-only, gathered while a surface is refreshing and
+discarded with the view. A workload with no configured probe shows nothing about
+serving, because an absent check is not a pass.
+
 ## Ended work and history
 
 Tether asks `tmux` for native pane status and exit information when the installed version supports it. This prevents a completed command from lingering as contradictory running/missing work or being offered as resumable.

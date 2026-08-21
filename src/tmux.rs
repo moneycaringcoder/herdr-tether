@@ -16,6 +16,18 @@ use crate::{
 
 const LAUNCH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" && exec /bin/sh -c \"$2\"";
 const SAME_DIRECTORY_SCRIPT: &str = "actual=$1; expected=$2; case \"$actual\" in '~') actual=$HOME ;; '~/'*) actual=$HOME${actual#\\~} ;; esac; case \"$expected\" in '~') expected=$HOME ;; '~/'*) expected=$HOME${expected#\\~} ;; esac; [ \"$actual\" -ef \"$expected\" ]";
+/// Enters the workload's directory, then runs the health command.
+///
+/// The same directory handling as [`LAUNCH_SCRIPT`], so a probe sees what the
+/// workload sees, but it runs the command rather than replacing the shell with
+/// it: the exit status is the answer, so the shell has to survive to report it.
+///
+/// A directory it cannot enter exits `126`, which is the conventional "found but
+/// could not execute". That keeps "I could not run the probe" apart from "the
+/// probe says no", which a plain shell failure would have merged.
+const HEALTH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory=$HOME ;; '~/'*) directory=$HOME${directory#\\~} ;; esac; cd -- \"$directory\" || exit 126; /bin/sh -c \"$2\"";
+/// Exit statuses that mean the health command itself could not run.
+pub(crate) const HEALTH_UNRUNNABLE: [i32; 2] = [126, 127];
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TMUX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const OWNERSHIP_GUARD_REJECTED: &str = "TETHER_OWNERSHIP_GUARD_REJECTED";
@@ -132,6 +144,26 @@ impl TmuxBackend {
                 Ok(CommandSpec::new(self.binaries.ssh(), ssh_arguments))
             }
         }
+    }
+
+    /// A shell command that runs in a workload's directory on its host.
+    ///
+    /// Used for a configured health command, which asks whether the workload is
+    /// serving. It deliberately does not enter the workload's own pane: a probe
+    /// must not be able to disturb the work it is asking about, and there is no
+    /// ownership-guarded way to run something in an existing pane.
+    pub(crate) fn directory_shell_spec(
+        &self,
+        directory: &str,
+        command: &str,
+    ) -> Result<CommandSpec> {
+        self.shell_spec(vec![
+            "-lc".to_owned(),
+            HEALTH_SCRIPT.to_owned(),
+            "tether-health".to_owned(),
+            directory.to_owned(),
+            command.to_owned(),
+        ])
     }
 
     fn bounded_output(&self, spec: &CommandSpec) -> Result<Output, BoundedExecutionError> {
@@ -747,6 +779,69 @@ mod tests {
             .status()
             .unwrap();
         assert!(comparison.success());
+    }
+
+    #[test]
+    fn a_health_probe_runs_in_the_workload_directory_without_entering_its_pane() {
+        let home = env::var("HOME").unwrap();
+        let expected = fs::canonicalize(&home).unwrap();
+
+        // `~` resolves the same way a launch does, so a probe sees the directory
+        // the workload sees.
+        let output = Command::new("/bin/sh")
+            .args(["-lc", HEALTH_SCRIPT, "tether-health", "~", "pwd -P"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let actual = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(fs::canonicalize(actual.trim()).unwrap(), expected);
+
+        // The exit status is the answer, so the wrapper reports it rather than
+        // replacing itself with the command and losing it.
+        let refused = Command::new("/bin/sh")
+            .args(["-lc", HEALTH_SCRIPT, "tether-health", "/", "exit 9"])
+            .status()
+            .unwrap();
+        assert_eq!(refused.code(), Some(9));
+
+        // A directory it cannot enter is reported as unrunnable, not as a
+        // verdict about the workload.
+        let unreachable = Command::new("/bin/sh")
+            .args([
+                "-lc",
+                HEALTH_SCRIPT,
+                "tether-health",
+                "/definitely/not/a/directory",
+                "exit 0",
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            unreachable
+                .code()
+                .is_some_and(|code| HEALTH_UNRUNNABLE.contains(&code)),
+            "{unreachable:?}"
+        );
+
+        // A remote probe travels as one quoted remote command, and never as a
+        // `tmux` pane operation.
+        let backend = TmuxBackend::remote(
+            "builder@example.test".to_owned(),
+            ProcessBinaries::new("ssh", "tmux"),
+        )
+        .unwrap();
+        let spec = backend
+            .directory_shell_spec("/srv/app", "curl -fsS localhost:8080/healthz")
+            .unwrap();
+        assert!(
+            spec.program.ends_with("ssh"),
+            "a remote probe travels over ssh: {:?}",
+            spec.program
+        );
+        let remote = spec.args.last().unwrap();
+        assert!(remote.contains("/srv/app"), "{remote}");
+        assert!(remote.contains("localhost:8080/healthz"), "{remote}");
+        assert!(!remote.contains("tmux"), "{remote}");
     }
     #[test]
     fn exact_inspection_distinguishes_running_and_dead_panes_with_identity() {

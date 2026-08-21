@@ -15,6 +15,7 @@ fn host(name: &str, target: &str) -> HostConfig {
             herdr_agent: None,
             name: "shell".into(),
             command: "exec ${SHELL:-/bin/sh} -l".into(),
+            health_command: None,
         }],
     }
 }

@@ -119,6 +119,45 @@ but it also produces no sidebar agent row and no Mission Control binding. Tether
 warns when it can reach Herdr and the kind is unrecognized, rather than letting
 a typo fail silently.
 
+### Optional health commands
+
+A preset may carry a `health_command`, which answers whether a workload built
+from that preset is serving:
+
+```toml
+[[hosts.presets]]
+name = "api"
+command = "exec cargo run --release"
+health_command = "curl -fsS localhost:8080/healthz"
+```
+
+The probe runs in the workload's directory, on the workload's host, after each
+liveness check, and it never enters the workload's own pane. Exit zero reads
+`serving`; any other status reads `not serving` with the status.
+
+Anything that stops the probe from reporting reads `health unknown`, which is
+deliberately not a pass and not a failure: Tether states what it could not
+establish rather than assuming the workload is fine or broken. That covers a
+probe that timed out, could not be started, was killed by something outside
+Tether, could not enter the directory, exited `126` or `127` because it could
+not be executed, or ran over SSH to a host that could not be reached - for a
+remote host, `255` is SSH's own transport failure rather than the workload's
+answer, and it is read as such. A host that is unreachable is not probed at all;
+its workloads report unknown once, rather than the refresh re-attempting a
+connection the liveness check just proved dead.
+
+All of a host's probes share one budget of at most five seconds, so a host's
+status refresh costs the same whether it has one probed workload or fifty. A
+probe that does not fit reports unknown.
+
+A health command is trusted code on the same terms as `command`, and it is
+subject to the same length limit. It runs only while a Tether surface is
+refreshing status; nothing probes a workload on a schedule, and a result is
+display-only - it is never written to `state.json` and never changes a
+workload's lifecycle. A workload whose preset has no health command, or which
+was created without a preset, reports nothing about serving rather than an
+implied pass.
+
 ### Mission Control prompt capability
 
 Each orchestration worker stores independent `observe_output`,

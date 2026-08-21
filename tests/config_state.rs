@@ -41,6 +41,7 @@ fn sample_config() -> Config {
                 herdr_agent: None,
                 name: "shell".into(),
                 command: "exec ${SHELL:-/bin/sh} -l".into(),
+                health_command: None,
             }],
         }],
         ui: UiDefaults {
@@ -62,6 +63,7 @@ fn config_at_serialized_limit() -> Config {
                     herdr_agent: None,
                     name: format!("preset-{index}"),
                     command: "x".into(),
+                    health_command: None,
                 })
                 .collect(),
         }],
@@ -543,6 +545,7 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
             herdr_agent: None,
             name: format!("preset-{index}"),
             command: "true".into(),
+            health_command: None,
         })
         .collect();
     let mut presets_over = presets.clone();
@@ -550,6 +553,7 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
         herdr_agent: None,
         name: "over".into(),
         command: "true".into(),
+        health_command: None,
     });
     cases.push(("host presets", presets, presets_over));
 
@@ -591,6 +595,26 @@ fn config_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     let mut command_over = command.clone();
     command_over.hosts[0].presets[0].command.push('x');
     cases.push(("preset command", command, command_over));
+
+    // A health command is trusted code held to the same standard as the command
+    // it checks, so an empty or oversized probe is a configuration mistake.
+    let mut health = sample_config();
+    health.hosts[0].presets[0].health_command = Some("x".repeat(CommandPreset::MAX_COMMAND_BYTES));
+    let mut health_over = health.clone();
+    health_over.hosts[0].presets[0]
+        .health_command
+        .as_mut()
+        .unwrap()
+        .push('x');
+    cases.push(("preset health command", health, health_over));
+
+    let mut empty_health = sample_config();
+    empty_health.hosts[0].presets[0].health_command = Some(String::new());
+    let error = empty_health.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("health command must not be empty"),
+        "an empty probe must be rejected rather than run: {error}"
+    );
 
     for (category, valid, invalid) in cases {
         valid
