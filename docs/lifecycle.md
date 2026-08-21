@@ -113,6 +113,55 @@ persisted; it is display-only, gathered while a surface is refreshing and
 discarded with the view. A workload with no configured probe shows nothing about
 serving, because an absent check is not a pass.
 
+## What a workload is using
+
+A running row also carries what that workload's processes are using on their
+host, so the answer to "which of these twenty is eating the machine" is on the
+screen rather than the result of a manual hunt:
+
+```
+[running] [running] Tether · Open …0000002 · /srv/app · shell · 144% · 1.5G
+```
+
+The figure comes after the row's own words, not in front of them: rows truncate
+from the right, and knowing which workload a number belongs to matters more than
+the number.
+
+A workload is a `tmux` session rather than a single process, and its pane's shell
+is usually idle while a child does the work, so these are the totals for every
+process under the workload's panes. Processor share is what the host reports, so
+it can exceed 100% on a multi-core host - which is exactly the case worth seeing.
+
+Processor share is what the workload used while Tether watched, not an average
+over its life. `ps` reports the latter, which would round a workload that has been
+up for days and just started eating a core down to nothing, so Tether takes two
+samples of cumulative processor time a second apart and reports the difference.
+
+Tether asks each host two questions per refresh, whatever the number of workloads
+on it: which process each pane belongs to, and what its processes are using. A
+host with twenty workloads therefore costs the same as a host with one, the whole
+phase is bounded so a slow host delays figures rather than the refresh, and a host
+with nothing running is not asked at all.
+
+Resident memory is summed per process, so pages shared between a workload's own
+processes are counted once for each of them. A workload that forks eight workers
+over one heap therefore reads high; the figure is a comparison between workloads
+rather than an accounting of the machine.
+
+Absence is stated rather than drawn as a zero. `usage unknown` on a row means the
+host could not be asked, did not answer, answered unusably, or does not account
+for that workload's processes - a host that cannot report is not a workload using
+nothing, and a zero would say the opposite. An unreachable host is not asked at
+all: the liveness check already proved it cannot answer, so its workloads read as
+unknown once rather than the refresh relearning the same failure. Stopped
+workloads carry no figure, because a workload that is not running is not using
+anything.
+
+Like health, these figures are display-only. They are never written to
+`state.json`, never change what actions are available, and are not part of the
+`snapshot` JSON, which reports what Tether observed about a workload's lifecycle
+rather than what its host is spending on it.
+
 ## Ended work and history
 
 Tether asks `tmux` for native pane status and exit information when the installed version supports it. This prevents a completed command from lingering as contradictory running/missing work or being offered as resumable.

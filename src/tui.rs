@@ -36,9 +36,9 @@ use crate::{
     model::{ExternalSessionName, HerdrAgentKind, Placement, SessionId},
     state::{SessionRecord, SessionStatus, State, compare_normal_sessions, is_normal_session},
     status::{
-        ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability, StatusHost,
-        StatusMessage, StatusRequest, StatusRequestError, StatusRun, StatusService, StatusWorkload,
-        WorkloadStatus,
+        ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability, ResourceReport,
+        StatusHost, StatusMessage, StatusRequest, StatusRequestError, StatusRun, StatusService,
+        StatusWorkload, WorkloadStatus,
     },
 };
 
@@ -752,6 +752,26 @@ fn format_status_label<T>(
     }
 }
 
+/// Puts a value after a row's own words instead of in front of them.
+///
+/// Rows truncate from the right, so a fact in front costs the identity behind
+/// it. Anything that is worth showing but not worth losing a workload's name
+/// over belongs here.
+fn format_appended_status<T>(
+    base: &str,
+    cell: &StatusCell<T>,
+    text: impl Fn(&T) -> String,
+) -> String {
+    if cell.loading {
+        return base.to_owned();
+    }
+    match (&cell.value, cell.stale) {
+        (Some(value), true) => format!("{base} · stale: {}", text(value)),
+        (Some(value), false) => format!("{base} · {}", text(value)),
+        (None, _) => base.to_owned(),
+    }
+}
+
 fn host_status_text(status: &HostReachability) -> String {
     match status {
         HostReachability::Reachable => "online",
@@ -789,6 +809,54 @@ fn health_status_text(status: &HealthStatus) -> String {
     }
 }
 
+/// How a workload's resource figures read on a row.
+///
+/// Compact because a row already carries the lifecycle, the liveness and, where
+/// configured, the health verdict. `usage unknown` is a value like any other:
+/// zero would claim the workload is idle, and a blank would claim nothing is
+/// worth saying.
+fn resource_text(report: &ResourceReport) -> String {
+    match report {
+        ResourceReport::Known(usage) => format!(
+            "{} · {}",
+            cpu_percent(usage.cpu_percent),
+            human_bytes(usage.memory_bytes)
+        ),
+        ResourceReport::Unknown => "usage unknown".to_owned(),
+    }
+}
+
+/// Processor share, keeping a decimal where it changes the meaning.
+///
+/// A known figure below half a percent must not render as `0%`: a workload using
+/// a little and a workload using nothing are different answers, and collapsing
+/// them is the zero this feature exists to avoid.
+fn cpu_percent(percent: f32) -> String {
+    if percent < 10.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
+/// Bytes in the shortest form that still says what it is.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1024 * 1024 * 1024, "G"), (1024 * 1024, "M"), (1024, "K")];
+    for (scale, suffix) in UNITS {
+        if bytes >= scale {
+            // One decimal below ten, because 1.4G and 1.9G are worth telling
+            // apart while 431M and 432M are not.
+            let value = bytes as f64 / scale as f64;
+            return if value < 10.0 {
+                format!("{value:.1}{suffix}")
+            } else {
+                format!("{value:.0}{suffix}")
+            };
+        }
+    }
+    format!("{bytes}B")
+}
+
 #[derive(Clone, Debug)]
 pub struct PickerState {
     options: PickerOptions,
@@ -811,6 +879,11 @@ pub struct PickerState {
     /// serving is a real state, and so is a serving workload Tether could not
     /// confirm is alive.
     workload_health: HashMap<SessionId, StatusCell<HealthStatus>>,
+    /// What each running workload's processes are using, when the host reports.
+    ///
+    /// A third axis beside liveness and health: a workload can be alive and
+    /// serving while eating the machine, which is the question this answers.
+    workload_resources: HashMap<SessionId, StatusCell<ResourceReport>>,
     catalogs: HashMap<String, CatalogCell>,
     discovery_generation: u64,
     base_directories: HashMap<String, Vec<String>>,
@@ -870,6 +943,7 @@ impl PickerState {
             host_error_details: HashMap::new(),
             workload_status: HashMap::new(),
             workload_health: HashMap::new(),
+            workload_resources: HashMap::new(),
             catalogs: HashMap::new(),
             discovery_generation: 0,
             base_directories,
@@ -1060,6 +1134,7 @@ impl PickerState {
                 for id in &removed_ids {
                     self.workload_status.remove(id);
                     self.workload_health.remove(id);
+                    self.workload_resources.remove(id);
                     self.close_failed.remove(id);
                 }
                 self.restore_selection(selected_host, selected_resource);
@@ -1087,6 +1162,7 @@ impl PickerState {
             });
             self.workload_status.remove(&result.id);
             self.workload_health.remove(&result.id);
+            self.workload_resources.remove(&result.id);
             self.close_failed.remove(&result.id);
             self.restore_selection(selected_host, selected_resource);
         }
@@ -1432,6 +1508,14 @@ impl PickerState {
                         .or_default()
                         .begin_refresh();
                 }
+                // Unlike liveness, no cell is created here: a row says nothing
+                // about usage until a host has answered for it, so an ordinary
+                // refresh does not flicker a `loading` bracket onto every running
+                // workload. A figure already on screen goes stale the way any
+                // other retained value does.
+                if let Some(cell) = self.workload_resources.get_mut(&workload.id) {
+                    cell.begin_refresh();
+                }
             }
             if host.allow_existing {
                 self.catalogs
@@ -1544,6 +1628,30 @@ impl PickerState {
                 cell.apply(status, checked_at);
                 true
             }),
+            StatusMessage::Resources {
+                id,
+                report,
+                checked_at,
+                ..
+            } => {
+                // The answer is what puts usage on a row, so the cell is created
+                // here rather than seeded on every refresh. It is created only
+                // for a row that still exists: a workload pruned while its
+                // result was in flight would otherwise leave a cell no later
+                // pass can reach.
+                self.options
+                    .hosts
+                    .iter()
+                    .flat_map(|host| &host.workloads)
+                    .any(|workload| workload.id == id)
+                    && {
+                        self.workload_resources
+                            .entry(id)
+                            .or_default()
+                            .apply(report, checked_at);
+                        true
+                    }
+            }
             StatusMessage::Finished { .. } => false,
         };
         if applied {
@@ -1632,6 +1740,9 @@ impl PickerState {
                         .collect(),
                 })
                 .collect(),
+            // The picker shows the figures, so it is the surface that asks for
+            // them.
+            resources: true,
         }
     }
 
@@ -1819,11 +1930,20 @@ impl PickerState {
                     );
                     // The health verdict sits beside liveness rather than
                     // replacing it, because they answer different questions.
-                    match self.workload_health.get(&workload.id) {
+                    let health = match self.workload_health.get(&workload.id) {
                         Some(cell) => {
                             format_status_label(&liveness, Some(cell), health_status_text)
                         }
                         None => liveness,
+                    };
+                    // Usage goes after the row's own words rather than in front
+                    // of them. A row is truncated from the right, and knowing
+                    // which workload a figure belongs to matters more than the
+                    // figure: a bracket in front would push the directory off
+                    // the end and leave a number attached to nothing.
+                    match self.workload_resources.get(&workload.id) {
+                        Some(cell) => format_appended_status(&health, cell, resource_text),
+                        None => health,
                     }
                 } else {
                     workload.base_label.clone()
@@ -3775,6 +3895,7 @@ mod close_render_tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::status::ResourceUsage;
 
     fn close_picker() -> (PickerState, SessionId) {
         let id = "tether-0197f198000070008000000000000001".parse().unwrap();
@@ -3849,6 +3970,72 @@ mod close_render_tests {
     }
 
     #[test]
+    fn a_running_row_carries_usage_and_says_when_it_is_unknown() {
+        let (mut picker, _) = close_picker();
+        picker.handle(PickerEvent::DismissClose);
+        let id = picker.options.hosts[picker.host_index].workloads[0].id;
+
+        picker.begin_refresh(11);
+        assert!(picker.apply_status(StatusMessage::Host {
+            generation: 11,
+            host: "build-box".to_owned(),
+            status: HostReachability::Reachable,
+            detail: None,
+            checked_at: std::time::SystemTime::now(),
+        }));
+        assert!(picker.apply_status(StatusMessage::Workload {
+            generation: 11,
+            id,
+            status: WorkloadStatus::Running { attached: 0 },
+            checked_at: std::time::SystemTime::now(),
+        }));
+        assert!(picker.apply_status(StatusMessage::Resources {
+            generation: 11,
+            id,
+            report: ResourceReport::Known(ResourceUsage {
+                cpu_percent: 143.6,
+                memory_bytes: 1_610_612_736,
+            }),
+            checked_at: std::time::SystemTime::now(),
+        }));
+
+        // The label is composed before it is truncated, so what a person can
+        // actually read is the rendered row. Identity comes first: a figure that
+        // pushed the workload's directory off the end would be unattributable.
+        let rendered = render_picker_to_text(72, 20, &picker).unwrap();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("00000001"))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            row.contains("/srv/app"),
+            "the row still says which workload it is: {row:?}"
+        );
+        // Over a core is the answer to "which of these is eating the machine",
+        // so it is not clamped to 100.
+        let label = picker.workload_label(id).expect("the row exists");
+        assert!(label.contains("144%"), "{label}");
+        assert!(label.contains("1.5G"), "{label}");
+        assert!(
+            label.starts_with("[running]"),
+            "identity and state stay in front: {label}"
+        );
+
+        // A host that cannot report says so on the row. Zero would claim the
+        // workload is idle and a blank would claim there was nothing to say.
+        picker.begin_refresh(12);
+        assert!(picker.apply_status(StatusMessage::Resources {
+            generation: 12,
+            id,
+            report: ResourceReport::Unknown,
+            checked_at: std::time::SystemTime::now(),
+        }));
+        let label = picker.workload_label(id).expect("the row exists");
+        assert!(label.contains("usage unknown"), "{label}");
+        assert!(!label.contains("0% cpu"), "{label}");
+    }
+
+    #[test]
     fn a_rechecked_host_and_a_failed_check_read_apart_in_the_footer() {
         let (mut picker, _) = close_picker();
         picker.handle(PickerEvent::DismissClose);
@@ -3900,6 +4087,23 @@ mod close_render_tests {
             !still_failing.contains("no retry needed"),
             "{still_failing}"
         );
+    }
+
+    #[test]
+    fn a_known_sub_percent_figure_is_not_rendered_as_zero() {
+        // A workload known to be using a little and one using nothing are
+        // different answers; rounding both to `0%` is the zero this feature
+        // exists to avoid, just arrived at by a different route.
+        let small = resource_text(&ResourceReport::Known(ResourceUsage {
+            cpu_percent: 0.4,
+            memory_bytes: 4 * 1024 * 1024,
+        }));
+        assert!(small.starts_with("0.4%"), "{small}");
+        let large = resource_text(&ResourceReport::Known(ResourceUsage {
+            cpu_percent: 143.6,
+            memory_bytes: 1_610_612_736,
+        }));
+        assert!(large.starts_with("144%"), "{large}");
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
