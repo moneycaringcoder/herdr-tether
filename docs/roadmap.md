@@ -1,93 +1,67 @@
 # Roadmap
 
-Ideas for future work, roughly in the order they would most improve Tether. None
-of this is committed to a release, and nothing here is a promise.
+What is settled, what has been decided against, and where open work is tracked.
 
-Two boundaries are settled and nothing here reopens them: **Tether does not
-provide remote Herdr federation or pane streaming**, and **only Tether-owned
-workloads can be stopped or removed**. Discovered external `tmux` sessions stay
-attach-only.
+An entry in this file is work that has not been done. An idea is removed here in
+the change that ships it, so a reader never has to guess whether a paragraph
+describes a plan or a property the code already has. Open work lives in the issue
+tracker rather than being restated here, because an issue has a state and a
+paragraph does not.
 
-One idea has been closed rather than deferred: **preset sharing**. Presets are
-shared by sending the TOML, and [Configuration](configuration.md) records both how
-and why there is no import command.
+## Settled boundaries
 
-## Correctness
+Nothing here reopens these:
 
-### Publish a compatibility matrix per release
+- **Tether does not provide remote Herdr federation or pane streaming.** Remote
+  support is OpenSSH and `tmux` on the selected machine.
+- **Only Tether-owned workloads can be stopped or removed.** Discovered external
+  `tmux` sessions stay attach-only, and a group operation does not become a way
+  around that.
 
-`doctor` already reports a protocol above the verified ceiling as "newer and not
-yet verified", which is the right behaviour at runtime. What a user cannot see
-before installing is which Herdr versions a given Tether release was actually
-exercised against. The upstream canary produces exactly that evidence on a
-schedule; publishing it turns a private signal into something a user can check.
+The full trust boundary, including what Tether treats as trusted code and what it
+never persists, is in [Architecture and security](architecture.md) and
+`SECURITY.md`.
 
-## Lifecycle
+## Decided against
 
-### Crash-loop detection and restart backoff
+### Preset sharing
 
-A restart that immediately fails is currently a restart that immediately fails
-again if the user presses `Enter` again. Detecting the loop and backing off turns
-a frustrating cycle into a legible one, without ever restarting anything on the
-user's behalf.
-
-### Health checks
-
-`Ended` is derived from the process. "The process is alive" and "the thing is
-actually serving" are different facts, and for a dev server or a watcher the
-second is the one that matters. An optional per-workload health command would
-report it, with an explicit `unknown` when it cannot run — never an inferred pass.
-
-### Notify on non-zero exit
-
-A workload that ends with a failing status is exactly the event worth surfacing,
-and it is currently indistinguishable at a glance from one that finished cleanly.
-
-## Mission Control
-
-### Group-level operations
-
-The orchestration group already organizes workloads and holds explicit
-permissions. Acting on the group — restart every worker, stop every worker —
-is the obvious next step, and it must go through the same explicit confirmation
-and ownership checks as the single-workload path, not around them.
-
-### A bounded output preview per tile
-
-Enough recent output to recognize what a workload is doing, without inferring
-agent state from it. State comes from Herdr's event stream and typed socket API
-for recognized agents, and from bounded `tmux` capture otherwise — a preview must
-not become a third, guessed source of truth.
-
-## Operating it
-
-### A structured audit trail
-
-Lifecycle transitions are the thing people reconstruct after something goes wrong.
-A structured, bounded record of them — never including prompt text, terminal
-contents, or credentials, exactly as state and logs already exclude them — would
-make that reconstruction possible.
-
-### Per-workload resource reporting
-
-Where the backend can supply it. Answers "which of these twenty is eating the
-machine", which is otherwise a manual hunt.
-
-### Preset sharing — closed
-
-Presets already share: sending the `[[hosts.presets]]` block is the mechanism,
-and [Configuration](configuration.md) documents it, including which host a pasted
-block binds to and what a rejected one costs.
+Presets already share: sending the `[[hosts.presets]]` block is the mechanism, and
+[Configuration](configuration.md) documents it, including which host a pasted block
+binds to and what a rejected one costs.
 
 An import command was considered and declined on cost rather than on safety. One
-that printed the exact `command` and `health_command`, named the host and
-directory they would bind to, and required typed confirmation would show a
-recipient what reading the block shows them. It would also be a permanent
-surface, a file format, and a second way to add a preset, in exchange for a
-paste — and it would make preset text something Tether itself takes from
-elsewhere and then executes, which is the one intake boundary worth not moving
-for convenience.
+that printed the exact `command` and `health_command`, named the host and directory
+they would bind to, and required typed confirmation would show a recipient what
+reading the block shows them. It would also be a permanent surface, a file format,
+and a second way to add a preset, in exchange for a paste — and it would make
+preset text something Tether itself takes from elsewhere and then executes, which
+is the one intake boundary worth not moving for convenience.
 
 What remains worth doing is unrelated to sharing and is tracked as issue #110:
 showing a preset's command before it runs, for every preset rather than only for
 adopted ones.
+
+## Shipped
+
+Everything this file previously listed as an idea has been built, and the entries
+have been retired rather than left to read as plans:
+
+- Finishing the `EINTR` audit across the socket, `tmux`, and SSH paths.
+- Worktree resolution for `--separate-git-dir` and submodule layouts.
+- A published Herdr compatibility matrix per release, `compatibility.md`.
+- Naming a workload that ended with a failing status, and a toast for it.
+- Pacing the restart of a workload that failed immediately, without ever
+  restarting anything on the user's behalf.
+- Optional per-workload health commands, with an explicit `unknown` rather than an
+  inferred pass.
+- Telling `UNREACHABLE` and `STALE` apart in the interface.
+- Group-level stop and restart, through the same ownership checks and confirmation
+  as the single-workload path.
+- A bounded output preview per Mission Control tile that never becomes a second
+  source of agent state.
+- Per-workload resource reporting, with absence stated rather than drawn as zero.
+- A structured, bounded audit trail of lifecycle transitions.
+
+Each shipped with the constraint its entry named, and with tests defending it. The
+release notes in `CHANGELOG.md` say what each one does.
