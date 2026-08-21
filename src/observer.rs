@@ -122,8 +122,8 @@ pub enum ObserverCapture {
     /// lines for the whole story.
     Preview {
         text: String,
-        /// How many lines were asked for, so the tile can say what it sampled.
-        lines: u32,
+        /// Whether Herdr reported it dropped older rows from the sample.
+        truncated: bool,
     },
     Unavailable,
 }
@@ -139,7 +139,7 @@ enum CaptureStatus {
 
 struct PreviousWorkerState {
     capture: Option<String>,
-    preview_lines: Option<u32>,
+    sampled: bool,
     last_observed: Option<String>,
     latency_ms: Option<u64>,
     live_agent: bool,
@@ -218,12 +218,12 @@ pub struct ObserverWorker {
     pub incarnation: Option<TmuxSessionId>,
     /// Untrusted capture content. Rendering sanitizes and bounds it before display.
     pub capture: Option<String>,
-    /// When the capture is a bounded sample rather than everything Herdr has,
-    /// how many lines were asked for.
+    /// Whether the capture is a bounded sample rather than everything Herdr has.
     ///
-    /// A tile that showed a sample as if it were the whole output would invite
-    /// a reader to conclude nothing else happened.
-    pub preview_lines: Option<u32>,
+    /// A tile that showed a sample as if it were the whole output would invite a
+    /// reader to conclude nothing else happened, so this follows the text
+    /// everywhere the text goes.
+    pub sampled: bool,
     /// Why this worker is `STALE`, when it is.
     ///
     /// The reasons have different remedies, and the capture status cannot tell
@@ -523,7 +523,7 @@ impl ObserverState {
                     worker.id,
                     PreviousWorkerState {
                         capture: worker.capture,
-                        preview_lines: worker.preview_lines,
+                        sampled: worker.sampled,
                         last_observed: worker.last_observed,
                         live_agent: worker.live_agent,
                         latency_ms: worker.latency_ms,
@@ -557,7 +557,7 @@ impl ObserverState {
                         // one is kept - along with whether it was a sample, or
                         // the next refresh would present it as everything.
                         worker.capture.clone_from(&previous.capture);
-                        worker.preview_lines = previous.preview_lines;
+                        worker.sampled = previous.sampled;
                     }
                     if worker.last_observed.is_none()
                         && let Some(previous) = previous
@@ -719,25 +719,29 @@ impl ObserverState {
         let status = match capture {
             ObserverCapture::Loading => {
                 worker.capture = None;
-                worker.preview_lines = None;
+                worker.sampled = false;
                 CaptureStatus::Loading
             }
             // An explicit read is everything Herdr offered, so it clears any
             // sample marker the tile was carrying.
             ObserverCapture::Ready(capture) => {
                 worker.capture = Some(sanitize_capture(&capture));
-                worker.preview_lines = None;
+                worker.sampled = false;
                 CaptureStatus::Ready
             }
             ObserverCapture::Truncated(capture) => {
                 worker.capture = Some(sanitize_capture(&capture));
-                worker.preview_lines = None;
+                worker.sampled = false;
                 CaptureStatus::Truncated
             }
-            ObserverCapture::Preview { text, lines } => {
+            ObserverCapture::Preview { text, truncated } => {
                 worker.capture = Some(sanitize_capture(&text));
-                worker.preview_lines = Some(lines);
-                CaptureStatus::Ready
+                worker.sampled = true;
+                if truncated {
+                    CaptureStatus::Truncated
+                } else {
+                    CaptureStatus::Ready
+                }
             }
             ObserverCapture::Unavailable
                 if worker.capture.is_some() && worker.last_observed.is_some() =>
@@ -1271,8 +1275,12 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
         .latency_ms
         .map(|latency| format!(" · {latency}ms"))
         .unwrap_or_default();
+    // The body marker is the first thing a short or narrow tile drops, and an
+    // unlabelled sample reads as the whole output. The title is the fallback: it
+    // costs no body row and is clipped last.
+    let sampled = if worker.sampled { " · PREVIEW" } else { "" };
     let title = format!(
-        "{marker}{} · {}{latency}{eligibility}",
+        "{marker}{} · {}{latency}{sampled}{eligibility}",
         display_title,
         worker.status_label()
     );
@@ -1398,28 +1406,38 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
                     .as_deref()
                     .map(sanitize_capture)
                     .unwrap_or_default();
+                // A retained sample is still a sample, so the marker travels with
+                // it even when the tile is no longer current.
+                let sampled = if worker.sampled { " · PREVIEW" } else { "" };
                 let explanation = state_line.unwrap_or_else(|| "STALE".to_owned());
-                format!("{explanation}\n{capture}")
+                format!("{explanation}{sampled}\n{capture}")
             }
             status @ (CaptureStatus::Ready | CaptureStatus::Truncated) => {
-                // A sample says so. Without this a reader takes the last few
-                // lines for everything that happened, which is exactly the wrong
-                // conclusion to invite from a preview.
-                let sampled = worker
-                    .preview_lines
-                    .map(|lines| format!("PREVIEW · last {lines} lines · v for more"));
-                // Every line above the output costs a row of it, and none of them
-                // may cost the last one: on a tile too short to hold both, the
-                // output the user came for wins. They are offered in the order
-                // they matter - the tile not being current first, then output
-                // Herdr dropped, then this being only a sample.
+                // A sample says so, without naming a line count: what is shown is
+                // whatever survived Herdr's answer, the display bounds, and the
+                // rows this tile has, so a number here would overstate it.
+                let sampled = worker.sampled.then(|| {
+                    widest_that_fits(
+                        inner_width,
+                        &[
+                            "PREVIEW · recent output · v for more".to_owned(),
+                            "PREVIEW · v for more".to_owned(),
+                            "PREVIEW".to_owned(),
+                        ],
+                    )
+                });
+                // Every line above the output costs a row of it, and none may cost
+                // the last one: on a tile too short to hold both, the output wins.
+                // Offered in order of what has no fallback elsewhere: truncation is
+                // only ever said here, while the state and the sample are both in
+                // the border title as well.
                 let mut reserved = 2;
                 let mut prefix_lines = Vec::new();
                 for line in [
-                    state_line,
                     (status == CaptureStatus::Truncated)
                         .then(|| "TRUNCATED · older output dropped by Herdr".to_owned()),
                     sampled,
+                    state_line,
                 ]
                 .into_iter()
                 .flatten()

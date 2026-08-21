@@ -196,12 +196,14 @@ fallback. A connection loss retains last-known information as `STALE`, disables
 input, and never fabricates completion. Closing the view never stops a workload.
 
 Each tile also shows a bounded sample of recent output, so a page tells you what
-its workloads are doing without opening any of them. The sample is labelled
-`PREVIEW`, because it is deliberately not everything: press `v` for the fuller
-read. It is taken when a tile first appears and when Herdr reports that worker
-changed state, never on a timer, so an idle Mission Control reads no output at
-all. It is presentation only - agent state still comes from Herdr's typed
-snapshot and events, never from what the output says.
+its workloads are doing without opening any of them. It is marked `PREVIEW`,
+because it is deliberately not everything: press `v` for the fuller read. A
+sample is taken when a tile first appears, when Herdr reports that worker changed
+state, and when the one on screen has aged out - never on the refresh timer, and
+never on the thread drawing the screen, so a slow Herdr costs a late sample
+rather than a frozen surface. `r` takes fresh ones. It is presentation only:
+agent state still comes from Herdr's typed snapshot and events, never from what
+the output says.
 
 Use **Edit workers** or **Change orchestrator** to update a group after another
 explicit review. Press `d` to delete group metadata only. The Agents sidebar

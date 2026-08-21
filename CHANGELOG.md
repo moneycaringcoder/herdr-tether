@@ -71,12 +71,15 @@
   exit status is non-zero if any member failed or if nothing was acted on.
 - A bounded output preview per Mission Control tile. A recognized agent's tile
   previously showed nothing until someone pressed `v`, so a page of four agents
-  said nothing about what any of them was doing; each tile now carries a sample
-  of recent output, labelled `PREVIEW · last N lines · v for more` so a sample is
-  never mistaken for everything. A sample is taken when a tile first appears and
-  when Herdr reports that worker changed state, never on the refresh timer, so an
-  idle surface reads no output at all and a pass costs at most the visible page.
-  It is presentation only: subject to the existing sanitization and display
+  said nothing about what any of them was doing; each tile now carries a sample of
+  recent output, marked `PREVIEW` in both the body and the border title so a
+  narrow or short tile cannot present a sample as a complete read. Herdr's
+  truncation flag is carried through, so a clipped sample says both that it is a
+  sample and that rows were dropped. Samples are taken on their own thread - a
+  slow Herdr delays a sample rather than freezing the surface - and are requested
+  when a tile first appears, when Herdr reports that worker changed state, or when
+  the sample on screen has aged out, never on the refresh timer; `r` takes fresh
+  ones. It is presentation only: subject to the existing sanitization and display
   bounds, never persisted, and never read back to derive agent state, which still
   comes from Herdr's typed snapshot and events. Every line above the output now
   earns its row and none may take the last one, so a short tile still shows
