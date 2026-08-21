@@ -1093,7 +1093,11 @@ fn stop_marks_a_missing_workload_ended_without_killing_it() {
         .args(["session", "stop", SESSION_ID])
         .assert()
         .success()
-        .stdout(format!("stopped {SESSION_ID}\n"));
+        // Nothing was stopped: the record was already gone, and the command says
+        // so rather than claiming an act it did not perform.
+        .stdout(format!(
+            "no workload found for {SESSION_ID}; recorded as ended\n"
+        ));
 
     let transcript = fs::read_to_string(log).unwrap();
     assert!(transcript.contains("list-sessions"));
@@ -1600,13 +1604,17 @@ fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone()
     assert!(!stderr.contains("/srv/app"), "{stderr}");
     assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
 
-    // A `tmux` that runs but cannot reach a server is not evidence either, and the
+    // A `tmux` that ran but rejected the query is not evidence either, and the
     // group inherits that refusal because it calls the same operation.
     fs::write(sandbox.state_file(), state.to_string()).unwrap();
     let blind = sandbox.path("blind-bin");
     fs::create_dir_all(&blind).unwrap();
     let blind_tmux = blind.join("tmux");
-    fs::write(&blind_tmux, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::write(
+        &blind_tmux,
+        "#!/bin/sh\necho 'unknown option -- f' >&2\nexit 1\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     fs::set_permissions(&blind_tmux, fs::Permissions::from_mode(0o700)).unwrap();
     let before = fs::read_to_string(sandbox.state_file()).unwrap();

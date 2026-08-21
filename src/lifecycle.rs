@@ -56,9 +56,7 @@ pub enum CloseOwnedError {
     UnknownSession(SessionId),
     #[error("session `{0}` is already closed")]
     AlreadyClosed(SessionId),
-    #[error(
-        "could not determine whether session `{0}` exists; run `herdr-tether doctor` to check the backend, then retry"
-    )]
+    #[error("could not determine whether session `{0}` exists")]
     WorkloadUnknown(SessionId),
     #[error("session `{0}` changed while it was closing; retry close")]
     ConcurrentModification(SessionId),
@@ -285,12 +283,14 @@ impl LifecycleService {
                 status,
                 stdout,
                 stdout_truncated,
+                stderr,
                 ..
             } => Ok(backend.classify_exact_inspect_parts(
                 id,
                 ownership_proof,
                 status.code(),
                 &stdout,
+                &stderr,
                 stdout_truncated,
             )),
             output => Err(CloseOwnedError::Inspect {
