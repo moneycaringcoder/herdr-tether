@@ -647,6 +647,30 @@ fn config_serialized_ceiling_round_trips_current_and_migrated_bytes() {
 }
 
 #[test]
+fn a_config_written_before_a_notification_setting_existed_keeps_the_documented_default() {
+    let config = sample_config();
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let store = ConfigStore::new(path.clone());
+    let mut written = toml::Value::try_from(&config).unwrap();
+    written
+        .as_table_mut()
+        .unwrap()
+        .get_mut("notifications")
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+        .remove("workload_failed");
+    fs::write(&path, toml::to_string(&written).unwrap()).unwrap();
+
+    // A setting the file predates must not read as "off". Opting out has to be
+    // something the user wrote, not something the file's age decided.
+    let loaded = store.load().unwrap();
+    assert!(loaded.notifications.workload_failed);
+    assert_eq!(loaded, config);
+}
+
+#[test]
 fn config_serialized_n_plus_one_is_rejected_without_changing_file() {
     let mut config = config_at_serialized_limit();
     config.hosts[0]

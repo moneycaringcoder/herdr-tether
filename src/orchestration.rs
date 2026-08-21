@@ -36,9 +36,9 @@ use crate::{
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        AgentAttention, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
+        AttentionReason, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
         ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
-        ObserverWorker, render,
+        ObserverWorker, WorkerAttention, render,
     },
     paths::AppPaths,
     state::{
@@ -1129,7 +1129,7 @@ fn refresh_observer_metadata(
             mission_latency_ms,
         ),
     );
-    notify_agent_attention(mission_client, notifications, &attention);
+    notify_attention(mission_client, notifications, &attention);
     *agent_panes = group_agent_panes(mission_snapshot.as_ref(), group_id);
     *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
@@ -1224,7 +1224,7 @@ fn update_observer_metadata(
     previous_fingerprints: &HashMap<String, CaptureFingerprint>,
     current_fingerprints: &HashMap<String, CaptureFingerprint>,
     mut workers: Vec<ObserverWorker>,
-) -> Vec<AgentAttention> {
+) -> Vec<WorkerAttention> {
     let previous_captures: HashMap<_, _> = observer
         .workers()
         .iter()
@@ -1291,26 +1291,39 @@ fn group_agent_panes(
 /// disabled or refused toast changes nothing and is never surfaced as an error.
 /// Only the worker's already-sanitized display label travels in the body; host,
 /// directory, command, and prompt text never do.
-fn notify_agent_attention(
+fn notify_attention(
     mission_client: Option<&HerdrSocketClient>,
     notifications: NotificationDefaults,
-    attention: &[AgentAttention],
+    attention: &[WorkerAttention],
 ) {
     let Some(client) = mission_client else {
         return;
     };
     for event in attention {
-        let (enabled, sound) = match event.state {
-            ObserverAgentState::Blocked => {
-                (notifications.agent_blocked, NotificationSound::Request)
-            }
-            ObserverAgentState::Done => (notifications.agent_done, NotificationSound::Done),
-            _ => continue,
+        let (enabled, sound, body) = match event.reason {
+            AttentionReason::Agent(state @ ObserverAgentState::Blocked) => (
+                notifications.agent_blocked,
+                NotificationSound::Request,
+                format!("{} is {}", event.label, state.label()),
+            ),
+            AttentionReason::Agent(state @ ObserverAgentState::Done) => (
+                notifications.agent_done,
+                NotificationSound::Done,
+                format!("{} is {}", event.label, state.label()),
+            ),
+            AttentionReason::Agent(_) => continue,
+            // The exit status is a small integer `tmux` reported, not output, so
+            // it carries none of what the privacy contract excludes, and it is
+            // the one detail that makes the toast actionable.
+            AttentionReason::Failed { exit_status } => (
+                notifications.workload_failed,
+                NotificationSound::Request,
+                format!("{} exited with status {exit_status}", event.label),
+            ),
         };
         if !enabled {
             continue;
         }
-        let body = format!("{} is {}", event.label, event.state.label());
         let _ = client.show_notification("Tether", Some(&body), sound);
     }
 }
@@ -1421,7 +1434,14 @@ fn observer_workers(
                 Some(SessionStatus::Creating) => ObserverLifecycle::Starting,
                 Some(SessionStatus::Running) => ObserverLifecycle::Running,
                 Some(SessionStatus::Stopping) => ObserverLifecycle::Stopping,
-                Some(SessionStatus::Ended) => ObserverLifecycle::Ended,
+                Some(SessionStatus::Ended) => match record.and_then(|record| record.exit_status) {
+                    // A status `tmux` could not report is an unknown outcome,
+                    // and an unknown outcome is not a failure.
+                    Some(exit_status) if exit_status != 0 => {
+                        ObserverLifecycle::Failed { exit_status }
+                    }
+                    _ => ObserverLifecycle::Ended,
+                },
                 Some(SessionStatus::Removed) => ObserverLifecycle::Removed,
                 None => ObserverLifecycle::Missing,
             };
@@ -1871,6 +1891,127 @@ mod tests {
             assert_eq!(refreshed[0].agent_state, expected);
             assert!(refreshed[0].uses_live_agent());
         }
+    }
+
+    #[test]
+    fn a_failing_exit_becomes_its_own_tile_state_and_an_unknown_one_does_not() {
+        let worker_id = "tether-0197f198000070008000000000000041"
+            .parse::<SessionId>()
+            .unwrap();
+        let membership_id: OrchestrationMembershipId =
+            "0197f198000070008000000000000042".parse().unwrap();
+        let group = OrchestrationGroup {
+            id: "exit-control".parse().unwrap(),
+            title: "Exit control".parse().unwrap(),
+            orchestrator_session_id: worker_id,
+            workers: vec![OrchestrationMember {
+                session_id: worker_id,
+                membership_id,
+                title: Some("Worker".parse().unwrap()),
+                capabilities: OrchestrationCapabilities {
+                    observe_output: true,
+                    open_interactive: true,
+                    prompt_agent: false,
+                },
+            }],
+        };
+        let lifecycle_for = |status: SessionStatus, exit_status: Option<i32>| {
+            let mut record = exact_running_session(worker_id, "$1");
+            record.status = status;
+            record.exit_status = exit_status;
+            if status != SessionStatus::Running {
+                record.closed_at = Some(record.last_used_at);
+            }
+            let state = State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![record],
+                orchestration_groups: vec![group.clone()],
+            };
+            observer_workers(&state.orchestration_groups[0], &state, None, false, None)[0].lifecycle
+        };
+
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, Some(2)),
+            ObserverLifecycle::Failed { exit_status: 2 }
+        );
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, Some(0)),
+            ObserverLifecycle::Ended,
+            "a clean exit is not a failure"
+        );
+        // An explicit stop records no status, and `tmux` cannot always report
+        // one. Neither is evidence of failure.
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, None),
+            ObserverLifecycle::Ended,
+            "an unknown outcome is not a failure"
+        );
+        assert_eq!(
+            lifecycle_for(SessionStatus::Running, None),
+            ObserverLifecycle::Running
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_exit_notifies_with_its_status_only_when_the_setting_allows_it() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let attention = [WorkerAttention {
+            worker_id: "w".to_owned(),
+            label: "Worker w".to_owned(),
+            reason: AttentionReason::Failed { exit_status: 2 },
+        }];
+
+        let socket = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap().to_owned();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"id": id, "result": {"type": "notification_show", "shown": true}})
+            )
+            .unwrap();
+            request
+        });
+        notify_attention(
+            Some(&HerdrSocketClient::new(socket.clone())),
+            NotificationDefaults::default(),
+            &attention,
+        );
+        let request = server.join().unwrap();
+        assert_eq!(request["method"], "notification.show");
+        assert_eq!(request["params"]["title"], "Tether");
+        assert_eq!(request["params"]["sound"], "request");
+        assert_eq!(request["params"]["body"], "Worker w exited with status 2");
+
+        // Turning the setting off means nothing is sent at all, rather than a
+        // toast Herdr is asked to suppress.
+        let quiet_socket = temp.path().join("quiet.sock");
+        let quiet = UnixListener::bind(&quiet_socket).unwrap();
+        quiet.set_nonblocking(true).unwrap();
+        notify_attention(
+            Some(&HerdrSocketClient::new(quiet_socket)),
+            NotificationDefaults {
+                workload_failed: false,
+                ..NotificationDefaults::default()
+            },
+            &attention,
+        );
+        assert_eq!(
+            quiet.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a disabled notification must not reach the socket"
+        );
     }
 
     #[derive(Default)]

@@ -43,6 +43,15 @@ pub enum ObserverLifecycle {
     Running,
     Stopping,
     Ended,
+    /// The command ended with a failing status, which `tmux` reported.
+    ///
+    /// Kept apart from [`Self::Ended`] because a clean finish and a failure are
+    /// the two outcomes a person most needs to tell apart, and they were
+    /// previously the same word. An end whose status could not be read stays
+    /// `Ended`: an unknown outcome is not a failure.
+    Failed {
+        exit_status: i32,
+    },
     Missing,
     Removed,
     #[default]
@@ -56,6 +65,7 @@ impl ObserverLifecycle {
             Self::Running => "RUNNING",
             Self::Stopping => "STOPPING",
             Self::Ended => "ENDED",
+            Self::Failed { .. } => "FAILED",
             Self::Missing => "MISSING",
             Self::Removed => "REMOVED",
             Self::Unknown => "UNKNOWN",
@@ -115,21 +125,32 @@ enum CaptureStatus {
     Unavailable,
     Stale,
 }
+
 struct PreviousWorkerState {
     capture: Option<String>,
     last_observed: Option<String>,
     latency_ms: Option<u64>,
     live_agent: bool,
     agent_state: ObserverAgentState,
+    lifecycle: ObserverLifecycle,
 }
 
 /// A worker that just entered a state a person may want to know about.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentAttention {
+pub struct WorkerAttention {
     pub worker_id: String,
     /// Already-sanitized display label. Never a host, directory, or command.
     pub label: String,
-    pub state: ObserverAgentState,
+    pub reason: AttentionReason,
+}
+
+/// Why a worker wants attention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttentionReason {
+    /// A live agent entered a state that waits on a person.
+    Agent(ObserverAgentState),
+    /// The workload's command ended with a failing status.
+    Failed { exit_status: i32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,12 +443,13 @@ impl ObserverState {
     /// worker in loading. Duplicate IDs after their first occurrence and workers beyond
     /// [`MAX_WORKERS`] are ignored. If the selected identity disappeared, the prior
     /// numeric position is retained where possible.
-    /// Replaces the worker set and reports newly attention-worthy agents.
+    /// Replaces the worker set and reports newly attention-worthy workers.
     ///
     /// A transition is only reported when a live agent *changes into* `BLOCKED`
-    /// or `DONE`. Re-reporting a state the worker was already in would turn
-    /// every refresh into a notification.
-    pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) -> Vec<AgentAttention> {
+    /// or `DONE`, or when a workload *changes into* a failing end. Re-reporting
+    /// a state the worker was already in would turn every refresh into a
+    /// notification.
+    pub fn update_workers(&mut self, workers: Vec<ObserverWorker>) -> Vec<WorkerAttention> {
         let previous_index = self.selected_index().unwrap_or(0);
         let previous_workers: HashMap<String, PreviousWorkerState> = self
             .workers
@@ -441,6 +463,7 @@ impl ObserverState {
                         live_agent: worker.live_agent,
                         latency_ms: worker.latency_ms,
                         agent_state: worker.agent_state,
+                        lifecycle: worker.lifecycle,
                     },
                 )
             })
@@ -511,7 +534,7 @@ impl ObserverState {
                 worker
             })
             .collect();
-        let attention: Vec<AgentAttention> = self
+        let agents = self
             .workers
             .iter()
             .filter(|worker| worker.live_agent)
@@ -526,12 +549,32 @@ impl ObserverState {
                     .get(&worker.id)
                     .is_none_or(|previous| previous.agent_state != worker.agent_state)
             })
-            .map(|worker| AgentAttention {
+            .map(|worker| WorkerAttention {
                 worker_id: worker.id.clone(),
                 label: worker.display_title(),
-                state: worker.agent_state,
+                reason: AttentionReason::Agent(worker.agent_state),
+            });
+        // A failing end is reported once, when it is first seen. A worker that
+        // was already failing is not news, and a worker seen for the first time
+        // already failed before this Observer opened.
+        let failures = self
+            .workers
+            .iter()
+            .filter_map(|worker| match worker.lifecycle {
+                ObserverLifecycle::Failed { exit_status } => Some((worker, exit_status)),
+                _ => None,
             })
-            .collect();
+            .filter(|(worker, _)| {
+                previous_workers
+                    .get(&worker.id)
+                    .is_some_and(|previous| previous.lifecycle != worker.lifecycle)
+            })
+            .map(|(worker, exit_status)| WorkerAttention {
+                worker_id: worker.id.clone(),
+                label: worker.display_title(),
+                reason: AttentionReason::Failed { exit_status },
+            });
+        let attention: Vec<WorkerAttention> = agents.chain(failures).collect();
         self.prompt_targets.retain(|id| {
             self.workers
                 .iter()

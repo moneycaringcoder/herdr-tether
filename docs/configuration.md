@@ -72,6 +72,7 @@ closed_days = 30
 [notifications]
 agent_blocked = true
 agent_done = true
+workload_failed = true
 ```
 
 Unknown fields and invalid values are rejected rather than ignored.
@@ -170,19 +171,25 @@ Discovery is bounded by depth, visited entries, results, time, and worker count.
 ### Notifications
 
 `notifications.agent_blocked` and `notifications.agent_done` ask Herdr to show a
-toast when a Mission Control agent changes into `BLOCKED` or `DONE`. Both default
-to true. A toast is sent only on a change into that state, so an agent that stays
-blocked does not notify again on every refresh.
+toast when a Mission Control agent changes into `BLOCKED` or `DONE`.
+`notifications.workload_failed` does the same when a workload's command ends with
+a failing status. All three default to true. A toast is sent only on a change
+into that state, so an agent that stays blocked, or a workload that stays failed,
+does not notify again on every refresh.
+
+A setting that a configuration file predates falls back to these defaults rather
+than to off, so an older file keeps behaving as documented.
 
 These are advisory and best effort. Herdr shows nothing unless you have enabled
 its own `ui.toast.delivery` setting, which ships as `off`, and it may decline
 while another surface owns the screen. Tether treats either outcome as normal:
-the Mission Control tile remains the authoritative view of agent state.
+the Mission Control tile remains the authoritative view.
 
 Notification text carries only the worker's already-sanitized display label and
-its state. Host, directory, command, capture, and prompt text are never included.
-Tether notifies only while a Mission Control surface is open; nothing observes
-agent state when no Tether surface is running.
+either its state or the exit status `tmux` reported. Host, directory, command,
+capture, and prompt text are never included. Tether notifies only while a
+Mission Control surface is open; nothing observes a workload or an agent when no
+Tether surface is running.
 
 ### Retention
 

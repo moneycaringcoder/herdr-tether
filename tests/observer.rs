@@ -6,11 +6,11 @@ mod observer;
 mod model;
 
 use observer::{
-    MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, MAX_PROMPT_TARGETS, ObserverAction,
-    ObserverAgentState, ObserverCapabilities, ObserverCapture, ObserverInputKind, ObserverKey,
-    ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, action_for_input,
-    action_for_key, observer_theme_style, render, render_to_styles, render_to_text,
-    sanitize_capture, worker_rects,
+    AttentionReason, MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, MAX_PROMPT_TARGETS,
+    ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture, ObserverInputKind,
+    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker,
+    action_for_input, action_for_key, observer_theme_style, render, render_to_styles,
+    render_to_text, sanitize_capture, worker_rects,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -459,7 +459,10 @@ fn attention_reports_each_transition_into_blocked_or_done_exactly_once() {
 
     let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Blocked)]);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].state, ObserverAgentState::Blocked);
+    assert_eq!(
+        attention[0].reason,
+        AttentionReason::Agent(ObserverAgentState::Blocked)
+    );
     assert_eq!(attention[0].worker_id, "a");
 
     // Staying blocked across refreshes must not notify again; the Observer
@@ -471,7 +474,91 @@ fn attention_reports_each_transition_into_blocked_or_done_exactly_once() {
     observer.update_workers(vec![live_worker("a", ObserverAgentState::Working)]);
     let attention = observer.update_workers(vec![live_worker("a", ObserverAgentState::Done)]);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].state, ObserverAgentState::Done);
+    assert_eq!(
+        attention[0].reason,
+        AttentionReason::Agent(ObserverAgentState::Done)
+    );
+}
+
+#[test]
+fn a_workload_that_ends_with_a_failing_status_is_reported_once() {
+    let mut observer = ObserverState::new(Vec::new());
+    let running = ObserverWorker {
+        lifecycle: ObserverLifecycle::Running,
+        ..worker("w")
+    };
+    let failed = ObserverWorker {
+        lifecycle: ObserverLifecycle::Failed { exit_status: 2 },
+        ..worker("w")
+    };
+
+    assert!(observer.update_workers(vec![running.clone()]).is_empty());
+
+    let attention = observer.update_workers(vec![failed.clone()]);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].worker_id, "w");
+    assert_eq!(
+        attention[0].reason,
+        AttentionReason::Failed { exit_status: 2 }
+    );
+
+    // The Observer refreshes on a timer, so a workload that is still failed is
+    // not news.
+    assert!(
+        observer.update_workers(vec![failed.clone()]).is_empty(),
+        "a failing end must be reported once, not on every refresh"
+    );
+
+    // A restart that fails again is a new event.
+    observer.update_workers(vec![running]);
+    let attention = observer.update_workers(vec![ObserverWorker {
+        lifecycle: ObserverLifecycle::Failed { exit_status: 3 },
+        ..worker("w")
+    }]);
+    assert_eq!(
+        attention[0].reason,
+        AttentionReason::Failed { exit_status: 3 }
+    );
+}
+
+#[test]
+fn a_clean_end_and_a_first_sighting_are_not_reported_as_failures() {
+    let mut observer = ObserverState::new(Vec::new());
+    // A workload already failed before this Observer opened. Announcing it now
+    // would report history as news.
+    let attention = observer.update_workers(vec![ObserverWorker {
+        lifecycle: ObserverLifecycle::Failed { exit_status: 1 },
+        ..worker("first-sight")
+    }]);
+    assert!(attention.is_empty(), "{attention:?}");
+
+    let mut observer = ObserverState::new(Vec::new());
+    observer.update_workers(vec![ObserverWorker {
+        lifecycle: ObserverLifecycle::Running,
+        ..worker("clean")
+    }]);
+    let attention = observer.update_workers(vec![ObserverWorker {
+        lifecycle: ObserverLifecycle::Ended,
+        ..worker("clean")
+    }]);
+    assert!(attention.is_empty(), "a clean end is not attention-worthy");
+}
+
+#[test]
+fn a_failing_end_is_labelled_apart_from_a_clean_one_in_the_tile() {
+    assert_eq!(ObserverLifecycle::Ended.label(), "ENDED");
+    assert_eq!(
+        ObserverLifecycle::Failed { exit_status: 1 }.label(),
+        "FAILED"
+    );
+
+    let observer = ObserverState::new(vec![ObserverWorker {
+        lifecycle: ObserverLifecycle::Failed { exit_status: 1 },
+        ..worker("failed")
+    }]);
+    let rendered = render_to_text(60, 10, &observer).unwrap();
+    assert!(rendered.contains("FAILED"), "{rendered}");
+    assert!(!rendered.contains("ENDED"), "{rendered}");
 }
 
 #[test]

@@ -11,6 +11,15 @@
   evidence and the protocol constants in the source, and the documentation check
   refuses a matrix that has drifted from them, so it cannot become a stale
   hand-maintained claim.
+- A workload that ends with a failing status is now named as one. The picker
+  reads `[failed]` instead of `[ended]`, a Mission Control tile reads `FAILED`,
+  `session list` reads `Failed (exit 2)`, and a Mission Control surface that sees
+  a workload reach a failing end asks Herdr for a toast naming the workload and
+  its status. `notifications.workload_failed` controls the toast and defaults to
+  true; a configuration written before the setting existed keeps that default
+  rather than reading as off. An end whose status `tmux` could not report stays
+  `ended`, because an unknown outcome is not a failure, and an explicit Stop
+  records no status at all.
 
 ### Changed
 
