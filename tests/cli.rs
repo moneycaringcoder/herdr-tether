@@ -1463,19 +1463,20 @@ fn restarting_a_workload_that_failed_immediately_is_declined_with_the_wait() {
     fs::write(sandbox.state_file(), state.to_string()).unwrap();
     let before = fs::read_to_string(sandbox.state_file()).unwrap();
 
-    // The command is declined rather than deferred, and the message says how
-    // long to wait and what else to do. Nothing is restarted, and the record is
-    // untouched.
+    // The command is declined rather than deferred, the wait it reports is the
+    // real remainder rather than a rounded-down zero, and it names what else to
+    // do. Nothing is restarted, and the record is untouched.
     sandbox
         .command()
         .args(["session", "restart", SESSION_ID])
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed immediately"))
-        .stderr(predicate::str::contains("in "))
+        .stderr(predicate::str::contains("in 28s").or(predicate::str::contains("in 27s")))
         .stderr(predicate::str::contains("herdr-tether open"));
     assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
 }
+
 #[test]
 fn external_attach_is_exact_and_does_not_mutate_state() {
     let sandbox = Sandbox::new();

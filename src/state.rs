@@ -100,6 +100,16 @@ impl SessionRecord {
         self.paced_restart_until().is_some()
     }
 
+    /// The moment this workload was last active: when it ended, or when it was
+    /// last started or opened if it has not.
+    ///
+    /// Ordering uses this rather than `last_used_at` alone, because
+    /// `last_used_at` now keeps the start of the current incarnation so that a
+    /// workload's lifetime can be told from its record.
+    pub fn activity_at(&self) -> DateTime<Utc> {
+        self.closed_at.unwrap_or(self.last_used_at)
+    }
+
     /// When a restart of this workload stops being paced, if it is paced.
     ///
     /// The evidence is already recorded: `last_used_at` is stamped when the
@@ -109,8 +119,13 @@ impl SessionRecord {
     /// incarnation it replaced — a paced restart reports one failure that
     /// arrived at once, which is the shape of a loop, rather than a tally.
     ///
-    /// An end whose status `tmux` could not report is not paced: an unknown
-    /// outcome is not a failure.
+    /// Three ends are deliberately not paced. One whose status `tmux` could not
+    /// report, because an unknown outcome is not a failure. One whose recorded
+    /// lifetime is not positive, which is how a record written before the start
+    /// stamp was preserved looks: both fields hold the same instant, and a
+    /// lifetime of exactly zero is missing evidence rather than an instant
+    /// failure. And one that ran longer than the window, which failed at its
+    /// work rather than on starting.
     pub fn paced_restart_until(&self) -> Option<DateTime<Utc>> {
         if self.status != SessionStatus::Ended
             || !self.exit_status.is_some_and(|status| status != 0)
@@ -119,7 +134,8 @@ impl SessionRecord {
         }
         let closed_at = self.closed_at?;
         let ran_for = closed_at.signed_duration_since(self.last_used_at);
-        (ran_for <= FAST_FAILURE_WINDOW).then(|| closed_at + RESTART_PACE)
+        (ran_for > TimeDelta::zero() && ran_for <= FAST_FAILURE_WINDOW)
+            .then(|| closed_at + RESTART_PACE)
     }
 }
 
@@ -174,6 +190,31 @@ mod pace_tests {
         // An explicit Stop records no status, and `tmux` cannot always report
         // one. Neither is evidence of a failure to pace.
         assert!(!ended(TimeDelta::milliseconds(400), None).failed_immediately());
+    }
+
+    #[test]
+    fn a_record_without_a_readable_lifetime_is_not_paced() {
+        // A record written before the start stamp was preserved carries the end
+        // instant in both fields, so its lifetime reads as exactly zero. That is
+        // missing evidence, not an instant failure, and pacing every such record
+        // would pace every historical failure at once.
+        let mut legacy = ended(TimeDelta::milliseconds(400), Some(1));
+        legacy.last_used_at = legacy.closed_at.unwrap();
+        assert!(!legacy.failed_immediately());
+
+        // Re-observing an already-ended workload used to push `last_used_at`
+        // past `closed_at`. A negative lifetime is not a fast one.
+        let mut inverted = ended(TimeDelta::milliseconds(400), Some(1));
+        inverted.last_used_at = inverted.closed_at.unwrap() + TimeDelta::minutes(5);
+        assert!(!inverted.failed_immediately());
+    }
+
+    #[test]
+    fn the_window_boundary_is_inclusive() {
+        assert!(ended(FAST_FAILURE_WINDOW, Some(1)).failed_immediately());
+        assert!(
+            !ended(FAST_FAILURE_WINDOW + TimeDelta::milliseconds(1), Some(1)).failed_immediately()
+        );
     }
 
     #[test]

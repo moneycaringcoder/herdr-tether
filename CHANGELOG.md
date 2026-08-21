@@ -49,6 +49,10 @@
   left out without comment, because a bare clone reports itself among its own
   worktrees, and the confirmation is bounded so a wedged network mount cannot
   hold the picker closed.
+- A workload's recorded end no longer overwrites the moment it started, so a
+  record says how long its last incarnation ran. Ordering now uses the end where
+  there is one, which keeps the picker, `session list`, and the snapshot in the
+  order they were already in.
 - Herdr toasts now name a workload by a short reference rather than by its tile
   title. The title is generated from the workload's host, repository name, and
   preset, and a notification leaves the surface that produced it, so the

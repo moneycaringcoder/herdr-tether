@@ -334,10 +334,10 @@ pub fn collect(
             records.sort_by(|left, right| {
                 compare_normal_sessions(
                     left.status,
-                    left.last_used_at,
+                    left.activity_at(),
                     left.id,
                     right.status,
-                    right.last_used_at,
+                    right.activity_at(),
                     right.id,
                 )
             });
@@ -419,10 +419,10 @@ pub fn collect(
         records.sort_by(|left, right| {
             compare_normal_sessions(
                 left.status,
-                left.last_used_at,
+                left.activity_at(),
                 left.id,
                 right.status,
-                right.last_used_at,
+                right.activity_at(),
                 right.id,
             )
         });

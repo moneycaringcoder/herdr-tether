@@ -1219,11 +1219,15 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
     // deferred: Tether never runs a workload the user did not ask for at the
     // moment they asked for it.
     if let Some(until) = record.paced_restart_until() {
-        let remaining = until.signed_duration_since(Utc::now()).num_seconds();
-        if remaining > 0 {
+        let remaining = until.signed_duration_since(Utc::now());
+        // The guard is the full duration so the command and the picker agree at
+        // the boundary, and the reported wait rounds up so it never says a
+        // number the user can beat by pressing the key again immediately.
+        if remaining > chrono::TimeDelta::zero() {
+            let seconds = (remaining.num_milliseconds() + 999) / 1_000;
             bail!(
                 "session `{id}` failed immediately; retry `herdr-tether session restart {id}` \
-                 in {remaining}s, or fix the command first with `herdr-tether open`"
+                 in {seconds}s, or fix the command first with `herdr-tether open`"
             );
         }
     }
@@ -1470,10 +1474,10 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             sessions.sort_by(|left, right| {
                 compare_normal_sessions(
                     left.status,
-                    left.last_used_at,
+                    left.activity_at(),
                     left.id,
                     right.status,
-                    right.last_used_at,
+                    right.activity_at(),
                     right.id,
                 )
             });

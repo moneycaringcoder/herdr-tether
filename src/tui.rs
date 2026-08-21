@@ -89,7 +89,9 @@ pub struct PickerWorkload {
     pub id: SessionId,
     pub status: SessionStatus,
     pub legacy: bool,
-    pub last_used_at: chrono::DateTime<chrono::Utc>,
+    /// When this workload was last active: when it ended, or when it was last
+    /// started or opened if it has not. Used for ordering only.
+    pub activity_at: chrono::DateTime<chrono::Utc>,
     /// When a restart of this workload stops being paced.
     ///
     /// Set only for a workload that failed almost as soon as it started, which
@@ -336,10 +338,10 @@ fn recent_directories(state: &State, host: &str, target: &str) -> Vec<String> {
     sessions.sort_by(|left, right| {
         compare_normal_sessions(
             left.status,
-            left.last_used_at,
+            left.activity_at(),
             (left.directory.as_str(), left.id),
             right.status,
-            right.last_used_at,
+            right.activity_at(),
             (right.directory.as_str(), right.id),
         )
     });
@@ -360,10 +362,10 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
     sessions.sort_by(|left, right| {
         compare_normal_sessions(
             left.status,
-            left.last_used_at,
+            left.activity_at(),
             left.id,
             right.status,
-            right.last_used_at,
+            right.activity_at(),
             right.id,
         )
     });
@@ -375,7 +377,7 @@ fn owned_workloads(state: &State, host: &str, target: &str) -> Vec<PickerWorkloa
                 id: session.id,
                 status: session.status,
                 legacy: session.ownership_proof.is_none(),
-                last_used_at: session.last_used_at,
+                activity_at: session.activity_at(),
                 paced_until: paced_restart_until(session),
                 base_label: label.clone(),
                 label,
@@ -1179,7 +1181,7 @@ impl PickerState {
                     id: record.id,
                     status: record.status,
                     legacy: record.ownership_proof.is_none(),
-                    last_used_at: record.last_used_at,
+                    activity_at: record.activity_at(),
                     paced_until: paced_restart_until(record),
                     base_label: label.clone(),
                     label,
@@ -1189,10 +1191,10 @@ impl PickerState {
                 .sort_by(|left, right| {
                     compare_normal_sessions(
                         left.status,
-                        left.last_used_at,
+                        left.activity_at,
                         left.id,
                         right.status,
-                        right.last_used_at,
+                        right.activity_at,
                         right.id,
                     )
                 });
@@ -1642,6 +1644,27 @@ impl PickerState {
         }
     }
 
+    /// The selected workload when its restart is paced, so `x` still removes it.
+    ///
+    /// Reported as a restart-shaped action because Remove is what `x` offers on
+    /// an ended workload; the restart itself stays withheld by
+    /// [`Self::current_owned_action_at`].
+    fn paced_owned_target(&self) -> Option<(SessionId, bool)> {
+        if self.stage != PickerStage::Resource || !self.current_host_reachable() {
+            return None;
+        }
+        let ResourceIdentity::Owned(id) = self.current_resource_identity()? else {
+            return None;
+        };
+        let workload = self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| workload.id == id)?;
+        (!workload.legacy
+            && workload.status == SessionStatus::Ended
+            && paced_remaining(workload, chrono::Utc::now()).is_some())
+        .then_some((id, true))
+    }
     fn rebuild_status_labels(&mut self) {
         for host in &mut self.options.hosts {
             if host.origin == PickerHostOrigin::Effective {
@@ -1835,7 +1858,13 @@ impl PickerState {
             self.close_modal = Some(PickerCloseModal::Confirm { id });
             return PickerOutcome::Continue;
         }
-        let Some((id, restart)) = self.current_owned_action() else {
+        // The pace withholds a restart, not the row. Remove touches metadata
+        // rather than work, so it stays available while a workload waits — a
+        // paced row with two inert keys would read as Tether being broken.
+        let Some((id, restart)) = self
+            .current_owned_action()
+            .or_else(|| self.paced_owned_target())
+        else {
             return PickerOutcome::Continue;
         };
         self.close_modal_action = Some(if restart {
@@ -2652,6 +2681,9 @@ fn run_terminal_picker(
     let mut status_run = start_status_run(state, status_service, generation)?;
     let mut discovery_run = start_discovery_run(state, discovery_service, generation);
     let mut dirty = true;
+    // Whether the last frame showed a paced restart, so the frame after it ends
+    // is drawn once more and the action visibly returns.
+    let mut paced_frame = false;
     let (close_sender, close_receiver) = mpsc::channel::<PickerCloseResult>();
     let (prune_preview_sender, prune_preview_receiver) = mpsc::channel::<PickerPruneResult>();
     let (prune_apply_sender, prune_apply_receiver) = mpsc::channel::<PickerPruneResult>();
@@ -2703,6 +2735,12 @@ fn run_terminal_picker(
             dirty = false;
         }
         if !event::poll(Duration::from_millis(50)).context("poll terminal picker input")? {
+            // A paced restart is the only footer content that changes without an
+            // event, so an idle picker would otherwise show a frozen countdown
+            // and keep saying the restart is paced after it became available.
+            let paced_now = state.paced_remaining_selected(chrono::Utc::now()).is_some();
+            dirty = paced_now || paced_frame;
+            paced_frame = paced_now;
             continue;
         }
         let Event::Key(key) = event::read().context("read terminal picker input")? else {
@@ -3610,7 +3648,7 @@ mod close_render_tests {
                     base_label: label.clone(),
                     status: SessionStatus::Running,
                     legacy: false,
-                    last_used_at: chrono::Utc::now(),
+                    activity_at: chrono::Utc::now(),
                     paced_until: None,
                     label,
                 }],
