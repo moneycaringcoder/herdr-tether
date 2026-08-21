@@ -9,8 +9,8 @@ use herdr_tether::{
     model::{ExternalSessionName, SessionId},
     status::{
         ExternalCatalogStatus, ExternalSession, HealthStatus, HostReachability,
-        MAX_STATUS_WORKLOADS, StatusHost, StatusMessage, StatusRequest, StatusRequestError,
-        StatusService, StatusWorkload, WorkloadStatus,
+        MAX_STATUS_WORKLOADS, ResourceReport, StatusHost, StatusMessage, StatusRequest,
+        StatusRequestError, StatusService, StatusWorkload, WorkloadStatus,
     },
 };
 use tempfile::tempdir;
@@ -63,6 +63,7 @@ fn fast_host_publishes_before_slow_host_times_out() {
     let run = service
         .try_start(StatusRequest {
             generation: 7,
+            resources: false,
             hosts: vec![
                 StatusHost {
                     name: "slow".into(),
@@ -144,6 +145,7 @@ fn catalog_publishes_only_safe_non_tether_sessions() {
     let run = service
         .try_start(StatusRequest {
             generation: 8,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "dev".into(),
                 target: Some("dev".into()),
@@ -222,6 +224,7 @@ esac
     let run = service
         .try_start(StatusRequest {
             generation: 10,
+            resources: false,
             hosts: vec![
                 StatusHost {
                     name: "duplicate".into(),
@@ -301,6 +304,7 @@ fn cancelled_generation_does_not_publish_late_results() {
     let run = service
         .try_start(StatusRequest {
             generation: 1,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "slow".into(),
                 target: Some("slow".into()),
@@ -352,6 +356,7 @@ esac
     let run = service
         .try_start(StatusRequest {
             generation: 9,
+            resources: false,
             hosts: vec![
                 StatusHost {
                     name: "offline".into(),
@@ -446,6 +451,7 @@ fn local_spawn_error_includes_actionable_tool_locations() {
     let run = service
         .try_start(StatusRequest {
             generation: 9,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -487,6 +493,7 @@ fn a_configured_health_command_is_probed_after_liveness() {
     let run = service
         .try_start(StatusRequest {
             generation: 11,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -569,6 +576,7 @@ fn an_unreachable_host_reports_unknown_health_without_probing() {
     let run = service
         .try_start(StatusRequest {
             generation: 12,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "offline".into(),
                 target: Some("offline".into()),
@@ -624,6 +632,7 @@ fn the_health_phase_stays_bounded_however_many_workloads_are_probed() {
     let run = service
         .try_start(StatusRequest {
             generation: 13,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -667,6 +676,136 @@ fn the_health_phase_stays_bounded_however_many_workloads_are_probed() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn resource_figures_are_reported_per_workload_and_absence_is_explicit() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let busy = id("tether-0197f198000070008000000000000001");
+    let idle = id("tether-0197f198000070008000000000000002");
+    // A host that answers all three questions: which sessions exist, which
+    // process each pane belongs to, and what the processes are using. The busy
+    // workload's own pane is idle while its child burns a core, which is exactly
+    // the case a figure taken from the pane alone would miss.
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n\
+             *list-sessions*) printf '%s:1\\n%s:0\\n' '{busy}' '{idle}' ;;\n\
+             *list-panes*) printf '%s:100\\n%s:200\\n' '{busy}' '{idle}' ;;\n\
+             *' ps '*|*'ps -Ao'*) printf '100 1 0.5 4096\\n101 100 99.5 1048576\\n200 1 1.0 8192\\n' ;;\n\
+             *) exit 99 ;;\n\
+             esac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let absent = id("tether-0197f198000070008000000000000003");
+    let run = service
+        .try_start(StatusRequest {
+            generation: 14,
+            resources: true,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![probe(busy), probe(idle), probe(absent)],
+            }],
+        })
+        .unwrap();
+
+    let mut reports = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if let StatusMessage::Resources { id, report, .. } = message {
+            reports.push((id, report));
+        }
+        if finished {
+            break;
+        }
+    }
+
+    let report = |wanted| {
+        reports
+            .iter()
+            .find(|(id, _)| *id == wanted)
+            .map(|(_, report)| *report)
+            .expect("every requested workload is reported")
+    };
+    let ResourceReport::Known(usage) = report(busy) else {
+        panic!("the busy workload reports a figure: {reports:?}");
+    };
+    // The pane plus its child, not the pane alone.
+    assert!((usage.cpu_percent - 100.0).abs() < 0.01, "{usage:?}");
+    assert_eq!(usage.memory_bytes, (4096 + 1_048_576) * 1024);
+    let ResourceReport::Known(usage) = report(idle) else {
+        panic!("the idle workload still reports a figure: {reports:?}");
+    };
+    assert!((usage.cpu_percent - 1.0).abs() < 0.01, "{usage:?}");
+    // A workload the host said nothing about is unknown, not zero.
+    assert_eq!(report(absent), ResourceReport::Unknown);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreachable_host_reports_unknown_usage_without_asking() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let marker = temp.path().join("attempts");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf 'x' >> '{}'\nexit 255\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let workload = id("tether-0197f198000070008000000000000001");
+    let run = service
+        .try_start(StatusRequest {
+            generation: 15,
+            resources: true,
+            hosts: vec![StatusHost {
+                name: "offline".into(),
+                target: Some("offline".into()),
+                workloads: vec![probe(workload)],
+            }],
+        })
+        .unwrap();
+
+    let mut reports = Vec::new();
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if let StatusMessage::Resources { id, report, .. } = message {
+            reports.push((id, report));
+        }
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(reports, vec![(workload, ResourceReport::Unknown)]);
+    // The liveness attempt already proved the host cannot answer; asking it two
+    // more questions per refresh would spend the refresh relearning that.
+    assert_eq!(
+        fs::read(&marker).unwrap().len(),
+        1,
+        "an unreachable host is contacted once, not once per phase"
+    );
+}
+
 #[test]
 fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
     let temp = tempdir().unwrap();
@@ -682,6 +821,7 @@ fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
     let run = service
         .try_start(StatusRequest {
             generation: 10,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -691,6 +831,7 @@ fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
         .unwrap();
 
     let first = run.receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
     assert!(matches!(
         first,
         StatusMessage::Host {
@@ -713,6 +854,64 @@ fn unrepresentable_timeout_does_not_lose_a_spawned_probe() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_caller_that_does_not_ask_for_usage_does_not_pay_for_it() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let argv = temp.path().join("argv");
+    let workload = id("tether-0197f198000070008000000000000001");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s:1\\n' '{workload}'\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let run = service
+        .try_start(StatusRequest {
+            generation: 16,
+            resources: false,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![probe(workload)],
+            }],
+        })
+        .unwrap();
+
+    let mut reports = 0;
+    loop {
+        let message = run.receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        let finished = matches!(message, StatusMessage::Finished { .. });
+        if matches!(message, StatusMessage::Resources { .. }) {
+            reports += 1;
+        }
+        if finished {
+            break;
+        }
+    }
+
+    assert_eq!(
+        reports, 0,
+        "no figures were asked for, so none are reported"
+    );
+    // The two extra questions are the cost this flag exists to avoid: a caller
+    // that shows no figures must not make the host answer them.
+    let invoked = fs::read_to_string(&argv).unwrap();
+    assert!(
+        !invoked.contains("list-panes") && !invoked.contains("ps -"),
+        "unexpected resource commands: {invoked}"
+    );
+}
+
 #[test]
 fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
     let temp = tempdir().unwrap();
@@ -732,6 +931,7 @@ fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
     let run = service
         .try_start(StatusRequest {
             generation: 11,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "private-alias".into(),
                 target: Some("private.example".into()),
@@ -779,6 +979,7 @@ fn successful_probe_does_not_leave_background_descendants_running() {
     let run = service
         .try_start(StatusRequest {
             generation: 12,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -832,6 +1033,7 @@ fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
     let error = service
         .try_start(StatusRequest {
             generation: 20,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -852,6 +1054,7 @@ fn status_rejects_workload_cardinality_n_plus_one_before_probe() {
     let run = service
         .try_start(StatusRequest {
             generation: 21,
+            resources: false,
             hosts: vec![StatusHost {
                 name: "local".into(),
                 target: None,
@@ -904,6 +1107,7 @@ fn duplicate_heavy_status_request_probes_and_reports_each_exact_target_once() {
     let run = service
         .try_start(StatusRequest {
             generation: 21,
+            resources: false,
             hosts: vec![duplicate.clone(), duplicate],
         })
         .unwrap();

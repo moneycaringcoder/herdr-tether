@@ -64,6 +64,34 @@ pub enum HealthStatus {
     Unknown,
 }
 
+/// What a workload's processes are using on their host.
+///
+/// A workload is a `tmux` session, not one process: the pane's shell is usually
+/// idle while a child does the work, so a figure that described only the pane
+/// would report nothing for a workload compiling flat out. These are the totals
+/// for every process under the workload's panes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResourceUsage {
+    /// Processor share as the host reports it, summed over the workload's
+    /// processes. Can exceed 100 on a multi-core host, which is the point.
+    pub cpu_percent: f32,
+    /// Resident memory in bytes, summed over the workload's processes.
+    pub memory_bytes: u64,
+}
+
+/// What a workload is using, or that Tether could not find out.
+///
+/// Absence is a value here rather than a zero or an empty string: a host that
+/// cannot report is not a workload using nothing, and the two would be
+/// indistinguishable if this collapsed into numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResourceReport {
+    Known(ResourceUsage),
+    /// The host could not be asked, did not answer, answered unusably, or does
+    /// not report the workload's processes at all.
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalCatalogStatus {
     Available,
@@ -99,6 +127,12 @@ pub struct StatusHost {
 pub struct StatusRequest {
     pub generation: u64,
     pub hosts: Vec<StatusHost>,
+    /// Whether to ask each reachable host what its workloads are using.
+    ///
+    /// Opt-in because it costs two more commands per host, and a caller that
+    /// does not display figures should not pay for them: `snapshot` asks only
+    /// what it reports.
+    pub resources: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -109,7 +143,7 @@ pub enum StatusRequestError {
     TooManyWorkloads { actual: usize, maximum: usize },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StatusMessage {
     Host {
         generation: u64,
@@ -139,6 +173,12 @@ pub enum StatusMessage {
         status: HealthStatus,
         checked_at: SystemTime,
     },
+    Resources {
+        generation: u64,
+        id: SessionId,
+        report: ResourceReport,
+        checked_at: SystemTime,
+    },
     Finished {
         generation: u64,
     },
@@ -151,6 +191,7 @@ impl StatusMessage {
             | Self::Workload { generation, .. }
             | Self::Catalog { generation, .. }
             | Self::Health { generation, .. }
+            | Self::Resources { generation, .. }
             | Self::Finished { generation } => *generation,
         }
     }
@@ -179,11 +220,11 @@ impl StatusService {
     }
 
     fn start_validated(&self, request: StatusRequest) -> StatusRun {
-        // Two messages per workload now: liveness and, where configured, health.
-        // Sized so a worker's send never blocks, because a blocked send stops
-        // observing the cancellation flag.
+        // Three messages per workload now: liveness, health where configured, and
+        // usage where asked for. Sized so a worker's send never blocks, because a
+        // blocked send stops observing the cancellation flag.
         let (sender, receiver) =
-            mpsc::sync_channel(MAX_STATUS_WORKLOADS * 2 + MAX_STATUS_HOSTS * 2 + 1);
+            mpsc::sync_channel(MAX_STATUS_WORKLOADS * 3 + MAX_STATUS_HOSTS * 2 + 1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let jobs = Arc::new(Mutex::new(VecDeque::from(request.hosts)));
         let worker_count = self
@@ -198,8 +239,11 @@ impl StatusService {
             let binaries = self.binaries.clone();
             let timeout = self.timeout;
             let generation = request.generation;
+            let resources = request.resources;
             handles.push(thread::spawn(move || {
-                worker_loop(generation, jobs, &sender, &cancelled, &binaries, timeout);
+                worker_loop(
+                    generation, jobs, &sender, &cancelled, &binaries, timeout, resources,
+                );
             }));
         }
 
@@ -297,6 +341,7 @@ fn worker_loop(
     cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
     timeout: Duration,
+    resources: bool,
 ) {
     loop {
         if cancelled.load(Ordering::Acquire) {
@@ -305,7 +350,9 @@ fn worker_loop(
         let Some(host) = jobs.lock().expect("status jobs lock").pop_front() else {
             return;
         };
-        probe_host(generation, host, sender, cancelled, binaries, timeout);
+        probe_host(
+            generation, host, sender, cancelled, binaries, timeout, resources,
+        );
     }
 }
 
@@ -316,6 +363,7 @@ fn probe_host(
     cancelled: &AtomicBool,
     binaries: &ProcessBinaries,
     timeout: Duration,
+    resources: bool,
 ) {
     let backend = match &host.target {
         Some(target) => TmuxBackend::remote(target.clone(), binaries.clone()),
@@ -380,8 +428,16 @@ fn probe_host(
     // whole refresh re-learning the same failure.
     if classified.reachability == HostReachability::Reachable {
         probe_health(generation, &host, sender, cancelled, binaries, timeout);
+        if resources {
+            probe_resources(generation, &host, sender, cancelled, binaries, timeout);
+        }
     } else {
         report_unknown_health(generation, &host, sender, cancelled);
+        if resources {
+            // A host that could not be reached cannot report what its workloads
+            // are using either, and that is different from them using nothing.
+            report_unknown_resources(generation, &host, sender, cancelled);
+        }
     }
 }
 
@@ -482,6 +538,229 @@ fn report_unknown_health(
             return;
         }
     }
+}
+
+/// How long a host's whole resource phase may take.
+///
+/// Two commands, however many workloads the host has, so this is a ceiling on
+/// the phase rather than a per-workload allowance. Short because it answers a
+/// question about right now, and the picker is waiting on it.
+const RESOURCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Asks a reachable host what its workloads' processes are using.
+///
+/// Two commands for the whole host: which process each pane belongs to, and the
+/// host's process table. Every workload's total is then summed locally from the
+/// panes down, so a host with twenty workloads costs the same as one with one.
+/// Anything that stops either command, or leaves a workload's processes
+/// unidentifiable, reports [`ResourceReport::Unknown`] for that workload rather
+/// than a figure it cannot stand behind.
+fn probe_resources(
+    generation: u64,
+    host: &StatusHost,
+    sender: &SyncSender<StatusMessage>,
+    cancelled: &AtomicBool,
+    binaries: &ProcessBinaries,
+    timeout: Duration,
+) {
+    if host.workloads.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + RESOURCE_TIMEOUT.min(timeout);
+    let usage = collect_resource_usage(host, cancelled, binaries, deadline);
+    for workload in &host.workloads {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let report = usage
+            .as_ref()
+            .and_then(|usage| usage.get(&workload.id).copied())
+            .map_or(ResourceReport::Unknown, ResourceReport::Known);
+        if sender
+            .send(StatusMessage::Resources {
+                generation,
+                id: workload.id,
+                report,
+                checked_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Reports every workload as unknown without asking the host anything.
+fn report_unknown_resources(
+    generation: u64,
+    host: &StatusHost,
+    sender: &SyncSender<StatusMessage>,
+    cancelled: &AtomicBool,
+) {
+    for workload in &host.workloads {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if sender
+            .send(StatusMessage::Resources {
+                generation,
+                id: workload.id,
+                report: ResourceReport::Unknown,
+                checked_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Runs both commands and sums each owned workload's processes.
+///
+/// `None` means the host could not be asked at all, which is different from a
+/// workload whose processes were simply not in the answer: the first makes every
+/// workload unknown, the second only that one.
+fn collect_resource_usage(
+    host: &StatusHost,
+    cancelled: &AtomicBool,
+    binaries: &ProcessBinaries,
+    deadline: Instant,
+) -> Option<HashMap<SessionId, ResourceUsage>> {
+    let backend = match host.target.as_deref() {
+        Some(target) => TmuxBackend::remote(target.to_owned(), binaries.clone()).ok()?,
+        None => TmuxBackend::local(binaries.clone()),
+    };
+    let panes = run_within(&backend.pane_pids_spec().ok()?, cancelled, deadline)?;
+    let processes = run_within(&backend.process_table_spec().ok()?, cancelled, deadline)?;
+    Some(sum_workload_usage(
+        &parse_pane_pids(&panes),
+        &parse_process_table(&processes),
+    ))
+}
+
+/// Runs one command inside what is left of the phase's deadline.
+fn run_within(spec: &CommandSpec, cancelled: &AtomicBool, deadline: Instant) -> Option<Vec<u8>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    match run_bounded(spec, remaining, cancelled) {
+        BoundedOutput::Completed {
+            status,
+            stdout,
+            stdout_truncated: false,
+            ..
+        } if status.success() => Some(stdout),
+        // Anything else is an answer Tether cannot use: a truncated table would
+        // silently drop processes and undercount the workloads that own them.
+        _ => None,
+    }
+}
+
+/// One process as the host reported it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProcessEntry {
+    parent: u32,
+    cpu_percent: f32,
+    memory_bytes: u64,
+}
+
+/// Maps each owned session to the processes its panes were started for.
+fn parse_pane_pids(stdout: &[u8]) -> HashMap<SessionId, Vec<u32>> {
+    let mut panes: HashMap<SessionId, Vec<u32>> = HashMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some((name, pid)) = line.rsplit_once(':') else {
+            continue;
+        };
+        // Only Tether's own sessions: a pane belonging to something else is not
+        // a workload this answer is about.
+        let Ok(id) = name.trim().parse::<SessionId>() else {
+            continue;
+        };
+        if let Ok(pid) = pid.trim().parse::<u32>() {
+            panes.entry(id).or_default().push(pid);
+        }
+    }
+    panes
+}
+
+/// Reads `pid ppid pcpu rss` rows into a process table.
+///
+/// `rss` is reported in kibibytes by both supported `ps` implementations.
+fn parse_process_table(stdout: &[u8]) -> HashMap<u32, ProcessEntry> {
+    let mut processes = HashMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent), Some(cpu), Some(rss)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(parent), Ok(cpu), Ok(rss)) = (
+            pid.parse::<u32>(),
+            parent.parse::<u32>(),
+            cpu.parse::<f32>(),
+            rss.parse::<u64>(),
+        ) else {
+            continue;
+        };
+        processes.insert(
+            pid,
+            ProcessEntry {
+                parent,
+                cpu_percent: cpu,
+                memory_bytes: rss.saturating_mul(1024),
+            },
+        );
+    }
+    processes
+}
+
+/// Sums each workload's processes, panes and everything under them.
+///
+/// The pane's own shell is usually idle while a child does the work, so a total
+/// that stopped at the pane would report a busy workload as using nothing.
+fn sum_workload_usage(
+    panes: &HashMap<SessionId, Vec<u32>>,
+    processes: &HashMap<u32, ProcessEntry>,
+) -> HashMap<SessionId, ResourceUsage> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, entry) in processes {
+        children.entry(entry.parent).or_default().push(*pid);
+    }
+    let mut usage = HashMap::new();
+    for (id, roots) in panes {
+        let mut cpu_percent = 0.0;
+        let mut memory_bytes = 0u64;
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut pending: Vec<u32> = roots.clone();
+        let mut found = false;
+        while let Some(pid) = pending.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(entry) = processes.get(&pid) {
+                found = true;
+                cpu_percent += entry.cpu_percent;
+                memory_bytes = memory_bytes.saturating_add(entry.memory_bytes);
+            }
+            if let Some(descendants) = children.get(&pid) {
+                pending.extend(descendants.iter().copied());
+            }
+        }
+        // A pane whose processes are all gone is not a workload using nothing;
+        // it is a workload this answer says nothing about.
+        if found {
+            usage.insert(
+                *id,
+                ResourceUsage {
+                    cpu_percent,
+                    memory_bytes,
+                },
+            );
+        }
+    }
+    usage
 }
 
 /// The command that runs a workload's health check where the workload runs.
@@ -1208,5 +1487,116 @@ mod tests {
             receiver.recv().is_err(),
             "a workload with no probe must report nothing about serving"
         );
+    }
+
+    fn session(tail: u8) -> SessionId {
+        format!("tether-0197f1980000700080000000000000{tail:02}")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_workload_totals_every_process_under_its_panes() {
+        // The pane's shell is idle; the compiler underneath it is not. A total
+        // that stopped at the pane would report this workload as using nothing,
+        // which is the whole failure this sums past.
+        let panes = HashMap::from([(session(1), vec![100]), (session(2), vec![200, 201])]);
+        let processes = HashMap::from([
+            (
+                100,
+                ProcessEntry {
+                    parent: 1,
+                    cpu_percent: 0.1,
+                    memory_bytes: 2 * 1024 * 1024,
+                },
+            ),
+            (
+                101,
+                ProcessEntry {
+                    parent: 100,
+                    cpu_percent: 90.0,
+                    memory_bytes: 500 * 1024 * 1024,
+                },
+            ),
+            (
+                102,
+                ProcessEntry {
+                    parent: 101,
+                    cpu_percent: 10.0,
+                    memory_bytes: 10 * 1024 * 1024,
+                },
+            ),
+            (
+                200,
+                ProcessEntry {
+                    parent: 1,
+                    cpu_percent: 1.0,
+                    memory_bytes: 1024 * 1024,
+                },
+            ),
+            (
+                201,
+                ProcessEntry {
+                    parent: 1,
+                    cpu_percent: 2.0,
+                    memory_bytes: 1024 * 1024,
+                },
+            ),
+        ]);
+
+        let usage = sum_workload_usage(&panes, &processes);
+        let first = usage.get(&session(1)).expect("the busy workload is summed");
+        assert!(
+            (first.cpu_percent - 100.1).abs() < 0.01,
+            "the pane and everything under it: {first:?}"
+        );
+        assert_eq!(first.memory_bytes, 512 * 1024 * 1024);
+        // A session with two panes is one workload.
+        let second = usage.get(&session(2)).expect("both panes are one workload");
+        assert!((second.cpu_percent - 3.0).abs() < 0.01, "{second:?}");
+        assert_eq!(second.memory_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_workload_whose_processes_are_gone_is_absent_rather_than_zero() {
+        // Nothing under this pane is in the process table any more. Reporting
+        // zero would say the workload is idle; it has to say nothing at all so
+        // the caller can report it as unknown.
+        let panes = HashMap::from([(session(1), vec![999])]);
+        let usage = sum_workload_usage(&panes, &HashMap::new());
+        assert!(
+            !usage.contains_key(&session(1)),
+            "an absent process is not a zero figure: {usage:?}"
+        );
+    }
+
+    #[test]
+    fn a_process_table_row_is_read_or_ignored_but_never_guessed() {
+        let processes = parse_process_table(
+            b"  100     1  12.5  4096\n\
+              101   100   0.0   2048\n\
+              garbage row\n\
+              102   100   notanumber 4\n",
+        );
+        assert_eq!(processes.len(), 2, "{processes:?}");
+        let entry = processes.get(&100).unwrap();
+        assert_eq!(entry.parent, 1);
+        assert!((entry.cpu_percent - 12.5).abs() < 0.01);
+        // `ps` reports resident size in kibibytes on both supported platforms.
+        assert_eq!(entry.memory_bytes, 4096 * 1024);
+    }
+
+    #[test]
+    fn only_tether_owned_panes_are_matched_to_workloads() {
+        let panes = parse_pane_pids(
+            format!(
+                "{}:100\nsomeone-elses-session:200\n{}:notapid\n",
+                session(1),
+                session(2)
+            )
+            .as_bytes(),
+        );
+        assert_eq!(panes.len(), 1, "{panes:?}");
+        assert_eq!(panes.get(&session(1)), Some(&vec![100]));
     }
 }

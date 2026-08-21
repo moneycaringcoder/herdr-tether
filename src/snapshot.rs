@@ -194,6 +194,10 @@ pub fn collect(
     let status_run = status_service.try_start(StatusRequest {
         generation,
         hosts: status_hosts,
+        // The snapshot reports what Tether observed about a workload's
+        // lifecycle, not what its host is spending on it, so it does not pay for
+        // figures it would discard.
+        resources: false,
     });
     let discovery_run = discovery_service.start(DiscoveryRequest {
         generation,
@@ -577,6 +581,10 @@ fn apply_status(
         // health result. Its JSON reports what Tether observed, not what a
         // workload's own probe says.
         StatusMessage::Health { .. } => {}
+        // Resource figures are display-only, and the snapshot schema is a
+        // versioned public interface: adding a field here is a schema decision,
+        // not a side effect of collecting one more fact.
+        StatusMessage::Resources { .. } => {}
         StatusMessage::Catalog {
             host,
             status,

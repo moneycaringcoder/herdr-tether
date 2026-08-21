@@ -359,6 +359,37 @@ impl TmuxBackend {
         )
     }
 
+    /// Asks which process each pane on this host was started for.
+    ///
+    /// A workload is a session, and Tether stores its session identity rather
+    /// than a process id, so this is what connects an owned workload to the
+    /// processes running under it. One call covers every session, which is why a
+    /// host's cost does not grow with the number of workloads on it.
+    pub(crate) fn pane_pids_spec(&self) -> Result<CommandSpec> {
+        self.tmux_spec(
+            vec![
+                "list-panes".to_owned(),
+                "-a".to_owned(),
+                "-F".to_owned(),
+                "#{session_name}:#{pane_pid}".to_owned(),
+            ],
+            false,
+        )
+    }
+
+    /// Asks the host for its process table, once.
+    ///
+    /// Every process with its parent, processor share, and resident size, so a
+    /// workload's total can be summed from the panes down without asking per
+    /// workload. `ps` is specified by POSIX and these four columns are common to
+    /// the Linux and macOS implementations Tether supports.
+    pub(crate) fn process_table_spec(&self) -> Result<CommandSpec> {
+        self.shell_spec(vec![
+            "-c".to_owned(),
+            "ps -Ao pid=,ppid=,pcpu=,rss=".to_owned(),
+        ])
+    }
+
     pub fn attach_external_command(&self, name: &ExternalSessionName) -> Result<CommandSpec> {
         self.tmux_spec(
             vec![

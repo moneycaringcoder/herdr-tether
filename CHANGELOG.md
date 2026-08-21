@@ -84,6 +84,18 @@
   comes from Herdr's typed snapshot and events. Every line above the output now
   earns its row and none may take the last one, so a short tile still shows
   output rather than only labels.
+- Per-workload resource reporting. A running picker row now carries what that
+  workload's processes are using on their host - `[144% cpu · 1.5G rss]` beside
+  the liveness and health it already showed - so "which of these twenty is eating
+  the machine" is answered on screen. A workload is a `tmux` session rather than
+  one process, so the figures are totals for every process under its panes; the
+  pane's own shell is usually idle while a child does the work. Each host is asked
+  two questions per refresh whatever the number of workloads on it, under one
+  bounded phase. Absence is explicit: `usage unknown` when a host could not be
+  asked, did not answer, answered unusably, or does not account for a workload's
+  processes, and an unreachable host is not asked at all. Figures are
+  display-only, never persisted, and deliberately not part of the versioned
+  `snapshot` JSON.
 
 ### Changed
 
