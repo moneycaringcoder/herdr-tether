@@ -227,6 +227,78 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
     );
 }
 
+/// A fake `tmux` that answers the exact inspection with `line` and lets the
+/// close path succeed, which needs `if-shell` to exit cleanly with no output.
+fn write_close_aware_fake(path: &Path, log: &Path, line: &str) {
+    let script = format!(
+        "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\nlist-sessions) printf '%s' '{line}';;\nesac\nexit 0\n",
+        log = log.display(),
+        line = line.replace('\'', "'\\''"),
+    );
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn stop_fixture(line: &str) -> (tempfile::TempDir, StateStore, LifecycleService) {
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    write_close_aware_fake(&tmux, &temp.path().join("tmux.args"), line);
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+    (temp, store, service)
+}
+
+#[test]
+fn stopping_an_already_dead_workload_keeps_the_exit_status_it_observed() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // A dead pane that `remain-on-exit` kept listed, reporting status 2. This is
+    // the only moment that status exists anywhere: reaping the pane destroys it.
+    let (_temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:1:2:0197f198000070008000000000000002",
+    );
+
+    let result = service.stop_owned(id()).unwrap();
+    assert_eq!(result.workload, ClosedWorkload::Terminated);
+
+    let state = store.load().unwrap();
+    let record = &state.sessions[0];
+    assert_eq!(record.status, SessionStatus::Ended);
+    assert_eq!(
+        record.exit_status,
+        Some(2),
+        "reaping a workload that already failed must not erase how it failed"
+    );
+}
+
+#[test]
+fn stopping_a_running_workload_records_no_exit_status() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // Tether ended this one on purpose, so any status would describe the kill
+    // rather than the work.
+    let (_temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002",
+    );
+
+    let result = service.stop_owned(id()).unwrap();
+    assert_eq!(result.workload, ClosedWorkload::Terminated);
+
+    let state = store.load().unwrap();
+    assert_eq!(state.sessions[0].status, SessionStatus::Ended);
+    assert_eq!(state.sessions[0].exit_status, None);
+}
+
 #[test]
 fn owned_close_unknown_preserves_active_but_close_failure_leaves_closing() {
     let _guard = FAKE_PROCESS_LOCK.lock();

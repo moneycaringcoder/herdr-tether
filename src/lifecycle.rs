@@ -155,14 +155,25 @@ impl LifecycleService {
         };
         self.ensure_stopping(&record, identity)?;
 
+        // A workload whose command already exited holds the only exit status
+        // anyone will ever see: the pane is dead, and reaping it destroys the
+        // evidence. Tether ending a *running* workload is different, and still
+        // records nothing, because the status would describe the kill rather
+        // than the work.
+        let mut observed_exit_status = None;
         let workload = if let Some(identity) = identity {
             match self.inspect_exact(&backend, &id, &ownership_proof)? {
                 WorkloadState::Running {
                     identity: current, ..
-                }
-                | WorkloadState::Ended {
-                    identity: current, ..
                 } if current == identity => {
+                    self.close_exact(&backend, id, &ownership_proof, identity)?;
+                    ClosedWorkload::Terminated
+                }
+                WorkloadState::Ended {
+                    identity: current,
+                    exit_status,
+                } if current == identity => {
+                    observed_exit_status = exit_status;
                     self.close_exact(&backend, id, &ownership_proof, identity)?;
                     ClosedWorkload::Terminated
                 }
@@ -173,7 +184,7 @@ impl LifecycleService {
         } else {
             ClosedWorkload::Missing
         };
-        self.finish_close(&id, &record.target, None)?;
+        self.finish_close(&id, &record.target, observed_exit_status)?;
         Ok(CloseOwnedResult { id, workload })
     }
 

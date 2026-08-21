@@ -1481,6 +1481,7 @@ fn observer_workers(
                 live_agent,
                 owned,
                 last_observed,
+                incarnation: record.and_then(|record| record.tmux_session_id),
                 latency_ms: live_agent.then_some(mission_latency_ms).flatten(),
                 capture: None,
             }
@@ -1725,6 +1726,7 @@ mod tests {
             live_agent: false,
             owned: true,
             last_observed: None,
+            incarnation: None,
             latency_ms: None,
             capture: capture.map(str::to_owned),
         }
@@ -1953,65 +1955,159 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_failing_exit_notifies_with_its_status_only_when_the_setting_allows_it() {
+    fn served_notification(
+        directory: &std::path::Path,
+        name: &str,
+        notifications: NotificationDefaults,
+        attention: WorkerAttention,
+    ) -> Option<serde_json::Value> {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
-        let temp = tempfile::tempdir().unwrap();
-        let attention = [WorkerAttention {
-            worker_id: "w".to_owned(),
-            label: "Worker w".to_owned(),
-            reason: AttentionReason::Failed { exit_status: 2 },
-        }];
-
-        let socket = temp.path().join("herdr.sock");
+        let socket = directory.join(name);
         let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-            let id = request["id"].as_str().unwrap().to_owned();
-            writeln!(
-                stream,
-                "{}",
-                serde_json::json!({"id": id, "result": {"type": "notification_show", "shown": true}})
-            )
-            .unwrap();
-            request
+            // Long enough for a local socket connection, short enough that the
+            // cases which must send nothing do not pad the suite.
+            for _ in 0..100 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut request)
+                            .unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                        let id = request["id"].as_str().unwrap().to_owned();
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({
+                                "id": id,
+                                "result": {"type": "notification_show", "shown": true},
+                            })
+                        )
+                        .unwrap();
+                        return Some(request);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            None
         });
         notify_attention(
-            Some(&HerdrSocketClient::new(socket.clone())),
-            NotificationDefaults::default(),
-            &attention,
+            Some(&HerdrSocketClient::new(socket)),
+            notifications,
+            &[attention],
         );
-        let request = server.join().unwrap();
-        assert_eq!(request["method"], "notification.show");
-        assert_eq!(request["params"]["title"], "Tether");
-        assert_eq!(request["params"]["sound"], "request");
-        assert_eq!(request["params"]["body"], "Worker w exited with status 2");
+        server.join().unwrap()
+    }
 
-        // Turning the setting off means nothing is sent at all, rather than a
-        // toast Herdr is asked to suppress.
-        let quiet_socket = temp.path().join("quiet.sock");
-        let quiet = UnixListener::bind(&quiet_socket).unwrap();
-        quiet.set_nonblocking(true).unwrap();
-        notify_attention(
-            Some(&HerdrSocketClient::new(quiet_socket)),
-            NotificationDefaults {
-                workload_failed: false,
-                ..NotificationDefaults::default()
-            },
-            &attention,
+    #[cfg(unix)]
+    #[test]
+    fn each_attention_reason_notifies_with_its_own_sound_and_wording() {
+        let temp = tempfile::tempdir().unwrap();
+        let attention = |reason| WorkerAttention {
+            worker_id: "w".to_owned(),
+            label: "Worker w".to_owned(),
+            reason,
+        };
+        let cases = [
+            (
+                "blocked",
+                AttentionReason::Agent(ObserverAgentState::Blocked),
+                "request",
+                "Worker w is BLOCKED",
+            ),
+            (
+                "done",
+                AttentionReason::Agent(ObserverAgentState::Done),
+                "done",
+                "Worker w is DONE",
+            ),
+            (
+                "failed",
+                AttentionReason::Failed { exit_status: 2 },
+                "request",
+                "Worker w exited with status 2",
+            ),
+        ];
+        for (name, reason, sound, body) in cases {
+            let request = served_notification(
+                temp.path(),
+                name,
+                NotificationDefaults::default(),
+                attention(reason),
+            )
+            .unwrap_or_else(|| panic!("{name} should have notified"));
+            assert_eq!(request["method"], "notification.show");
+            assert_eq!(request["params"]["title"], "Tether");
+            assert_eq!(request["params"]["sound"], sound, "{name}");
+            assert_eq!(request["params"]["body"], body, "{name}");
+        }
+
+        // A state nobody asked to hear about sends nothing at all.
+        assert!(
+            served_notification(
+                temp.path(),
+                "working",
+                NotificationDefaults::default(),
+                attention(AttentionReason::Agent(ObserverAgentState::Working)),
+            )
+            .is_none()
         );
-        assert_eq!(
-            quiet.accept().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock,
-            "a disabled notification must not reach the socket"
-        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disabled_setting_sends_nothing_rather_than_a_suppressed_toast() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "failed-off",
+                NotificationDefaults {
+                    workload_failed: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Failed { exit_status: 2 },
+            ),
+            (
+                "blocked-off",
+                NotificationDefaults {
+                    agent_blocked: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Agent(ObserverAgentState::Blocked),
+            ),
+            (
+                "done-off",
+                NotificationDefaults {
+                    agent_done: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Agent(ObserverAgentState::Done),
+            ),
+        ];
+        for (name, notifications, reason) in cases {
+            assert!(
+                served_notification(
+                    temp.path(),
+                    name,
+                    notifications,
+                    WorkerAttention {
+                        worker_id: "w".to_owned(),
+                        label: "Worker w".to_owned(),
+                        reason,
+                    },
+                )
+                .is_none(),
+                "{name} must not reach the socket"
+            );
+        }
     }
 
     #[derive(Default)]

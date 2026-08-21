@@ -5,6 +5,7 @@ mod observer;
 #[path = "../src/model.rs"]
 mod model;
 
+use model::TmuxSessionId;
 use observer::{
     AttentionReason, MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, MAX_PROMPT_TARGETS,
     ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture, ObserverInputKind,
@@ -29,6 +30,7 @@ fn worker(id: &str) -> ObserverWorker {
         live_agent: false,
         owned: true,
         last_observed: None,
+        incarnation: None,
         latency_ms: None,
         capture: Some(format!("output-{id}")),
     }
@@ -481,20 +483,24 @@ fn attention_reports_each_transition_into_blocked_or_done_exactly_once() {
 }
 
 #[test]
-fn a_workload_that_ends_with_a_failing_status_is_reported_once() {
+fn a_workload_that_ends_with_a_failing_status_is_reported_once_per_incarnation() {
+    let first: TmuxSessionId = "$1".parse().unwrap();
+    let second: TmuxSessionId = "$2".parse().unwrap();
     let mut observer = ObserverState::new(Vec::new());
-    let running = ObserverWorker {
+    let running = |incarnation: TmuxSessionId| ObserverWorker {
         lifecycle: ObserverLifecycle::Running,
+        incarnation: Some(incarnation),
         ..worker("w")
     };
-    let failed = ObserverWorker {
+    let failed = |incarnation: TmuxSessionId| ObserverWorker {
         lifecycle: ObserverLifecycle::Failed { exit_status: 2 },
+        incarnation: Some(incarnation),
         ..worker("w")
     };
 
-    assert!(observer.update_workers(vec![running.clone()]).is_empty());
+    assert!(observer.update_workers(vec![running(first)]).is_empty());
 
-    let attention = observer.update_workers(vec![failed.clone()]);
+    let attention = observer.update_workers(vec![failed(first)]);
     assert_eq!(attention.len(), 1);
     assert_eq!(attention[0].worker_id, "w");
     assert_eq!(
@@ -505,20 +511,22 @@ fn a_workload_that_ends_with_a_failing_status_is_reported_once() {
     // The Observer refreshes on a timer, so a workload that is still failed is
     // not news.
     assert!(
-        observer.update_workers(vec![failed.clone()]).is_empty(),
+        observer.update_workers(vec![failed(first)]).is_empty(),
         "a failing end must be reported once, not on every refresh"
     );
 
-    // A restart that fails again is a new event.
-    observer.update_workers(vec![running]);
-    let attention = observer.update_workers(vec![ObserverWorker {
-        lifecycle: ObserverLifecycle::Failed { exit_status: 3 },
-        ..worker("w")
-    }]);
+    // A restart that fails the same way is a different incarnation, and the
+    // whole restart can land between two refreshes, so the exit status cannot be
+    // what tells the two failures apart.
+    let attention = observer.update_workers(vec![failed(second)]);
+    assert_eq!(attention.len(), 1, "a re-failure is a new event");
     assert_eq!(
         attention[0].reason,
-        AttentionReason::Failed { exit_status: 3 }
+        AttentionReason::Failed { exit_status: 2 }
     );
+
+    // Still the same incarnation on the next refresh: silent again.
+    assert!(observer.update_workers(vec![failed(second)]).is_empty());
 }
 
 #[test]

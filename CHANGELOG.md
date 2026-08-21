@@ -14,12 +14,12 @@
 - A workload that ends with a failing status is now named as one. The picker
   reads `[failed]` instead of `[ended]`, a Mission Control tile reads `FAILED`,
   `session list` reads `Failed (exit 2)`, and a Mission Control surface that sees
-  a workload reach a failing end asks Herdr for a toast naming the workload and
-  its status. `notifications.workload_failed` controls the toast and defaults to
-  true; a configuration written before the setting existed keeps that default
-  rather than reading as off. An end whose status `tmux` could not report stays
-  `ended`, because an unknown outcome is not a failure, and an explicit Stop
-  records no status at all.
+  a workload in that state asks Herdr for a toast, once per workload
+  incarnation rather than once per refresh. `notifications.workload_failed`
+  controls the toast and defaults to true; a configuration written before the
+  setting existed keeps that default rather than reading as off. An end whose
+  status `tmux` could not report stays `ended`, because an unknown outcome is
+  not a failure.
 
 ### Changed
 
@@ -44,6 +44,11 @@
 
 ### Fixed
 
+- Stopping a workload whose command had already exited no longer discards the
+  exit status `tmux` reported for it. The pane was already dead, so reaping it
+  was destroying the only record of how the work ended, and the workload then
+  read as a clean finish. Stopping a workload that is still running still records
+  no status, because that status would describe the kill rather than the work.
 - A signal arriving while a bounded `tmux` or SSH command is being polled no
   longer ends the command as a transport failure. `Child::try_wait` reports an
   interruption rather than repeating its `waitpid`, so a `SIGWINCH` that landed

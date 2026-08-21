@@ -1393,6 +1393,49 @@ fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() 
 }
 
 #[test]
+fn session_lists_name_a_failing_exit_in_text_and_keep_the_status_in_json() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
+    let state = r#"{"version":4,"sessions":[
+{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/failed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z","exit_status":2},
+{"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/clean","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-03T00:00:00Z","exit_status":0}
+],"orchestration_groups":[]}"#;
+    fs::write(sandbox.state_file(), state).unwrap();
+
+    let human = sandbox
+        .command()
+        .args(["session", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    let statuses: Vec<&str> = human
+        .lines()
+        .map(|line| line.rsplit('\t').next().unwrap())
+        .collect();
+    assert_eq!(statuses, ["Failed (exit 2)", "Ended"]);
+
+    // The JSON form is the state record, so it keeps the stored vocabulary and
+    // reports the status as its own field rather than renaming the state.
+    let json_output = sandbox
+        .command()
+        .args(["session", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: serde_json::Value = serde_json::from_slice(&json_output).unwrap();
+    let records = listed.as_array().unwrap();
+    assert_eq!(records[0]["status"], "ended");
+    assert_eq!(records[0]["exit_status"], 2);
+    assert_eq!(records[1]["exit_status"], 0);
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), state);
+}
+
+#[test]
 fn external_attach_is_exact_and_does_not_mutate_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();

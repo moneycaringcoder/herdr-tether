@@ -52,7 +52,7 @@ Observation and persistence are deliberately separate. A refresh may update what
 
 Tether asks `tmux` for native pane status and exit information when the installed version supports it. This prevents a completed command from lingering as contradictory running/missing work or being offered as resumable.
 
-A failing exit status is kept apart from a clean one, because they are the two outcomes worth telling apart at a glance. When a Mission Control surface is open and observes a workload reaching a failing end, it also asks Herdr for a toast naming the workload and its exit status, which `notifications.workload_failed` controls. Nothing observes a workload while no Tether surface is running, so the notice arrives when the end is observed rather than the moment it happens.
+A failing exit status is kept apart from a clean one, because they are the two outcomes worth telling apart at a glance. Tether records one when it reconciles a workload against `tmux`: when Stop reaps a workload whose command had already exited, or when a restart's verification finds the new incarnation already ended. Nothing watches a workload continuously, so a command that exits while no operation is running is recorded the next time one is. A Mission Control surface that sees a workload in that state asks Herdr for a toast, once per incarnation, which `notifications.workload_failed` controls.
 
 Ended metadata is retained long enough to make Restart and diagnostics useful. Safe finalized history becomes eligible for automatic metadata-only cleanup after the configured retention period (30 days by default). Cleanup never contacts SSH, invokes `tmux`, stops workloads, or expands to newly eligible records during an in-progress operation.
 

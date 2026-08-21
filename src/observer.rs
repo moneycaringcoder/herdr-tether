@@ -9,7 +9,7 @@ use std::{
     fmt,
 };
 
-use crate::model::SessionId;
+use crate::model::{SessionId, TmuxSessionId};
 
 use ratatui::{
     Frame, Terminal,
@@ -133,6 +133,7 @@ struct PreviousWorkerState {
     live_agent: bool,
     agent_state: ObserverAgentState,
     lifecycle: ObserverLifecycle,
+    incarnation: Option<TmuxSessionId>,
 }
 
 /// A worker that just entered a state a person may want to know about.
@@ -164,6 +165,12 @@ pub struct ObserverWorker {
     pub owned: bool,
     pub last_observed: Option<String>,
     pub latency_ms: Option<u64>,
+    /// The exact `tmux` incarnation this worker's state describes.
+    ///
+    /// A restart produces a new one, which is what tells a repeated failure
+    /// apart from the same failure seen again. The exit status cannot: a command
+    /// that keeps failing keeps failing the same way.
+    pub incarnation: Option<TmuxSessionId>,
     /// Untrusted capture content. Rendering sanitizes and bounds it before display.
     pub capture: Option<String>,
 }
@@ -464,6 +471,7 @@ impl ObserverState {
                         latency_ms: worker.latency_ms,
                         agent_state: worker.agent_state,
                         lifecycle: worker.lifecycle,
+                        incarnation: worker.incarnation,
                     },
                 )
             })
@@ -554,9 +562,12 @@ impl ObserverState {
                 label: worker.display_title(),
                 reason: AttentionReason::Agent(worker.agent_state),
             });
-        // A failing end is reported once, when it is first seen. A worker that
-        // was already failing is not news, and a worker seen for the first time
-        // already failed before this Observer opened.
+        // A failing end is reported once per incarnation. A worker seen for the
+        // first time already failed before this Observer opened, which is
+        // history rather than news; a worker that stays failed is not news
+        // either. A restart that fails again is a different incarnation, and a
+        // command that fails the same way twice is the ordinary case, so the
+        // exit status cannot be what tells them apart.
         let failures = self
             .workers
             .iter()
@@ -565,9 +576,10 @@ impl ObserverState {
                 _ => None,
             })
             .filter(|(worker, _)| {
-                previous_workers
-                    .get(&worker.id)
-                    .is_some_and(|previous| previous.lifecycle != worker.lifecycle)
+                previous_workers.get(&worker.id).is_some_and(|previous| {
+                    !matches!(previous.lifecycle, ObserverLifecycle::Failed { .. })
+                        || previous.incarnation != worker.incarnation
+                })
             })
             .map(|(worker, exit_status)| WorkerAttention {
                 worker_id: worker.id.clone(),
