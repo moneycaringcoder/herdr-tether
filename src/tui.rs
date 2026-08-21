@@ -1671,34 +1671,53 @@ impl PickerState {
         })
     }
 
-    /// Whether the selected host's status is a retained answer being rechecked.
-    fn current_host_stale(&self) -> bool {
-        let Some(host) = self.options.hosts.get(self.host_index) else {
-            return false;
-        };
-        self.host_status
-            .get(&host.name)
-            .is_some_and(|cell| cell.stale)
+    /// The selected host's retained status while a new check is in flight.
+    ///
+    /// The retained value matters: a host that was already failing is still
+    /// failing until the new answer lands, and telling someone to wait would
+    /// deny the problem their row is reporting.
+    fn current_host_rechecking(&self) -> Option<HostReachability> {
+        let host = self.options.hosts.get(self.host_index)?;
+        let cell = self.host_status.get(&host.name)?;
+        cell.stale.then_some(cell.value).flatten()
     }
 
     /// The sentence shown when the selected host's status cannot be trusted.
     ///
-    /// `[stale: …]` and an unreachable host both mean the row is not current,
-    /// but for different reasons and with different remedies: one is waiting for
-    /// an answer that is already on its way, the other needs the host fixed
-    /// first. Saying which one it is here keeps that out of the documentation.
-    fn reachability_notice(&self) -> Option<&'static str> {
-        if self.current_host_stale() {
-            return Some(
-                "Stale · last answer shown while a new check runs · actions wait for it, no retry needed",
-            );
+    /// `[stale: …]` and a failed check both mean the row is not current, but for
+    /// different reasons and with different remedies: one is waiting for an
+    /// answer that is already on its way, the other needs the host fixed first.
+    /// Saying which one it is here keeps that out of the documentation. The
+    /// wording leads with the word the row itself shows, so there is no fourth
+    /// vocabulary to learn.
+    fn reachability_notice(&self) -> Option<String> {
+        // Only the resource stage withholds anything on host status; at the host
+        // stage `Enter` still selects, so a notice about waiting would be wrong.
+        if self.stage != PickerStage::Resource {
+            return None;
         }
-        if self.current_host_unreachable() {
-            return Some(
-                "Unreachable · the check failed, so the state is unproven · actions that would guess are withheld · fix the host, then r Retry",
-            );
+        if let Some(retained) = self.current_host_rechecking() {
+            if retained == HostReachability::Reachable {
+                return Some(
+                    "Rechecking · the last answer is shown until the new one lands · open, restart, and stop wait for it".to_owned(),
+                );
+            }
+            // Still failing, and being rechecked. Waiting is not the remedy.
+            return Some(format!(
+                "Rechecking · still {} since the last check · fix the host; r Retry checks again",
+                host_status_text(&retained)
+            ));
         }
-        None
+        let host = self.options.hosts.get(self.host_index)?;
+        let cell = self.host_status.get(&host.name)?;
+        let status = cell.value.filter(|_| !cell.stale)?;
+        if status == HostReachability::Reachable {
+            return None;
+        }
+        Some(format!(
+            "{} · the check failed, so the state is unproven · open, restart, and stop are withheld rather than guessed · fix the host, then r Retry",
+            host_status_text(&status)
+        ))
     }
 
     fn current_legacy_id(&self) -> Option<SessionId> {
@@ -2541,10 +2560,10 @@ impl PickerState {
                 {
                     parts.push(waiting);
                 }
-                // The host's own state explains the rows under it, so it is worth
-                // saying on both the host and the resource stage.
+                // The host's own state explains the rows under it, and at this
+                // stage its actions are the ones being withheld.
                 if let Some(notice) = self.reachability_notice() {
-                    parts.push(notice.to_owned());
+                    parts.push(notice);
                 }
                 let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
                     if self.current_legacy_id().is_some() {
@@ -3830,27 +3849,27 @@ mod close_render_tests {
     }
 
     #[test]
-    fn a_stale_host_and_an_unreachable_one_read_apart_in_the_footer() {
+    fn a_rechecked_host_and_a_failed_check_read_apart_in_the_footer() {
         let (mut picker, _) = close_picker();
         picker.handle(PickerEvent::DismissClose);
 
         // A reachable host explains nothing: there is nothing wrong to explain.
         let reachable = picker.footer_text();
-        assert!(!reachable.contains("Stale ·"), "{reachable}");
-        assert!(!reachable.contains("Unreachable ·"), "{reachable}");
+        assert!(!reachable.contains("Rechecking"), "{reachable}");
+        assert!(!reachable.contains("withheld"), "{reachable}");
 
-        // A refresh in flight over a previous answer. The remedy is to wait, so
-        // the footer must not send the user off to fix a host that is fine.
+        // A refresh in flight over an answer that was fine. The remedy is to
+        // wait, so the footer must not send anyone off to fix a healthy host.
         picker.begin_refresh(10);
-        let stale = picker.footer_text();
-        assert!(stale.contains("Stale ·"), "{stale}");
+        let rechecking = picker.footer_text();
+        assert!(rechecking.contains("Rechecking"), "{rechecking}");
         assert!(
-            stale.contains("new check runs") && stale.contains("no retry needed"),
-            "a stale row must say the answer is already on its way: {stale}"
+            rechecking.contains("until the new one lands"),
+            "a recheck over a good answer must say the wait is the remedy: {rechecking}"
         );
-        assert!(!stale.contains("fix the host"), "{stale}");
+        assert!(!rechecking.contains("fix the host"), "{rechecking}");
 
-        // The check itself failed. Now the remedy is the host, and the footer
+        // The check itself failed. The footer names the state the row shows and
         // says why the actions went away rather than leaving them missing.
         assert!(picker.apply_status(StatusMessage::Host {
             generation: 10,
@@ -3859,16 +3878,27 @@ mod close_render_tests {
             detail: Some("connection refused".to_owned()),
             checked_at: std::time::SystemTime::now(),
         }));
-        let unreachable = picker.footer_text();
-        assert!(unreachable.contains("Unreachable ·"), "{unreachable}");
+        let failed = picker.footer_text();
         assert!(
-            unreachable.contains("unproven") && unreachable.contains("withheld"),
-            "an unreachable row must say why its actions are gone: {unreachable}"
+            failed.contains("offline · the check failed"),
+            "the footer must lead with the word the row shows: {failed}"
         );
-        assert!(unreachable.contains("r Retry"), "{unreachable}");
+        assert!(failed.contains("withheld rather than guessed"), "{failed}");
+        assert!(failed.contains("r Retry"), "{failed}");
+        assert!(!failed.contains("Rechecking"), "{failed}");
+
+        // Rechecking a host that was already failing must not claim the wait is
+        // the remedy: it is still offline until the new answer says otherwise.
+        picker.begin_refresh(11);
+        let still_failing = picker.footer_text();
         assert!(
-            !unreachable.contains("Stale ·"),
-            "the two states must not read the same: {unreachable}"
+            still_failing.contains("still offline"),
+            "a recheck over a failure must keep naming the failure: {still_failing}"
+        );
+        assert!(still_failing.contains("fix the host"), "{still_failing}");
+        assert!(
+            !still_failing.contains("no retry needed"),
+            "{still_failing}"
         );
     }
 

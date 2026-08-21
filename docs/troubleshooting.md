@@ -142,14 +142,27 @@ Control while disconnected still leaves every Tether workload running.
 
 `UNREACHABLE` and `STALE` both mean the tile is not current, and each says which
 it is and what to do about it on the tile itself, so this page is a reference
-rather than a requirement. `STALE` means the information shown is remembered:
-either retained output that could not be re-read, with the time it was last
-live, or a binding that is no longer exactly one recognized occupant. `r` retries
-in both cases; a binding that stays stale needs the pane reopened rather than
-worked around. `UNREACHABLE` means nothing was retained and nothing answered, so
-the remedy is access to Herdr or the host first. In the picker, `[stale: …]` on a
-host means the previous answer is on screen while a new check runs, which needs
-no retry, and an unreachable host means the check itself failed.
+rather than a requirement.
+
+`STALE` has three reasons, and the tile names the one that applies. Output that
+could not be re-read is shown as retained, with the time it was last live.
+A lost Mission Control connection shows the last known state, also dated, and
+comes back on its own once the connection does. A binding that is no longer
+exactly one recognized occupant is different: `r` resnapshots, but if the pane
+really moved or was replaced, the worker has to be reopened from the picker
+rather than worked around.
+
+`UNREACHABLE` means nothing answered. When there is nothing retained the tile
+says so, because there is no remembered output to read; when Herdr is
+unreachable but `tmux` capture still worked, the tile shows that output and dates
+it as not current rather than claiming it is live. The remedy is access to Herdr
+or the host first.
+
+In the picker, a host being rechecked keeps whatever its last answer was: if that
+answer was good, the footer says the wait is the remedy, and if the host was
+already failing it keeps naming the failure instead of implying a fix is in
+progress. A host whose check failed says why open, restart, and stop are
+withheld, using the same word the row shows - `offline`, `timeout`, or `error`.
 
 ## The picker is difficult to read or use with assistive technology
 

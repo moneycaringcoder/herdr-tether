@@ -38,7 +38,7 @@ use crate::{
     observer::{
         AttentionReason, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
         ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
-        ObserverWorker, WorkerAttention, render,
+        ObserverWorker, StaleReason, WorkerAttention, render,
     },
     paths::AppPaths,
     state::{
@@ -1491,6 +1491,11 @@ fn observer_workers(
                 incarnation: record.and_then(|record| record.tmux_session_id),
                 latency_ms: live_agent.then_some(mission_latency_ms).flatten(),
                 capture: None,
+                // In this projection the only way to be stale is a binding that
+                // is no longer exactly one recognized occupant; a lost
+                // connection reads as unreachable here and is named later.
+                stale_reason: (agent_state == ObserverAgentState::Stale)
+                    .then_some(StaleReason::Binding),
             }
         })
         .collect()
@@ -1736,6 +1741,7 @@ mod tests {
             incarnation: None,
             latency_ms: None,
             capture: capture.map(str::to_owned),
+            stale_reason: None,
         }
     }
 

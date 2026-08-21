@@ -40,15 +40,19 @@
   share one bounded budget, so a refresh costs the same however many workloads
   are probed. Results are display-only: nothing is persisted, no lifecycle
   action is unlocked or withheld, and no probe runs on a schedule.
-- `UNREACHABLE` and `STALE` now explain themselves where they are shown. Both
-  mean a tile is not current, and the tile now says which reason applies and
-  what to do: retained output that could not be re-read names the time it was
-  last live, a binding that is no longer exactly one recognized occupant says so
-  and that reopening is the remedy if the pane moved, and an unreachable worker
-  says nothing was retained and nothing answered. The explanation shortens rather
-  than clipping on a narrow tile, so the key never falls off the end. In the
-  picker, a host whose previous answer is shown while a new check runs says the
-  wait needs no retry, and an unreachable host says why its actions are withheld.
+- `UNREACHABLE` and `STALE` now explain themselves where they are shown. A tile
+  names which of the three reasons for `STALE` applies - output that could not be
+  re-read, a lost Mission Control connection, or a binding that is no longer
+  exactly one recognized occupant - because only the last one needs the worker
+  reopened rather than retried, and dates what it is still showing. An
+  unreachable tile says whether anything was retained: with Herdr unreachable but
+  `tmux` capture working it shows that output and marks it not current instead of
+  claiming it is live. Explanations shorten rather than clipping on a narrow tile,
+  never spend a tile's last row of output, and use the same word for the `r` key
+  that the surface's own controls use. In the picker, a host being rechecked keeps
+  naming a failure it already had rather than implying the wait is the fix, and a
+  host whose check failed says why open, restart, and stop are withheld, in the
+  same word the row shows.
 
 ### Changed
 
