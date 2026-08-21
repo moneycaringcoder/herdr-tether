@@ -37,6 +37,10 @@ Tether does not stream a remote Herdr workspace or federate Herdr instances. It 
 - Git and Rust 1.88 or newer
 - OpenSSH with non-interactive access already configured for remote hosts
 
+[Herdr compatibility](docs/compatibility.md) lists the Herdr releases this
+version was exercised against, per platform, so it can be checked before
+installing.
+
 Choose the source that matches your stability and reproducibility needs. Herdr
 shows the source and build commands for review before you confirm.
 

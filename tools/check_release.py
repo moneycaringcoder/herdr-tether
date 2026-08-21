@@ -22,6 +22,7 @@ PUBLIC_RELEASE_FILES = (
     Path("CHANGELOG.md"),
     Path("SECURITY.md"),
     Path("docs/architecture.md"),
+    Path("docs/compatibility.md"),
     Path("docs/quickstart.md"),
     Path("integrations/hermes/SKILL.md"),
     Path("herdr-plugin.toml"),

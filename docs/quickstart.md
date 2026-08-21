@@ -14,6 +14,8 @@ You need:
 
 Remote access must already succeed non-interactively under your normal SSH keys, agent, proxy, and `known_hosts` policy. Tether does not configure SSH trust.
 
+[Herdr compatibility](compatibility.md) lists the Herdr releases this version was exercised against, per platform. Check it before installing if you run a Herdr other than the one named there.
+
 ## 2. Install the plugin
 
 Choose one source:

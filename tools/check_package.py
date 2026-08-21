@@ -52,6 +52,7 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "assets/tether-mark.svg",
         "assets/tether-wordmark.svg",
         "docs/architecture.md",
+        "docs/compatibility.md",
         "docs/configuration.md",
         "docs/lifecycle.md",
         "docs/quickstart.md",
