@@ -94,6 +94,16 @@ against a group you did not build.
 
 Observation and persistence are deliberately separate. A refresh may update what the picker knows, but it cannot silently authorize Stop or Remove. Confirmation and error dialogs stay active until their own operation finishes or you explicitly cancel them.
 
+What counts as evidence that a workload is gone is deliberately narrow: a `tmux`
+server that answered, and held no session with that name and ownership proof.
+A `tmux` that is not installed, cannot be executed, or cannot reach a server at
+all is a failure to look, and Tether refuses the action rather than recording an
+end - the socket `tmux` uses depends on the environment, so a workload can be
+running under a server the invocation cannot see. Stop, Restart, Remove, and
+group actions all refuse on that footing and change nothing, and the refusal
+points at `herdr-tether doctor`, which already reports whether the backend is
+usable.
+
 ## Serving is a different question from running
 
 Every state above answers whether the workload's process is alive. Whether the

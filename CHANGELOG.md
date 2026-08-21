@@ -151,6 +151,19 @@
 
 ### Fixed
 
+- A Stop no longer ends a record on the strength of a `tmux` that could not reach
+  a server. The exact inspection filters by session name and ownership proof, so a
+  server that answers reports an empty list when it holds no such session - that
+  is the evidence Stop needs. Exit 1 is what `tmux` reports when it could not
+  reach a server at all, which was being read as the same thing; because the
+  socket `tmux` looks for depends on the environment, a workload can be running
+  under a server the invocation cannot see, and its record was being marked
+  `Ended` while it ran. Stop, Restart, Remove, and group actions now refuse and
+  change nothing, and the refusal points at `herdr-tether doctor` rather than
+  repeating its diagnosis. A `tmux` that is missing or not executable already
+  refused; that behaviour now has tests at the lifecycle boundary, distinct from a
+  server that genuinely reports no such session.
+
 - Stopping a workload whose command had already exited no longer discards the
   exit status `tmux` reported for it. The pane was already dead, so reaping it
   was destroying the only record of how the work ended, and the workload then

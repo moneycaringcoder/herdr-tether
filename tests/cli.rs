@@ -1600,11 +1600,46 @@ fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone()
     assert!(!stderr.contains("/srv/app"), "{stderr}");
     assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
 
-    // Back on a reachable host: the member's workload is already gone, so the
-    // group reconciles it and says so, and the legacy record stays untouched.
+    // A `tmux` that runs but cannot reach a server is not evidence either, and the
+    // group inherits that refusal because it calls the same operation.
     fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    let blind = sandbox.path("blind-bin");
+    fs::create_dir_all(&blind).unwrap();
+    let blind_tmux = blind.join("tmux");
+    fs::write(&blind_tmux, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&blind_tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = fs::read_to_string(sandbox.state_file()).unwrap();
+    let refused = sandbox
+        .command()
+        .env("PATH", &blind)
+        .args(["orchestration", "stop-workers", "fleet", "--yes"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert!(stderr.contains("could not prove whether"), "{stderr}");
+    assert!(
+        !stderr.contains("already gone"),
+        "a server that could not be reached is not a workload that ended: {stderr}"
+    );
+    assert_eq!(fs::read_to_string(sandbox.state_file()).unwrap(), before);
+
+    // Back on a reachable host, with a `tmux` that answers: the member's workload
+    // is already gone, so the group reconciles it and says so, and the legacy
+    // record stays untouched. The answer has to come from a server that replied -
+    // a `tmux` that cannot reach one is not evidence that anything ended.
+    fs::write(sandbox.state_file(), state.to_string()).unwrap();
+    let bin = sandbox.path("answering-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
     sandbox
         .command()
+        .env("PATH", &bin)
         .args(["orchestration", "stop-workers", "fleet", "--yes"])
         .assert()
         .success()

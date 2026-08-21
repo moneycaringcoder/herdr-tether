@@ -771,9 +771,16 @@ fn classify_exact_inspect(
             }
             _ => WorkloadState::Unknown,
         }
-    } else if exit_code == Some(1) {
-        WorkloadState::Missing
     } else {
+        // Exit 1 is not evidence that the workload is gone. This query filters by
+        // session name and ownership proof, so a server that is reachable answers
+        // 0 with an empty list when it holds no such session - that is the
+        // authoritative absence, handled above. Exit 1 is what `tmux` reports when
+        // it could not reach a server at all: `error connecting to <socket>` or
+        // `no server running on <socket>`. The socket depends on the environment,
+        // so a workload can be running under a server this invocation cannot see,
+        // and treating that as absence would let a failure to look end a record
+        // for a workload that is still running.
         WorkloadState::Unknown
     }
 }

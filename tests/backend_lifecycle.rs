@@ -1437,11 +1437,138 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
 }
 
 #[test]
-fn inspect_maps_missing_and_failure_results() {
+fn a_stop_refuses_when_the_inspection_could_not_run() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path.clone());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let before = fs::read_to_string(&state_path).unwrap();
+
+    // `tmux` is not installed.
+    let absent = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new("unused-ssh", "tmux-that-does-not-exist-for-test"),
+    );
+    assert!(
+        matches!(
+            absent.stop_owned(id()),
+            Err(CloseOwnedError::Inspect { .. })
+        ),
+        "a stop that could not look must not report having stopped anything"
+    );
+
+    // `tmux` is installed but cannot be executed.
+    let dud = temp.path().join("dud-tmux");
+    fs::write(&dud, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&dud, fs::Permissions::from_mode(0o000)).unwrap();
+    let unusable = LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", &dud));
+    assert!(matches!(
+        unusable.stop_owned(id()),
+        Err(CloseOwnedError::Inspect { .. })
+    ));
+
+    // `tmux` runs but cannot reach a server, which is what it reports when the
+    // socket it looks for is not the one the workload is running under.
+    let no_server = temp.path().join("no-server-tmux");
+    fs::write(
+        &no_server,
+        "#!/bin/sh\necho 'error connecting to /tmp/tmux-1000/default (No such file or directory)' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&no_server, fs::Permissions::from_mode(0o700)).unwrap();
+    let unreachable = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new("unused-ssh", &no_server),
+    );
+    let error = unreachable.stop_owned(id()).unwrap_err();
+    assert!(
+        matches!(error, CloseOwnedError::WorkloadUnknown(_)),
+        "a server Tether could not reach is not a workload that ended: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("herdr-tether doctor"),
+        "the refusal points at the existing diagnosis: {error}"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&state_path).unwrap(),
+        before,
+        "no refusal may leave the record changed"
+    );
+
+    // The distinction that makes the refusals meaningful: a server that answered,
+    // holding no such session, is evidence, and the record is ended.
+    let answering = temp.path().join("answering-tmux");
+    write_fake(&answering, &temp.path().join("tmux.args"), "", 0);
+    let reachable =
+        LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", answering));
+    assert_eq!(
+        reachable.stop_owned(id()).unwrap().workload,
+        ClosedWorkload::Missing
+    );
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
+}
+
+#[test]
+fn a_restart_and_an_observation_refuse_the_same_way() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path.clone());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![owned_record(SessionStatus::Running)],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let before = fs::read_to_string(&state_path).unwrap();
+    let no_server = temp.path().join("no-server-tmux");
+    fs::write(&no_server, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&no_server, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new("unused-ssh", &no_server),
+    );
+
+    // A restart must not create a second incarnation of a workload it cannot see,
+    // and an observation must not reconcile one to ended.
+    assert!(matches!(
+        service.restart_owned(id()),
+        Err(CloseOwnedError::WorkloadUnknown(_))
+    ));
+    assert!(matches!(
+        service.observe_owned(id()),
+        Err(CloseOwnedError::WorkloadUnknown(_))
+    ));
+    assert_eq!(fs::read_to_string(&state_path).unwrap(), before);
+}
+
+#[test]
+fn inspect_reads_only_a_reachable_server_as_evidence_of_absence() {
     let _guard = FAKE_PROCESS_LOCK.lock();
     for (status, expected) in [
+        // A server that answered, holding no session matching the name and the
+        // ownership proof: the query filters, so this is authoritative absence.
         (0, WorkloadState::Missing),
-        (1, WorkloadState::Missing),
+        // `tmux` could not reach a server. Real `tmux` reports this as
+        // `error connecting to <socket>` or `no server running on <socket>`, and
+        // the socket it looks for depends on the environment - so the workload may
+        // be running under a server this invocation cannot see.
+        (1, WorkloadState::Unknown),
         (2, WorkloadState::Unknown),
         (255, WorkloadState::Unknown),
     ] {

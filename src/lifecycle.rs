@@ -56,7 +56,9 @@ pub enum CloseOwnedError {
     UnknownSession(SessionId),
     #[error("session `{0}` is already closed")]
     AlreadyClosed(SessionId),
-    #[error("could not determine whether session `{0}` exists")]
+    #[error(
+        "could not determine whether session `{0}` exists; run `herdr-tether doctor` to check the backend, then retry"
+    )]
     WorkloadUnknown(SessionId),
     #[error("session `{0}` changed while it was closing; retry close")]
     ConcurrentModification(SessionId),
