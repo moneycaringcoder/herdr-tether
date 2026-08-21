@@ -8,6 +8,10 @@ provide remote Herdr federation or pane streaming**, and **only Tether-owned
 workloads can be stopped or removed**. Discovered external `tmux` sessions stay
 attach-only.
 
+One idea has been closed rather than deferred: **preset sharing**. Presets are
+shared by sending the TOML, and [Configuration](configuration.md) records both how
+and why there is no import command.
+
 ## Correctness
 
 ### Publish a compatibility matrix per release
@@ -69,9 +73,21 @@ make that reconstruction possible.
 Where the backend can supply it. Answers "which of these twenty is eating the
 machine", which is otherwise a manual hunt.
 
-### Preset sharing
+### Preset sharing — closed
 
-Presets are trusted code: Tether starts a login shell and runs the command
-through it, and does not sandbox anything. Any sharing mechanism has to lead with
-that, show the exact command before it is adopted, and never fetch a preset
-implicitly.
+Presets already share: sending the `[[hosts.presets]]` block is the mechanism,
+and [Configuration](configuration.md) documents it, including which host a pasted
+block binds to and what a rejected one costs.
+
+An import command was considered and declined on cost rather than on safety. One
+that printed the exact `command` and `health_command`, named the host and
+directory they would bind to, and required typed confirmation would show a
+recipient what reading the block shows them. It would also be a permanent
+surface, a file format, and a second way to add a preset, in exchange for a
+paste — and it would make preset text something Tether itself takes from
+elsewhere and then executes, which is the one intake boundary worth not moving
+for convenience.
+
+What remains worth doing is unrelated to sharing and is tracked as issue #110:
+showing a preset's command before it runs, for every preset rather than only for
+adopted ones.

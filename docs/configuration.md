@@ -158,6 +158,65 @@ workload's lifecycle. A workload whose preset has no health command, or which
 was created without a preset, reports nothing about serving rather than an
 implied pass.
 
+### Sharing a preset
+
+Send the `[[hosts.presets]]` block. A preset does not name its own host, so where
+it is pasted decides which machine the code runs on: TOML attaches the block to
+the `[[hosts]]` entry above it, and a block dropped at the end of a file lands on
+whichever host happens to be last.
+
+A host entry Tether wrote already reads `presets = []`. Replace that line with the
+block, under the host you mean:
+
+```toml
+[[hosts]]
+name = "build"
+target = "build.example.net"
+roots = ["/srv/repos"]
+
+[[hosts.presets]]
+name = "tests"
+command = "cargo test"
+```
+
+Adding the block while `presets = []` is still there is a duplicate key, and TOML
+rejects the whole file rather than that one line. The same is true of a preset
+whose name the host already uses, and of a field from a newer Tether that this one
+does not know: adopting one block can leave the entire configuration unusable
+until it is removed. `doctor` reports it as `unusable` and names the line.
+
+Read what you are given the way you would read a shell script from the same
+person. A preset is code: `command`, and `health_command` when there is one, each
+run through `/bin/sh -c` on that host, as your login user there.
+
+`herdr-tether host add NAME TARGET --preset NAME=COMMAND` avoids hand-editing when
+the host is being added at the same time. It cannot carry `health_command` or
+`herdr_agent`, which is why the TOML is the general answer.
+
+### Why there is no import command
+
+There is no `preset import`, no export format, and nothing that fetches. That is
+a judgment about cost, not a claim that importing could not be done safely: a
+command that printed the exact `command` and `health_command`, said which host
+and directory they would bind to, and required typed confirmation would show a
+recipient everything reading the block shows them, and would get the host binding
+right rather than leaving it to where the paste landed.
+
+It loses on what it costs. It is a permanent surface, a file format, and a second
+way to add a preset, in exchange for a paste - and it would make preset text
+something Tether itself takes from elsewhere and then executes. Tether's own
+intake is otherwise deliberately narrow: hosts are ones you selected, Herdr
+answers over a local socket, and session catalogues, `tmux` output, and SSH
+aliases are validated, bounded, or display-only.
+
+Configuration you did not write can already reach a shell, but through OpenSSH
+rather than through Tether: an inherited `~/.ssh/config` can carry `ProxyCommand`
+or `Match exec`, which is why `SECURITY.md` places OpenSSH configuration and
+proxies inside the trusted computing base. A preset is the same kind of trust,
+which is why that document places user-controlled presets there too. Keep write
+access to the configuration as narrow as write access to `~/.profile` on every
+host it names.
+
 ### Mission Control prompt capability
 
 Each orchestration worker stores independent `observe_output`,
