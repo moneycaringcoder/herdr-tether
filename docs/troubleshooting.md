@@ -140,6 +140,17 @@ An SSH or Herdr connection loss preserves the last-known tile as `STALE`.
 Reconnect and press `r`; Tether will resubscribe and resnapshot. Closing Mission
 Control while disconnected still leaves every Tether workload running.
 
+`UNREACHABLE` and `STALE` both mean the tile is not current, and each says which
+it is and what to do about it on the tile itself, so this page is a reference
+rather than a requirement. `STALE` means the information shown is remembered:
+either retained output that could not be re-read, with the time it was last
+live, or a binding that is no longer exactly one recognized occupant. `r` retries
+in both cases; a binding that stays stale needs the pane reopened rather than
+worked around. `UNREACHABLE` means nothing was retained and nothing answered, so
+the remedy is access to Herdr or the host first. In the picker, `[stale: …]` on a
+host means the previous answer is on screen while a new check runs, which needs
+no retry, and an unreachable host means the check itself failed.
+
 ## The picker is difficult to read or use with assistive technology
 
 Use a terminal at least 80 columns wide when possible. Tether wraps controls on

@@ -1671,6 +1671,36 @@ impl PickerState {
         })
     }
 
+    /// Whether the selected host's status is a retained answer being rechecked.
+    fn current_host_stale(&self) -> bool {
+        let Some(host) = self.options.hosts.get(self.host_index) else {
+            return false;
+        };
+        self.host_status
+            .get(&host.name)
+            .is_some_and(|cell| cell.stale)
+    }
+
+    /// The sentence shown when the selected host's status cannot be trusted.
+    ///
+    /// `[stale: …]` and an unreachable host both mean the row is not current,
+    /// but for different reasons and with different remedies: one is waiting for
+    /// an answer that is already on its way, the other needs the host fixed
+    /// first. Saying which one it is here keeps that out of the documentation.
+    fn reachability_notice(&self) -> Option<&'static str> {
+        if self.current_host_stale() {
+            return Some(
+                "Stale · last answer shown while a new check runs · actions wait for it, no retry needed",
+            );
+        }
+        if self.current_host_unreachable() {
+            return Some(
+                "Unreachable · the check failed, so the state is unproven · actions that would guess are withheld · fix the host, then r Retry",
+            );
+        }
+        None
+    }
+
     fn current_legacy_id(&self) -> Option<SessionId> {
         if self.stage != PickerStage::Resource {
             return None;
@@ -2510,6 +2540,11 @@ impl PickerState {
                     && let Some(waiting) = self.paced_notice(now)
                 {
                     parts.push(waiting);
+                }
+                // The host's own state explains the rows under it, so it is worth
+                // saying on both the host and the resource stage.
+                if let Some(notice) = self.reachability_notice() {
+                    parts.push(notice.to_owned());
                 }
                 let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
                     if self.current_legacy_id().is_some() {
@@ -3792,6 +3827,49 @@ mod close_render_tests {
         assert!(unreachable.contains("r Retry"));
         assert!(!unreachable.contains("Enter Open"));
         assert!(!unreachable.contains("x Stop"));
+    }
+
+    #[test]
+    fn a_stale_host_and_an_unreachable_one_read_apart_in_the_footer() {
+        let (mut picker, _) = close_picker();
+        picker.handle(PickerEvent::DismissClose);
+
+        // A reachable host explains nothing: there is nothing wrong to explain.
+        let reachable = picker.footer_text();
+        assert!(!reachable.contains("Stale ·"), "{reachable}");
+        assert!(!reachable.contains("Unreachable ·"), "{reachable}");
+
+        // A refresh in flight over a previous answer. The remedy is to wait, so
+        // the footer must not send the user off to fix a host that is fine.
+        picker.begin_refresh(10);
+        let stale = picker.footer_text();
+        assert!(stale.contains("Stale ·"), "{stale}");
+        assert!(
+            stale.contains("new check runs") && stale.contains("no retry needed"),
+            "a stale row must say the answer is already on its way: {stale}"
+        );
+        assert!(!stale.contains("fix the host"), "{stale}");
+
+        // The check itself failed. Now the remedy is the host, and the footer
+        // says why the actions went away rather than leaving them missing.
+        assert!(picker.apply_status(StatusMessage::Host {
+            generation: 10,
+            host: "build-box".to_owned(),
+            status: HostReachability::Unreachable,
+            detail: Some("connection refused".to_owned()),
+            checked_at: std::time::SystemTime::now(),
+        }));
+        let unreachable = picker.footer_text();
+        assert!(unreachable.contains("Unreachable ·"), "{unreachable}");
+        assert!(
+            unreachable.contains("unproven") && unreachable.contains("withheld"),
+            "an unreachable row must say why its actions are gone: {unreachable}"
+        );
+        assert!(unreachable.contains("r Retry"), "{unreachable}");
+        assert!(
+            !unreachable.contains("Stale ·"),
+            "the two states must not read the same: {unreachable}"
+        );
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {

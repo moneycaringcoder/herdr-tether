@@ -48,12 +48,6 @@ permissions. Acting on the group — restart every worker, stop every worker —
 is the obvious next step, and it must go through the same explicit confirmation
 and ownership checks as the single-workload path, not around them.
 
-### A sharper `UNREACHABLE` versus `STALE` distinction
-
-Both mean "the tile is not telling you the truth right now", for different
-reasons and with different remedies. The tiles name them; the difference could be
-explained where the user is looking rather than in the documentation.
-
 ### A bounded output preview per tile
 
 Enough recent output to recognize what a workload is doing, without inferring

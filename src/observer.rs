@@ -1187,34 +1187,91 @@ fn render_worker(
         .borders(Borders::ALL)
         .title(Line::from(title))
         .style(style);
+    // Both of these states mean the tile is not telling the truth right now, for
+    // different reasons and with different remedies, so the tile says which. The
+    // remedy is the part a narrow tile must not lose, so the candidates shorten
+    // the reason first and keep the key.
+    let inner_width = area.width.saturating_sub(2);
+    let state_line = match worker.agent_state {
+        ObserverAgentState::Unreachable => Some(widest_that_fits(
+            inner_width,
+            &[
+                "UNREACHABLE · Herdr or the host did not answer · nothing retained · r retry"
+                    .to_owned(),
+                "UNREACHABLE · no answer, nothing retained · r retry".to_owned(),
+                "UNREACHABLE · r retry".to_owned(),
+            ],
+        )),
+        ObserverAgentState::Stale if capture_status == CaptureStatus::Stale => {
+            let observed = worker
+                .last_observed
+                .as_deref()
+                .map(|value| sanitize_label(value, 80))
+                .unwrap_or_else(|| "unknown".to_owned());
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    format!("STALE · retained, not current · last live {observed} · r retry"),
+                    // The time it was last live outranks the prose: it is the
+                    // fact that tells a reader how old what they see is.
+                    format!("STALE · not current · last live {observed} · r retry"),
+                    format!("STALE · last live {observed} · r retry"),
+                    "STALE · retained, not current · r retry".to_owned(),
+                ],
+            ))
+        }
+        // A binding that is no longer exactly one recognized occupant. Retrying
+        // resnapshots; if the pane really moved or was replaced, the binding has
+        // to be re-established rather than worked around.
+        ObserverAgentState::Stale => Some(widest_that_fits(
+            inner_width,
+            &[
+                "STALE · binding no longer exact · r retry, or reopen if the pane moved".to_owned(),
+                "STALE · binding no longer exact · r retry".to_owned(),
+                "STALE · binding · r retry".to_owned(),
+            ],
+        )),
+        _ => None,
+    };
     let body = if !worker.capabilities.observe_output {
-        "Output not authorized".to_owned()
+        state_line.unwrap_or_else(|| "Output not authorized".to_owned())
     } else {
         match capture_status {
             CaptureStatus::Loading if worker.uses_live_agent() => {
                 "Herdr agent attached · press v to read output".to_owned()
             }
             CaptureStatus::Loading => "Loading output".to_owned(),
-            CaptureStatus::Unavailable => "Output unavailable".to_owned(),
+            CaptureStatus::Unavailable => {
+                state_line.unwrap_or_else(|| "Output unavailable".to_owned())
+            }
             CaptureStatus::Stale => {
                 let capture = worker
                     .capture
                     .as_deref()
                     .map(sanitize_capture)
                     .unwrap_or_default();
-                let observed = worker
-                    .last_observed
-                    .as_deref()
-                    .map(|value| sanitize_label(value, 80))
-                    .unwrap_or_else(|| "unknown".to_owned());
-                format!("STALE · last live {observed}\n{capture}")
+                let explanation = state_line.unwrap_or_else(|| "STALE".to_owned());
+                format!("{explanation}\n{capture}")
             }
             status @ (CaptureStatus::Ready | CaptureStatus::Truncated) => {
                 // Herdr reports truncation when it dropped older rows. Spend one
                 // row saying so rather than presenting a clipped capture as the
                 // worker's complete output.
                 let truncated = status == CaptureStatus::Truncated;
-                let reserved = if truncated { 3 } else { 2 };
+                let mut reserved = if truncated { 3 } else { 2 };
+                // An explanation costs a row of capture rather than overflowing
+                // the tile it explains.
+                if state_line.is_some() {
+                    reserved += 1;
+                }
+                let prefix = [
+                    state_line.as_deref(),
+                    truncated.then_some("TRUNCATED · older output dropped by Herdr"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
                 worker
                     .capture
                     .as_deref()
@@ -1226,17 +1283,17 @@ fn render_worker(
                             area.width.saturating_sub(2),
                             area.height.saturating_sub(reserved),
                         );
-                        if truncated {
-                            format!("TRUNCATED · older output dropped by Herdr\n{viewport}")
-                        } else {
+                        if prefix.is_empty() {
                             viewport
+                        } else {
+                            format!("{prefix}\n{viewport}")
                         }
                     })
                     .unwrap_or_else(|| {
-                        if truncated {
-                            "TRUNCATED · older output dropped by Herdr".to_owned()
-                        } else {
+                        if prefix.is_empty() {
                             "No captured output".to_owned()
+                        } else {
+                            prefix.clone()
                         }
                     })
             }

@@ -40,6 +40,15 @@
   share one bounded budget, so a refresh costs the same however many workloads
   are probed. Results are display-only: nothing is persisted, no lifecycle
   action is unlocked or withheld, and no probe runs on a schedule.
+- `UNREACHABLE` and `STALE` now explain themselves where they are shown. Both
+  mean a tile is not current, and the tile now says which reason applies and
+  what to do: retained output that could not be re-read names the time it was
+  last live, a binding that is no longer exactly one recognized occupant says so
+  and that reopening is the remedy if the pane moved, and an unreachable worker
+  says nothing was retained and nothing answered. The explanation shortens rather
+  than clipping on a narrow tile, so the key never falls off the end. In the
+  picker, a host whose previous answer is shown while a new check runs says the
+  wait needs no retry, and an unreachable host says why its actions are withheld.
 
 ### Changed
 
