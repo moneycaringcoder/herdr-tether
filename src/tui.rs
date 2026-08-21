@@ -387,10 +387,17 @@ fn workload_label(session: &SessionRecord) -> String {
             short_id, command, session.directory
         );
     }
+    // A failing end and a clean one are the two outcomes worth telling apart at
+    // a glance, and the action for both is still an explicit Restart. An end
+    // whose status `tmux` could not report stays `ended`: unknown is not
+    // failure.
+    let failed = session.status == SessionStatus::Ended
+        && session.exit_status.is_some_and(|status| status != 0);
     let (lifecycle, action) = match session.status {
         SessionStatus::Creating => ("creating", "Pending"),
         SessionStatus::Running => ("running", "Open"),
         SessionStatus::Stopping => ("stopping", "Pending"),
+        SessionStatus::Ended if failed => ("failed", "Restart"),
         SessionStatus::Ended => ("ended", "Restart"),
         SessionStatus::Removed => ("removed", "Metadata"),
     };

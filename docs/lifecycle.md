@@ -39,7 +39,8 @@ When a host, SSH connection, or backend cannot be inspected, Tether shows the wo
 | State | Meaning | Safe actions |
 | --- | --- | --- |
 | **Running** | The exact owned workload was observed alive. | Open or Stop |
-| **Ended** | The owned command exited, with exit context retained when available. | Restart or Remove |
+| **Ended** | The owned command exited cleanly, or with an outcome `tmux` could not report. | Restart or Remove |
+| **Failed** | The owned command exited with a failing status, which is shown as `[failed]` in the picker and `FAILED` on a Mission Control tile. | Restart or Remove |
 | **Stopping** | A confirmed Stop is in progress or needs safe reconciliation after interruption. | Wait or retry the visible operation |
 | **Unreachable** | Tether cannot currently prove whether the workload is running. | Retry or back out |
 | **Removed** | The ended record was finalized and is no longer an active picker item. | None |
@@ -50,6 +51,8 @@ Observation and persistence are deliberately separate. A refresh may update what
 ## Ended work and history
 
 Tether asks `tmux` for native pane status and exit information when the installed version supports it. This prevents a completed command from lingering as contradictory running/missing work or being offered as resumable.
+
+A failing exit status is kept apart from a clean one, because they are the two outcomes worth telling apart at a glance. Tether records one when it reconciles a workload against `tmux`: when Stop reaps a workload whose command had already exited, or when a restart's verification finds the new incarnation already ended. Nothing watches a workload continuously, so a command that exits while no operation is running is recorded the next time one is. A Mission Control surface that sees a workload in that state asks Herdr for a toast, once per incarnation, which `notifications.workload_failed` controls.
 
 Ended metadata is retained long enough to make Restart and diagnostics useful. Safe finalized history becomes eligible for automatic metadata-only cleanup after the configured retention period (30 days by default). Cleanup never contacts SSH, invokes `tmux`, stops workloads, or expands to newly eligible records during an in-progress operation.
 

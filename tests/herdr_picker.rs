@@ -2553,6 +2553,50 @@ fn close_success_retains_exact_row_as_authoritative_closed_metadata() {
 }
 
 #[test]
+fn a_workload_that_ended_with_a_failing_status_reads_apart_from_a_clean_end() {
+    let (config, mut state) = picker_fixture();
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    for session in &mut state.sessions {
+        session.status = SessionStatus::Ended;
+        session.closed_at = Some(now);
+    }
+    state.sessions[0].exit_status = Some(1);
+    state.sessions[1].exit_status = Some(0);
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+
+    let labels: Vec<&str> = options.hosts[0]
+        .workloads
+        .iter()
+        .map(|workload| workload.label.as_str())
+        .collect();
+    // The failing one is named, the clean one keeps the ordinary word, and both
+    // still offer an explicit Restart rather than anything automatic.
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[failed] Tether · Restart")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("[ended] Tether · Restart")),
+        "{labels:?}"
+    );
+
+    // An end whose status tmux could not report is not a failure.
+    state.sessions[0].exit_status = None;
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", false);
+    assert!(
+        options.hosts[0]
+            .workloads
+            .iter()
+            .all(|workload| !workload.label.contains("[failed]")),
+        "an unknown outcome must not read as a failure"
+    );
+}
+
+#[test]
 fn successful_close_with_authoritative_absence_removes_exact_retained_group() {
     let (config, mut state) = picker_fixture();
     let record = state.sessions.remove(0);

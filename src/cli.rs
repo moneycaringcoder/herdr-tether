@@ -1425,6 +1425,21 @@ fn confirm_replacement(client: &HerdrClient) -> Result<()> {
     Ok(())
 }
 
+/// The listed status of a workload, naming a failing exit rather than hiding it.
+///
+/// `Ended` covers a clean finish, a failing one, and an outcome `tmux` could not
+/// report. Only the failing case is renamed, and it carries the status that made
+/// it one, because "it ended" and "it failed with 2" call for different next
+/// steps.
+fn session_status_text(session: &SessionRecord) -> String {
+    match (session.status, session.exit_status) {
+        (SessionStatus::Ended, Some(exit_status)) if exit_status != 0 => {
+            format!("Failed (exit {exit_status})")
+        }
+        (status, _) => format!("{status:?}"),
+    }
+}
+
 fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
     let store = StateStore::new(paths.state_file.clone());
     match command {
@@ -1459,12 +1474,12 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             } else {
                 for session in sessions {
                     println!(
-                        "{}\t{}\t{}\t{}\t{:?}",
+                        "{}\t{}\t{}\t{}\t{}",
                         session.id,
                         session.host,
                         session.directory,
                         session.last_used_at,
-                        session.status
+                        session_status_text(session)
                     );
                 }
             }
@@ -2369,6 +2384,41 @@ mod tests {
         });
 
         assert!(matches!(result, Err(mpsc::RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn a_listed_workload_names_a_failing_exit_and_nothing_else() {
+        let mut record = SessionRecord {
+            herdr_agent: None,
+            id: "tether-0197f198000070008000000000000001".parse().unwrap(),
+            host: "local".to_owned(),
+            target: "local".to_owned(),
+            directory: "/tmp".to_owned(),
+            preset: None,
+            command: None,
+            tmux_session_id: None,
+            ownership_proof: None,
+            status: SessionStatus::Ended,
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            closed_at: Some(Utc::now()),
+            exit_status: Some(2),
+        };
+        assert_eq!(session_status_text(&record), "Failed (exit 2)");
+
+        record.exit_status = Some(0);
+        assert_eq!(session_status_text(&record), "Ended");
+        record.exit_status = None;
+        assert_eq!(
+            session_status_text(&record),
+            "Ended",
+            "an outcome tmux could not report is not a failure"
+        );
+
+        record.status = SessionStatus::Running;
+        record.exit_status = None;
+        record.closed_at = None;
+        assert_eq!(session_status_text(&record), "Running");
     }
 
     #[test]

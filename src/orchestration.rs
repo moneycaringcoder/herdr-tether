@@ -36,9 +36,9 @@ use crate::{
         Placement, SessionId, TmuxSessionId,
     },
     observer::{
-        AgentAttention, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
+        AttentionReason, ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture,
         ObserverInputKind, ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState,
-        ObserverWorker, render,
+        ObserverWorker, WorkerAttention, render,
     },
     paths::AppPaths,
     state::{
@@ -1129,7 +1129,7 @@ fn refresh_observer_metadata(
             mission_latency_ms,
         ),
     );
-    notify_agent_attention(mission_client, notifications, &attention);
+    notify_attention(mission_client, notifications, &attention);
     *agent_panes = group_agent_panes(mission_snapshot.as_ref(), group_id);
     *capture_fingerprints = next_fingerprints;
     let request = CaptureRequest {
@@ -1224,7 +1224,7 @@ fn update_observer_metadata(
     previous_fingerprints: &HashMap<String, CaptureFingerprint>,
     current_fingerprints: &HashMap<String, CaptureFingerprint>,
     mut workers: Vec<ObserverWorker>,
-) -> Vec<AgentAttention> {
+) -> Vec<WorkerAttention> {
     let previous_captures: HashMap<_, _> = observer
         .workers()
         .iter()
@@ -1285,32 +1285,52 @@ fn group_agent_panes(
     panes
 }
 
-/// Sends one advisory Herdr toast per newly attention-worthy agent.
+/// Asks Herdr to show a toast for each newly attention-worthy worker.
 ///
 /// Delivery is best effort: the Observer tile is the authoritative view, so a
 /// disabled or refused toast changes nothing and is never surfaced as an error.
-/// Only the worker's already-sanitized display label travels in the body; host,
-/// directory, command, and prompt text never do.
-fn notify_agent_attention(
+/// The body carries a workload reference and either a state or an exit status.
+/// Host, directory, command, capture, and prompt text never travel, which is why
+/// it is not the tile's display title: that title is generated from the host,
+/// repository name, and preset.
+fn notify_attention(
     mission_client: Option<&HerdrSocketClient>,
     notifications: NotificationDefaults,
-    attention: &[AgentAttention],
+    attention: &[WorkerAttention],
 ) {
     let Some(client) = mission_client else {
         return;
     };
     for event in attention {
-        let (enabled, sound) = match event.state {
-            ObserverAgentState::Blocked => {
-                (notifications.agent_blocked, NotificationSound::Request)
-            }
-            ObserverAgentState::Done => (notifications.agent_done, NotificationSound::Done),
-            _ => continue,
+        // The body names the workload rather than describing it. A display title
+        // is generated from host, repository name, and preset, and a toast leaves
+        // the surface that produced it, so the reference travels and the title
+        // stays on the tile. The exit status is a small integer `tmux` reported,
+        // not output, and it is the one detail that makes the toast actionable.
+        let (enabled, sound, body) = match event.reason {
+            AttentionReason::Agent(state @ ObserverAgentState::Blocked) => (
+                notifications.agent_blocked,
+                NotificationSound::Request,
+                format!("Workload {} is {}", event.reference, state.label()),
+            ),
+            AttentionReason::Agent(state @ ObserverAgentState::Done) => (
+                notifications.agent_done,
+                NotificationSound::Done,
+                format!("Workload {} is {}", event.reference, state.label()),
+            ),
+            AttentionReason::Agent(_) => continue,
+            AttentionReason::Failed { exit_status } => (
+                notifications.workload_failed,
+                NotificationSound::Request,
+                format!(
+                    "Workload {} exited with status {exit_status}",
+                    event.reference
+                ),
+            ),
         };
         if !enabled {
             continue;
         }
-        let body = format!("{} is {}", event.label, event.state.label());
         let _ = client.show_notification("Tether", Some(&body), sound);
     }
 }
@@ -1421,7 +1441,14 @@ fn observer_workers(
                 Some(SessionStatus::Creating) => ObserverLifecycle::Starting,
                 Some(SessionStatus::Running) => ObserverLifecycle::Running,
                 Some(SessionStatus::Stopping) => ObserverLifecycle::Stopping,
-                Some(SessionStatus::Ended) => ObserverLifecycle::Ended,
+                Some(SessionStatus::Ended) => match record.and_then(|record| record.exit_status) {
+                    // A status `tmux` could not report is an unknown outcome,
+                    // and an unknown outcome is not a failure.
+                    Some(exit_status) if exit_status != 0 => {
+                        ObserverLifecycle::Failed { exit_status }
+                    }
+                    _ => ObserverLifecycle::Ended,
+                },
                 Some(SessionStatus::Removed) => ObserverLifecycle::Removed,
                 None => ObserverLifecycle::Missing,
             };
@@ -1461,6 +1488,7 @@ fn observer_workers(
                 live_agent,
                 owned,
                 last_observed,
+                incarnation: record.and_then(|record| record.tmux_session_id),
                 latency_ms: live_agent.then_some(mission_latency_ms).flatten(),
                 capture: None,
             }
@@ -1705,6 +1733,7 @@ mod tests {
             live_agent: false,
             owned: true,
             last_observed: None,
+            incarnation: None,
             latency_ms: None,
             capture: capture.map(str::to_owned),
         }
@@ -1870,6 +1899,221 @@ mod tests {
             );
             assert_eq!(refreshed[0].agent_state, expected);
             assert!(refreshed[0].uses_live_agent());
+        }
+    }
+
+    #[test]
+    fn a_failing_exit_becomes_its_own_tile_state_and_an_unknown_one_does_not() {
+        let worker_id = "tether-0197f198000070008000000000000041"
+            .parse::<SessionId>()
+            .unwrap();
+        let membership_id: OrchestrationMembershipId =
+            "0197f198000070008000000000000042".parse().unwrap();
+        let group = OrchestrationGroup {
+            id: "exit-control".parse().unwrap(),
+            title: "Exit control".parse().unwrap(),
+            orchestrator_session_id: worker_id,
+            workers: vec![OrchestrationMember {
+                session_id: worker_id,
+                membership_id,
+                title: Some("Worker".parse().unwrap()),
+                capabilities: OrchestrationCapabilities {
+                    observe_output: true,
+                    open_interactive: true,
+                    prompt_agent: false,
+                },
+            }],
+        };
+        let lifecycle_for = |status: SessionStatus, exit_status: Option<i32>| {
+            let mut record = exact_running_session(worker_id, "$1");
+            record.status = status;
+            record.exit_status = exit_status;
+            if status != SessionStatus::Running {
+                record.closed_at = Some(record.last_used_at);
+            }
+            let state = State {
+                version: State::CURRENT_VERSION,
+                sessions: vec![record],
+                orchestration_groups: vec![group.clone()],
+            };
+            observer_workers(&state.orchestration_groups[0], &state, None, false, None)[0].lifecycle
+        };
+
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, Some(2)),
+            ObserverLifecycle::Failed { exit_status: 2 }
+        );
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, Some(0)),
+            ObserverLifecycle::Ended,
+            "a clean exit is not a failure"
+        );
+        // An explicit stop records no status, and `tmux` cannot always report
+        // one. Neither is evidence of failure.
+        assert_eq!(
+            lifecycle_for(SessionStatus::Ended, None),
+            ObserverLifecycle::Ended,
+            "an unknown outcome is not a failure"
+        );
+        assert_eq!(
+            lifecycle_for(SessionStatus::Running, None),
+            ObserverLifecycle::Running
+        );
+    }
+
+    #[cfg(unix)]
+    fn served_notification(
+        directory: &std::path::Path,
+        name: &str,
+        notifications: NotificationDefaults,
+        attention: WorkerAttention,
+    ) -> Option<serde_json::Value> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket = directory.join(name);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            // Long enough for a local socket connection, short enough that the
+            // cases which must send nothing do not pad the suite.
+            for _ in 0..100 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut request)
+                            .unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                        let id = request["id"].as_str().unwrap().to_owned();
+                        writeln!(
+                            stream,
+                            "{}",
+                            serde_json::json!({
+                                "id": id,
+                                "result": {"type": "notification_show", "shown": true},
+                            })
+                        )
+                        .unwrap();
+                        return Some(request);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            None
+        });
+        notify_attention(
+            Some(&HerdrSocketClient::new(socket)),
+            notifications,
+            &[attention],
+        );
+        server.join().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_attention_reason_notifies_with_its_own_sound_and_wording() {
+        let temp = tempfile::tempdir().unwrap();
+        let attention = |reason| WorkerAttention {
+            worker_id: "tether-0197f198000070008000000000000001".to_owned(),
+            reference: "…00000001".to_owned(),
+            reason,
+        };
+        let cases = [
+            (
+                "blocked",
+                AttentionReason::Agent(ObserverAgentState::Blocked),
+                "request",
+                "Workload …00000001 is BLOCKED",
+            ),
+            (
+                "done",
+                AttentionReason::Agent(ObserverAgentState::Done),
+                "done",
+                "Workload …00000001 is DONE",
+            ),
+            (
+                "failed",
+                AttentionReason::Failed { exit_status: 2 },
+                "request",
+                "Workload …00000001 exited with status 2",
+            ),
+        ];
+        for (name, reason, sound, body) in cases {
+            let request = served_notification(
+                temp.path(),
+                name,
+                NotificationDefaults::default(),
+                attention(reason),
+            )
+            .unwrap_or_else(|| panic!("{name} should have notified"));
+            assert_eq!(request["method"], "notification.show");
+            assert_eq!(request["params"]["title"], "Tether");
+            assert_eq!(request["params"]["sound"], sound, "{name}");
+            assert_eq!(request["params"]["body"], body, "{name}");
+        }
+
+        // A state nobody asked to hear about sends nothing at all.
+        assert!(
+            served_notification(
+                temp.path(),
+                "working",
+                NotificationDefaults::default(),
+                attention(AttentionReason::Agent(ObserverAgentState::Working)),
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disabled_setting_sends_nothing_rather_than_a_suppressed_toast() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "failed-off",
+                NotificationDefaults {
+                    workload_failed: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Failed { exit_status: 2 },
+            ),
+            (
+                "blocked-off",
+                NotificationDefaults {
+                    agent_blocked: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Agent(ObserverAgentState::Blocked),
+            ),
+            (
+                "done-off",
+                NotificationDefaults {
+                    agent_done: false,
+                    ..NotificationDefaults::default()
+                },
+                AttentionReason::Agent(ObserverAgentState::Done),
+            ),
+        ];
+        for (name, notifications, reason) in cases {
+            assert!(
+                served_notification(
+                    temp.path(),
+                    name,
+                    notifications,
+                    WorkerAttention {
+                        worker_id: "w".to_owned(),
+                        reference: "…00000001".to_owned(),
+                        reason,
+                    },
+                )
+                .is_none(),
+                "{name} must not reach the socket"
+            );
         }
     }
 

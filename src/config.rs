@@ -333,18 +333,24 @@ impl Default for RetentionDefaults {
     }
 }
 
-/// Opt-in Herdr toasts for agent states that want a person's attention.
+/// Opt-in Herdr toasts for events that want a person's attention.
 ///
 /// These are advisory. Herdr delivers a toast only when the user has enabled
 /// `ui.toast.delivery`, and Tether's own surfaces remain the authoritative view
-/// of agent state either way.
+/// either way.
+///
+/// Missing fields fall back to these defaults rather than to `false`, so a
+/// configuration written before a setting existed keeps behaving as documented
+/// instead of silently opting out of it.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct NotificationDefaults {
     /// Notify when a Mission Control agent starts waiting on a person.
     pub agent_blocked: bool,
     /// Notify when a Mission Control agent settles as done.
     pub agent_done: bool,
+    /// Notify when a workload's command ends with a failing status.
+    pub workload_failed: bool,
 }
 
 impl Default for NotificationDefaults {
@@ -352,6 +358,7 @@ impl Default for NotificationDefaults {
         Self {
             agent_blocked: true,
             agent_done: true,
+            workload_failed: true,
         }
     }
 }
