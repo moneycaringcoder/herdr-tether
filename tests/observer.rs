@@ -9,7 +9,7 @@ use model::TmuxSessionId;
 use observer::{
     AttentionReason, MAX_CAPTURE_BYTES, MAX_CAPTURE_CELLS, MAX_CAPTURE_LINES, MAX_PROMPT_TARGETS,
     ObserverAction, ObserverAgentState, ObserverCapabilities, ObserverCapture, ObserverInputKind,
-    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker,
+    ObserverKey, ObserverLifecycle, ObserverOutcome, ObserverState, ObserverWorker, StaleReason,
     action_for_input, action_for_key, observer_theme_style, render, render_to_styles,
     render_to_text, sanitize_capture, worker_rects,
 };
@@ -33,6 +33,7 @@ fn worker(id: &str) -> ObserverWorker {
         incarnation: None,
         latency_ms: None,
         capture: Some(format!("output-{id}")),
+        stale_reason: None,
     }
 }
 
@@ -448,6 +449,175 @@ fn live_worker(id: &str, state: ObserverAgentState) -> ObserverWorker {
         live_agent: true,
         agent_state: state,
         ..worker(id)
+    }
+}
+
+/// The tile body rows, without the border or the surrounding chrome.
+///
+/// The controls footer carries its own `r retry`, and the border title carries
+/// the bare state name, so an assertion about what a tile *explains* has to read
+/// the body or it proves nothing.
+fn tile_body(rendered: &str) -> String {
+    rendered
+        .lines()
+        .filter(|line| line.starts_with('│'))
+        .map(|line| line.trim_matches('│').trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_failed_reread_says_what_is_retained_and_when_it_was_live() {
+    let mut observer = ObserverState::new(vec![ObserverWorker {
+        capture: Some("previous output".to_owned()),
+        last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
+        ..live_worker("a", ObserverAgentState::Working)
+    }]);
+
+    observer.merge_capture("a", ObserverCapture::Unavailable);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("STALE · retained, not current"), "{body}");
+    assert!(body.contains("last live 2026-08-21T11:00:00Z"), "{body}");
+    assert!(body.contains("r retry"), "{body}");
+    assert!(body.contains("previous output"), "{body}");
+    assert!(
+        !body.contains("binding"),
+        "a failed reread must not blame the binding: {body}"
+    );
+}
+
+#[test]
+fn an_unreachable_tile_never_claims_more_than_it_retained() {
+    // Nothing retained: the remedy is access, and the tile must not imply there
+    // is old output to look at.
+    let mut observer = ObserverState::new(vec![ObserverWorker {
+        capabilities: ObserverCapabilities {
+            observe_output: true,
+            open_interactive: true,
+            prompt_agent: true,
+        },
+        ..live_worker("a", ObserverAgentState::Working)
+    }]);
+    observer.merge_capture("a", ObserverCapture::Unavailable);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("UNREACHABLE"), "{body}");
+    assert!(body.contains("did not answer"), "{body}");
+    assert!(body.contains("nothing retained"), "{body}");
+    assert!(body.contains("r retry"), "{body}");
+
+    // The Herdr socket can fail while `tmux` capture still works, so an
+    // unreachable worker can be holding output. Then "nothing retained" would be
+    // contradicted by the rows underneath it.
+    let observer = ObserverState::new(vec![ObserverWorker {
+        capture: Some("captured anyway".to_owned()),
+        ..live_worker("a", ObserverAgentState::Unreachable)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("UNREACHABLE"), "{body}");
+    assert!(body.contains("captured anyway"), "{body}");
+    assert!(
+        !body.contains("nothing retained"),
+        "a tile showing output must not claim nothing was retained: {body}"
+    );
+    assert!(
+        body.contains("not current"),
+        "output shown under an unreachable state must be dated as not current: {body}"
+    );
+}
+
+#[test]
+fn a_stale_binding_and_a_lost_connection_do_not_share_a_remedy() {
+    // A binding that is no longer exactly one recognized occupant. The output
+    // may still read fine, so the tile has to say the claim is what went bad,
+    // and where that is fixed, which is not this surface.
+    let observer = ObserverState::new(vec![ObserverWorker {
+        capture: Some("looks fine".to_owned()),
+        stale_reason: Some(StaleReason::Binding),
+        ..live_worker("a", ObserverAgentState::Stale)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("STALE · binding no longer exact"), "{body}");
+    assert!(body.contains("reopen from the picker"), "{body}");
+    assert!(body.contains("looks fine"), "{body}");
+    assert!(
+        !body.contains("retained, not current"),
+        "a binding failure is not a failed reread: {body}"
+    );
+
+    // A lost Mission Control connection comes back on its own, so its remedy is
+    // the retry alone and it must not send anyone to reopen a healthy pane.
+    let observer = ObserverState::new(vec![ObserverWorker {
+        capture: Some("last known".to_owned()),
+        last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
+        stale_reason: Some(StaleReason::Connection),
+        ..live_worker("a", ObserverAgentState::Stale)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("STALE · connection lost"), "{body}");
+    assert!(body.contains("last live 2026-08-21T11:00:00Z"), "{body}");
+    assert!(
+        !body.contains("reopen"),
+        "a lost connection must not ask for a reopen: {body}"
+    );
+}
+
+#[test]
+fn a_stale_tile_with_nothing_retained_offers_no_remembered_output() {
+    // `CaptureStatus::Stale` can arrive with the capture already cleared. The
+    // sentence must not invite a reader to look at output that is not there.
+    let mut observer = ObserverState::new(vec![live_worker("a", ObserverAgentState::Working)]);
+    observer.merge_capture("a", ObserverCapture::Loading);
+    observer.update_workers(vec![ObserverWorker {
+        capture: None,
+        ..live_worker("a", ObserverAgentState::Unreachable)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("STALE"), "{body}");
+    assert!(
+        !body.contains("retained, not current"),
+        "nothing was retained, so nothing may be offered as retained: {body}"
+    );
+
+    // Output that was never authorized stays explained: no retry changes a
+    // capability the operator set.
+    let observer = ObserverState::new(vec![ObserverWorker {
+        capabilities: ObserverCapabilities {
+            observe_output: false,
+            open_interactive: true,
+            prompt_agent: false,
+        },
+        capture: None,
+        stale_reason: Some(StaleReason::Binding),
+        ..live_worker("a", ObserverAgentState::Stale)
+    }]);
+    let body = tile_body(&render_to_text(96, 12, &observer).unwrap());
+    assert!(body.contains("STALE"), "{body}");
+    assert!(
+        body.contains("Output not authorized"),
+        "an authorization fact must survive a state explanation: {body}"
+    );
+}
+
+#[test]
+fn a_narrow_tile_keeps_the_remedy_on_the_tile() {
+    // The explanation shortens rather than clipping, because a clip takes the
+    // remedy off the end first - and the retained wording is the longest one.
+    let mut observer = ObserverState::new(vec![ObserverWorker {
+        capture: Some("previous output".to_owned()),
+        last_observed: Some("2026-08-21T11:00:00Z".to_owned()),
+        ..live_worker("a", ObserverAgentState::Working)
+    }]);
+    observer.merge_capture("a", ObserverCapture::Unavailable);
+    for width in [32, 44, 64, 96] {
+        let body = tile_body(&render_to_text(width, 12, &observer).unwrap());
+        let line = body
+            .lines()
+            .find(|line| line.contains("STALE"))
+            .unwrap_or_else(|| panic!("width {width}: {body}"));
+        assert!(
+            line.contains("r retry"),
+            "width {width} lost the remedy: {line:?}"
+        );
     }
 }
 

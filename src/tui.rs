@@ -1671,6 +1671,55 @@ impl PickerState {
         })
     }
 
+    /// The selected host's retained status while a new check is in flight.
+    ///
+    /// The retained value matters: a host that was already failing is still
+    /// failing until the new answer lands, and telling someone to wait would
+    /// deny the problem their row is reporting.
+    fn current_host_rechecking(&self) -> Option<HostReachability> {
+        let host = self.options.hosts.get(self.host_index)?;
+        let cell = self.host_status.get(&host.name)?;
+        cell.stale.then_some(cell.value).flatten()
+    }
+
+    /// The sentence shown when the selected host's status cannot be trusted.
+    ///
+    /// `[stale: …]` and a failed check both mean the row is not current, but for
+    /// different reasons and with different remedies: one is waiting for an
+    /// answer that is already on its way, the other needs the host fixed first.
+    /// Saying which one it is here keeps that out of the documentation. The
+    /// wording leads with the word the row itself shows, so there is no fourth
+    /// vocabulary to learn.
+    fn reachability_notice(&self) -> Option<String> {
+        // Only the resource stage withholds anything on host status; at the host
+        // stage `Enter` still selects, so a notice about waiting would be wrong.
+        if self.stage != PickerStage::Resource {
+            return None;
+        }
+        if let Some(retained) = self.current_host_rechecking() {
+            if retained == HostReachability::Reachable {
+                return Some(
+                    "Rechecking · the last answer is shown until the new one lands · open, restart, and stop wait for it".to_owned(),
+                );
+            }
+            // Still failing, and being rechecked. Waiting is not the remedy.
+            return Some(format!(
+                "Rechecking · still {} since the last check · fix the host; r Retry checks again",
+                host_status_text(&retained)
+            ));
+        }
+        let host = self.options.hosts.get(self.host_index)?;
+        let cell = self.host_status.get(&host.name)?;
+        let status = cell.value.filter(|_| !cell.stale)?;
+        if status == HostReachability::Reachable {
+            return None;
+        }
+        Some(format!(
+            "{} · the check failed, so the state is unproven · open, restart, and stop are withheld rather than guessed · fix the host, then r Retry",
+            host_status_text(&status)
+        ))
+    }
+
     fn current_legacy_id(&self) -> Option<SessionId> {
         if self.stage != PickerStage::Resource {
             return None;
@@ -2510,6 +2559,11 @@ impl PickerState {
                     && let Some(waiting) = self.paced_notice(now)
                 {
                     parts.push(waiting);
+                }
+                // The host's own state explains the rows under it, and at this
+                // stage its actions are the ones being withheld.
+                if let Some(notice) = self.reachability_notice() {
+                    parts.push(notice);
                 }
                 let (primary_hint, destructive_hint) = if self.stage == PickerStage::Resource {
                     if self.current_legacy_id().is_some() {
@@ -3792,6 +3846,60 @@ mod close_render_tests {
         assert!(unreachable.contains("r Retry"));
         assert!(!unreachable.contains("Enter Open"));
         assert!(!unreachable.contains("x Stop"));
+    }
+
+    #[test]
+    fn a_rechecked_host_and_a_failed_check_read_apart_in_the_footer() {
+        let (mut picker, _) = close_picker();
+        picker.handle(PickerEvent::DismissClose);
+
+        // A reachable host explains nothing: there is nothing wrong to explain.
+        let reachable = picker.footer_text();
+        assert!(!reachable.contains("Rechecking"), "{reachable}");
+        assert!(!reachable.contains("withheld"), "{reachable}");
+
+        // A refresh in flight over an answer that was fine. The remedy is to
+        // wait, so the footer must not send anyone off to fix a healthy host.
+        picker.begin_refresh(10);
+        let rechecking = picker.footer_text();
+        assert!(rechecking.contains("Rechecking"), "{rechecking}");
+        assert!(
+            rechecking.contains("until the new one lands"),
+            "a recheck over a good answer must say the wait is the remedy: {rechecking}"
+        );
+        assert!(!rechecking.contains("fix the host"), "{rechecking}");
+
+        // The check itself failed. The footer names the state the row shows and
+        // says why the actions went away rather than leaving them missing.
+        assert!(picker.apply_status(StatusMessage::Host {
+            generation: 10,
+            host: "build-box".to_owned(),
+            status: HostReachability::Unreachable,
+            detail: Some("connection refused".to_owned()),
+            checked_at: std::time::SystemTime::now(),
+        }));
+        let failed = picker.footer_text();
+        assert!(
+            failed.contains("offline · the check failed"),
+            "the footer must lead with the word the row shows: {failed}"
+        );
+        assert!(failed.contains("withheld rather than guessed"), "{failed}");
+        assert!(failed.contains("r Retry"), "{failed}");
+        assert!(!failed.contains("Rechecking"), "{failed}");
+
+        // Rechecking a host that was already failing must not claim the wait is
+        // the remedy: it is still offline until the new answer says otherwise.
+        picker.begin_refresh(11);
+        let still_failing = picker.footer_text();
+        assert!(
+            still_failing.contains("still offline"),
+            "a recheck over a failure must keep naming the failure: {still_failing}"
+        );
+        assert!(still_failing.contains("fix the host"), "{still_failing}");
+        assert!(
+            !still_failing.contains("no retry needed"),
+            "{still_failing}"
+        );
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {

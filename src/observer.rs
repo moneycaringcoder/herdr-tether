@@ -172,6 +172,21 @@ pub enum AttentionReason {
     Failed { exit_status: i32 },
 }
 
+/// Why a worker's information is no longer current.
+///
+/// Each one has its own remedy, which is the whole point of telling them apart:
+/// a lost connection comes back on its own, and a binding that is no longer
+/// exact does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaleReason {
+    /// The Herdr claim is no longer exactly one recognized occupant.
+    Binding,
+    /// Mission Control lost the connection that was reporting this worker.
+    Connection,
+    /// The observed output could not be re-read, so what is shown is retained.
+    Retained,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObserverWorker {
     pub id: String,
@@ -191,6 +206,12 @@ pub struct ObserverWorker {
     pub incarnation: Option<TmuxSessionId>,
     /// Untrusted capture content. Rendering sanitizes and bounds it before display.
     pub capture: Option<String>,
+    /// Why this worker is `STALE`, when it is.
+    ///
+    /// The reasons have different remedies, and the capture status cannot tell
+    /// them apart: it is a separate axis, set by a separate path. A tile that
+    /// guessed from it would blame the binding for a lost connection.
+    pub stale_reason: Option<StaleReason>,
 }
 
 impl ObserverWorker {
@@ -530,6 +551,15 @@ impl ObserverState {
                     if lost_live_agent {
                         worker.live_agent = true;
                     }
+                    // A worker that arrives already stale was made stale
+                    // upstream, by a binding that is no longer exactly one
+                    // recognized occupant. Anything demoted here is stale for a
+                    // reason this loop knows.
+                    if worker.agent_state == ObserverAgentState::Stale
+                        && worker.stale_reason.is_none()
+                    {
+                        worker.stale_reason = Some(StaleReason::Binding);
+                    }
                     if lost_live_agent
                         || (worker.capture.is_some()
                             && matches!(
@@ -537,6 +567,13 @@ impl ObserverState {
                                 ObserverAgentState::Unreachable | ObserverAgentState::Stale
                             ))
                     {
+                        if worker.agent_state == ObserverAgentState::Unreachable {
+                            worker.stale_reason = Some(if lost_live_agent {
+                                StaleReason::Connection
+                            } else {
+                                StaleReason::Retained
+                            });
+                        }
                         worker.agent_state = ObserverAgentState::Stale;
                         CaptureStatus::Stale
                     } else if matches!(
@@ -673,6 +710,7 @@ impl ObserverState {
                 if worker.capture.is_some() && worker.last_observed.is_some() =>
             {
                 worker.agent_state = ObserverAgentState::Stale;
+                worker.stale_reason = Some(StaleReason::Retained);
                 CaptureStatus::Stale
             }
             ObserverCapture::Unavailable => {
@@ -1018,15 +1056,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
             render_worker(
                 frame,
                 rect,
-                worker,
-                observer
-                    .capture_statuses
-                    .get(&worker.id)
-                    .copied()
-                    .unwrap_or(CaptureStatus::Loading),
-                &observer.worker_display_title(worker),
-                observer.selected_id() == Some(worker.id.as_str()),
-                observer.is_prompt_target(&worker.id),
+                &TileView {
+                    worker,
+                    capture_status: observer
+                        .capture_statuses
+                        .get(&worker.id)
+                        .copied()
+                        .unwrap_or(CaptureStatus::Loading),
+                    display_title: &observer.worker_display_title(worker),
+                    selected: observer.selected_id() == Some(worker.id.as_str()),
+                    prompt_target: observer.is_prompt_target(&worker.id),
+                    refresh_verb: if mission_control { "retry" } else { "refresh" },
+                },
             );
         }
     }
@@ -1146,19 +1187,39 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, observer: &ObserverState) {
         controls_area,
     );
 }
+/// When a worker was last seen live, for dating what a tile is still showing.
+fn last_live(worker: &ObserverWorker) -> String {
+    worker
+        .last_observed
+        .as_deref()
+        .map(|value| sanitize_label(value, 80))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
 
-fn render_worker(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    worker: &ObserverWorker,
+/// Everything a tile needs about the worker it draws.
+struct TileView<'a> {
+    worker: &'a ObserverWorker,
     capture_status: CaptureStatus,
-    display_title: &str,
+    display_title: &'a str,
     selected: bool,
     prompt_target: bool,
-) {
+    /// The word the footer of this surface uses for the `r` key, so a tile never
+    /// names it differently from the controls beneath it.
+    refresh_verb: &'a str,
+}
+
+fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
     if area.is_empty() {
         return;
     }
+    let TileView {
+        worker,
+        capture_status,
+        display_title,
+        selected,
+        prompt_target,
+        refresh_verb,
+    } = *view;
     let marker = if selected {
         "▶ "
     } else if prompt_target {
@@ -1187,34 +1248,146 @@ fn render_worker(
         .borders(Borders::ALL)
         .title(Line::from(title))
         .style(style);
+    // Both of these states mean the tile is not telling the truth right now, for
+    // different reasons and with different remedies, so the tile says which. Each
+    // sentence is built from what this tile can see - the state, why it went
+    // stale, and whether anything is retained - because a sentence that outran
+    // the facts would contradict the rows underneath it.
+    let inner_width = area.width.saturating_sub(2);
+    let retained = worker.capture.is_some();
+    let state_line = match worker.agent_state {
+        ObserverAgentState::Unreachable if retained => Some(widest_that_fits(
+            inner_width,
+            &[
+                format!(
+                    "UNREACHABLE · nothing answered · the output below is not current · r {refresh_verb}"
+                ),
+                format!(
+                    "UNREACHABLE · nothing answered · output is not current · r {refresh_verb}"
+                ),
+                format!("UNREACHABLE · output not current · r {refresh_verb}"),
+                format!("UNREACHABLE · r {refresh_verb}"),
+            ],
+        )),
+        ObserverAgentState::Unreachable => Some(widest_that_fits(
+            inner_width,
+            &[
+                format!(
+                    "UNREACHABLE · Herdr or the host did not answer · nothing retained · r {refresh_verb}"
+                ),
+                format!("UNREACHABLE · no answer, nothing retained · r {refresh_verb}"),
+                format!("UNREACHABLE · nothing retained · r {refresh_verb}"),
+                format!("UNREACHABLE · r {refresh_verb}"),
+            ],
+        )),
+        // Retrying resnapshots, but a pane that really moved or was replaced has
+        // to be reopened, which is a picker operation rather than anything this
+        // surface can do.
+        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::Binding) => {
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    format!(
+                        "STALE · binding no longer exact · r {refresh_verb}, or reopen from the picker"
+                    ),
+                    format!("STALE · binding no longer exact · r {refresh_verb}"),
+                    format!("STALE · binding · r {refresh_verb}"),
+                    format!("STALE · r {refresh_verb}"),
+                ],
+            ))
+        }
+        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::Connection) => {
+            let observed = last_live(worker);
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    format!(
+                        "STALE · connection lost · showing last known · last live {observed} · r {refresh_verb}"
+                    ),
+                    format!("STALE · connection lost · last live {observed} · r {refresh_verb}"),
+                    format!("STALE · last live {observed} · r {refresh_verb}"),
+                    format!("STALE · connection lost · r {refresh_verb}"),
+                    format!("STALE · r {refresh_verb}"),
+                ],
+            ))
+        }
+        ObserverAgentState::Stale if retained => {
+            let observed = last_live(worker);
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    format!(
+                        "STALE · retained, not current · last live {observed} · r {refresh_verb}"
+                    ),
+                    // The time it was last live outranks the prose: it is the
+                    // fact that tells a reader how old what they see is.
+                    format!("STALE · not current · last live {observed} · r {refresh_verb}"),
+                    format!("STALE · last live {observed} · r {refresh_verb}"),
+                    format!("STALE · retained, not current · r {refresh_verb}"),
+                    format!("STALE · r {refresh_verb}"),
+                ],
+            ))
+        }
+        // Stale with nothing retained: there is no remembered output to offer,
+        // so the sentence must not imply there is.
+        ObserverAgentState::Stale => Some(widest_that_fits(
+            inner_width,
+            &[
+                format!("STALE · not current, and nothing retained · r {refresh_verb}"),
+                format!("STALE · not current, nothing retained · r {refresh_verb}"),
+                format!("STALE · not current · r {refresh_verb}"),
+                format!("STALE · r {refresh_verb}"),
+            ],
+        )),
+        _ => None,
+    };
+    // An explanation is added to what the body already said, never swapped for
+    // it: why output is missing and why the tile is not current are different
+    // facts, and a retry fixes only one of them.
+    let prefixed = |line: Option<String>, body: &str| match line {
+        Some(line) => format!("{line}\n{body}"),
+        None => body.to_owned(),
+    };
     let body = if !worker.capabilities.observe_output {
-        "Output not authorized".to_owned()
+        prefixed(state_line, "Output not authorized")
     } else {
         match capture_status {
-            CaptureStatus::Loading if worker.uses_live_agent() => {
+            // A tile that is not current must not advertise a read key the
+            // surface refuses in that state.
+            CaptureStatus::Loading if worker.uses_live_agent() && state_line.is_none() => {
                 "Herdr agent attached · press v to read output".to_owned()
             }
-            CaptureStatus::Loading => "Loading output".to_owned(),
-            CaptureStatus::Unavailable => "Output unavailable".to_owned(),
+            CaptureStatus::Loading => prefixed(state_line, "Loading output"),
+            CaptureStatus::Unavailable => prefixed(state_line, "Output unavailable"),
             CaptureStatus::Stale => {
                 let capture = worker
                     .capture
                     .as_deref()
                     .map(sanitize_capture)
                     .unwrap_or_default();
-                let observed = worker
-                    .last_observed
-                    .as_deref()
-                    .map(|value| sanitize_label(value, 80))
-                    .unwrap_or_else(|| "unknown".to_owned());
-                format!("STALE · last live {observed}\n{capture}")
+                let explanation = state_line.unwrap_or_else(|| "STALE".to_owned());
+                format!("{explanation}\n{capture}")
             }
             status @ (CaptureStatus::Ready | CaptureStatus::Truncated) => {
                 // Herdr reports truncation when it dropped older rows. Spend one
                 // row saying so rather than presenting a clipped capture as the
                 // worker's complete output.
                 let truncated = status == CaptureStatus::Truncated;
-                let reserved = if truncated { 3 } else { 2 };
+                let mut reserved = if truncated { 3 } else { 2 };
+                // The explanation costs a row of capture, but never the last one:
+                // on a tile too short to hold both, the output the user came for
+                // wins and the state stays legible in the border title.
+                let explained = state_line
+                    .filter(|_| area.height > reserved + 1)
+                    .inspect(|_| reserved += 1);
+                let prefix = [
+                    explained.as_deref(),
+                    truncated.then_some("TRUNCATED · older output dropped by Herdr"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
                 worker
                     .capture
                     .as_deref()
@@ -1226,17 +1399,17 @@ fn render_worker(
                             area.width.saturating_sub(2),
                             area.height.saturating_sub(reserved),
                         );
-                        if truncated {
-                            format!("TRUNCATED · older output dropped by Herdr\n{viewport}")
-                        } else {
+                        if prefix.is_empty() {
                             viewport
+                        } else {
+                            format!("{prefix}\n{viewport}")
                         }
                     })
                     .unwrap_or_else(|| {
-                        if truncated {
-                            "TRUNCATED · older output dropped by Herdr".to_owned()
-                        } else {
+                        if prefix.is_empty() {
                             "No captured output".to_owned()
+                        } else {
+                            prefix.clone()
                         }
                     })
             }
