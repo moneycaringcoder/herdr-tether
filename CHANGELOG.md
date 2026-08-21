@@ -84,6 +84,14 @@
   comes from Herdr's typed snapshot and events. Every line above the output now
   earns its row and none may take the last one, so a short tile still shows
   output rather than only labels.
+- A trail of lifecycle transitions, `audit.json`, and `herdr-tether session
+  history` to read it. A record says where a workload ended up; the trail says how
+  it got there - the reservation, the activation, a Stop beginning and finishing, a
+  restart's incarnation, a reconciliation, a removal - with the exit status when
+  one was observed. It carries no host, target, directory, command, preset, or
+  ownership proof, is bounded by both the configured retention window and a
+  ceiling on entries, and is dropped rather than failing an operation when it
+  cannot be written.
 - Per-workload resource reporting. A running picker row now says what that
   workload's processes are using on their host, after the row's own words so a
   figure never costs the identity it belongs to, answering "which of these twenty

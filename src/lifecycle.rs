@@ -6,6 +6,7 @@ use thiserror::Error;
 use chrono::{DateTime, Duration, Utc};
 
 use crate::{
+    audit::{AuditAction, AuditEntry, AuditStore},
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     model::{OwnershipProof, SessionId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
@@ -118,11 +119,54 @@ pub enum CloseOwnedError {
 pub struct LifecycleService {
     store: StateStore,
     binaries: ProcessBinaries,
+    /// Where transitions are recorded, when a caller wants a trail.
+    ///
+    /// Optional so a caller that only reads state pays nothing, and so the
+    /// service keeps working when the trail cannot be written: a record of what
+    /// happened must never be the reason something does not happen.
+    audit: Option<AuditStore>,
 }
 
 impl LifecycleService {
     pub fn new(store: StateStore, binaries: ProcessBinaries) -> Self {
-        Self { store, binaries }
+        Self {
+            store,
+            binaries,
+            audit: None,
+        }
+    }
+
+    /// Records the transitions this service commits.
+    #[must_use]
+    pub fn with_audit(mut self, audit: AuditStore) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Notes one transition, if a trail is being kept.
+    ///
+    /// A failure to write is deliberately dropped rather than surfaced: the
+    /// transition already happened, and turning a bookkeeping failure into an
+    /// operation failure would be worse than a missing line. The error text is
+    /// not logged either, because it would carry the trail's path.
+    fn note(
+        &self,
+        record: &SessionRecord,
+        action: AuditAction,
+        from: SessionStatus,
+        to: SessionStatus,
+    ) {
+        if let Some(audit) = self.audit.as_ref() {
+            let _ = audit.record(AuditEntry {
+                at: Utc::now(),
+                session: record.id,
+                action,
+                from: Some(from),
+                to,
+                incarnation: record.tmux_session_id,
+                exit_status: record.exit_status,
+            });
+        }
     }
 
     /// Reads the exact persisted record without configuring or invoking transport.
@@ -154,6 +198,12 @@ impl LifecycleService {
             WorkloadState::Unknown => unreachable!("handled above"),
         };
         self.ensure_stopping(&record, identity)?;
+        self.note(
+            &record,
+            AuditAction::Stop,
+            record.status,
+            SessionStatus::Stopping,
+        );
 
         // A workload whose command already exited holds the only exit status
         // anyone will ever see: the pane is dead, and reaping it destroys the
@@ -185,6 +235,15 @@ impl LifecycleService {
             ClosedWorkload::Missing
         };
         self.finish_close(&id, &record.target, observed_exit_status)?;
+        self.note(
+            &SessionRecord {
+                exit_status: observed_exit_status,
+                ..record.clone()
+            },
+            AuditAction::Stopped,
+            SessionStatus::Stopping,
+            SessionStatus::Ended,
+        );
         Ok(CloseOwnedResult { id, workload })
     }
 
@@ -463,8 +522,26 @@ impl LifecycleService {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
                 self.mark_ended(&record, Some(identity), exit_status)?;
+                self.note(
+                    &SessionRecord {
+                        tmux_session_id: Some(identity),
+                        exit_status,
+                        ..record.clone()
+                    },
+                    AuditAction::Reconciled,
+                    record.status,
+                    SessionStatus::Ended,
+                );
             }
-            WorkloadState::Missing => self.mark_ended(&record, None, None)?,
+            WorkloadState::Missing => {
+                self.mark_ended(&record, None, None)?;
+                self.note(
+                    &record,
+                    AuditAction::Reconciled,
+                    record.status,
+                    SessionStatus::Ended,
+                );
+            }
         }
         Ok(observed)
     }
@@ -498,6 +575,16 @@ impl LifecycleService {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
                 self.promote_running(&record, identity)?;
+                self.note(
+                    &SessionRecord {
+                        tmux_session_id: Some(identity),
+                        exit_status: None,
+                        ..record.clone()
+                    },
+                    AuditAction::Observed,
+                    record.status,
+                    SessionStatus::Running,
+                );
                 return Ok(RestartOwnedResult { id, identity });
             }
             WorkloadState::Ended { identity, .. } => {
@@ -562,6 +649,16 @@ impl LifecycleService {
             })
             .map_err(|source| CloseOwnedError::Create { id, source })?;
         self.promote_running(&reservation, identity)?;
+        self.note(
+            &SessionRecord {
+                tmux_session_id: Some(identity),
+                exit_status: None,
+                ..reservation.clone()
+            },
+            AuditAction::Restart,
+            SessionStatus::Creating,
+            SessionStatus::Running,
+        );
         Ok(RestartOwnedResult { id, identity })
     }
 
@@ -595,6 +692,12 @@ impl LifecycleService {
                     Ok(())
                 })
                 .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+            self.note(
+                &record,
+                AuditAction::Removed,
+                record.status,
+                SessionStatus::Removed,
+            );
             return Ok(RemoveOwnedResult {
                 id,
                 workload: ClosedWorkload::Missing,
@@ -648,6 +751,12 @@ impl LifecycleService {
                 Ok(())
             })
             .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
+        self.note(
+            &record,
+            AuditAction::Removed,
+            record.status,
+            SessionStatus::Removed,
+        );
         Ok(RemoveOwnedResult { id, workload })
     }
 

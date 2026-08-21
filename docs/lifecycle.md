@@ -172,6 +172,31 @@ Ended metadata is retained long enough to make Restart and diagnostics useful. S
 
 History maintenance is intentionally not part of the normal workflow. Use the advanced CLI maintenance command only when you need to inspect or clear eligible history explicitly; run `herdr-tether session --help` for the commands supported by the installed version.
 
+## Reconstructing what happened
+
+A record says where a workload ended up. What people actually want after
+something goes wrong is the order things happened in, so Tether keeps a trail of
+the transitions themselves: the reservation, the activation, a Stop beginning and
+finishing, a restart's new incarnation, a reconciliation that found the work
+already ended, and a removal. Each line carries when it happened, which workload,
+which `tmux` incarnation, and the exit status when one was observed. Run
+`herdr-tether session history` to read it.
+
+The trail says nothing about where a workload runs or what it does. No host, no
+target, no directory, no command, no preset, no ownership proof - the same
+exclusions state and notifications already enforce, and more of them, because a
+trail is the thing someone pastes into a bug report.
+
+It is bounded twice over. Transitions are dropped once they pass the same
+`retention.closed_days` window that decides how long closed workloads are kept,
+and a ceiling on the number of entries stops one busy day from growing the file
+without limit; the oldest go first. The trail is a sibling of `state.json` with
+its own schema, so reading current state never carries the whole history.
+
+It is a record of work, never a precondition for it. A transition that cannot be
+written to the trail is dropped rather than failing the operation that already
+succeeded, so a missing line means bookkeeping failed, not that the work did.
+
 ## Ownership boundary
 
 Tether reserves generated `tether-*` identities for workloads it creates. Lifecycle actions use exact recorded host and session identities.

@@ -9,6 +9,7 @@ use std::{
 use chrono::{Duration, TimeZone, Utc};
 use fs2::FileExt;
 use herdr_tether::{
+    audit::{AuditAction, AuditStore},
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
     lifecycle::{
         CleanupEligibility, CloseOwnedError, ClosedWorkload, LifecycleService, PruneError,
@@ -260,6 +261,60 @@ fn stop_fixture(line: &str) -> (tempfile::TempDir, StateStore, LifecycleService)
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
     (temp, store, service)
+}
+
+#[test]
+fn a_real_stop_leaves_both_of_its_transitions_in_the_trail() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    // A dead pane reporting status 2: a stop is two transitions, and the record
+    // afterwards shows only the second one.
+    let (temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:1:2:0197f198000070008000000000000002",
+    );
+    let trail = AuditStore::new(temp.path().join("audit.json"), 30);
+    let service = service.with_audit(trail.clone());
+
+    service.stop_owned(id()).unwrap();
+
+    let entries = trail.entries().unwrap();
+    let actions: Vec<AuditAction> = entries.iter().map(|entry| entry.action).collect();
+    assert_eq!(
+        actions,
+        vec![AuditAction::Stop, AuditAction::Stopped],
+        "a stop passes through Stopping on its way to Ended: {entries:?}"
+    );
+    assert_eq!(entries[0].from, Some(SessionStatus::Running));
+    assert_eq!(entries[1].to, SessionStatus::Ended);
+    assert_eq!(
+        entries[1].exit_status,
+        Some(2),
+        "the trail keeps how it ended, not just that it ended"
+    );
+    assert_eq!(
+        entries[1].session,
+        store.load().unwrap().sessions[0].id,
+        "the trail names the same workload the state does"
+    );
+}
+
+#[test]
+fn a_trail_that_cannot_be_written_does_not_fail_the_stop() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let (temp, store, service) = stop_fixture(
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002",
+    );
+    // A directory where the trail expects a file: recording cannot succeed.
+    let path = temp.path().join("audit.json");
+    fs::create_dir(&path).unwrap();
+    let service = service.with_audit(AuditStore::new(path, 30));
+
+    service
+        .stop_owned(id())
+        .expect("a record of the work is not a precondition for the work");
+    assert_eq!(
+        store.load().unwrap().sessions[0].status,
+        SessionStatus::Ended
+    );
 }
 
 #[test]

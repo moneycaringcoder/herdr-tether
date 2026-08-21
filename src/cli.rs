@@ -15,12 +15,13 @@ use serde::Serialize;
 
 use crate::{
     agent_view::AgentViewService,
+    audit::{AuditAction, AuditEntry, AuditStore},
     backend::{
         CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, create_outcome_is_uncertain,
     },
     config::{
         CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
-        HostConfig,
+        HostConfig, RetentionDefaults,
     },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
@@ -30,7 +31,7 @@ use crate::{
     lifecycle::{ClosedWorkload, LifecycleService, PruneError, PruneService},
     model::{
         ExternalSessionName, HerdrAgentKind, OrchestrationGroupId, OrchestrationTitle,
-        OwnershipProof, Placement, SessionId,
+        OwnershipProof, Placement, SessionId, TmuxSessionId,
     },
     observer_manager::{ObserverManagerAction, ObserverManagerState, run_observer_manager},
     orchestration::{
@@ -246,6 +247,8 @@ enum SessionCommand {
     Remove { id: SessionId },
     /// Clear old ended or removed history without touching workloads.
     Prune(PruneArgs),
+    /// Show the recorded lifecycle transitions.
+    History(HistoryArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,6 +338,19 @@ struct PruneArgs {
     /// Minimum age since close. Uses configured retention when omitted.
     #[arg(long)]
     older_than_days: Option<u64>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct HistoryArgs {
+    /// Show only one workload's transitions.
+    #[arg(long)]
+    session: Option<SessionId>,
+    /// Show the most recent transitions only.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -738,6 +754,7 @@ fn open(paths: &AppPaths, args: OpenArgs) -> Result<()> {
     loop {
         let state = state_store.load()?;
         let Some(selection) = selection_from_picker(
+            paths,
             &config,
             &aliases,
             &state_store,
@@ -1000,6 +1017,7 @@ fn selection_from_args(
 }
 
 fn selection_from_picker(
+    paths: &AppPaths,
     config: &Config,
     aliases: &[String],
     state_store: &StateStore,
@@ -1050,8 +1068,7 @@ fn selection_from_picker(
             workers: config.discovery.workers,
         },
     );
-    let lifecycle_service =
-        LifecycleService::new(state_store.clone(), ProcessBinaries::new("ssh", "tmux"));
+    let lifecycle_service = audited_lifecycle(paths, state_store.clone());
     let prune_service = PruneService::new(state_store.clone());
     let Some(selection) = run_picker_with_operation_error(
         options,
@@ -1120,6 +1137,35 @@ fn retain_requested_host_groups(options: &mut PickerOptions, requested_host: Opt
     }
 }
 
+/// The trail this installation keeps, with the retention it asked for.
+fn audit_trail(paths: &AppPaths, config: &Config) -> AuditStore {
+    AuditStore::new(paths.audit_file(), config.retention.closed_days)
+}
+
+/// Records a transition the create path commits itself.
+///
+/// Dropped on failure for the same reason the lifecycle service drops it: the
+/// workload exists either way, and a bookkeeping failure must not fail a create
+/// that already succeeded.
+fn note_transition(
+    trail: &AuditStore,
+    session: SessionId,
+    action: AuditAction,
+    from: Option<SessionStatus>,
+    to: SessionStatus,
+    incarnation: Option<TmuxSessionId>,
+) {
+    let _ = trail.record(AuditEntry {
+        at: Utc::now(),
+        session,
+        action,
+        from,
+        to,
+        incarnation,
+        exit_status: None,
+    });
+}
+
 fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection) -> Result<()> {
     if selection.directory.trim().is_empty() {
         bail!("session directory must not be empty");
@@ -1170,6 +1216,17 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         state.sessions.push(record);
         Ok(())
     })?;
+    // A reservation that is never activated is the case a trail exists for: it
+    // is the only evidence that a create was attempted at all.
+    let trail = audit_trail(paths, config);
+    note_transition(
+        &trail,
+        id,
+        AuditAction::Create,
+        None,
+        SessionStatus::Creating,
+        None,
+    );
     let identity = match backend.create(&launch) {
         Ok(identity) => identity,
         Err(error) => {
@@ -1206,6 +1263,14 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
                 "record created session `{id}`; the workload remains safely recoverable from its creating reservation"
             )
         })?;
+    note_transition(
+        &trail,
+        id,
+        AuditAction::Activate,
+        Some(SessionStatus::Creating),
+        SessionStatus::Running,
+        Some(identity),
+    );
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
@@ -1233,11 +1298,25 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         )?)
     }
 }
+/// A lifecycle service that records the transitions it commits.
+///
+/// One place builds this, so a transition is either recorded for every caller or
+/// for none. Retention comes from `retention.closed_days`, the same window that
+/// decides how long closed workloads are kept: the trail describes those
+/// workloads, so outliving them would be a promise nobody asked for. A config
+/// that cannot be read falls back to the default window rather than failing an
+/// operation, because the trail is never the point of the command.
+fn audited_lifecycle(paths: &AppPaths, store: StateStore) -> LifecycleService {
+    let retention_days = ConfigStore::new(paths.config_file.clone())
+        .load()
+        .map(|config| config.retention.closed_days)
+        .unwrap_or_else(|_| RetentionDefaults::default().closed_days);
+    LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"))
+        .with_audit(AuditStore::new(paths.audit_file(), retention_days))
+}
+
 fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
-    let service = LifecycleService::new(
-        StateStore::new(paths.state_file.clone()),
-        ProcessBinaries::new("ssh", "tmux"),
-    );
+    let service = audited_lifecycle(paths, StateStore::new(paths.state_file.clone()));
     let record = service
         .owned_record(id)?
         .with_context(|| format!("unknown Tether session `{id}`"))?;
@@ -1282,10 +1361,7 @@ fn restart_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> 
 fn resume_and_attach(paths: &AppPaths, id: SessionId, placement: Placement) -> Result<()> {
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
-        let service = LifecycleService::new(
-            StateStore::new(paths.state_file.clone()),
-            ProcessBinaries::new("ssh", "tmux"),
-        );
+        let service = audited_lifecycle(paths, StateStore::new(paths.state_file.clone()));
         let record = service
             .owned_record(id)?
             .with_context(|| format!("unknown Tether session `{id}`"))?;
@@ -1555,8 +1631,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                     "session `{id}` was removed; run `herdr-tether open` to create a new workload"
                 ),
             }
-            let attach = LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
-                .open_owned(id)?;
+            let attach = audited_lifecycle(paths, store.clone()).open_owned(id)?;
             run_attach(attach_with_agent_hint(attach, record.herdr_agent.as_ref())?)
         }
         SessionCommand::AttachExternal { target, name } => {
@@ -1577,7 +1652,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
             })
         }
         SessionCommand::Stop { id } => {
-            LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+            audited_lifecycle(paths, store.clone())
                 .close_owned(id)
                 .with_context(|| {
                     format!(
@@ -1594,7 +1669,7 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 .iter()
                 .find(|record| record.id == id)
                 .is_some_and(|record| record.ownership_proof.is_none());
-            LifecycleService::new(store.clone(), ProcessBinaries::new("ssh", "tmux"))
+            audited_lifecycle(paths, store.clone())
                 .remove_owned(id)
                 .with_context(|| {
                     format!(
@@ -1605,6 +1680,29 @@ fn session_command(paths: &AppPaths, command: SessionCommand) -> Result<()> {
                 println!("removed legacy metadata {id}; no workload was contacted");
             } else {
                 println!("removed {id}");
+            }
+            Ok(())
+        }
+        SessionCommand::History(args) => {
+            let retention = ConfigStore::new(paths.config_file.clone())
+                .load()
+                .map(|config| config.retention.closed_days)
+                .unwrap_or_else(|_| RetentionDefaults::default().closed_days);
+            let mut entries = AuditStore::new(paths.audit_file(), retention).entries()?;
+            if let Some(session) = args.session {
+                entries.retain(|entry| entry.session == session);
+            }
+            if let Some(limit) = args.limit {
+                // The most recent are the ones being reconstructed from.
+                let excess = entries.len().saturating_sub(limit);
+                entries.drain(..excess);
+            }
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                for entry in &entries {
+                    println!("{}", entry.summary());
+                }
             }
             Ok(())
         }
@@ -1756,7 +1854,7 @@ fn group_action(
     confirm_group_action(action, group, acting.len(), args.yes)?;
 
     let store = StateStore::new(paths.state_file.clone());
-    let lifecycle = LifecycleService::new(store, ProcessBinaries::new("ssh", "tmux"));
+    let lifecycle = audited_lifecycle(paths, store);
     // Each line is printed as its member finishes: a stop contacts a host per
     // member, and a command that went silent for minutes would invite the
     // interruption that loses the record of what it already ended.
