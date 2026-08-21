@@ -752,6 +752,26 @@ fn format_status_label<T>(
     }
 }
 
+/// Puts a value after a row's own words instead of in front of them.
+///
+/// Rows truncate from the right, so a fact in front costs the identity behind
+/// it. Anything that is worth showing but not worth losing a workload's name
+/// over belongs here.
+fn format_appended_status<T>(
+    base: &str,
+    cell: &StatusCell<T>,
+    text: impl Fn(&T) -> String,
+) -> String {
+    if cell.loading {
+        return base.to_owned();
+    }
+    match (&cell.value, cell.stale) {
+        (Some(value), true) => format!("{base} · stale: {}", text(value)),
+        (Some(value), false) => format!("{base} · {}", text(value)),
+        (None, _) => base.to_owned(),
+    }
+}
+
 fn host_status_text(status: &HostReachability) -> String {
     match status {
         HostReachability::Reachable => "online",
@@ -798,11 +818,24 @@ fn health_status_text(status: &HealthStatus) -> String {
 fn resource_text(report: &ResourceReport) -> String {
     match report {
         ResourceReport::Known(usage) => format!(
-            "{:.0}% cpu · {} rss",
-            usage.cpu_percent,
+            "{} · {}",
+            cpu_percent(usage.cpu_percent),
             human_bytes(usage.memory_bytes)
         ),
         ResourceReport::Unknown => "usage unknown".to_owned(),
+    }
+}
+
+/// Processor share, keeping a decimal where it changes the meaning.
+///
+/// A known figure below half a percent must not render as `0%`: a workload using
+/// a little and a workload using nothing are different answers, and collapsing
+/// them is the zero this feature exists to avoid.
+fn cpu_percent(percent: f32) -> String {
+    if percent < 10.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
     }
 }
 
@@ -1601,13 +1634,23 @@ impl PickerState {
                 checked_at,
                 ..
             } => {
-                // The answer itself is what puts usage on a row, and it only
-                // arrives for a workload the request asked about.
-                self.workload_resources
-                    .entry(id)
-                    .or_default()
-                    .apply(report, checked_at);
-                true
+                // The answer is what puts usage on a row, so the cell is created
+                // here rather than seeded on every refresh. It is created only
+                // for a row that still exists: a workload pruned while its
+                // result was in flight would otherwise leave a cell no later
+                // pass can reach.
+                self.options
+                    .hosts
+                    .iter()
+                    .flat_map(|host| &host.workloads)
+                    .any(|workload| workload.id == id)
+                    && {
+                        self.workload_resources
+                            .entry(id)
+                            .or_default()
+                            .apply(report, checked_at);
+                        true
+                    }
             }
             StatusMessage::Finished { .. } => false,
         };
@@ -1893,11 +1936,13 @@ impl PickerState {
                         }
                         None => liveness,
                     };
-                    // Usage sits beside both, and only on a running row: a
-                    // stopped workload is not using anything, which is a fact
-                    // rather than a figure Tether is missing.
+                    // Usage goes after the row's own words rather than in front
+                    // of them. A row is truncated from the right, and knowing
+                    // which workload a figure belongs to matters more than the
+                    // figure: a bracket in front would push the directory off
+                    // the end and leave a number attached to nothing.
                     match self.workload_resources.get(&workload.id) {
-                        Some(cell) => format_status_label(&health, Some(cell), resource_text),
+                        Some(cell) => format_appended_status(&health, cell, resource_text),
                         None => health,
                     }
                 } else {
@@ -3953,14 +3998,27 @@ mod close_render_tests {
             }),
             checked_at: std::time::SystemTime::now(),
         }));
-        let label = picker.workload_label(id).expect("the row exists");
+
+        // The label is composed before it is truncated, so what a person can
+        // actually read is the rendered row. Identity comes first: a figure that
+        // pushed the workload's directory off the end would be unattributable.
+        let rendered = render_picker_to_text(72, 20, &picker).unwrap();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("00000001"))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            row.contains("/srv/app"),
+            "the row still says which workload it is: {row:?}"
+        );
         // Over a core is the answer to "which of these is eating the machine",
         // so it is not clamped to 100.
-        assert!(label.contains("144% cpu"), "{label}");
-        assert!(label.contains("1.5G rss"), "{label}");
+        let label = picker.workload_label(id).expect("the row exists");
+        assert!(label.contains("144%"), "{label}");
+        assert!(label.contains("1.5G"), "{label}");
         assert!(
-            label.contains("[running]"),
-            "usage sits beside liveness: {label}"
+            label.starts_with("[running]"),
+            "identity and state stay in front: {label}"
         );
 
         // A host that cannot report says so on the row. Zero would claim the
@@ -4029,6 +4087,23 @@ mod close_render_tests {
             !still_failing.contains("no retry needed"),
             "{still_failing}"
         );
+    }
+
+    #[test]
+    fn a_known_sub_percent_figure_is_not_rendered_as_zero() {
+        // A workload known to be using a little and one using nothing are
+        // different answers; rounding both to `0%` is the zero this feature
+        // exists to avoid, just arrived at by a different route.
+        let small = resource_text(&ResourceReport::Known(ResourceUsage {
+            cpu_percent: 0.4,
+            memory_bytes: 4 * 1024 * 1024,
+        }));
+        assert!(small.starts_with("0.4%"), "{small}");
+        let large = resource_text(&ResourceReport::Known(ResourceUsage {
+            cpu_percent: 143.6,
+            memory_bytes: 1_610_612_736,
+        }));
+        assert!(large.starts_with("144%"), "{large}");
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {

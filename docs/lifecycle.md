@@ -120,19 +120,33 @@ host, so the answer to "which of these twenty is eating the machine" is on the
 screen rather than the result of a manual hunt:
 
 ```
-[144% cpu · 1.5G rss] [running] [running] Tether · Open …0000002 · /srv/app · shell
+[running] [running] Tether · Open …0000002 · /srv/app · shell · 144% · 1.5G
 ```
+
+The figure comes after the row's own words, not in front of them: rows truncate
+from the right, and knowing which workload a number belongs to matters more than
+the number.
 
 A workload is a `tmux` session rather than a single process, and its pane's shell
 is usually idle while a child does the work, so these are the totals for every
 process under the workload's panes. Processor share is what the host reports, so
 it can exceed 100% on a multi-core host - which is exactly the case worth seeing.
 
+Processor share is what the workload used while Tether watched, not an average
+over its life. `ps` reports the latter, which would round a workload that has been
+up for days and just started eating a core down to nothing, so Tether takes two
+samples of cumulative processor time a second apart and reports the difference.
+
 Tether asks each host two questions per refresh, whatever the number of workloads
-on it: which process each pane belongs to, and what the host's processes are
-using. A host with twenty workloads therefore costs the same as a host with one,
-and the whole phase is bounded so a slow host delays figures rather than the
-refresh.
+on it: which process each pane belongs to, and what its processes are using. A
+host with twenty workloads therefore costs the same as a host with one, the whole
+phase is bounded so a slow host delays figures rather than the refresh, and a host
+with nothing running is not asked at all.
+
+Resident memory is summed per process, so pages shared between a workload's own
+processes are counted once for each of them. A workload that forks eight workers
+over one heap therefore reads high; the figure is a comparison between workloads
+rather than an accounting of the machine.
 
 Absence is stated rather than drawn as a zero. `usage unknown` on a row means the
 host could not be asked, did not answer, answered unusably, or does not account

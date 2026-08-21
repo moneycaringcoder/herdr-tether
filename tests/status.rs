@@ -693,7 +693,7 @@ fn resource_figures_are_reported_per_workload_and_absence_is_explicit() {
             "#!/bin/sh\ncase \" $* \" in\n\
              *list-sessions*) printf '%s:1\\n%s:0\\n' '{busy}' '{idle}' ;;\n\
              *list-panes*) printf '%s:100\\n%s:200\\n' '{busy}' '{idle}' ;;\n\
-             *' ps '*|*'ps -Ao'*) printf '100 1 0.5 4096\\n101 100 99.5 1048576\\n200 1 1.0 8192\\n' ;;\n\
+             *ps*) printf '100 1 00:10 4096\\n101 100 00:00 1048576\\n200 1 00:05 8192\\ntether-sample\\n100 00:10\\n101 00:01\\n200 00:05\\n' ;;\n\
              *) exit 99 ;;\n\
              esac\n"
         ),
@@ -740,13 +740,17 @@ fn resource_figures_are_reported_per_workload_and_absence_is_explicit() {
     let ResourceReport::Known(usage) = report(busy) else {
         panic!("the busy workload reports a figure: {reports:?}");
     };
-    // The pane plus its child, not the pane alone.
+    // The child used a second of processor time while Tether waited a second;
+    // the pane's own shell used none. A figure from the pane alone would be zero.
     assert!((usage.cpu_percent - 100.0).abs() < 0.01, "{usage:?}");
     assert_eq!(usage.memory_bytes, (4096 + 1_048_576) * 1024);
     let ResourceReport::Known(usage) = report(idle) else {
         panic!("the idle workload still reports a figure: {reports:?}");
     };
-    assert!((usage.cpu_percent - 1.0).abs() < 0.01, "{usage:?}");
+    assert!(
+        usage.cpu_percent.abs() < 0.01,
+        "an idle workload is idle: {usage:?}"
+    );
     // A workload the host said nothing about is unknown, not zero.
     assert_eq!(report(absent), ResourceReport::Unknown);
 }
@@ -954,6 +958,51 @@ fn unreachable_remote_reports_typed_context_without_raw_ssh_stderr() {
     );
     assert!(!detail.contains("private.example"));
     assert!(!detail.contains('\u{1b}'));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_host_with_nothing_running_is_not_asked_what_it_is_using() {
+    let temp = tempdir().unwrap();
+    let ssh = temp.path().join("ssh");
+    let argv = temp.path().join("argv");
+    // The host answers, but none of the requested workloads is there, so no row
+    // can carry a figure. Asking two more questions would buy nothing.
+    fs::write(
+        &ssh,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", argv.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = StatusService::new(
+        ProcessBinaries::new(&ssh, temp.path().join("tmux")),
+        Duration::from_secs(10),
+        1,
+    );
+    let workload = id("tether-0197f198000070008000000000000001");
+    let run = service
+        .try_start(StatusRequest {
+            generation: 17,
+            resources: true,
+            hosts: vec![StatusHost {
+                name: "dev".into(),
+                target: Some("dev".into()),
+                workloads: vec![probe(workload)],
+            }],
+        })
+        .unwrap();
+
+    while let Ok(message) = run.receiver.recv_timeout(Duration::from_secs(15)) {
+        if matches!(message, StatusMessage::Finished { .. }) {
+            break;
+        }
+    }
+
+    let invoked = fs::read_to_string(&argv).unwrap();
+    assert!(
+        !invoked.contains("list-panes") && !invoked.contains("ps -"),
+        "a host with nothing running was asked anyway: {invoked}"
+    );
 }
 
 #[cfg(unix)]

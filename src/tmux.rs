@@ -29,6 +29,15 @@ const HEALTH_SCRIPT: &str = "directory=$1; case \"$directory\" in '~') directory
 /// Exit statuses that mean the health command itself could not run.
 pub(crate) const HEALTH_UNRUNNABLE: [i32; 2] = [126, 127];
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Separates the two process samples in one invocation's output.
+pub(crate) const PROCESS_SAMPLE_SEPARATOR: &str = "tether-sample";
+
+/// How long to wait between the two processor-time samples.
+///
+/// Long enough that a busy process accumulates measurable time, short enough to
+/// sit inside the phase budget with both samples.
+pub(crate) const PROCESS_SAMPLE_SECONDS: u64 = 1;
+
 const TMUX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const OWNERSHIP_GUARD_REJECTED: &str = "TETHER_OWNERSHIP_GUARD_REJECTED";
 
@@ -377,16 +386,26 @@ impl TmuxBackend {
         )
     }
 
-    /// Asks the host for its process table, once.
+    /// Asks the host what its processes are using, twice.
     ///
-    /// Every process with its parent, processor share, and resident size, so a
-    /// workload's total can be summed from the panes down without asking per
-    /// workload. `ps` is specified by POSIX and these four columns are common to
-    /// the Linux and macOS implementations Tether supports.
-    pub(crate) fn process_table_spec(&self) -> Result<CommandSpec> {
+    /// `ps` reports `%CPU` as an average over a process's whole life, which is
+    /// the wrong question: a workload that has been up for days and starts
+    /// eating a core would round to nothing, while one that finished a burst a
+    /// minute ago would still look busy. So this takes two samples of cumulative
+    /// processor time either side of a short wait and lets the caller difference
+    /// them, which is what "using right now" means.
+    ///
+    /// One invocation, so the two samples and the pane mapping cannot drift far
+    /// apart, and `pid` reuse between them stays a microsecond window rather than
+    /// a round trip. `pid`, `ppid`, `time` and `rss` are all POSIX `-o` format
+    /// names.
+    pub(crate) fn process_samples_spec(&self) -> Result<CommandSpec> {
         self.shell_spec(vec![
             "-c".to_owned(),
-            "ps -Ao pid=,ppid=,pcpu=,rss=".to_owned(),
+            format!(
+                "ps -Ao pid=,ppid=,time=,rss=; echo '{PROCESS_SAMPLE_SEPARATOR}'; sleep {}; ps -Ao pid=,time=",
+                PROCESS_SAMPLE_SECONDS
+            ),
         ])
     }
 
@@ -872,6 +891,66 @@ mod tests {
         let remote = spec.args.last().unwrap();
         assert!(remote.contains("/srv/app"), "{remote}");
         assert!(remote.contains("localhost:8080/healthz"), "{remote}");
+        assert!(!remote.contains("tmux"), "{remote}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_process_sample_command_runs_on_this_host_and_finds_this_process() {
+        // The command's exact text is the whole feature: a typo or a column name
+        // one supported platform does not accept degrades silently to "usage
+        // unknown", so it is run here rather than only matched by a fixture.
+        let spec = TmuxBackend::local(ProcessBinaries::new("ssh", "tmux"))
+            .process_samples_spec()
+            .unwrap();
+        let output = Command::new(&spec.program)
+            .args(&spec.args)
+            .output()
+            .expect("the sampling command runs");
+        assert!(
+            output.status.success(),
+            "ps rejected the requested columns: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (first, second) = text
+            .split_once(PROCESS_SAMPLE_SEPARATOR)
+            .expect("both samples are separated");
+        let own = std::process::id();
+        // This process is in both samples, with a parent and a resident size, so
+        // every column the parser reads is present in the order it expects.
+        let row = first
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .find(|fields| fields.first() == Some(&own.to_string().as_str()))
+            .expect("this process appears in the first sample");
+        assert_eq!(row.len(), 4, "{row:?}");
+        assert!(row[1].parse::<u32>().is_ok(), "a parent pid: {row:?}");
+        assert!(
+            row[3].parse::<u64>().is_ok_and(|rss| rss > 0),
+            "a resident size in kibibytes: {row:?}"
+        );
+        assert!(
+            second
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(own.to_string().as_str())),
+            "this process appears in the second sample too"
+        );
+    }
+
+    #[test]
+    fn a_remote_sample_travels_as_one_quoted_command() {
+        let spec = TmuxBackend::remote(
+            "builder@example.test".to_owned(),
+            ProcessBinaries::new("ssh", "tmux"),
+        )
+        .unwrap()
+        .process_samples_spec()
+        .unwrap();
+        assert!(spec.program.ends_with("ssh"), "{:?}", spec.program);
+        let remote = spec.args.last().unwrap();
+        assert!(remote.contains("ps -Ao"), "{remote}");
+        assert!(remote.contains(PROCESS_SAMPLE_SEPARATOR), "{remote}");
         assert!(!remote.contains("tmux"), "{remote}");
     }
     #[test]

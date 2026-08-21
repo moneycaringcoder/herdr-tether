@@ -18,7 +18,7 @@ use crate::{
     backend::{CommandSpec, ProcessBinaries},
     interrupt::{self, Budget},
     model::{ExternalSessionName, SessionId},
-    tmux::TmuxBackend,
+    tmux::{PROCESS_SAMPLE_SECONDS, PROCESS_SAMPLE_SEPARATOR, TmuxBackend},
 };
 use thiserror::Error;
 
@@ -223,8 +223,12 @@ impl StatusService {
         // Three messages per workload now: liveness, health where configured, and
         // usage where asked for. Sized so a worker's send never blocks, because a
         // blocked send stops observing the cancellation flag.
-        let (sender, receiver) =
-            mpsc::sync_channel(MAX_STATUS_WORKLOADS * 3 + MAX_STATUS_HOSTS * 2 + 1);
+        // One Host and one Catalog per host, and per workload one liveness plus
+        // at most one health and one usage result. Sized from the request so the
+        // guarantee costs what this run needs rather than what the largest
+        // conceivable run would.
+        let workloads: usize = request.hosts.iter().map(|host| host.workloads.len()).sum();
+        let (sender, receiver) = mpsc::sync_channel(workloads * 3 + request.hosts.len() * 2 + 1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let jobs = Arc::new(Mutex::new(VecDeque::from(request.hosts)));
         let worker_count = self
@@ -380,6 +384,10 @@ fn probe_host(
 
     let checked_at = SystemTime::now();
     let classified = classify_result(&host, result);
+    let running = classified
+        .workloads
+        .iter()
+        .any(|(_, status)| matches!(status, WorkloadStatus::Running { .. }));
     if sender
         .send(StatusMessage::Host {
             generation,
@@ -428,7 +436,10 @@ fn probe_host(
     // whole refresh re-learning the same failure.
     if classified.reachability == HostReachability::Reachable {
         probe_health(generation, &host, sender, cancelled, binaries, timeout);
-        if resources {
+        // Only a running workload can be using anything, and asking a host whose
+        // workloads have all ended would spend two commands on rows that cannot
+        // show a figure.
+        if resources && running {
             probe_resources(generation, &host, sender, cancelled, binaries, timeout);
         }
     } else {
@@ -615,7 +626,15 @@ fn report_unknown_resources(
     }
 }
 
-/// Runs both commands and sums each owned workload's processes.
+/// How much of a host's answer Tether will read for the process table.
+///
+/// Larger than the general capture cap because this output is bounded by the
+/// host's process count rather than by anything a workload writes: a build box
+/// with thousands of processes is exactly the machine someone asks this question
+/// about, and discarding its answer would report every workload on it as unknown.
+const MAX_PROCESS_TABLE_BYTES: usize = 1024 * 1024;
+
+/// Runs the two commands and sums each owned workload's processes.
 ///
 /// `None` means the host could not be asked at all, which is different from a
 /// workload whose processes were simply not in the answer: the first makes every
@@ -630,21 +649,36 @@ fn collect_resource_usage(
         Some(target) => TmuxBackend::remote(target.to_owned(), binaries.clone()).ok()?,
         None => TmuxBackend::local(binaries.clone()),
     };
-    let panes = run_within(&backend.pane_pids_spec().ok()?, cancelled, deadline)?;
-    let processes = run_within(&backend.process_table_spec().ok()?, cancelled, deadline)?;
+    let panes = run_within(
+        &backend.pane_pids_spec().ok()?,
+        cancelled,
+        deadline,
+        MAX_CAPTURE_BYTES,
+    )?;
+    let samples = run_within(
+        &backend.process_samples_spec().ok()?,
+        cancelled,
+        deadline,
+        MAX_PROCESS_TABLE_BYTES,
+    )?;
     Some(sum_workload_usage(
         &parse_pane_pids(&panes),
-        &parse_process_table(&processes),
+        &parse_process_samples(&samples)?,
     ))
 }
 
 /// Runs one command inside what is left of the phase's deadline.
-fn run_within(spec: &CommandSpec, cancelled: &AtomicBool, deadline: Instant) -> Option<Vec<u8>> {
+fn run_within(
+    spec: &CommandSpec,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    max_capture: usize,
+) -> Option<Vec<u8>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return None;
     }
-    match run_bounded(spec, remaining, cancelled) {
+    match run_bounded_with_capture(spec, remaining, cancelled, max_capture) {
         BoundedOutput::Completed {
             status,
             stdout,
@@ -684,36 +718,79 @@ fn parse_pane_pids(stdout: &[u8]) -> HashMap<SessionId, Vec<u32>> {
     panes
 }
 
-/// Reads `pid ppid pcpu rss` rows into a process table.
+/// Reads `[[dd-]hh:]mm:ss` cumulative processor time into seconds.
+fn parse_cpu_time(field: &str) -> Option<f64> {
+    let (days, clock) = match field.split_once('-') {
+        Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
+        None => (0.0, field),
+    };
+    let mut seconds = 0.0;
+    for part in clock.split(':') {
+        seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(days * 86_400.0 + seconds)
+}
+
+/// Differences two processor-time samples into what each process is using now.
 ///
-/// `rss` is reported in kibibytes by both supported `ps` implementations.
-fn parse_process_table(stdout: &[u8]) -> HashMap<u32, ProcessEntry> {
-    let mut processes = HashMap::new();
-    for line in String::from_utf8_lossy(stdout).lines() {
+/// The first sample carries the parentage and resident size; the second exists
+/// only to say how much processor time each process consumed while Tether
+/// waited. A process that appears in one sample and not the other is left out
+/// rather than counted as idle or as having used everything.
+fn parse_process_samples(stdout: &[u8]) -> Option<HashMap<u32, ProcessEntry>> {
+    let text = String::from_utf8_lossy(stdout);
+    let (first, second) = text.split_once(PROCESS_SAMPLE_SEPARATOR)?;
+    let mut later: HashMap<u32, f64> = HashMap::new();
+    for line in second.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(pid), Some(parent), Some(cpu), Some(rss)) =
+        if let (Some(pid), Some(time)) = (fields.next(), fields.next())
+            && let (Ok(pid), Some(time)) = (pid.parse::<u32>(), parse_cpu_time(time))
+        {
+            later.insert(pid, time);
+        }
+    }
+    let interval = PROCESS_SAMPLE_SECONDS as f64;
+    let mut processes = HashMap::new();
+    for line in first.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent), Some(time), Some(rss)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
-        let (Ok(pid), Ok(parent), Ok(cpu), Ok(rss)) = (
+        let (Ok(pid), Ok(parent), Some(time), Ok(rss)) = (
             pid.parse::<u32>(),
             parent.parse::<u32>(),
-            cpu.parse::<f32>(),
+            parse_cpu_time(time),
             rss.parse::<u64>(),
         ) else {
             continue;
         };
+        let Some(used) = later.get(&pid).map(|later| later - time) else {
+            continue;
+        };
+        // A negative delta means the pid was reused between samples, so neither
+        // figure describes one process.
+        if !used.is_finite() || used < 0.0 || !rss_is_plausible(rss) {
+            continue;
+        }
         processes.insert(
             pid,
             ProcessEntry {
                 parent,
-                cpu_percent: cpu,
+                cpu_percent: (used / interval * 100.0) as f32,
                 memory_bytes: rss.saturating_mul(1024),
             },
         );
     }
-    processes
+    Some(processes)
+}
+
+/// Whether a resident-size field is a figure rather than nonsense.
+fn rss_is_plausible(rss: u64) -> bool {
+    // A pathological `ps` could report a size larger than any real machine has;
+    // saturating the sum would then hide it behind a plausible-looking total.
+    rss < u64::MAX / 1024
 }
 
 /// Sums each workload's processes, panes and everything under them.
@@ -1125,6 +1202,21 @@ pub(crate) fn run_bounded(
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> BoundedOutput {
+    run_bounded_with_capture(spec, timeout, cancelled, MAX_CAPTURE_BYTES)
+}
+
+/// Runs a bounded command, retaining at most `max_capture` bytes per stream.
+///
+/// The ceiling is a parameter because it is a judgement about the output, not
+/// about the command: a workload's terminal text is untrusted and kept small,
+/// while a host's process table is bounded by how many processes it has and
+/// discarding it would report every workload on a busy host as unknown.
+pub(crate) fn run_bounded_with_capture(
+    spec: &CommandSpec,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    max_capture: usize,
+) -> BoundedOutput {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -1148,16 +1240,16 @@ pub(crate) fn run_bounded(
     let deadline = Instant::now() + timeout.min(MAX_PROCESS_TIMEOUT);
 
     loop {
-        if drain_pipe(stdout.as_mut(), &mut stdout_capture).is_err()
-            || drain_pipe(stderr.as_mut(), &mut stderr_capture).is_err()
+        if drain_pipe(stdout.as_mut(), &mut stdout_capture, max_capture).is_err()
+            || drain_pipe(stderr.as_mut(), &mut stderr_capture, max_capture).is_err()
         {
             terminate_child(&mut child);
             return BoundedOutput::Error;
         }
         if cancelled.load(Ordering::Acquire) {
             terminate_child(&mut child);
-            let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
-            let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
+            let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture, max_capture);
+            let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture, max_capture);
             return BoundedOutput::Cancelled;
         }
         // `try_wait` polls with `WNOHANG` and, unlike `Child::wait`, reports an
@@ -1172,8 +1264,8 @@ pub(crate) fn run_bounded(
                 // into its fresh process group. End them before returning so a
                 // completed bounded command cannot leave orphaned work behind.
                 kill_process_group(child.id());
-                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
-                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
+                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture, max_capture);
+                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture, max_capture);
                 return BoundedOutput::Completed {
                     status,
                     stdout: stdout_capture.bytes,
@@ -1184,8 +1276,8 @@ pub(crate) fn run_bounded(
             }
             Ok(None) if Instant::now() >= deadline => {
                 terminate_child(&mut child);
-                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
-                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
+                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture, max_capture);
+                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture, max_capture);
                 return BoundedOutput::TimedOut;
             }
             Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
@@ -1194,8 +1286,8 @@ pub(crate) fn run_bounded(
             // the arm above rather than an unexplained transport failure.
             Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                 terminate_child(&mut child);
-                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture);
-                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture);
+                let _ = drain_pipe(stdout.as_mut(), &mut stdout_capture, max_capture);
+                let _ = drain_pipe(stderr.as_mut(), &mut stderr_capture, max_capture);
                 return BoundedOutput::TimedOut;
             }
             Err(_) => {
@@ -1252,7 +1344,11 @@ struct Capture {
     truncated: bool,
 }
 
-fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Result<()> {
+fn drain_pipe<R: Read>(
+    pipe: Option<&mut R>,
+    capture: &mut Capture,
+    max_capture: usize,
+) -> io::Result<()> {
     let Some(pipe) = pipe else {
         return Ok(());
     };
@@ -1265,7 +1361,7 @@ fn drain_pipe<R: Read>(pipe: Option<&mut R>, capture: &mut Capture) -> io::Resul
             Ok(0) => return Ok(()),
             Ok(length) => {
                 drained += length;
-                let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.bytes.len());
+                let remaining = max_capture.saturating_sub(capture.bytes.len());
                 let retained = remaining.min(length);
                 capture.bytes.extend_from_slice(&buffer[..retained]);
                 capture.truncated |= retained < length;
@@ -1326,7 +1422,8 @@ mod tests {
             interrupted: false,
         };
         let mut capture = Capture::default();
-        drain_pipe(Some(&mut pipe), &mut capture).expect("an interruption is not a failure");
+        drain_pipe(Some(&mut pipe), &mut capture, MAX_CAPTURE_BYTES)
+            .expect("an interruption is not a failure");
         assert_eq!(capture.bytes, b"session\n");
         assert!(!capture.truncated);
     }
@@ -1342,7 +1439,7 @@ mod tests {
         }
 
         let mut capture = Capture::default();
-        let error = drain_pipe(Some(&mut Broken), &mut capture).unwrap_err();
+        let error = drain_pipe(Some(&mut Broken), &mut capture, MAX_CAPTURE_BYTES).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 
@@ -1571,19 +1668,58 @@ mod tests {
     }
 
     #[test]
-    fn a_process_table_row_is_read_or_ignored_but_never_guessed() {
-        let processes = parse_process_table(
-            b"  100     1  12.5  4096\n\
-              101   100   0.0   2048\n\
-              garbage row\n\
-              102   100   notanumber 4\n",
+    fn processor_share_is_what_was_used_between_the_samples() {
+        // `ps` reports %CPU as an average over a process's whole life, so a
+        // workload that has been up for days and starts eating a core would
+        // round to nothing. Differencing two samples asks what it is using now.
+        let samples = format!(
+            "  100     1  00:10 4096\n\
+               101   100  1-02:03:04 2048\n\
+             {PROCESS_SAMPLE_SEPARATOR}\n\
+               100        00:11\n\
+               101        1-02:03:04\n"
         );
+        let processes = parse_process_samples(samples.as_bytes()).unwrap();
         assert_eq!(processes.len(), 2, "{processes:?}");
-        let entry = processes.get(&100).unwrap();
-        assert_eq!(entry.parent, 1);
-        assert!((entry.cpu_percent - 12.5).abs() < 0.01);
-        // `ps` reports resident size in kibibytes on both supported platforms.
-        assert_eq!(entry.memory_bytes, 4096 * 1024);
+        // One second of processor time over a one second wait is a full core,
+        // whatever the process did before Tether looked.
+        let busy = processes.get(&100).unwrap();
+        assert!((busy.cpu_percent - 100.0).abs() < 0.01, "{busy:?}");
+        assert_eq!(busy.memory_bytes, 4096 * 1024);
+        // A day of accumulated time and no movement is idle now.
+        let idle = processes.get(&101).unwrap();
+        assert!(idle.cpu_percent.abs() < 0.01, "{idle:?}");
+    }
+
+    #[test]
+    fn a_process_row_is_read_or_ignored_but_never_guessed() {
+        let samples = format!(
+            "  100     1  00:00 4096\n\
+               garbage row\n\
+               102   100  notanumber 4\n\
+               103   100  00:00 2048\n\
+               104   100  00:20 2048\n\
+             {PROCESS_SAMPLE_SEPARATOR}\n\
+               100        00:01\n\
+               102        00:01\n\
+               104        00:10\n"
+        );
+        let processes = parse_process_samples(samples.as_bytes()).unwrap();
+        // 103 is missing from the second sample, so nothing is known about what
+        // it used; 104 went backwards, which means the pid was reused.
+        assert_eq!(
+            processes.keys().copied().collect::<Vec<_>>(),
+            vec![100],
+            "{processes:?}"
+        );
+    }
+
+    #[test]
+    fn output_without_both_samples_is_no_answer_at_all() {
+        // A host whose second sample never arrived has told Tether nothing it can
+        // difference, and a figure from the first alone would be the lifetime
+        // average this deliberately avoids.
+        assert!(parse_process_samples(b"100 1 00:10 4096\n").is_none());
     }
 
     #[test]
