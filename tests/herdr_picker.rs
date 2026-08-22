@@ -902,7 +902,7 @@ fn picker_fixture() -> (Config, State) {
                 herdr_agent: None,
                 name: "agent".into(),
                 command: "exec codex".into(),
-                health_command: None,
+                health_command: Some("pgrep -x codex".into()),
             }],
         }],
         discovery: DiscoveryDefaults {
@@ -1789,6 +1789,164 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
             id: removed_id,
             placement: Placement::SplitRight,
         })
+    );
+}
+
+/// Walks to the command stage with the preset highlighted.
+fn command_stage_picker(presets: Vec<CommandPreset>) -> PickerState {
+    let (mut config, state) = picker_fixture();
+    config.hosts[0].presets = presets;
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let mut picker = PickerState::new(options).unwrap();
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+    picker.handle(PickerEvent::Confirm);
+    assert_eq!(picker.stage(), PickerStage::Command);
+    // Shell is first; the preset is next.
+    picker.handle(PickerEvent::Next);
+    picker
+}
+
+#[test]
+fn the_command_stage_shows_both_programs_a_preset_would_run() {
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command: "exec codex --profile release".into(),
+        health_command: Some("pgrep -x codex".into()),
+    }]);
+
+    let rendered = render_picker_to_text(80, 24, &picker).unwrap();
+    assert!(
+        rendered.contains("Runs: exec codex --profile release"),
+        "the command a preset runs is shown before it runs: {rendered}"
+    );
+    assert!(
+        rendered.contains("Health: pgrep -x codex"),
+        "a preset naming two programs shows both: {rendered}"
+    );
+}
+
+#[test]
+fn a_preset_without_a_probe_shows_only_what_it_runs() {
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command: "exec codex".into(),
+        health_command: None,
+    }]);
+
+    let rendered = render_picker_to_text(80, 24, &picker).unwrap();
+    assert!(rendered.contains("Runs: exec codex"), "{rendered}");
+    assert!(
+        !rendered.contains("Health:"),
+        "a preset with no probe must not advertise an empty one: {rendered}"
+    );
+}
+
+#[test]
+fn the_shell_row_previews_nothing() {
+    let mut picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command: "exec codex".into(),
+        health_command: None,
+    }]);
+    // Back to Shell, which is the configured shell and has no body to quote.
+    picker.handle(PickerEvent::Previous);
+
+    let rendered = render_picker_to_text(80, 24, &picker).unwrap();
+    assert!(
+        !rendered.contains("Runs:"),
+        "the shell has no command worth previewing: {rendered}"
+    );
+}
+
+#[test]
+fn only_the_command_stage_previews_a_command() {
+    // The preview answers "what will this run", which is a question the command
+    // stage asks. On the stages before it the highlighted row is a host, a
+    // workload, or a directory, and a command quoted there would describe
+    // something the user has not chosen yet.
+    let (config, state) = picker_fixture();
+    let options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let mut picker = PickerState::new(options).unwrap();
+    let unpreviewed = |picker: &PickerState| {
+        let rendered = render_picker_to_text(80, 24, picker).unwrap();
+        assert!(
+            !rendered.contains("Runs:"),
+            "the {:?} stage has no command to preview: {rendered}",
+            picker.stage()
+        );
+    };
+
+    assert_eq!(picker.stage(), PickerStage::Host);
+    unpreviewed(&picker);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+
+    assert_eq!(picker.stage(), PickerStage::Resource);
+    unpreviewed(&picker);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Next);
+    picker.handle(PickerEvent::Confirm);
+
+    assert_eq!(picker.stage(), PickerStage::Directory);
+    unpreviewed(&picker);
+    picker.handle(PickerEvent::Confirm);
+
+    assert_eq!(picker.stage(), PickerStage::Command);
+    picker.handle(PickerEvent::Next);
+    let rendered = render_picker_to_text(80, 24, &picker).unwrap();
+    assert!(
+        rendered.contains("Runs: exec codex"),
+        "and the command stage does: {rendered}"
+    );
+
+    // Going back keeps the chosen command, so the preview has to be gated on the
+    // stage rather than on whether a command happens to be selected: a directory
+    // list captioned with a command describes a choice not being made.
+    picker.handle(PickerEvent::Back);
+    assert_eq!(picker.stage(), PickerStage::Directory);
+    unpreviewed(&picker);
+}
+
+#[test]
+fn a_command_too_long_for_the_panel_says_what_it_left_out() {
+    // A command far longer than any panel. Clipping it silently would render
+    // something that reads as the whole command, which is the failure this
+    // preview exists to prevent.
+    let long = format!("exec {}", "argument ".repeat(60));
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command: long.clone(),
+        health_command: None,
+    }]);
+
+    // The preview wraps across lines, so the rendered frame is compared with
+    // its whitespace and borders collapsed rather than character by character.
+    let rendered = render_picker_to_text(80, 40, &picker).unwrap();
+    let flattened = rendered
+        .replace(['│', '─', '┌', '┐', '└', '┘'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flattened.contains("more characters"),
+        "a shortened command must say it was shortened: {rendered}"
+    );
+    assert!(
+        flattened.contains("herdr-tether host presets"),
+        "and where the rest of it can be read: {rendered}"
+    );
+    let whole = long.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flattened.contains(&whole),
+        "the whole command cannot fit, so it must not claim to be there"
     );
 }
 

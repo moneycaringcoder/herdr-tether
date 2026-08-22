@@ -189,6 +189,21 @@ Read what you are given the way you would read a shell script from the same
 person. A preset is code: `command`, and `health_command` when there is one, each
 run through `/bin/sh -c` on that host, as your login user there.
 
+`herdr-tether host presets` prints every configured preset with the exact
+`command`, the `health_command` when there is one, and the agent kind if it names
+one, so reading what you were given does not mean opening the file. Every program
+is indented under the preset that owns it and control characters are shown
+escaped, because a command that arrived from somewhere else is where a terminal
+escape sequence would arrive; `--json` is byte-exact for anything that needs the
+original, and `--host NAME` narrows to one host.
+
+The picker shows the same thing at the moment of choosing: highlighting a preset
+on the command stage displays what it runs, and its probe when it has one, before
+Enter creates anything. A command too long for the panel says how many characters
+it left out rather than trailing off, so a long command is never mistaken for a
+short one. `herdr-tether open --preset NAME` prints what the name resolved to
+before the workload exists.
+
 `herdr-tether host add NAME TARGET --preset NAME=COMMAND` avoids hand-editing when
 the host is being added at the same time. It cannot carry `health_command` or
 `herdr_agent`, which is why the TOML is the general answer.
@@ -201,6 +216,11 @@ command that printed the exact `command` and `health_command`, said which host
 and directory they would bind to, and required typed confirmation would show a
 recipient everything reading the block shows them, and would get the host binding
 right rather than leaving it to where the paste landed.
+
+The half of that which was worth having shipped without the import: `host presets`
+prints the exact programs, and the picker and `open --preset` show them at the
+moment they would run. What is missing is only the part that would take preset
+text from elsewhere and adopt it.
 
 It loses on what it costs. It is a permanent surface, a file format, and a second
 way to add a preset, in exchange for a paste - and it would make preset text
