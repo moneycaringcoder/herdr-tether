@@ -511,6 +511,7 @@ fn snapshot_surfaces_status_workload_limit_as_typed_partial_data() {
         last_used_at: now,
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     };
     let mut config = Config::default();
     config.discovery.local_roots.clear();

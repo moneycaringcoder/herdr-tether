@@ -106,6 +106,11 @@ pub struct PickerWorkload {
     /// reproduce the failure, so the action waits; Tether never restarts
     /// anything itself, so waiting is all the pacing there is.
     pub paced_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many times in a row this workload has failed as soon as it started.
+    ///
+    /// Carried so the paced footer can say whether this is the first time or the
+    /// fourth, which is the difference between waiting and fixing the command.
+    pub immediate_failure_run: usize,
     pub base_label: String,
     pub label: String,
 }
@@ -402,6 +407,7 @@ fn owned_workloads(
                         .and_then(|preset| preset.health_command.clone())
                 }),
                 paced_until: paced_restart_until(session),
+                immediate_failure_run: session.immediate_failure_run(),
                 base_label: label.clone(),
                 label,
             }
@@ -1324,6 +1330,7 @@ impl PickerState {
                     // resolved for this workload, if the row existed before.
                     health_command: existing_health_command,
                     paced_until: paced_restart_until(record),
+                    immediate_failure_run: record.immediate_failure_run(),
                     base_label: label.clone(),
                     label,
                 });
@@ -2634,6 +2641,18 @@ impl PickerState {
         paced_remaining(workload, now)
     }
 
+    /// How many times in a row the selected workload has failed at once.
+    fn selected_immediate_failure_run(&self) -> usize {
+        let Some(ResourceIdentity::Owned(id)) = self.current_resource_identity() else {
+            return 0;
+        };
+        self.options.hosts[self.host_index]
+            .workloads
+            .iter()
+            .find(|workload| workload.id == id)
+            .map_or(0, |workload| workload.immediate_failure_run)
+    }
+
     /// The sentence shown while a restart is paced.
     ///
     /// It says what happened, what Tether is doing about it, and when the action
@@ -2642,8 +2661,14 @@ impl PickerState {
     fn paced_notice(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
         let remaining = self.paced_remaining_selected(now)?;
         let seconds = remaining.num_seconds().max(1);
+        let run = self.selected_immediate_failure_run();
+        let times = if run > 1 {
+            format!(" {run} times in a row")
+        } else {
+            String::new()
+        };
         Some(format!(
-            "Failed immediately · Restart paced {seconds}s to avoid a loop · Tether never restarts on its own"
+            "Failed immediately{times} · Restart paced {seconds}s to avoid a loop · Tether never restarts on its own"
         ))
     }
 
@@ -3943,6 +3968,7 @@ mod close_render_tests {
                     legacy: false,
                     activity_at: chrono::Utc::now(),
                     paced_until: None,
+                    immediate_failure_run: 0,
                     directory: "/srv/app".to_owned(),
                     health_command: None,
                     label,
@@ -4268,6 +4294,7 @@ mod close_render_tests {
                     last_used_at: now - chrono::Duration::days(40),
                     closed_at: Some(now - chrono::Duration::days(40)),
                     exit_status: None,
+                    immediate_failures: Vec::new(),
                 }],
                 orchestration_groups: Vec::new(),
             })

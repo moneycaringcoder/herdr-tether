@@ -452,7 +452,7 @@ fn orchestration_observe_creates_one_outer_pane_with_exact_destination_context()
     fs::write(
         state_file,
         r#"{
-  "version": 4,
+  "version": 5,
   "sessions": [],
   "orchestration_groups": [{
     "id": "build-fleet",
@@ -938,6 +938,7 @@ fn picker_fixture() -> (Config, State) {
                 last_used_at: now - Duration::hours(2),
                 closed_at: None,
                 exit_status: None,
+                immediate_failures: Vec::new(),
             },
             SessionRecord {
                 herdr_agent: None,
@@ -956,6 +957,7 @@ fn picker_fixture() -> (Config, State) {
                 last_used_at: now - Duration::hours(1),
                 closed_at: None,
                 exit_status: None,
+                immediate_failures: Vec::new(),
             },
         ],
         orchestration_groups: Vec::new(),
@@ -1705,6 +1707,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
         last_used_at: now,
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     });
     state.sessions[0].status = SessionStatus::Stopping;
     state.sessions[1].status = SessionStatus::Ended;
@@ -2980,6 +2983,7 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
             exit_status: None,
+            immediate_failures: Vec::new(),
         })
         .collect();
     store
@@ -3014,6 +3018,7 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
             last_used_at: now - Duration::days(40),
             closed_at: Some(now - Duration::days(40)),
             exit_status: None,
+            immediate_failures: Vec::new(),
         })
         .collect::<Vec<_>>();
     let state = State {
@@ -3078,6 +3083,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
             last_used_at: now - Duration::days(age),
             closed_at: (status == SessionStatus::Ended).then_some(now - Duration::days(age)),
             exit_status: None,
+            immediate_failures: Vec::new(),
         });
     }
     let state = State {

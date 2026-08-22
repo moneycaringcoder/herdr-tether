@@ -111,6 +111,7 @@ fn owned_record(status: SessionStatus) -> SessionRecord {
         last_used_at: now,
         closed_at: (status == SessionStatus::Ended).then_some(now),
         exit_status: None,
+        immediate_failures: Vec::new(),
     }
 }
 
@@ -314,6 +315,127 @@ fn a_trail_that_cannot_be_written_does_not_fail_the_stop() {
     assert_eq!(
         store.load().unwrap().sessions[0].status,
         SessionStatus::Ended
+    );
+}
+
+#[test]
+fn a_restart_keeps_the_failure_count_and_a_successful_run_clears_it() {
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Running);
+    // Started a second ago, so the end recorded below is an immediate failure.
+    record.last_used_at = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
+    record.command = Some("exec false".to_owned());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+
+    // A dead pane reporting a failing status: the shape of a loop.
+    let tmux = temp.path().join("tmux");
+    write_close_aware_fake(
+        &tmux,
+        &temp.path().join("tmux.args"),
+        "tether-0197f198000070008000000000000001:$7:0:1:3:0197f198000070008000000000000002",
+    );
+    LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), &tmux),
+    )
+    .stop_owned(id())
+    .unwrap();
+    let ended = &store.load().unwrap().sessions[0];
+    assert_eq!(
+        ended.immediate_failures.len(),
+        1,
+        "the end that just happened is recorded: {:?}",
+        ended.immediate_failures
+    );
+
+    // A real restart whose creation fails. The reservation is what survives that,
+    // and the count has to survive with it: it is the only evidence that a
+    // subsequent failure is the second in a row, and clearing it here is exactly
+    // what kept Tether from counting before.
+    let failing_create = temp.path().join("failing-create-tmux");
+    fs::write(
+        &failing_create,
+        "#!/bin/sh\ncase \"$1\" in\n  list-sessions) exit 0 ;;\n  new-session) exit 1 ;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&failing_create, fs::Permissions::from_mode(0o700)).unwrap();
+    let restarting = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new("unused-ssh", &failing_create),
+    );
+    assert!(
+        restarting.restart_owned(id()).is_err(),
+        "the fake refuses to create, which is the case the reservation exists for"
+    );
+    let reserved = &store.load().unwrap().sessions[0];
+    assert_eq!(reserved.status, SessionStatus::Creating);
+    assert_eq!(
+        reserved.immediate_failures.len(),
+        1,
+        "a reservation does not forget the failure it is retrying: {:?}",
+        reserved.immediate_failures
+    );
+
+    // A restart that does start is not proof the loop ended: a looping workload
+    // starts successfully every time, so a start that cleared the count would
+    // hold it at one forever and the wait would never grow.
+    let running = temp.path().join("running-tmux");
+    write_fake(
+        &running,
+        &temp.path().join("running.args"),
+        "tether-0197f198000070008000000000000001:$7:0:0::0197f198000070008000000000000002",
+        0,
+    );
+    let restarted =
+        LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", &running));
+    restarted.restart_owned(id()).unwrap();
+    let promoted = &store.load().unwrap().sessions[0];
+    assert_eq!(promoted.status, SessionStatus::Running);
+    assert_eq!(
+        promoted.immediate_failures.len(),
+        1,
+        "a promotion is not evidence the loop is over: {:?}",
+        promoted.immediate_failures
+    );
+
+    // Nor is observing it running afterwards.
+    restarted.observe_owned(id()).unwrap();
+    assert_eq!(
+        store.load().unwrap().sessions[0].immediate_failures.len(),
+        1,
+        "an observation is not evidence either"
+    );
+
+    // An end of a different shape is that evidence. This one ran for a minute
+    // before failing, which is a workload with a problem rather than one that
+    // cannot start, so the run of immediate failures is over.
+    let mut record = store.load().unwrap().sessions.remove(0);
+    record.last_used_at = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+    record.status = SessionStatus::Stopping;
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", &tmux))
+        .stop_owned(id())
+        .unwrap();
+    let cleared = &store.load().unwrap().sessions[0];
+    assert!(
+        cleared.immediate_failures.is_empty(),
+        "an end that is not immediate ends the run: {:?}",
+        cleared.immediate_failures
     );
 }
 
@@ -1673,6 +1795,7 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         last_used_at: now - Duration::days(30),
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     };
 
     assert_eq!(
@@ -1753,6 +1876,7 @@ fn prune_record(
         last_used_at: closed_at.unwrap_or(created_at),
         closed_at,
         exit_status: None,
+        immediate_failures: Vec::new(),
     }
 }
 

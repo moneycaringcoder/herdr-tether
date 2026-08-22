@@ -84,6 +84,21 @@ pub struct SessionRecord {
     pub closed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<i32>,
+    /// When this workload's recent incarnations failed as soon as they started.
+    ///
+    /// Timestamps only, so it inherits the exclusion on prompt text, terminal
+    /// contents, and credentials without needing one of its own. Bounded twice:
+    /// entries older than [`IMMEDIATE_FAILURE_MEMORY`] are dropped when the next
+    /// end is recorded, because a failure from an hour ago is not part of a loop
+    /// happening now, and the vector is capped at
+    /// [`SessionRecord::MAX_IMMEDIATE_FAILURES`].
+    ///
+    /// Preserved across a restart, and across a confirmed start, which is the
+    /// whole point of it: a workload in a loop starts successfully every time, so
+    /// clearing it there would hold the count at one. Cleared when the workload
+    /// ends any other way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub immediate_failures: Vec<DateTime<Utc>>,
 }
 
 /// How long after starting a failing end still counts as immediate.
@@ -91,10 +106,28 @@ pub struct SessionRecord {
 /// A command that fails this fast failed on its own terms rather than on the
 /// work it was given, so restarting it unchanged reproduces the failure.
 pub const FAST_FAILURE_WINDOW: TimeDelta = TimeDelta::seconds(10);
-/// How long a restart is paced after an immediate failure.
+/// How long a restart is paced after one immediate failure.
 pub const RESTART_PACE: TimeDelta = TimeDelta::seconds(30);
-
+/// The longest a restart is ever paced, however many failures precede it.
+///
+/// The wait doubles per repeat, so without a ceiling a workload that has failed
+/// a dozen times would be held for hours - which stops being an explanation and
+/// becomes an obstruction. Five minutes is long enough that nobody is retrying
+/// in a loop and short enough to wait out.
+pub const MAX_RESTART_PACE: TimeDelta = TimeDelta::seconds(300);
+/// How long an immediate failure stays part of the current run of them.
+///
+/// A failure from an hour ago says nothing about a loop happening now, so it
+/// stops counting rather than making the next wait longer forever.
+pub const IMMEDIATE_FAILURE_MEMORY: TimeDelta = TimeDelta::hours(1);
 impl SessionRecord {
+    /// The most immediate failures a record keeps.
+    ///
+    /// The wait stops growing well before this, so the rest would only make the
+    /// record bigger. Kept as a hard cap so a workload in a loop for a week
+    /// cannot grow its own record without limit.
+    pub const MAX_IMMEDIATE_FAILURES: usize = 16;
+
     /// Whether this workload's command failed as soon as it started.
     pub fn failed_immediately(&self) -> bool {
         self.paced_restart_until().is_some()
@@ -110,32 +143,109 @@ impl SessionRecord {
         self.closed_at.unwrap_or(self.last_used_at)
     }
 
-    /// When a restart of this workload stops being paced, if it is paced.
+    /// How many times in a row this workload has failed as soon as it started.
     ///
-    /// The evidence is already recorded: `last_used_at` is stamped when the
-    /// workload starts running and `closed_at` when it ends, so the difference
-    /// is how long the last incarnation lasted. Nothing is counted across
-    /// restarts, because a restart deliberately keeps no history of the
-    /// incarnation it replaced — a paced restart reports one failure that
-    /// arrived at once, which is the shape of a loop, rather than a tally.
+    /// Counted from the recorded history, and only within
+    /// [`IMMEDIATE_FAILURE_MEMORY`] of now, so a run that stopped an hour ago
+    /// neither lengthens today's wait nor keeps being reported once it is over.
+    /// Anchoring on the newest entry instead would leave a finished run counted
+    /// forever: the number would sit at four with no wait in force, and drop to
+    /// one the moment another failure arrived, which reads as the count falling
+    /// after a failure.
     ///
-    /// Three ends are deliberately not paced. One whose status `tmux` could not
+    /// A record whose current end failed at once always counts at least one, even
+    /// with no history: a record written before the history existed still shows
+    /// the failure in front of it, and reporting zero there would say a workload
+    /// nobody can restart yet has not failed.
+    pub fn immediate_failure_run(&self) -> usize {
+        let recorded = self.recent_immediate_failures(Utc::now());
+        recorded.max(usize::from(self.ended_immediately()))
+    }
+
+    /// How many recorded failures are still inside the memory window at `now`.
+    fn recent_immediate_failures(&self, now: DateTime<Utc>) -> usize {
+        let Some(cutoff) = now.checked_sub_signed(IMMEDIATE_FAILURE_MEMORY) else {
+            return self.immediate_failures.len();
+        };
+        self.immediate_failures
+            .iter()
+            .filter(|at| **at >= cutoff)
+            .count()
+    }
+
+    /// Whether the end this record describes arrived as soon as it started.
+    ///
+    /// Three ends are deliberately excluded. One whose status `tmux` could not
     /// report, because an unknown outcome is not a failure. One whose recorded
     /// lifetime is not positive, which is how a record written before the start
     /// stamp was preserved looks: both fields hold the same instant, and a
     /// lifetime of exactly zero is missing evidence rather than an instant
     /// failure. And one that ran longer than the window, which failed at its
     /// work rather than on starting.
-    pub fn paced_restart_until(&self) -> Option<DateTime<Utc>> {
+    fn ended_immediately(&self) -> bool {
         if self.status != SessionStatus::Ended
             || !self.exit_status.is_some_and(|status| status != 0)
         {
-            return None;
+            return false;
         }
-        let closed_at = self.closed_at?;
+        let Some(closed_at) = self.closed_at else {
+            return false;
+        };
         let ran_for = closed_at.signed_duration_since(self.last_used_at);
-        (ran_for > TimeDelta::zero() && ran_for <= FAST_FAILURE_WINDOW)
-            .then(|| closed_at + RESTART_PACE)
+        ran_for > TimeDelta::zero() && ran_for <= FAST_FAILURE_WINDOW
+    }
+
+    /// When a restart of this workload stops being paced, if it is paced.
+    ///
+    /// The evidence for one failure is already in the record: `last_used_at` is
+    /// stamped when the workload starts running and `closed_at` when it ends, so
+    /// the difference is how long the last incarnation lasted. Repeats come from
+    /// the recorded history, which a restart deliberately carries forward.
+    ///
+    /// The wait doubles for each repeat and stops at [`MAX_RESTART_PACE`]: the
+    /// second failure in a row is worth waiting longer for than the first, and a
+    /// twelfth is not worth waiting hours for. Tether still never restarts
+    /// anything itself, so the wait is a refusal to offer the action and an
+    /// explanation, not an action of its own.
+    pub fn paced_restart_until(&self) -> Option<DateTime<Utc>> {
+        let closed_at = self.closed_at?;
+        self.ended_immediately()
+            .then(|| closed_at + self.restart_pace())
+    }
+
+    /// How long the next restart is held, given the failures before it.
+    fn restart_pace(&self) -> TimeDelta {
+        // The run includes the failure just recorded, so one repeat is a run of
+        // two and the first doubling happens there rather than immediately.
+        let repeats = self.immediate_failure_run().saturating_sub(1).min(16) as u32;
+        RESTART_PACE
+            .checked_mul(2_i32.saturating_pow(repeats))
+            .unwrap_or(MAX_RESTART_PACE)
+            .min(MAX_RESTART_PACE)
+    }
+
+    /// Records that this workload's latest incarnation failed at once.
+    ///
+    /// Prunes what is no longer part of the current run first, so a workload
+    /// that failed a few times last week starts again rather than resuming, and
+    /// keeps the newest entries when the ceiling is reached: the wait is decided
+    /// by how many failures are recent, and the oldest are the ones that stop
+    /// counting first.
+    ///
+    /// Pruning uses the same window the count reads through, measured from now
+    /// rather than from the end being recorded, so a persisted timestamp is never
+    /// the thing arithmetic is done against and one definition covers both.
+    pub fn note_immediate_failure(&mut self) {
+        let now = Utc::now();
+        if let Some(cutoff) = now.checked_sub_signed(IMMEDIATE_FAILURE_MEMORY) {
+            self.immediate_failures.retain(|entry| *entry >= cutoff);
+        }
+        self.immediate_failures.push(self.closed_at.unwrap_or(now));
+        let excess = self
+            .immediate_failures
+            .len()
+            .saturating_sub(Self::MAX_IMMEDIATE_FAILURES);
+        self.immediate_failures.drain(..excess);
     }
 }
 
@@ -143,10 +253,121 @@ impl SessionRecord {
 mod pace_tests {
     use super::*;
 
+    #[test]
+    fn each_repeat_doubles_the_wait_until_the_ceiling() {
+        let mut record = ended(TimeDelta::seconds(1), Some(2));
+        let closed_at = record.closed_at.unwrap();
+        // The first failure is the one the record already describes.
+        record.note_immediate_failure();
+        for (run, expected) in [
+            (1, TimeDelta::seconds(30)),
+            (2, TimeDelta::seconds(60)),
+            (3, TimeDelta::seconds(120)),
+            (4, TimeDelta::seconds(240)),
+            // Doubling would be 480; the ceiling holds it at 300.
+            (5, MAX_RESTART_PACE),
+            (6, MAX_RESTART_PACE),
+        ] {
+            assert_eq!(record.immediate_failure_run(), run, "run after {run}");
+            assert_eq!(
+                record.paced_restart_until(),
+                Some(closed_at + expected),
+                "the wait after {run} failures in a row"
+            );
+            record.note_immediate_failure();
+        }
+    }
+
+    #[test]
+    fn a_run_that_stopped_long_ago_does_not_lengthen_todays_wait() {
+        let mut record = ended(TimeDelta::seconds(1), Some(2));
+        let closed_at = record.closed_at.unwrap();
+        // Four failures from well outside the memory window, then this one.
+        record.immediate_failures = (1..=4)
+            .map(|index| closed_at - IMMEDIATE_FAILURE_MEMORY - TimeDelta::minutes(index))
+            .collect();
+        record.note_immediate_failure();
+
+        assert_eq!(
+            record.immediate_failure_run(),
+            1,
+            "a stale run starts again rather than resuming: {:?}",
+            record.immediate_failures
+        );
+        assert_eq!(record.paced_restart_until(), Some(closed_at + RESTART_PACE));
+    }
+
+    #[test]
+    fn a_finished_run_stops_being_counted_once_the_window_passes() {
+        // Four failures, the last of them two hours ago, and the record's own end
+        // is an ordinary failure. Counting relative to the newest entry would
+        // report four forever, with no wait in force to explain the number, and
+        // then report one as soon as another failure arrived - a count that falls
+        // after a failure.
+        let mut record = ended(TimeDelta::minutes(5), Some(2));
+        let long_ago = Utc::now() - TimeDelta::hours(2);
+        record.immediate_failures = (0..4)
+            .map(|index| long_ago + TimeDelta::seconds(index))
+            .collect();
+
+        assert_eq!(record.immediate_failure_run(), 0);
+        assert_eq!(record.paced_restart_until(), None);
+
+        // A failure now is the first of a new run, not the fifth of the old one.
+        record.last_used_at = Utc::now() - TimeDelta::seconds(1);
+        record.closed_at = Some(Utc::now());
+        record.note_immediate_failure();
+        assert_eq!(
+            record.immediate_failures.len(),
+            1,
+            "the stale run is pruned"
+        );
+        assert_eq!(record.immediate_failure_run(), 1);
+        assert_eq!(record.restart_pace(), RESTART_PACE);
+    }
+
+    #[test]
+    fn the_history_is_capped_and_keeps_the_newest() {
+        let mut record = ended(TimeDelta::seconds(1), Some(2));
+        for _ in 0..SessionRecord::MAX_IMMEDIATE_FAILURES + 8 {
+            record.note_immediate_failure();
+        }
+        assert_eq!(
+            record.immediate_failures.len(),
+            SessionRecord::MAX_IMMEDIATE_FAILURES,
+            "a long loop cannot grow its own record without limit"
+        );
+        // Capping must not lose the pace: the run is still at the ceiling.
+        assert_eq!(
+            record.paced_restart_until(),
+            record
+                .closed_at
+                .map(|closed_at| closed_at + MAX_RESTART_PACE)
+        );
+    }
+
+    #[test]
+    fn an_end_that_is_not_immediate_is_not_counted() {
+        let mut record = ended(TimeDelta::seconds(1), Some(2));
+        record.note_immediate_failure();
+        record.note_immediate_failure();
+        assert_eq!(record.immediate_failure_run(), 2);
+
+        // The same record, having run for a while before failing: the current end
+        // is not immediate, so nothing about it is paced and the count reflects
+        // only what the history holds.
+        let mut ran = ended(TimeDelta::minutes(5), Some(2));
+        ran.immediate_failures = record.immediate_failures.clone();
+        assert_eq!(ran.paced_restart_until(), None);
+    }
+
+    /// A record whose end is `ran_for` after its start, and whose end is now.
+    ///
+    /// Relative to the present deliberately: the memory window is measured from
+    /// now, so a fixture pinned to a fixed date in the past would describe a run
+    /// that has already been forgotten.
     fn ended(ran_for: TimeDelta, exit_status: Option<i32>) -> SessionRecord {
-        let started = DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let started = Utc::now() - ran_for;
         SessionRecord {
             herdr_agent: None,
             id: "tether-0197f198000070008000000000000001".parse().unwrap(),
@@ -162,6 +383,7 @@ mod pace_tests {
             last_used_at: started,
             closed_at: Some(started + ran_for),
             exit_status,
+            immediate_failures: Vec::new(),
         }
     }
 
@@ -293,7 +515,7 @@ pub struct State {
 }
 
 impl State {
-    pub const CURRENT_VERSION: u32 = 4;
+    pub const CURRENT_VERSION: u32 = 5;
     pub const MAX_ORCHESTRATION_GROUPS: usize = 32;
     pub const MAX_SESSIONS: usize = 1_024;
     pub const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -371,6 +593,13 @@ impl State {
                 bail!(
                     "non-ended session `{}` must not have exit_status",
                     session.id
+                );
+            }
+            if session.immediate_failures.len() > SessionRecord::MAX_IMMEDIATE_FAILURES {
+                bail!(
+                    "session `{}` immediate failures may contain at most {} entries",
+                    session.id,
+                    SessionRecord::MAX_IMMEDIATE_FAILURES
                 );
             }
             if session.command.as_deref().is_some_and(str::is_empty) {
@@ -527,11 +756,24 @@ impl StateStore {
             })?;
 
         match version {
-            4 => {
+            5 => {
                 let state: State = serde_json::from_str(&source).with_context(|| {
-                    format!("decode state version 4 from `{}`", self.path.display())
+                    format!("decode state version 5 from `{}`", self.path.display())
                 })?;
                 state.validate()?;
+                Ok(state)
+            }
+            4 => {
+                let legacy: StateV4 = serde_json::from_str(&source).with_context(|| {
+                    format!("decode state version 4 from `{}`", self.path.display())
+                })?;
+                let state = legacy.migrate();
+                state.validate()?;
+                if persist_migration {
+                    self.save_unlocked(&state).with_context(|| {
+                        format!("rewrite migrated state `{}`", self.path.display())
+                    })?;
+                }
                 Ok(state)
             }
             3 => {
@@ -668,6 +910,35 @@ fn require_max_bytes(value: &str, max_bytes: usize, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// The shape a version 4 document has: everything current except the failure
+/// history, which did not exist and must not be invented from what did.
+///
+/// It decodes into the current record type, as the version 3 shape does, so the
+/// absent history simply defaults to empty. Nothing here reconstructs a history
+/// from `exit_status`, `closed_at`, or `last_used_at`: those describe one
+/// incarnation, and treating them as a run of failures would pace a restart on
+/// evidence the older Tether never collected.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateV4 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    orchestration_groups: Vec<OrchestrationGroup>,
+}
+
+impl StateV4 {
+    fn migrate(self) -> State {
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: self.sessions,
+            orchestration_groups: self.orchestration_groups,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateV3 {
@@ -774,6 +1045,9 @@ impl From<SessionRecordV2> for SessionRecord {
             last_used_at: record.last_used_at,
             closed_at: record.closed_at,
             exit_status: record.exit_status,
+            // The older schema kept no failure history, and none is invented:
+            // one recorded end is not a run of them.
+            immediate_failures: Vec::new(),
         }
     }
 }
@@ -847,6 +1121,7 @@ impl StateV1 {
                         last_used_at: session.last_used_at,
                         closed_at: session.closed_at,
                         exit_status: None,
+                        immediate_failures: Vec::new(),
                     }
                 })
                 .collect(),
@@ -897,6 +1172,7 @@ impl StateV0 {
                     last_used_at: session.last_used_at,
                     closed_at: None,
                     exit_status: None,
+                    immediate_failures: Vec::new(),
                 })
                 .collect(),
             orchestration_groups: Vec::new(),

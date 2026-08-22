@@ -37,6 +37,7 @@ fn session(suffix: u8, host: &str, directory: &str, preset: Option<&str>) -> Ses
         last_used_at: now,
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     }
 }
 

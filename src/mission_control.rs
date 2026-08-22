@@ -651,6 +651,7 @@ mod tests {
                 last_used_at: now,
                 closed_at: None,
                 exit_status: None,
+                immediate_failures: Vec::new(),
             }],
             orchestration_groups: vec![OrchestrationGroup {
                 id: "build-group".parse().unwrap(),

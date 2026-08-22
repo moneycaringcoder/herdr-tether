@@ -119,7 +119,10 @@ pub enum GroupSkip {
     /// Ended without a retained command, so there is nothing to restart.
     MissingCommand,
     /// Failed immediately, and its restart is still paced.
-    RestartPaced { seconds: i64 },
+    ///
+    /// `run` is how many times in a row it failed at once, which is why the wait
+    /// may be longer than the first one was.
+    RestartPaced { seconds: i64, run: usize },
     /// The membership changed between the plan and the act.
     MembershipChanged,
 }
@@ -133,7 +136,10 @@ impl GroupSkip {
             }
             Self::WrongStatus { status } => format!("{}", StatusReason(status)),
             Self::MissingCommand => "no retained command".to_owned(),
-            Self::RestartPaced { seconds } => {
+            Self::RestartPaced { seconds, run } if run > 1 => {
+                format!("failed immediately {run} times in a row; restart paced for {seconds}s")
+            }
+            Self::RestartPaced { seconds, .. } => {
                 format!("failed immediately; restart paced for {seconds}s")
             }
             Self::MembershipChanged => "membership changed since the plan".to_owned(),
@@ -267,7 +273,10 @@ fn plan_member(action: GroupAction, record: Option<&SessionRecord>) -> GroupDeci
                 match paced_seconds(record) {
                     // The pace withholds an explicit single-workload restart, so
                     // a group must not become the way around it.
-                    Some(seconds) => GroupDecision::Skip(GroupSkip::RestartPaced { seconds }),
+                    Some(seconds) => GroupDecision::Skip(GroupSkip::RestartPaced {
+                        seconds,
+                        run: record.immediate_failure_run(),
+                    }),
                     None => GroupDecision::Act,
                 }
             }
@@ -695,8 +704,11 @@ impl OrchestrationService {
                 // plan. Re-reading it here is what keeps a group from being the
                 // way around a pace that appeared in between.
                 match self.paced_since_plan(entry.session_id) {
-                    Ok(Some(seconds)) => {
-                        return GroupMemberResult::Skipped(GroupSkip::RestartPaced { seconds });
+                    Ok(Some((seconds, run))) => {
+                        return GroupMemberResult::Skipped(GroupSkip::RestartPaced {
+                            seconds,
+                            run,
+                        });
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -713,15 +725,18 @@ impl OrchestrationService {
         }
     }
 
-    /// Whether this member's restart is paced as of now.
-    fn paced_since_plan(&self, session_id: SessionId) -> Result<Option<i64>> {
+    /// Whether this member's restart is paced as of now, and how many failures
+    /// in a row are behind that wait.
+    fn paced_since_plan(&self, session_id: SessionId) -> Result<Option<(i64, usize)>> {
         Ok(self
             .store
             .load_read_only()?
             .sessions
             .iter()
             .find(|record| record.id == session_id)
-            .and_then(paced_seconds))
+            .and_then(|record| {
+                paced_seconds(record).map(|seconds| (seconds, record.immediate_failure_run()))
+            }))
     }
 
     fn membership_unchanged(
@@ -2670,6 +2685,7 @@ mod tests {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+            immediate_failures: Vec::new(),
         }
     }
 
@@ -3503,6 +3519,7 @@ mod tests {
                     last_used_at: now,
                     closed_at: None,
                     exit_status: None,
+                    immediate_failures: Vec::new(),
                 }],
                 orchestration_groups: vec![OrchestrationGroup {
                     id: group_id.clone(),
@@ -4125,6 +4142,7 @@ mod tests {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+            immediate_failures: Vec::new(),
         };
         let member = OrchestrationMember {
             session_id: worker_id,
@@ -4244,6 +4262,7 @@ mod tests {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+            immediate_failures: Vec::new(),
         };
         let running = base.clone();
         let legacy = SessionRecord {
@@ -4394,7 +4413,7 @@ mod tests {
                     GroupSkip::NoOwnershipProof,
                     // Measured from the recorded end against the wall clock, so
                     // the remainder is within a second of the full pace.
-                    GroupSkip::RestartPaced { seconds },
+                    GroupSkip::RestartPaced { seconds, run: 1 },
                     GroupSkip::WrongStatus {
                         status: SessionStatus::Stopping
                     },
@@ -4408,7 +4427,7 @@ mod tests {
         assert!(
             reasons.iter().any(|reason| matches!(
                 reason,
-                GroupSkip::RestartPaced { seconds } if *seconds >= 30
+                GroupSkip::RestartPaced { seconds, .. } if *seconds >= 30
             )),
             "{reasons:?}"
         );

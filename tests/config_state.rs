@@ -14,8 +14,8 @@ use herdr_tether::{
     },
     model::{OrchestrationGroupId, OrchestrationTitle, Placement, SessionId},
     state::{
-        OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, SessionRecord,
-        SessionStatus, State, StateStore,
+        OrchestrationCapabilities, OrchestrationGroup, OrchestrationMember, RESTART_PACE,
+        SessionRecord, SessionStatus, State, StateStore,
     },
 };
 use tempfile::tempdir;
@@ -106,6 +106,7 @@ fn state_at_serialized_limit() -> State {
                 last_used_at: now,
                 closed_at: None,
                 exit_status: None,
+                immediate_failures: Vec::new(),
             })
             .collect(),
         orchestration_groups: Vec::new(),
@@ -753,6 +754,7 @@ fn state_round_trips_and_migrates_v0() {
             last_used_at: now,
             closed_at: None,
             exit_status: None,
+            immediate_failures: Vec::new(),
         }],
         orchestration_groups: Vec::new(),
     };
@@ -776,7 +778,7 @@ fn state_round_trips_and_migrates_v0() {
     assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
     assert!(migrated.orchestration_groups.is_empty());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 4"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 5"));
 }
 
 #[test]
@@ -806,7 +808,7 @@ fn state_v2_migration_preserves_sessions_and_creates_no_groups() {
     assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
     assert!(migrated.orchestration_groups.is_empty());
     let rewritten = fs::read_to_string(path).unwrap();
-    assert!(rewritten.contains("\"version\": 4"));
+    assert!(rewritten.contains("\"version\": 5"));
     assert!(rewritten.contains("\"orchestration_groups\": []"));
 }
 
@@ -834,10 +836,52 @@ fn state_v3_migration_assigns_and_persists_membership_epochs() {
 }
 
 #[test]
+fn state_v4_migration_starts_the_failure_history_empty() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    // A version 4 record for a workload that failed one second after starting.
+    // The older Tether kept no history, and the migration must not invent one
+    // from the end it can see: a single recorded failure is not a run of them.
+    let source = r#"{"version":4,"sessions":[{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/srv/app","preset":null,"command":"exec true","status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-01T00:00:00Z","closed_at":"2026-01-01T00:00:01Z","exit_status":3}],"orchestration_groups":[]}"#;
+    fs::write(&path, source).unwrap();
+    let store = StateStore::new(path.clone());
+
+    let migrated = store.load().unwrap();
+
+    assert_eq!(migrated.version, State::CURRENT_VERSION);
+    assert!(
+        migrated.sessions[0].immediate_failures.is_empty(),
+        "a migrated record starts with no recorded history: {:?}",
+        migrated.sessions[0].immediate_failures
+    );
+    // The end it does have is still an immediate failure, so it is still paced -
+    // and counted as one, because the failure in front of it is real even though
+    // no history was kept for it.
+    assert!(migrated.sessions[0].failed_immediately());
+    assert_eq!(migrated.sessions[0].immediate_failure_run(), 1);
+    assert_eq!(
+        migrated.sessions[0].paced_restart_until(),
+        migrated.sessions[0]
+            .closed_at
+            .map(|closed_at| closed_at + RESTART_PACE),
+        "one failure is paced by one interval, as it was before the history existed"
+    );
+
+    let persisted = fs::read_to_string(&path).unwrap();
+    assert!(persisted.contains("\"version\": 5"), "{persisted}");
+    assert!(
+        !persisted.contains("immediate_failures"),
+        "an empty history is omitted rather than written as an empty list: {persisted}"
+    );
+    // Loading the rewritten document is stable.
+    assert_eq!(store.load().unwrap(), migrated);
+}
+
+#[test]
 fn future_state_version_fails_closed_without_rewriting_data() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
-    let source = br#"{"version":5,"sessions":[],"orchestration_groups":[]}"#;
+    let source = br#"{"version":6,"sessions":[],"orchestration_groups":[]}"#;
     fs::write(&path, source).unwrap();
 
     let error = StateStore::new(path.clone())
@@ -845,7 +889,7 @@ fn future_state_version_fails_closed_without_rewriting_data() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("unsupported state version 5"), "{error}");
+    assert!(error.contains("unsupported state version 6"), "{error}");
     assert_eq!(fs::read(path).unwrap(), source);
 }
 
@@ -1065,6 +1109,7 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
         last_used_at: now,
         closed_at: None,
         exit_status: None,
+        immediate_failures: Vec::new(),
     };
     let boundary = "x".repeat(State::MAX_STRING_BYTES);
     let mut cases: Vec<(&str, State, State)> = Vec::new();
@@ -1077,6 +1122,24 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
     let mut session_count_over = session_count.clone();
     session_count_over.sessions.push(session());
     cases.push(("state sessions", session_count, session_count_over));
+
+    let mut history_at = session();
+    history_at.immediate_failures = vec![now; SessionRecord::MAX_IMMEDIATE_FAILURES];
+    let mut history_over = session();
+    history_over.immediate_failures = vec![now; SessionRecord::MAX_IMMEDIATE_FAILURES + 1];
+    cases.push((
+        "immediate failures",
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![history_at],
+            orchestration_groups: Vec::new(),
+        },
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![history_over],
+            orchestration_groups: Vec::new(),
+        },
+    ));
 
     for field in [
         "session host",
@@ -1265,7 +1328,7 @@ fn oversized_state_input_is_rejected_before_json_parsing() {
 }
 
 #[test]
-fn state_v4_rejects_unsafe_orchestration_json() {
+fn state_v5_rejects_unsafe_orchestration_json() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
     let store = StateStore::new(path.clone());
@@ -1273,16 +1336,16 @@ fn state_v4_rejects_unsafe_orchestration_json() {
     let worker = "tether-0197f198000070008000000000000002";
     let invalid_sources = [
         format!(
-            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
+            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
         ),
         format!(
-            r#"{{"version":4,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","capabilities":{{"observe_output":true}}}}]}}]}}"#
+            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","capabilities":{{"observe_output":true}}}}]}}]}}"#
         ),
     ];
 
@@ -1315,9 +1378,13 @@ fn every_state_schema_rejects_unknown_fields() {
         r#"{"version":3,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
         r#"{"version":3,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
+        // Version 4 is a frozen decode path now, so it needs its own case rather
+        // than being retargeted to the current version.
         r#"{"version":4,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
-        r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
         r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
+        r#"{"version":5,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
+        r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
+        r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
     ];
 
     for source in sources {
@@ -1341,7 +1408,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 4"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 5"));
 }
 
 #[test]
@@ -1377,6 +1444,7 @@ fn concurrent_state_updates_preserve_both_records() {
                         last_used_at: now,
                         closed_at: None,
                         exit_status: None,
+                        immediate_failures: Vec::new(),
                     });
                     Ok(())
                 })
@@ -1557,7 +1625,7 @@ fn state_follows_symlink_and_rejects_fifo_storage_paths() {
     assert!(
         fs::read_to_string(&target)
             .unwrap()
-            .contains(r#""version": 4"#)
+            .contains(r#""version": 5"#)
     );
 
     let fifo_path = temp.path().join("fifo-state.json");
