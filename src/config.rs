@@ -278,6 +278,39 @@ impl CommandPreset {
     pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
 }
 
+/// Configured text with anything that could break a line or reorder one made
+/// visible.
+///
+/// Names, targets, and command bodies are validated for length and uniqueness,
+/// never for characters, and a configuration file is text a user may not have
+/// written. Three classes are spelled out rather than passed through: C0 and C1
+/// controls, which is where a terminal escape sequence arrives; the Unicode line
+/// and paragraph separators, which let one field forge another's line; and the
+/// bidirectional and zero-width formatting characters, which can display a
+/// command in an order or a spelling it will not run in.
+///
+/// Every surface that shows configured text to a person goes through this, so
+/// the picker and `host presets` describe a preset the same way. Anything that
+/// needs the original reads `host presets --json`, which escapes for a parser
+/// rather than for a terminal.
+pub fn escaped_config_text(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\n' => "\\n".to_owned(),
+            '\t' => "\\t".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200f}' => {
+                format!("\\u{{{:04x}}}", character as u32)
+            }
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                format!("\\u{{{:04x}}}", character as u32)
+            }
+            character if character.is_control() => format!("\\u{{{:04x}}}", character as u32),
+            character => character.to_string(),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {

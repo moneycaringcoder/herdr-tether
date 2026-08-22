@@ -22,7 +22,7 @@ use crate::{
     },
     config::{
         CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
-        HostConfig, RetentionDefaults,
+        HostConfig, RetentionDefaults, escaped_config_text,
     },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
@@ -145,6 +145,8 @@ enum HostCommand {
     Remove { name: String },
     /// Verify SSH, tmux, and an optional remote Herdr installation.
     Check { name: String },
+    /// Show what each configured preset runs, without running it.
+    Presets(HostPresetsArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -170,6 +172,15 @@ struct OutputArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct HostPresetsArgs {
+    /// Restrict to one configured host.
+    #[arg(long)]
+    host: Option<String>,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -623,7 +634,128 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
             let target = resolve_host(paths, &config, &name)?.target;
             check_host(&name, &target)
         }
+        HostCommand::Presets(args) => {
+            let aliases = discover_aliases(&paths.ssh_config_file)?;
+            list_presets(
+                &store.load()?,
+                &aliases,
+                args.host.as_deref(),
+                args.output.json,
+            )
+        }
     }
+}
+
+#[derive(Serialize)]
+struct PresetListEntry<'a> {
+    host: &'a str,
+    name: &'a str,
+    command: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health_command: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    herdr_agent: Option<&'a str>,
+}
+
+/// Prints what every configured preset would run.
+///
+/// This is the surface for a configuration someone else wrote: a preset arrives
+/// as TOML in a dotfiles repository or from a colleague, and until now the only
+/// way to see what `--preset build` executes was to open the file.
+///
+/// A preset command is arbitrary text of any length, so the human layout keeps
+/// every program on its own indented lines beneath the name that owns it.
+/// Nothing is truncated - a command too long for one line wraps in the terminal
+/// rather than being cut - and no program body ever starts at the left margin,
+/// so a command containing a newline cannot forge a line that looks like another
+/// preset's heading. Control characters are shown escaped, because a
+/// configuration that came from somewhere else is exactly where a terminal
+/// escape sequence would arrive; `--json` is byte-exact for anything that needs
+/// the original.
+fn list_presets(config: &Config, aliases: &[String], host: Option<&str>, json: bool) -> Result<()> {
+    // `local` and an SSH alias are hosts everywhere else in this command group,
+    // and neither can carry a preset: presets live on configured hosts. Saying
+    // they are unknown would send a reader looking for a host that is right
+    // there, so a name this command group accepts is answered with the truth
+    // that it has no presets.
+    let known = |name: &str| {
+        name == "local"
+            || config.hosts.iter().any(|entry| entry.name == name)
+            || aliases.iter().any(|alias| alias == name)
+    };
+    if let Some(host) = host
+        && !known(host)
+    {
+        bail!("unknown host `{host}`");
+    }
+    let hosts: Vec<&HostConfig> = config
+        .hosts
+        .iter()
+        .filter(|entry| host.is_none_or(|host| entry.name == host))
+        .collect();
+
+    if json {
+        let entries: Vec<PresetListEntry<'_>> = hosts
+            .iter()
+            .flat_map(|entry| {
+                entry.presets.iter().map(move |preset| PresetListEntry {
+                    host: &entry.name,
+                    name: &preset.name,
+                    command: &preset.command,
+                    health_command: preset.health_command.as_deref(),
+                    herdr_agent: preset.herdr_agent.as_ref().map(HerdrAgentKind::as_str),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+
+    if hosts.is_empty() {
+        // Silence would be indistinguishable from a command that did nothing.
+        match host {
+            Some(host) => println!("{} · no presets configured", escaped_config_text(host)),
+            None => println!("no configured hosts"),
+        }
+        return Ok(());
+    }
+
+    for entry in hosts {
+        // Every field here comes out of the configuration file, and a name is no
+        // more trustworthy than a command: a preset called
+        // "sneaky\nbuild (forged.test)" would otherwise print a line that reads
+        // as another host's heading.
+        println!(
+            "{} ({})",
+            escaped_config_text(&entry.name),
+            escaped_config_text(&entry.target)
+        );
+        if entry.presets.is_empty() {
+            println!("  no presets configured");
+            continue;
+        }
+        for preset in &entry.presets {
+            println!("  {}", escaped_config_text(&preset.name));
+            print_program("command", &preset.command);
+            if let Some(health_command) = &preset.health_command {
+                print_program("health command", health_command);
+            }
+            if let Some(agent) = &preset.herdr_agent {
+                println!("    agent: {}", escaped_config_text(agent.as_str()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One program under its label, indented so no part of it starts at the margin.
+///
+/// Escaping leaves the program on a single line, however long it is: a terminal
+/// wraps it, which keeps every character readable, where cutting it to a width
+/// would produce something that looked like the whole command.
+fn print_program(label: &str, program: &str) {
+    println!("    {label}:");
+    println!("      {}", escaped_config_text(program));
 }
 
 #[derive(Serialize)]
@@ -1287,6 +1419,36 @@ fn note_transition(
     });
 }
 
+/// Says what a named preset runs, before the workload that runs it exists.
+///
+/// `open --preset NAME` used to take a name and never repeat back what it stood
+/// for, so a preset from an inherited configuration ran unseen. Only presets are
+/// announced: a command given with `--command` was typed by the person reading
+/// this line.
+///
+/// Both programs appear, because a preset can name two and showing only the
+/// first would read as the whole of it. Nothing is shortened here - this is the
+/// moment before the command runs, and the exact text is the point.
+fn announce_preset(host: &HostConfig, preset: Option<&str>) {
+    let Some(preset) =
+        preset.and_then(|name| host.presets.iter().find(|preset| preset.name == name))
+    else {
+        return;
+    };
+    println!(
+        "preset {} runs: {}",
+        escaped_config_text(&preset.name),
+        escaped_config_text(&preset.command)
+    );
+    if let Some(health_command) = &preset.health_command {
+        println!(
+            "preset {} health command: {}",
+            escaped_config_text(&preset.name),
+            escaped_config_text(health_command)
+        );
+    }
+}
+
 fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection) -> Result<()> {
     if selection.directory.trim().is_empty() {
         bail!("session directory must not be empty");
@@ -1296,6 +1458,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     }
     let aliases = discover_aliases(&paths.ssh_config_file)?;
     let host = resolve_host_from(config, &aliases, &selection.host)?;
+    announce_preset(&host, selection.preset.as_deref());
     let id = SessionId::new();
     let ownership_proof = OwnershipProof::new();
     let backend = backend_for(&host.target)?;
