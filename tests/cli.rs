@@ -2389,6 +2389,12 @@ herdr_agent = "codex"
 name = "hostile"
 command = "echo one\nbuild (forged.test)\n\u001B[31mred\u001B[0m"
 
+[[hosts]]
+name = "bare"
+target = "bare@example.test"
+roots = ["/srv"]
+presets = []
+
 [ui]
 placement = "split-right"
 
@@ -2493,12 +2499,6 @@ fn host_presets_json_is_byte_exact_and_filters_by_host() {
         .assert()
         .success()
         .stdout(predicate::str::contains("release"));
-    sandbox
-        .command()
-        .args(["host", "presets", "--host", "absent"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown configured host `absent`"));
 }
 
 #[test]
@@ -2556,4 +2556,155 @@ fn open_names_what_a_preset_runs_before_it_runs_it() {
         !typed.contains("runs:"),
         "an explicit command is not announced back: {typed}"
     );
+}
+
+#[test]
+fn a_preset_name_cannot_forge_a_heading_either() {
+    // Preset names are checked for length and uniqueness, never for characters
+    // (src/config.rs validation), so a name is exactly as untrustworthy as a
+    // command. Escaping only the programs left the names able to forge a line
+    // that reads as another host.
+    let sandbox = Sandbox::new();
+    let config = sandbox.config_file();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        SHARED_CONFIG.replace(
+            r#"name = "hostile""#,
+            r#"name = "sneaky\nbuild (forged.test)\n  quiet""#,
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox
+        .command()
+        .args(["host", "presets"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains(r"  sneaky\nbuild (forged.test)\n  quiet"),
+        "a name is shown escaped, on one line: {stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| !line.starts_with(' '))
+            .collect::<Vec<_>>(),
+        ["build (builder@example.test)", "bare (bare@example.test)"],
+        "only real hosts may start a line: {stdout}"
+    );
+}
+
+#[test]
+fn host_presets_answers_when_there_is_nothing_to_show() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.config_file();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, SHARED_CONFIG).unwrap();
+
+    // A configured host with no presets says so rather than being skipped: an
+    // absent line is indistinguishable from a command that did nothing.
+    sandbox
+        .command()
+        .args(["host", "presets", "--host", "bare"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no presets configured"));
+
+    // `local` and SSH aliases are hosts everywhere else in this command group and
+    // cannot carry presets, so they are answered rather than called unknown.
+    sandbox
+        .command()
+        .args(["host", "presets", "--host", "local"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local · no presets configured"));
+    sandbox
+        .command()
+        .args(["host", "presets", "--host", "absent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown host `absent`"));
+}
+
+#[test]
+fn host_presets_says_so_when_no_host_is_configured() {
+    // `Sandbox` holds a process-wide lock, so this cannot share a test with
+    // another sandbox.
+    let sandbox = Sandbox::new();
+    let config = sandbox.config_file();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let hostless = format!(
+        "version = 3\nhosts = []\n\n[ui]{}",
+        SHARED_CONFIG.split("[ui]").nth(1).unwrap()
+    );
+    fs::write(&config, hostless).unwrap();
+
+    sandbox
+        .command()
+        .args(["host", "presets"])
+        .assert()
+        .success()
+        .stdout("no configured hosts\n");
+}
+
+#[test]
+fn host_presets_json_omits_what_a_preset_does_not_have() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.config_file();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, SHARED_CONFIG).unwrap();
+
+    let output = sandbox
+        .command()
+        .args(["host", "presets", "--json"])
+        .assert()
+        .success();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let hostile = &parsed.as_array().unwrap()[1];
+
+    // A key present and null would say the preset configures an empty probe or
+    // an empty agent kind, which is a different claim from configuring neither.
+    assert!(hostile.get("health_command").is_none(), "{parsed}");
+    assert!(hostile.get("herdr_agent").is_none(), "{parsed}");
+}
+
+#[test]
+fn characters_that_hide_or_reorder_a_command_are_shown() {
+    // A zero-width space renders as nothing, so `curl evil\u{200b}.example.test`
+    // displays as a different host from the one it contacts. A right-to-left
+    // override reorders what is displayed against what runs. A line separator is
+    // a line break to some terminals. None of these are `char::is_control`, so
+    // control-character handling alone would pass them through.
+    let sandbox = Sandbox::new();
+    let config = sandbox.config_file();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        SHARED_CONFIG.replace(
+            r#"command = "echo one\nbuild (forged.test)\n\u001B[31mred\u001B[0m""#,
+            r#"command = "curl evil\u200B.example.test\u2028rm -rf /\u202Etxt.sh""#,
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox
+        .command()
+        .args(["host", "presets"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains(r"curl evil\u{200b}.example.test\u{2028}rm -rf /\u{202e}txt.sh"),
+        "every character that would hide or reorder the command is shown: {stdout}"
+    );
+    for hidden in ['\u{200b}', '\u{2028}', '\u{202e}'] {
+        assert!(
+            !stdout.contains(hidden),
+            "{hidden:?} must not reach the terminal: {stdout}"
+        );
+    }
 }

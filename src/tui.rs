@@ -27,7 +27,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    config::{CommandPreset, Config},
+    config::{CommandPreset, Config, escaped_config_text},
     discovery::{
         DiscoveryCompletion, DiscoveryLocation, DiscoveryMessage, DiscoveryRequest, DiscoveryRun,
         DiscoveryService,
@@ -54,6 +54,12 @@ const SHELL_COMMAND: &str = "exec ${SHELL:-/bin/sh}";
 /// Roughly three wrapped lines at the panel's width, which keeps a preset with
 /// two long programs from pushing the list off a short terminal.
 const MAX_PREVIEW_CHARACTERS: usize = 180;
+
+/// Shown when the panel has no room for the command itself.
+///
+/// Naming the command that prints it is the whole content: a panel this short
+/// cannot show a program honestly, and a cut one would be worse than none.
+const PREVIEW_ELIDED_MESSAGE: &str = "Command too long for this panel · herdr-tether host presets";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerCommand {
@@ -2859,22 +2865,23 @@ impl PickerState {
     }
 }
 
-/// One program, sanitised for a terminal and bounded to something a panel can
+/// One program, escaped for a terminal and bounded to something a panel can
 /// hold.
 ///
 /// A shortened program names the count it left out rather than trailing off, so
-/// a long command cannot be mistaken for a short one. The bound counts
-/// characters rather than bytes, because it exists to keep the panel a sensible
-/// height rather than to protect a buffer.
+/// a long command cannot be mistaken for a short one. Bounded by grapheme, the
+/// way [`bounded_label`] bounds a row: cutting mid-cluster would show a
+/// different letter from the one the command runs.
 fn previewed_program(program: &str) -> String {
-    let safe = terminal_safe_text(program);
-    let mut characters = safe.chars();
-    let shown: String = characters.by_ref().take(MAX_PREVIEW_CHARACTERS).collect();
-    let omitted = characters.count();
-    if omitted == 0 {
-        return shown;
+    let safe = escaped_config_text(program);
+    let mut clusters = safe.graphemes(true);
+    let shown: String = clusters.by_ref().take(MAX_PREVIEW_CHARACTERS).collect();
+    let omitted = clusters.count();
+    match omitted {
+        0 => shown,
+        1 => format!("{shown}… 1 more character · herdr-tether host presets"),
+        omitted => format!("{shown}… {omitted} more characters · herdr-tether host presets"),
     }
-    format!("{shown}… {omitted} more characters · herdr-tether host presets")
 }
 
 fn terminal_safe_text(text: &str) -> Cow<'_, str> {
@@ -3397,18 +3404,40 @@ fn render_picker_with_color_mode(frame: &mut Frame<'_>, state: &PickerState, col
     let desired_preview_height = preview
         .as_deref()
         .map_or(0, |preview| wrapped_line_count(preview, footer_width));
+    // A panel showing a preview also has to fit the viewport line above the
+    // rows, which the other stages take out of the list chunk's spare height.
+    let metadata_row = u16::from(desired_preview_height > 0);
     let area = centered_rect(
         frame.area(),
         72,
         visible_rows
             .saturating_add(desired_footer_height)
             .saturating_add(desired_preview_height)
+            .saturating_add(metadata_row)
             .saturating_add(4)
             .max(9),
     );
     let available = area.height.saturating_sub(4);
     let footer_height = desired_footer_height.min(available);
-    let preview_height = desired_preview_height.min(available.saturating_sub(footer_height));
+    let for_preview = available.saturating_sub(footer_height);
+    // A cut preview is the failure this preview exists to prevent: ratatui drops
+    // the overflow, which discards the very line saying the command was
+    // shortened and leaves a long command reading as a short one. So the whole
+    // thing is shown or none of it is, and a panel with room for only a line
+    // says where the command can be read instead.
+    let (preview, preview_height) = match preview {
+        Some(_) if desired_preview_height <= for_preview => (preview, desired_preview_height),
+        Some(_) => {
+            let elided = PREVIEW_ELIDED_MESSAGE.to_owned();
+            let height = wrapped_line_count(&elided, footer_width);
+            if height <= for_preview {
+                (Some(elided), height)
+            } else {
+                (None, 0)
+            }
+        }
+        None => (None, 0),
+    };
     frame.render_widget(Clear, area);
     let destructive = compact_guidance;
     let accent = if !colors_enabled {

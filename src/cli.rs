@@ -22,7 +22,7 @@ use crate::{
     },
     config::{
         CommandPreset, Config, ConfigStore, HerdrKeybindingInstall, HerdrKeybindingStore,
-        HostConfig, RetentionDefaults,
+        HostConfig, RetentionDefaults, escaped_config_text,
     },
     discovery::{DiscoveryLimits, DiscoveryService},
     herdr::{HerdrClient, HerdrContext, PaneTitle, PlacedPane},
@@ -635,7 +635,13 @@ fn host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
             check_host(&name, &target)
         }
         HostCommand::Presets(args) => {
-            list_presets(&store.load()?, args.host.as_deref(), args.output.json)
+            let aliases = discover_aliases(&paths.ssh_config_file)?;
+            list_presets(
+                &store.load()?,
+                &aliases,
+                args.host.as_deref(),
+                args.output.json,
+            )
         }
     }
 }
@@ -666,19 +672,31 @@ struct PresetListEntry<'a> {
 /// configuration that came from somewhere else is exactly where a terminal
 /// escape sequence would arrive; `--json` is byte-exact for anything that needs
 /// the original.
-fn list_presets(config: &Config, host: Option<&str>, json: bool) -> Result<()> {
+fn list_presets(config: &Config, aliases: &[String], host: Option<&str>, json: bool) -> Result<()> {
+    // `local` and an SSH alias are hosts everywhere else in this command group,
+    // and neither can carry a preset: presets live on configured hosts. Saying
+    // they are unknown would send a reader looking for a host that is right
+    // there, so a name this command group accepts is answered with the truth
+    // that it has no presets.
+    let known = |name: &str| {
+        name == "local"
+            || config.hosts.iter().any(|entry| entry.name == name)
+            || aliases.iter().any(|alias| alias == name)
+    };
     if let Some(host) = host
-        && !config.hosts.iter().any(|entry| entry.name == host)
+        && !known(host)
     {
-        bail!("unknown configured host `{host}`");
+        bail!("unknown host `{host}`");
     }
-    let hosts = config
+    let hosts: Vec<&HostConfig> = config
         .hosts
         .iter()
-        .filter(|entry| host.is_none_or(|host| entry.name == host));
+        .filter(|entry| host.is_none_or(|host| entry.name == host))
+        .collect();
 
     if json {
         let entries: Vec<PresetListEntry<'_>> = hosts
+            .iter()
             .flat_map(|entry| {
                 entry.presets.iter().map(move |preset| PresetListEntry {
                     host: &entry.name,
@@ -693,20 +711,37 @@ fn list_presets(config: &Config, host: Option<&str>, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    if hosts.is_empty() {
+        // Silence would be indistinguishable from a command that did nothing.
+        match host {
+            Some(host) => println!("{} · no presets configured", escaped_config_text(host)),
+            None => println!("no configured hosts"),
+        }
+        return Ok(());
+    }
+
     for entry in hosts {
-        println!("{} ({})", entry.name, entry.target);
+        // Every field here comes out of the configuration file, and a name is no
+        // more trustworthy than a command: a preset called
+        // "sneaky\nbuild (forged.test)" would otherwise print a line that reads
+        // as another host's heading.
+        println!(
+            "{} ({})",
+            escaped_config_text(&entry.name),
+            escaped_config_text(&entry.target)
+        );
         if entry.presets.is_empty() {
             println!("  no presets configured");
             continue;
         }
         for preset in &entry.presets {
-            println!("  {}", preset.name);
+            println!("  {}", escaped_config_text(&preset.name));
             print_program("command", &preset.command);
             if let Some(health_command) = &preset.health_command {
                 print_program("health command", health_command);
             }
             if let Some(agent) = &preset.herdr_agent {
-                println!("    agent: {}", agent.as_str());
+                println!("    agent: {}", escaped_config_text(agent.as_str()));
             }
         }
     }
@@ -720,26 +755,7 @@ fn list_presets(config: &Config, host: Option<&str>, json: bool) -> Result<()> {
 /// would produce something that looked like the whole command.
 fn print_program(label: &str, program: &str) {
     println!("    {label}:");
-    println!("      {}", escaped_program(program));
-}
-
-/// A program with control characters made visible.
-///
-/// A configuration file is text a user may not have written, so an escape
-/// sequence in it must not reach the terminal as one. Newlines and tabs are
-/// spelled out rather than laid out, which keeps one program to one line and
-/// keeps the indentation meaningful.
-fn escaped_program(program: &str) -> String {
-    program
-        .chars()
-        .map(|character| match character {
-            '\n' => "\\n".to_owned(),
-            '\t' => "\\t".to_owned(),
-            '\r' => "\\r".to_owned(),
-            character if character.is_control() => format!("\\u{{{:04x}}}", character as u32),
-            character => character.to_string(),
-        })
-        .collect()
+    println!("      {}", escaped_config_text(program));
 }
 
 #[derive(Serialize)]
@@ -1421,14 +1437,14 @@ fn announce_preset(host: &HostConfig, preset: Option<&str>) {
     };
     println!(
         "preset {} runs: {}",
-        preset.name,
-        escaped_program(&preset.command)
+        escaped_config_text(&preset.name),
+        escaped_config_text(&preset.command)
     );
     if let Some(health_command) = &preset.health_command {
         println!(
             "preset {} health command: {}",
-            preset.name,
-            escaped_program(health_command)
+            escaped_config_text(&preset.name),
+            escaped_config_text(health_command)
         );
     }
 }

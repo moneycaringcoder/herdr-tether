@@ -14,12 +14,16 @@
   and not the probe would look complete while hiding half of what runs.
 - Long and untrusted preset text is handled rather than assumed away. A command too
   long for the picker panel says how many characters it left out and where to read
-  the rest, so a long command is never rendered as a short one. In `host presets`
-  every program is indented beneath the preset that owns it, so a command
-  containing a newline cannot forge a heading, and control characters are shown
-  escaped rather than sent to the terminal - an inherited configuration is exactly
-  where an escape sequence would arrive. `snapshot` still excludes preset command
-  bodies.
+  the rest, and a panel with no room for the whole preview shows none of it and
+  names `host presets` instead: a command cut to fit reads as a complete short
+  command, which is the mistake the preview exists to prevent. In `host presets`
+  every field is indented beneath the one that owns it, so neither a command nor a
+  preset name containing a newline can forge a heading - names are checked for
+  length and uniqueness, never for characters. Control characters, the Unicode line
+  separators, and the bidirectional and zero-width formatting characters are shown
+  escaped rather than sent to the terminal, so what is displayed is what runs; an
+  inherited configuration is exactly where those arrive. `--json` remains
+  byte-exact, and `snapshot` still excludes preset command bodies.
 
 - Repeated immediate failures are counted, and the wait grows with them. A
   workload that fails within ten seconds of starting was paced for thirty seconds

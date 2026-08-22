@@ -1866,6 +1866,104 @@ fn the_shell_row_previews_nothing() {
 }
 
 #[test]
+fn a_panel_too_short_for_the_preview_never_shows_part_of_a_command() {
+    // ratatui drops a paragraph's overflow lines, so a preview allotted fewer
+    // lines than it needs loses its tail - which is exactly where the marker
+    // saying the command was shortened lives. A 419-character command then reads
+    // as a complete three-word one. `split-right` is the default placement, so a
+    // 40-column pane is the ordinary case, not the exotic one.
+    let long = format!("exec {}", "argument ".repeat(46));
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "long".into(),
+        command: long.clone(),
+        health_command: Some("pgrep -x codex".into()),
+    }]);
+
+    for (width, height) in [(40, 9), (40, 13), (60, 10), (80, 9), (100, 9)] {
+        let rendered = render_picker_to_text(width, height, &picker).unwrap();
+        let flattened = rendered
+            .replace(['│', '─', '┌', '┐', '└', '┘'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shortened = flattened.contains("more characters");
+        let elided = flattened.contains("Command too long for this panel");
+        let partial = flattened.contains("Runs:") && !shortened;
+        assert!(
+            !partial,
+            "{width}x{height} shows part of a command with nothing saying so: {rendered}"
+        );
+        assert!(
+            !(flattened.contains("Runs:") && !flattened.contains("Health:")),
+            "{width}x{height} shows one program of two as though it were all: {rendered}"
+        );
+        assert!(
+            !elided || !flattened.contains("Runs:"),
+            "{width}x{height} cannot both quote and decline to quote: {rendered}"
+        );
+    }
+
+    // Given the room, the whole thing is shown: both programs and the count.
+    let rendered = render_picker_to_text(80, 24, &picker).unwrap();
+    let flattened = rendered
+        .replace(['│', '─', '┌', '┐', '└', '┘'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(flattened.contains("more characters"), "{rendered}");
+    assert!(flattened.contains("Health: pgrep -x codex"), "{rendered}");
+}
+
+#[test]
+fn the_preview_never_takes_the_rows_it_describes() {
+    // The command stage exists to offer a choice, so the alternatives stay on
+    // screen. A preview that pushed them off would describe one option by hiding
+    // the others.
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command: format!("exec {}", "argument ".repeat(46)),
+        health_command: Some("pgrep -x codex".into()),
+    }]);
+
+    let rendered = render_picker_to_text(80, 9, &picker).unwrap();
+    assert!(
+        rendered.contains("Shell") && rendered.contains("agent"),
+        "both commands stay visible on a short panel: {rendered}"
+    );
+    assert!(
+        !rendered.contains("more above"),
+        "nothing is scrolled out of view to make room: {rendered}"
+    );
+}
+
+#[test]
+fn the_preview_bound_does_not_split_a_grapheme_cluster() {
+    // `bounded_label` is grapheme-safe and a test asserts it; the preview holds
+    // itself to the same rule. Splitting a cluster would display a different
+    // letter from the one the command runs: `e` where the command has `é`.
+    let cluster = "e\u{301}";
+    let command = format!("{}{cluster}{}", "x".repeat(179), "y".repeat(5));
+    let picker = command_stage_picker(vec![CommandPreset {
+        herdr_agent: None,
+        name: "agent".into(),
+        command,
+        health_command: None,
+    }]);
+
+    let preview = picker.command_preview().expect("a preset previews");
+    assert!(
+        preview.contains(&format!("{}{cluster}…", "x".repeat(179))),
+        "the last shown cluster is whole: {preview:?}"
+    );
+    assert!(
+        preview.contains("5 more characters"),
+        "and the count is of clusters, not of the bytes inside one: {preview:?}"
+    );
+}
+
+#[test]
 fn only_the_command_stage_previews_a_command() {
     // The preview answers "what will this run", which is a question the command
     // stage asks. On the stages before it the highlighted row is a host, a

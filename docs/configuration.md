@@ -191,18 +191,24 @@ run through `/bin/sh -c` on that host, as your login user there.
 
 `herdr-tether host presets` prints every configured preset with the exact
 `command`, the `health_command` when there is one, and the agent kind if it names
-one, so reading what you were given does not mean opening the file. Every program
-is indented under the preset that owns it and control characters are shown
-escaped, because a command that arrived from somewhere else is where a terminal
-escape sequence would arrive; `--json` is byte-exact for anything that needs the
-original, and `--host NAME` narrows to one host.
+one, so reading what you were given does not mean opening the file. Every field is
+indented under the one that owns it and nothing that could break a line or hide a
+character is passed through: control characters, the Unicode line separators, and
+the bidirectional and zero-width formatting characters are all shown escaped. That
+applies to names as much as to commands, because neither is checked for characters
+and a preset named `sneaky\nbuild (other.example)` would otherwise print a line
+that reads as another host. `--json` is byte-exact for anything that needs the
+original, and `--host NAME` narrows to one host - including `local` or an SSH
+alias, which are answered as having no presets rather than called unknown.
 
 The picker shows the same thing at the moment of choosing: highlighting a preset
 on the command stage displays what it runs, and its probe when it has one, before
 Enter creates anything. A command too long for the panel says how many characters
-it left out rather than trailing off, so a long command is never mistaken for a
-short one. `herdr-tether open --preset NAME` prints what the name resolved to
-before the workload exists.
+it left out rather than trailing off, and a panel with no room for the whole
+preview shows none of it, naming `host presets` instead - a command cut to fit
+would read as a complete short command, which is the mistake worth preventing.
+`herdr-tether open --preset NAME` prints what the name resolved to before the
+workload exists.
 
 `herdr-tether host add NAME TARGET --preset NAME=COMMAND` avoids hand-editing when
 the host is being added at the same time. It cannot carry `health_command` or
