@@ -105,6 +105,7 @@ fn owned_record(status: SessionStatus) -> SessionRecord {
         preset: Some("shell".into()),
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        tmux_pane_id: None,
         ownership_proof: Some(proof()),
         status,
         created_at: now,
@@ -229,6 +230,122 @@ fn owned_close_inspects_without_state_lock_then_finalizes_missing() {
             "#{&&:#{==:#{session_name},tether-0197f198000070008000000000000001},#{==:#{TETHER_OWNERSHIP_PROOF},0197f198000070008000000000000002}}",
         ]
     );
+}
+
+#[test]
+fn a_foreign_pane_that_exited_is_not_the_workload_ending() {
+    // Verified on tmux 3.6: a session running `sleep 300`, attached and split,
+    // with the split exited and selected, answers `list-sessions` with
+    // `pane_dead=1` and that pane's status - because those fields are
+    // pane-scoped and resolve to the active pane of the session's current
+    // window. This path persists what it reads, so believing it records a
+    // running workload as finished, reports a successful stop for something that
+    // never stopped, and lets a restart create a second incarnation beside the
+    // first.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    let script = format!(
+        "#!/bin/sh\n: > '{log}'\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\ncase \"$1\" in\n  list-sessions) printf '{id}:$7:1:1:7:{proof}' ;;\n  list-panes) printf '{id}:$7:1:0::{proof}' ;;\nesac\nexit 0\n",
+        log = log.display(),
+        id = id(),
+        proof = proof(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let observed = service.observe_owned(id()).unwrap();
+
+    assert_eq!(
+        observed,
+        WorkloadState::Running {
+            attached: 1,
+            identity: "$7".parse().unwrap(),
+        },
+        "the launched pane is alive, so the workload is running"
+    );
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Running);
+    assert_eq!(record.closed_at, None);
+    assert_eq!(
+        record.exit_status, None,
+        "a pane someone else added must never lend the workload its exit status"
+    );
+    assert_eq!(
+        read_argv(&log),
+        [
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}",
+            "-f",
+            "#{&&:#{==:#{pane_id},%3},#{&&:#{==:#{session_name},tether-0197f198000070008000000000000001},#{==:#{TETHER_OWNERSHIP_PROOF},0197f198000070008000000000000002}}}",
+        ],
+        "the pane the workload was launched in is the one asked about"
+    );
+}
+
+#[test]
+fn the_launched_pane_ending_is_still_recorded_with_its_status() {
+    // The other half of the same query: when the pane Tether launched is the one
+    // that died, its end and status are the workload's own and must persist.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    write_fake(
+        &tmux,
+        &log,
+        &format!("{id}:$7:0:1:3:{proof}", id = id(), proof = proof()),
+        0,
+    );
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let observed = service.observe_owned(id()).unwrap();
+
+    assert_eq!(
+        observed,
+        WorkloadState::Ended {
+            identity: "$7".parse().unwrap(),
+            exit_status: Some(3),
+        }
+    );
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Ended);
+    assert_eq!(record.exit_status, Some(3));
 }
 
 /// A fake `tmux` that answers the exact inspection with `line` and lets the
@@ -945,7 +1062,10 @@ fn missing_local_tmux_reports_install_and_search_guidance() {
         "unused-ssh-for-missing-tool-test",
         "tmux-that-does-not-exist-for-test",
     ));
-    let error = backend.inspect(&id(), &proof()).unwrap_err().to_string();
+    let error = backend
+        .inspect(&id(), &proof(), None)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("tmux-that-does-not-exist-for-test"));
     assert!(error.contains("install the tool or make it executable"));
     assert!(error.contains("/opt/homebrew/bin"));
@@ -1540,7 +1660,7 @@ fn local_backend_uses_argv_boundaries_and_exact_tmux_targets() {
     let backend = TmuxBackend::local(ProcessBinaries::new(ssh, tmux));
 
     assert_eq!(
-        backend.inspect(&id(), &proof()).unwrap(),
+        backend.inspect(&id(), &proof(), None).unwrap(),
         WorkloadState::Running {
             attached: 2,
             identity: "$7".parse().unwrap()
@@ -1745,7 +1865,7 @@ fn inspect_separates_an_answer_from_a_failure_to_ask() {
             TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
 
         assert_eq!(
-            backend.inspect(&id(), &proof()).unwrap(),
+            backend.inspect(&id(), &proof(), None).unwrap(),
             expected,
             "unexpected inspect state for exit {status} saying {stderr:?}"
         );
@@ -1789,6 +1909,7 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         preset: Some("shell".into()),
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        tmux_pane_id: None,
         ownership_proof: Some(proof()),
         status: SessionStatus::Running,
         created_at: now - Duration::days(30),
@@ -1870,6 +1991,7 @@ fn prune_record(
         preset: None,
         command: Some("exec shell".into()),
         tmux_session_id: None,
+        tmux_pane_id: None,
         ownership_proof: Some(proof()),
         status,
         created_at,
@@ -2546,6 +2668,6 @@ fn direct_backend_inspection_rejects_oversized_process_output() {
     fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
     let backend = TmuxBackend::local(ProcessBinaries::new(temp.path().join("unused-ssh"), tmux));
 
-    let error = backend.inspect(&id(), &proof()).unwrap_err();
+    let error = backend.inspect(&id(), &proof(), None).unwrap_err();
     assert!(error.to_string().contains("safe capture limit"));
 }

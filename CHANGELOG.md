@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An exact inspection judges the pane the workload was launched in, not whichever
+  pane happens to be active. `pane_dead` and `pane_dead_status` are pane-scoped,
+  and in `list-sessions` they resolve to the active pane of the session's current
+  window — so a workload someone attached to and split could be recorded as
+  finished with a foreign pane's exit status while its own command kept running.
+  Unlike the host-wide refresh, this path persists what it reads: a Stop then
+  reported success for a workload that never stopped, and a Restart created a
+  second incarnation beside the first. Reaching it took nothing more than
+  attaching and splitting, which is ordinary use of a terminal multiplexer.
+  Creation already learned the launched pane and discarded it; it is now recorded,
+  and every exact inspection asks `list-panes` about that pane by id, alongside
+  the session name and the ownership proof it already checked.
+- **State schema version 6.** The launched pane is a new field on each session
+  record, so a version 5 file is migrated on load. A migrated record has no pane
+  and keeps being judged as a whole session: a session's only pane is usually the
+  launched one, and "usually" is the assumption this field exists to remove, while
+  a guessed pane id would read as a workload that has gone. An absent pane is
+  omitted from the document rather than written as null.
+
 ### Added
 
 - A pane something else took is named on the tile, with the remedy it actually

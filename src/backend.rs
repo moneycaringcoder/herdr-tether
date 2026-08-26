@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 
 use crate::{
-    model::{OwnershipProof, SessionId, TmuxSessionId},
+    model::{OwnershipProof, SessionId, TmuxPaneId, TmuxSessionId},
     quote::posix_quote,
 };
 
@@ -153,10 +153,26 @@ pub enum WorkloadState {
     Unknown,
 }
 
+/// The identities a successful creation produced.
+///
+/// The pane is carried alongside the session because a workload's own end is a
+/// pane-scoped fact: asking a session for it answers about whichever pane is
+/// active, which stops being the launched one the moment someone splits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedWorkload {
+    pub session: TmuxSessionId,
+    pub pane: TmuxPaneId,
+}
+
 /// Operations required from a durable session backend.
 pub trait DurableBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId>;
-    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState>;
+    fn create(&self, launch: &LaunchSpec) -> Result<CreatedWorkload>;
+    fn inspect(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
+    ) -> Result<WorkloadState>;
     fn attach_command(
         &self,
         id: &SessionId,

@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use crate::{
     backend::{
-        CommandSpec, CreateOutcomeUncertain, DurableBackend, LaunchSpec, ProcessBinaries,
-        WorkloadState,
+        CommandSpec, CreateOutcomeUncertain, CreatedWorkload, DurableBackend, LaunchSpec,
+        ProcessBinaries, WorkloadState,
     },
-    model::{ExternalSessionName, OwnershipProof, SessionId, TmuxSessionId},
+    model::{ExternalSessionName, OwnershipProof, SessionId, TmuxPaneId, TmuxSessionId},
     quote::posix_quote,
     sshcfg::{OpenSshTarget, openssh_connection_args, openssh_target},
     status::{BoundedOutput, run_bounded},
@@ -211,25 +211,49 @@ impl TmuxBackend {
         self.bounded_output(spec).map_err(Into::into)
     }
 
+    /// Asks about one workload, judging the pane it was launched in.
+    ///
+    /// `pane_dead` and `pane_dead_status` are pane-scoped. In `list-sessions`
+    /// they resolve to the active pane of the session's current window, which is
+    /// the launched pane only until someone attaches and splits - and this answer
+    /// is persisted, so reading a foreign pane's exit as the workload's records a
+    /// running workload as finished. `list-panes -a` asks the same six fields of
+    /// one pane, pinned by id alongside the name and the ownership proof.
+    ///
+    /// A record written before the pane was recorded has none to pin, and keeps
+    /// the session-scoped question it was written under: less precise, and never
+    /// unactionable, which is the trade the migration arm documents.
     pub(crate) fn inspect_exact_spec(
         &self,
         id: &SessionId,
         ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
     ) -> Result<CommandSpec> {
         let id_text = id.to_string();
-        self.tmux_spec(
-            vec![
+        let format =
+            "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}"
+                .to_owned();
+        let owned_by_this_workload = format!(
+            "#{{&&:#{{==:#{{session_name}},{id_text}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}"
+        );
+        let arguments = match pane {
+            Some(pane) => vec![
+                "list-panes".to_owned(),
+                "-a".to_owned(),
+                "-F".to_owned(),
+                format,
+                "-f".to_owned(),
+                format!("#{{&&:#{{==:#{{pane_id}},{pane}}},{owned_by_this_workload}}}"),
+            ],
+            None => vec![
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
-                "#{session_name}:#{session_id}:#{session_attached}:#{pane_dead}:#{pane_dead_status}:#{TETHER_OWNERSHIP_PROOF}"
-                    .to_owned(),
+                format,
                 "-f".to_owned(),
-                format!(
-                    "#{{&&:#{{==:#{{session_name}},{id_text}}},#{{==:#{{TETHER_OWNERSHIP_PROOF}},{ownership_proof}}}}}"
-                ),
+                owned_by_this_workload,
             ],
-            false,
-        )
+        };
+        self.tmux_spec(arguments, false)
     }
 
     pub(crate) fn close_exact_spec(
@@ -570,7 +594,7 @@ impl TmuxBackend {
 }
 
 impl DurableBackend for TmuxBackend {
-    fn create(&self, launch: &LaunchSpec) -> Result<TmuxSessionId> {
+    fn create(&self, launch: &LaunchSpec) -> Result<CreatedWorkload> {
         let spec = self.tmux_spec(
             vec![
                 "new-session".to_owned(),
@@ -614,7 +638,7 @@ impl DurableBackend for TmuxBackend {
                 .split_once(':')
                 .context("tmux create did not return session and pane identities")?;
             let session_target = session_target.parse::<TmuxSessionId>()?;
-            let pane_target = validate_tmux_id(pane_target, '%', "pane")?;
+            let pane_target = pane_target.parse::<TmuxPaneId>()?;
             Ok::<_, anyhow::Error>((session_target, pane_target))
         })();
         let (session_target, pane_target) = match identities {
@@ -624,17 +648,26 @@ impl DurableBackend for TmuxBackend {
             // proof-based retry can reconcile it.
             Err(error) => return Err(CreateOutcomeUncertain::new(error).into()),
         };
-        self.enable_remain_on_exit(&pane_target)
-            .and_then(|()| self.verify_created_cwd(&pane_target, &launch.directory))
+        let pane_text = pane_target.to_string();
+        self.enable_remain_on_exit(&pane_text)
+            .and_then(|()| self.verify_created_cwd(&pane_text, &launch.directory))
             .and_then(|()| self.enable_mouse_for_target(session_target.to_string()))
             .map_err(|error| {
                 self.rollback_created(&launch.id, &launch.ownership_proof, session_target, error)
             })?;
-        Ok(session_target)
+        Ok(CreatedWorkload {
+            session: session_target,
+            pane: pane_target,
+        })
     }
 
-    fn inspect(&self, id: &SessionId, ownership_proof: &OwnershipProof) -> Result<WorkloadState> {
-        let spec = self.inspect_exact_spec(id, ownership_proof)?;
+    fn inspect(
+        &self,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
+    ) -> Result<WorkloadState> {
+        let spec = self.inspect_exact_spec(id, ownership_proof, pane)?;
         let output = self.output(&spec)?;
         Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
     }
@@ -829,18 +862,6 @@ fn stderr_reports_no_server(stderr: &[u8]) -> bool {
         || stderr.contains("no server running")
         || stderr.contains("error connecting to")
         || stderr.contains("failed to connect to server")
-}
-
-fn validate_tmux_id(value: &str, sigil: char, kind: &str) -> Result<String> {
-    if value.len() < 2
-        || !value.starts_with(sigil)
-        || !value[1..]
-            .chars()
-            .all(|character| character.is_ascii_digit())
-    {
-        bail!("tmux returned invalid internal {kind} ID `{value}`");
-    }
-    Ok(value.to_owned())
 }
 
 fn remote_tmux_command(arguments: &[String]) -> Result<String> {

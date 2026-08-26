@@ -100,6 +100,7 @@ fn state_at_serialized_limit() -> State {
                 preset: None,
                 command: Some("x".into()),
                 tmux_session_id: None,
+                tmux_pane_id: None,
                 ownership_proof: None,
                 status: SessionStatus::Running,
                 created_at: now,
@@ -748,6 +749,7 @@ fn state_round_trips_and_migrates_v0() {
             preset: Some("shell".into()),
             command: Some("exec shell".into()),
             tmux_session_id: Some("$7".parse().unwrap()),
+            tmux_pane_id: None,
             ownership_proof: None,
             status: SessionStatus::Running,
             created_at: now,
@@ -778,7 +780,7 @@ fn state_round_trips_and_migrates_v0() {
     assert!(migrated.sessions[0].ownership_proof.is_none());
     assert!(migrated.sessions[0].preset.is_none());
     assert!(migrated.orchestration_groups.is_empty());
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 5"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 6"));
 }
 
 #[test]
@@ -808,7 +810,7 @@ fn state_v2_migration_preserves_sessions_and_creates_no_groups() {
     assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
     assert!(migrated.orchestration_groups.is_empty());
     let rewritten = fs::read_to_string(path).unwrap();
-    assert!(rewritten.contains("\"version\": 5"));
+    assert!(rewritten.contains("\"version\": 6"));
     assert!(rewritten.contains("\"orchestration_groups\": []"));
 }
 
@@ -868,7 +870,7 @@ fn state_v4_migration_starts_the_failure_history_empty() {
     );
 
     let persisted = fs::read_to_string(&path).unwrap();
-    assert!(persisted.contains("\"version\": 5"), "{persisted}");
+    assert!(persisted.contains("\"version\": 6"), "{persisted}");
     assert!(
         !persisted.contains("immediate_failures"),
         "an empty history is omitted rather than written as an empty list: {persisted}"
@@ -878,10 +880,44 @@ fn state_v4_migration_starts_the_failure_history_empty() {
 }
 
 #[test]
+fn state_v5_migration_records_no_pane_and_keeps_the_session_scoped_reading() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    // A version 5 record for a running workload. No older Tether recorded which
+    // pane it launched, and the migration must not guess: a session's only pane
+    // is usually the launched one, and "usually" is the assumption the field
+    // exists to remove. A wrong pane id would read as a workload that has gone.
+    let source = r#"{"version":5,"sessions":[{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/srv/app","preset":null,"command":"exec shell","tmux_session_id":7,"ownership_proof":"0197f198-0000-7000-8000-000000000099","status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-01T00:00:00Z","closed_at":null}],"orchestration_groups":[]}"#;
+    fs::write(&path, source).unwrap();
+    let store = StateStore::new(path.clone());
+
+    let migrated = store.load().unwrap();
+
+    assert_eq!(migrated.version, State::CURRENT_VERSION);
+    assert_eq!(
+        migrated.sessions[0].tmux_pane_id, None,
+        "a migrated record has no pane, so it keeps being judged as a whole session"
+    );
+    assert_eq!(
+        migrated.sessions[0].tmux_session_id,
+        Some("$7".parse().unwrap())
+    );
+    assert_eq!(migrated.sessions[0].status, SessionStatus::Running);
+
+    let persisted = fs::read_to_string(&path).unwrap();
+    assert!(persisted.contains("\"version\": 6"), "{persisted}");
+    assert!(
+        !persisted.contains("tmux_pane_id"),
+        "an absent pane is omitted rather than written as null: {persisted}"
+    );
+    assert_eq!(store.load().unwrap(), migrated);
+}
+
+#[test]
 fn future_state_version_fails_closed_without_rewriting_data() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
-    let source = br#"{"version":6,"sessions":[],"orchestration_groups":[]}"#;
+    let source = br#"{"version":7,"sessions":[],"orchestration_groups":[]}"#;
     fs::write(&path, source).unwrap();
 
     let error = StateStore::new(path.clone())
@@ -889,7 +925,7 @@ fn future_state_version_fails_closed_without_rewriting_data() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("unsupported state version 6"), "{error}");
+    assert!(error.contains("unsupported state version 7"), "{error}");
     assert_eq!(fs::read(path).unwrap(), source);
 }
 
@@ -1103,6 +1139,7 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
         preset: Some("shell".into()),
         command: Some("true".into()),
         tmux_session_id: None,
+        tmux_pane_id: None,
         ownership_proof: None,
         status: SessionStatus::Running,
         created_at: now,
@@ -1336,16 +1373,16 @@ fn state_v5_rejects_unsafe_orchestration_json() {
     let worker = "tether-0197f198000070008000000000000002";
     let invalid_sources = [
         format!(
-            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":6,"sessions":[],"orchestration_groups":[{{"id":"Bad ID","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
+            r#"{{"version":6,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"line\nbreak","orchestrator_session_id":"{orchestrator}","workers":[]}}]}}"#
         ),
         format!(
-            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
+            r#"{{"version":6,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","title":" trailing ","capabilities":{{"observe_output":true,"open_interactive":false}}}}]}}]}}"#
         ),
         format!(
-            r#"{{"version":5,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","capabilities":{{"observe_output":true}}}}]}}]}}"#
+            r#"{{"version":6,"sessions":[],"orchestration_groups":[{{"id":"valid","title":"Valid","orchestrator_session_id":"{orchestrator}","workers":[{{"session_id":"{worker}","membership_id":"0197f198000070008000000000000011","capabilities":{{"observe_output":true}}}}]}}]}}"#
         ),
     ];
 
@@ -1382,9 +1419,9 @@ fn every_state_schema_rejects_unknown_fields() {
         // than being retargeted to the current version.
         r#"{"version":4,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
         r#"{"version":4,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
-        r#"{"version":5,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
-        r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
-        r#"{"version":5,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
+        r#"{"version":6,"sessions":[],"orchestration_groups":[],"unknown":true}"#.to_owned(),
+        r#"{"version":6,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[],"unknown":true}]}"#.to_owned(),
+        r#"{"version":6,"sessions":[],"orchestration_groups":[{"id":"valid","title":"Valid","orchestrator_session_id":"tether-0197f198000070008000000000000001","workers":[{"session_id":"tether-0197f198000070008000000000000002","membership_id":"0197f198000070008000000000000011","capabilities":{"observe_output":true,"open_interactive":false,"unknown":true}}]}]}"#.to_owned(),
     ];
 
     for source in sources {
@@ -1408,7 +1445,7 @@ fn state_load_time_migration_holds_the_advisory_lock() {
         StateStore::new(load_path).load().unwrap();
     });
 
-    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 5"));
+    assert!(fs::read_to_string(path).unwrap().contains("\"version\": 6"));
 }
 
 #[test]
@@ -1438,6 +1475,7 @@ fn concurrent_state_updates_preserve_both_records() {
                         preset: None,
                         command: Some("exec shell".into()),
                         tmux_session_id: None,
+                        tmux_pane_id: None,
                         ownership_proof: None,
                         status: SessionStatus::Running,
                         created_at: now,
@@ -1625,7 +1663,7 @@ fn state_follows_symlink_and_rejects_fifo_storage_paths() {
     assert!(
         fs::read_to_string(&target)
             .unwrap()
-            .contains(r#""version": 5"#)
+            .contains(r#""version": 6"#)
     );
 
     let fifo_path = temp.path().join("fifo-state.json");
