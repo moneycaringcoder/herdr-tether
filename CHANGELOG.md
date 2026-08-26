@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- A tag that passes every gate now publishes its own GitHub release. Release
+  validation gained a `publish` job that depends on every other job, is the only
+  job granted write access, and re-runs the identity check in the checkout it
+  publishes from rather than carrying notes between jobs as an artifact. The notes
+  are that version's dated `CHANGELOG.md` section, so what the release page says is
+  what the tagged tree says, and a section that is missing, undated, or holds only
+  sub-headings fails the check instead of publishing an empty page. Pushing the tag
+  is still the decision to release and still a human act; what is no longer manual
+  is the step after it, where notes could drift from the changelog or a release
+  could be forgotten while its tag existed. Existing tags keep their hand-written
+  releases: every tag from `v0.3.0` onward already has one, so there was nothing to
+  backfill.
+
 ## [0.7.3] - 2026-08-22
 
 ### Added

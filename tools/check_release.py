@@ -189,6 +189,47 @@ def validate_hermes_install(text: str, tag: str, *, surface: str) -> None:
             )
 
 
+def changelog_notes(text: str, version: str) -> str:
+    """The body of one dated changelog section, as the release notes for it.
+
+    Publication reads the notes from the same checkout every other gate ran
+    against, so what a release page says is what the tagged tree says.
+    """
+    heading = re.compile(
+        rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", re.MULTILINE
+    )
+    match = heading.search(text)
+    if match is None:
+        if re.search(rf"^## \[{re.escape(version)}\]", text, re.MULTILINE):
+            raise ReleaseIdentityError(
+                f"CHANGELOG.md has a [{version}] heading with no ISO-8601 date on it"
+            )
+        raise ReleaseIdentityError(f"CHANGELOG.md has no dated [{version}] release heading")
+    rest = text[match.end() :]
+    body: list[str] = []
+    fence: str | None = None
+    for line in rest.splitlines():
+        if fence is None:
+            # A fenced block can hold anything, including a line that looks like
+            # the next section, so the section ends at a heading only out here.
+            if line.startswith("## "):
+                break
+            if match_fence := re.match(r"(```+|~~~+)", line):
+                fence = match_fence.group(1)[:3]
+        elif line.startswith(fence):
+            fence = None
+        body.append(line)
+    if fence is not None:
+        raise ReleaseIdentityError(
+            f"CHANGELOG.md section for [{version}] leaves a code fence open"
+        )
+    # A section holding only sub-headings is empty to a reader, and publishing it
+    # produces a release page that says "### Added" and nothing else.
+    if not any(line.strip() and not line.lstrip().startswith("#") for line in body):
+        raise ReleaseIdentityError(f"CHANGELOG.md section for [{version}] says nothing")
+    return "\n".join(body).strip("\n") + "\n"
+
+
 def fail(message: str) -> None:
     print(f"release identity error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -209,6 +250,11 @@ def main() -> None:
         "--release",
         action="store_true",
         help="enforce tagged release install instructions (candidate mode is the default)",
+    )
+    parser.add_argument(
+        "--notes-out",
+        type=Path,
+        help="write this version's changelog section here once every check passes",
     )
     args = parser.parse_args()
     cargo_package = load_toml(ROOT / "Cargo.toml")["package"]
@@ -267,8 +313,10 @@ def main() -> None:
         )
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    if not re.search(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", changelog, re.MULTILINE):
-        fail(f"CHANGELOG.md has no dated [{version}] release heading")
+    try:
+        notes = changelog_notes(changelog, version)
+    except ReleaseIdentityError as error:
+        fail(str(error))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     try:
         validate_readme_install(readme, tag, args.release)
@@ -301,6 +349,12 @@ def main() -> None:
             if match := pattern.search(text):
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative_path}:{line} contains {label}")
+
+    if args.notes_out is not None:
+        try:
+            args.notes_out.write_text(notes, encoding="utf-8")
+        except OSError as error:
+            fail(f"notes could not be written: {error}")
 
     identity = "release" if args.release else "candidate"
     print(f"{identity} identity verified: {tag}")
