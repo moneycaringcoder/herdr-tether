@@ -30,8 +30,8 @@ use crate::{
     interrupt::{Budget, retry_interrupted},
     lifecycle::{CloseOwnedError, ClosedWorkload, LifecycleService},
     mission_control::{
-        BindingFailure, MemberTarget, MissionAgentState, MissionControlService, TargetDelivery,
-        label_materialized_member, resolve_binding,
+        BindingFailure, MemberTarget, MissionAgentState, MissionControlService, Occupant,
+        TargetDelivery, label_materialized_member, resolve_binding,
     },
     model::{
         OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle, OwnershipProof,
@@ -893,6 +893,7 @@ fn observer_key_for_event(key: KeyEvent) -> Option<(ObserverKey, ObserverInputKi
 fn handle_observer_open(
     observer: &mut ObserverState,
     gate: &mut ObserverOpenGate,
+    bound_occupants: &mut HashMap<String, BoundOccupant>,
     worker_id: &str,
     mut now: impl FnMut() -> Instant,
     mut render_feedback: impl FnMut(&ObserverState) -> Result<()>,
@@ -916,9 +917,18 @@ fn handle_observer_open(
     let result = open(worker_id);
     gate.record(worker_id, now());
     match result {
-        Ok(()) => observer.set_notice(Some(
-            "Worker opened; queued Enter will be ignored briefly".to_owned(),
-        )),
+        Ok(()) => {
+            // Opening materializes a new Herdr pane for this member, which is
+            // the remedy a replaced occupant is given. The pane that answers
+            // next is the one the operator just asked for, so what was
+            // remembered about the old occupant stops being evidence here. An
+            // open that failed changed nothing, and forgetting on it would leave
+            // the tile quiet about a replacement that is still there.
+            bound_occupants.remove(worker_id);
+            observer.set_notice(Some(
+                "Worker opened; queued Enter will be ignored briefly".to_owned(),
+            ));
+        }
         Err(error) => observer.set_notice(Some(format!("Open failed: {error:#}"))),
     }
     Ok(())
@@ -1104,6 +1114,9 @@ pub fn run_observer(
     let group = service.group(&group_id)?;
     let mut observer = ObserverState::new(Vec::with_capacity(group.workers.len()));
     let mut capture_fingerprints = HashMap::new();
+    // Who Herdr had in each worker's pane last time it resolved, so a pane
+    // something else took is visible at all: one snapshot cannot show it.
+    let mut bound_occupants: HashMap<String, BoundOccupant> = HashMap::new();
     // When each visible tile's sample was taken and for which state, so a sample
     // follows reported change and a bounded age rather than the refresh timer.
     let mut sampled_states: HashMap<String, SampleMark> = HashMap::new();
@@ -1127,6 +1140,7 @@ pub fn run_observer(
         &group_id,
         &mut observer,
         &mut capture_fingerprints,
+        &mut bound_occupants,
         capture_worker.sender(),
         MissionRefresh {
             client: mission_client.as_ref(),
@@ -1206,6 +1220,7 @@ pub fn run_observer(
                 &group_id,
                 &mut observer,
                 &mut capture_fingerprints,
+                &mut bound_occupants,
                 capture_worker.sender(),
                 MissionRefresh {
                     client: mission_client.as_ref(),
@@ -1223,6 +1238,7 @@ pub fn run_observer(
                 &group_id,
                 &mut observer,
                 &mut capture_fingerprints,
+                &mut bound_occupants,
                 capture_worker.sender(),
                 MissionRefresh {
                     client: mission_client.as_ref(),
@@ -1301,6 +1317,7 @@ pub fn run_observer(
                     &group_id,
                     &mut observer,
                     &mut capture_fingerprints,
+                    &mut bound_occupants,
                     capture_worker.sender(),
                     MissionRefresh {
                         client: mission_client.as_ref(),
@@ -1319,6 +1336,7 @@ pub fn run_observer(
                     &group_id,
                     &mut observer,
                     &mut capture_fingerprints,
+                    &mut bound_occupants,
                     capture_worker.sender(),
                     MissionRefresh {
                         client: mission_client.as_ref(),
@@ -1338,6 +1356,7 @@ pub fn run_observer(
                 handle_observer_open(
                     &mut observer,
                     &mut open_gate,
+                    &mut bound_occupants,
                     &worker_id,
                     Instant::now,
                     |state| {
@@ -1597,6 +1616,7 @@ fn refresh_observer_metadata(
     group_id: &OrchestrationGroupId,
     observer: &mut ObserverState,
     capture_fingerprints: &mut HashMap<String, CaptureFingerprint>,
+    bound_occupants: &mut HashMap<String, BoundOccupant>,
     capture_requests: &SyncSender<CaptureRequest>,
     mission: MissionRefresh<'_>,
 ) -> Result<ObserverAuthorityOutcome> {
@@ -1625,21 +1645,20 @@ fn refresh_observer_metadata(
             Some(Err(_)) => (None, true, None),
         };
     let next_fingerprints = capture_fingerprints_for(group, &state.sessions);
-    let attention = update_observer_metadata(
-        observer,
-        capture_fingerprints,
-        &next_fingerprints,
-        observer_workers(
-            group,
-            &state,
-            mission_snapshot.as_ref(),
-            mission_unreachable,
-            mission_latency_ms,
-        ),
+    let (workers, next_occupants) = observer_workers(
+        group,
+        &state,
+        mission_snapshot.as_ref(),
+        mission_unreachable,
+        mission_latency_ms,
+        bound_occupants,
     );
+    let attention =
+        update_observer_metadata(observer, capture_fingerprints, &next_fingerprints, workers);
     notify_attention(mission_client, notifications, &attention);
     *agent_panes = group_agent_panes(mission_snapshot.as_ref(), group_id);
     *capture_fingerprints = next_fingerprints;
+    *bound_occupants = next_occupants;
     let request = CaptureRequest {
         group: group.clone(),
         sessions: state.sessions,
@@ -2099,16 +2118,20 @@ fn observer_workers(
     snapshot: Option<&HerdrSessionSnapshot>,
     mission_unreachable: bool,
     mission_latency_ms: Option<u64>,
-) -> Vec<ObserverWorker> {
+    bound_occupants: &HashMap<String, BoundOccupant>,
+) -> (Vec<ObserverWorker>, HashMap<String, BoundOccupant>) {
     let sessions_by_id: HashMap<_, _> = state
         .sessions
         .iter()
         .map(|record| (record.id, record))
         .collect();
-    group
+    let mut next_occupants: HashMap<String, BoundOccupant> =
+        HashMap::with_capacity(group.workers.len());
+    let workers = group
         .workers
         .iter()
         .map(|member| {
+            let id = member.session_id.to_string();
             let record = sessions_by_id.get(&member.session_id).copied();
             let owned = record.is_some_and(|record| {
                 record.ownership_proof.is_some() && record.tmux_session_id.is_some()
@@ -2128,38 +2151,86 @@ fn observer_workers(
                 Some(SessionStatus::Removed) => ObserverLifecycle::Removed,
                 None => ObserverLifecycle::Missing,
             };
-            let (agent_state, last_observed, live_agent, binding_failure) =
-                if let Some(snapshot) = snapshot {
-                    let target = MemberTarget {
-                        session_id: member.session_id,
-                        membership_id: member.membership_id,
-                    };
-                    match crate::mission_control::binding_expectation(state, &group.id, &target) {
-                        Ok(expectation) => match resolve_binding(snapshot, &expectation) {
-                            Ok(binding) => (
-                                observer_agent_state(binding.status.into()),
-                                Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-                                true,
-                                None,
-                            ),
-                            Err(failure) => (
+            let (agent_state, last_observed, live_agent, binding_failure) = if let Some(snapshot) =
+                snapshot
+            {
+                let target = MemberTarget {
+                    session_id: member.session_id,
+                    membership_id: member.membership_id,
+                };
+                match crate::mission_control::binding_expectation(state, &group.id, &target) {
+                    Ok(expectation) => match resolve_binding(snapshot, &expectation) {
+                        // A binding resolves against one snapshot, so a
+                        // replaced occupant is only visible by remembering
+                        // who was bound before. The first occupant is kept
+                        // rather than the newcomer: the remedy is to reopen
+                        // the workload, and a tile that forgot would report
+                        // the replacement as live on the very next refresh.
+                        Ok(binding) => {
+                            let incarnation = record.and_then(|record| record.tmux_session_id);
+                            match bound_occupants
+                                .get(&id)
+                                .filter(|bound| bound.incarnation == incarnation)
+                            {
+                                Some(bound) if !binding.is_occupied_by(&bound.occupant) => {
+                                    next_occupants.insert(id.clone(), bound.clone());
+                                    (
+                                        observer_agent_state(BindingFailure::Replaced.state()),
+                                        None,
+                                        false,
+                                        Some(BindingFailure::Replaced),
+                                    )
+                                }
+                                bound => {
+                                    next_occupants.insert(
+                                        id.clone(),
+                                        match bound {
+                                            Some(bound) => bound.clone(),
+                                            None => BoundOccupant {
+                                                occupant: binding.occupant(),
+                                                incarnation,
+                                            },
+                                        },
+                                    );
+                                    (
+                                        observer_agent_state(binding.status.into()),
+                                        Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+                                        true,
+                                        None,
+                                    )
+                                }
+                            }
+                        }
+                        Err(failure) => {
+                            // Nothing bound says nothing about who is in the
+                            // pane, so what was last seen there is kept: a
+                            // worker that detaches and comes back with the
+                            // same occupant is not a replacement.
+                            carry_occupant(&mut next_occupants, bound_occupants, &id);
+                            (
                                 observer_agent_state(failure.state()),
                                 None,
                                 false,
                                 Some(failure),
-                            ),
-                        },
-                        Err(_) => (ObserverAgentState::Unknown, None, false, None),
+                            )
+                        }
+                    },
+                    Err(_) => {
+                        carry_occupant(&mut next_occupants, bound_occupants, &id);
+                        (ObserverAgentState::Unknown, None, false, None)
                     }
-                } else if mission_unreachable
-                    && record.is_some_and(|record| record.herdr_agent.is_some())
-                {
-                    (ObserverAgentState::Unreachable, None, false, None)
-                } else {
-                    (ObserverAgentState::Detached, None, false, None)
-                };
+                }
+            } else if mission_unreachable
+                && record.is_some_and(|record| record.herdr_agent.is_some())
+            {
+                carry_occupant(&mut next_occupants, bound_occupants, &id);
+                (ObserverAgentState::Unreachable, None, false, None)
+            } else {
+                carry_occupant(&mut next_occupants, bound_occupants, &id);
+                (ObserverAgentState::Detached, None, false, None)
+            };
             ObserverWorker {
-                id: member.session_id.to_string(),
+                id,
                 title: member.title.as_ref().map(|title| title.as_str().to_owned()),
                 capabilities: ObserverCapabilities {
                     observe_output: member.capabilities.observe_output,
@@ -2185,7 +2256,32 @@ fn observer_workers(
                 stale_reason: binding_failure.and_then(stale_reason_for),
             }
         })
-        .collect()
+        .collect();
+    (workers, next_occupants)
+}
+
+/// The occupant Tether bound, and the workload incarnation it was bound in.
+///
+/// The incarnation is what keeps the memory honest across the remedy: opening
+/// the workload again materializes a new Herdr pane, and a workload restarted
+/// anywhere is a new `tmux` session. Both are how an operator acts on a
+/// replacement, so an occupant remembered for a different incarnation is not
+/// evidence about this one and the pane that answers now is bound afresh.
+#[derive(Clone, Eq, PartialEq)]
+struct BoundOccupant {
+    occupant: Occupant,
+    incarnation: Option<TmuxSessionId>,
+}
+
+/// Keeps a worker's last known occupant while nothing can be resolved for it.
+fn carry_occupant(
+    next: &mut HashMap<String, BoundOccupant>,
+    previous: &HashMap<String, BoundOccupant>,
+    id: &str,
+) {
+    if let Some(occupant) = previous.get(id) {
+        next.insert(id.to_owned(), occupant.clone());
+    }
 }
 
 /// Which stale reason a binding failure is, when it is one.
@@ -2199,12 +2295,8 @@ const fn stale_reason_for(failure: BindingFailure) -> Option<StaleReason> {
     match failure {
         BindingFailure::StaleMembership => Some(StaleReason::EarlierMembership),
         BindingFailure::Ambiguous => Some(StaleReason::AmbiguousClaim),
-        // `Replaced` is declared but never detected: nothing in the crate
-        // constructs it, so a changed occupant arrives as one of the others
-        // today. Naming a reason no path can produce would document a remedy no
-        // operator can be shown, so it maps to nothing until it is detected.
-        BindingFailure::Replaced
-        | BindingFailure::Detached
+        BindingFailure::Replaced => Some(StaleReason::ReplacedOccupant),
+        BindingFailure::Detached
         | BindingFailure::UnknownAgent
         | BindingFailure::AgentKindMismatch => None,
     }
@@ -2791,12 +2883,13 @@ mod tests {
             ],
         };
 
-        let workers = observer_workers(
+        let (workers, _) = observer_workers(
             &state.orchestration_groups[0],
             &state,
             Some(&snapshot),
             false,
             Some(17),
+            &HashMap::new(),
         );
         assert_eq!(workers[0].agent_state, ObserverAgentState::Idle);
         assert_eq!(workers[1].agent_state, ObserverAgentState::Working);
@@ -2811,12 +2904,13 @@ mod tests {
             (AgentStatus::Done, ObserverAgentState::Done),
         ] {
             transitioned.agents[0].agent_status = status;
-            let refreshed = observer_workers(
+            let (refreshed, _) = observer_workers(
                 &state.orchestration_groups[0],
                 &state,
                 Some(&transitioned),
                 false,
                 Some(17),
+                &HashMap::new(),
             );
             assert_eq!(refreshed[0].agent_state, expected);
             assert!(refreshed[0].uses_live_agent());
@@ -2832,8 +2926,10 @@ mod tests {
                 Some(snapshot),
                 false,
                 Some(17),
-            )[0]
-            .stale_reason
+                &HashMap::new(),
+            )
+            .0[0]
+                .stale_reason
         };
 
         // Two panes claim the same membership.
@@ -2859,6 +2955,154 @@ mod tests {
         assert_eq!(
             membership_of(&earlier),
             Some(StaleReason::EarlierMembership)
+        );
+    }
+
+    #[test]
+    fn a_pane_another_agent_took_stays_named_until_the_workload_is_reopened() {
+        use crate::{
+            agent_view::GROUP_TOKEN,
+            herdr_socket::{AgentStatus, HerdrAgentInfo},
+            mission_control::{MEMBERSHIP_TOKEN, SESSION_TOKEN},
+        };
+
+        let worker_id = "tether-0197f198000070008000000000000051"
+            .parse::<SessionId>()
+            .unwrap();
+        let membership_id: OrchestrationMembershipId =
+            "0197f198000070008000000000000052".parse().unwrap();
+        let mut record = exact_running_session(worker_id, "$1");
+        record.herdr_agent = Some("codex".parse().unwrap());
+        let state = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: vec![OrchestrationGroup {
+                id: "replace-control".parse().unwrap(),
+                title: "Replace control".parse().unwrap(),
+                orchestrator_session_id: worker_id,
+                workers: vec![OrchestrationMember {
+                    session_id: worker_id,
+                    membership_id,
+                    title: Some("Worker".parse().unwrap()),
+                    capabilities: OrchestrationCapabilities {
+                        observe_output: true,
+                        open_interactive: true,
+                        prompt_agent: true,
+                    },
+                }],
+            }],
+        };
+        let occupant_agent = |terminal_id: &str, pane_id: &str| HerdrAgentInfo {
+            terminal_id: terminal_id.to_owned(),
+            name: Some("worker".to_owned()),
+            agent: Some("codex".to_owned()),
+            title: None,
+            agent_status: AgentStatus::Idle,
+            tokens: HashMap::from([
+                (GROUP_TOKEN.to_owned(), "replace-control".to_owned()),
+                (SESSION_TOKEN.to_owned(), worker_id.to_string()),
+                (MEMBERSHIP_TOKEN.to_owned(), membership_id.to_string()),
+            ]),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            pane_id: pane_id.to_owned(),
+            focused: false,
+            state_change_seq: 1,
+            revision: 1,
+        };
+        let snapshot_of = |agent: HerdrAgentInfo| HerdrSessionSnapshot {
+            version: "0.8.0".to_owned(),
+            protocol: 19,
+            focused_workspace_id: None,
+            focused_tab_id: None,
+            focused_pane_id: None,
+            panes: Vec::new(),
+            agents: vec![agent],
+        };
+        let project = |snapshot: &HerdrSessionSnapshot, bound: &HashMap<String, BoundOccupant>| {
+            observer_workers(
+                &state.orchestration_groups[0],
+                &state,
+                Some(snapshot),
+                false,
+                Some(17),
+                bound,
+            )
+        };
+
+        let bound = snapshot_of(occupant_agent("term-1", "w1:p1"));
+        let (workers, occupants) = project(&bound, &HashMap::new());
+        assert_eq!(workers[0].agent_state, ObserverAgentState::Idle);
+        assert_eq!(workers[0].stale_reason, None);
+
+        // A verified move by the same occupant stays accepted, and stays live.
+        let moved = snapshot_of(occupant_agent("term-1", "w9:p9"));
+        let (workers, occupants) = project(&moved, &occupants);
+        assert_eq!(workers[0].agent_state, ObserverAgentState::Idle);
+        assert_eq!(workers[0].stale_reason, None);
+
+        // A different terminal in the same membership is a different occupant.
+        let replaced = snapshot_of(occupant_agent("term-2", "w1:p1"));
+        let (workers, occupants) = project(&replaced, &occupants);
+        assert_eq!(workers[0].agent_state, ObserverAgentState::Stale);
+        assert_eq!(
+            workers[0].stale_reason,
+            Some(StaleReason::ReplacedOccupant),
+            "a pane something else took has its own remedy, and reporting it as \
+             an earlier membership sends the reader to a retry that cannot help"
+        );
+        assert!(!workers[0].live_agent);
+
+        // The newcomer is not adopted: a refresh reports the same replacement
+        // rather than presenting it as the worker's agent.
+        let (workers, occupants) = project(&replaced, &occupants);
+        assert_eq!(
+            workers[0].stale_reason,
+            Some(StaleReason::ReplacedOccupant),
+            "resnapshotting reports the same newcomer, so the tile must keep saying so"
+        );
+
+        // Nothing bound says nothing about the pane, and the occupant Tether
+        // did bind is remembered across it.
+        let (workers, occupants) = observer_workers(
+            &state.orchestration_groups[0],
+            &state,
+            None,
+            true,
+            None,
+            &occupants,
+        );
+        assert_eq!(workers[0].agent_state, ObserverAgentState::Unreachable);
+        let (workers, _) = project(&bound, &occupants);
+        assert_eq!(
+            workers[0].agent_state,
+            ObserverAgentState::Idle,
+            "the occupant Tether bound coming back is not a replacement"
+        );
+
+        // The other half of the remedy: a workload restarted anywhere is a new
+        // `tmux` session, and an occupant remembered for the incarnation before
+        // it says nothing about this one.
+        let mut restarted_record = exact_running_session(worker_id, "$2");
+        restarted_record.herdr_agent = Some("codex".parse().unwrap());
+        let restarted = State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![restarted_record],
+            orchestration_groups: state.orchestration_groups.clone(),
+        };
+        let (workers, _) = observer_workers(
+            &restarted.orchestration_groups[0],
+            &restarted,
+            Some(&replaced),
+            false,
+            Some(17),
+            &occupants,
+        );
+        assert_eq!(
+            workers[0].agent_state,
+            ObserverAgentState::Idle,
+            "a new incarnation binds whichever occupant answers it, or the remedy \
+             could never clear the tile"
         );
     }
 
@@ -2896,7 +3140,16 @@ mod tests {
                 sessions: vec![record],
                 orchestration_groups: vec![group.clone()],
             };
-            observer_workers(&state.orchestration_groups[0], &state, None, false, None)[0].lifecycle
+            observer_workers(
+                &state.orchestration_groups[0],
+                &state,
+                None,
+                false,
+                None,
+                &HashMap::new(),
+            )
+            .0[0]
+                .lifecycle
         };
 
         assert_eq!(
@@ -3135,6 +3388,7 @@ mod tests {
         let placements = Cell::new(0usize);
         let feedback = RefCell::new(Vec::new());
         let mut gate = ObserverOpenGate::default();
+        let mut bound_occupants = HashMap::new();
         let mut observer = ObserverState::new(vec![worker(
             "selected",
             ObserverLifecycle::Running,
@@ -3158,6 +3412,7 @@ mod tests {
                 handle_observer_open(
                     &mut observer,
                     &mut gate,
+                    &mut bound_occupants,
                     &worker_id,
                     || now.get(),
                     |state| {
@@ -3210,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_enter_preserves_open_failure_feedback() {
+    fn queued_enter_preserves_open_failure_feedback_and_the_bound_occupant() {
         let start = Instant::now();
         let mut gate = ObserverOpenGate::default();
         let mut observer = ObserverState::new(vec![worker(
@@ -3218,10 +3473,28 @@ mod tests {
             ObserverLifecycle::Running,
             Some("output"),
         )]);
+        // Opening is the remedy a replaced occupant is given, so a successful
+        // open has to end the condition and a failed one must not: a tile that
+        // forgot on failure would go quiet about a pane still in other hands.
+        let mut bound_occupants = HashMap::from([(
+            "selected".to_owned(),
+            BoundOccupant {
+                occupant: Occupant {
+                    group_id: "build-group".parse().unwrap(),
+                    session_id: "tether-0197f198000070008000000000000061".parse().unwrap(),
+                    membership_id: "0197f198000070008000000000000062".parse().unwrap(),
+                    terminal_id: "term-1".to_owned(),
+                    agent: "codex".to_owned(),
+                    name: Some("worker".to_owned()),
+                },
+                incarnation: Some("$1".parse().unwrap()),
+            },
+        )]);
 
         handle_observer_open(
             &mut observer,
             &mut gate,
+            &mut bound_occupants,
             "selected",
             || start,
             |_| Ok(()),
@@ -3233,10 +3506,15 @@ mod tests {
                 .notice()
                 .is_some_and(|notice| notice.contains("destination unavailable"))
         );
+        assert!(
+            bound_occupants.contains_key("selected"),
+            "an open that failed changed nothing about who is in the pane"
+        );
 
         handle_observer_open(
             &mut observer,
             &mut gate,
+            &mut bound_occupants,
             "selected",
             || start + Duration::from_millis(25),
             |_| Ok(()),
@@ -3246,6 +3524,25 @@ mod tests {
         let notice = observer.notice().unwrap();
         assert!(notice.contains("destination unavailable"), "{notice}");
         assert!(notice.contains("ignored"), "{notice}");
+        assert!(
+            bound_occupants.contains_key("selected"),
+            "a suppressed Enter never opened anything"
+        );
+
+        handle_observer_open(
+            &mut observer,
+            &mut gate,
+            &mut bound_occupants,
+            "selected",
+            || start + Duration::from_secs(60),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            bound_occupants.is_empty(),
+            "the pane the operator just asked for is the one to bind next"
+        );
     }
 
     #[test]
@@ -3404,6 +3701,7 @@ mod tests {
         )]);
         let stale = observer.workers().to_vec();
         let mut fingerprints = HashMap::new();
+        let mut occupants = HashMap::new();
         let (capture_requests, _) = mpsc::sync_channel(1);
 
         let outcome = refresh_observer_metadata(
@@ -3411,6 +3709,7 @@ mod tests {
             &group_id,
             &mut observer,
             &mut fingerprints,
+            &mut occupants,
             &capture_requests,
             MissionRefresh {
                 client: None,

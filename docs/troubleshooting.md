@@ -127,9 +127,11 @@ metadata to Herdr.
 Prompt is allowed only while Herdr resolves exactly one matching recognized
 agent in `IDLE` or `DONE`. `WORKING`, `BLOCKED`, `UNKNOWN`, `UNREACHABLE`, and
 `STALE` deliberately reject input. A verified pane move remains valid when the
-same recognized occupant moved; a replacement, unverified move, stale
-membership, or ambiguous binding rejects delivery. Press `r` to
-retry/resnapshot rather than bypassing the binding check.
+same recognized occupant moved; a replacement, an unverified move, a stale
+membership, or an ambiguous binding rejects delivery, and so does an agent that
+changed state between authorization and delivery — the rejection says which of
+the two happened, because a changed occupant and a changed state are not the same
+problem. Press `r` to retry/resnapshot rather than bypassing the binding check.
 
 `REJECTED` means Herdr confirmed no delivery. `UNCERTAIN` means the connection
 failed or timed out after delivery may have begun. Tether never retries an
@@ -149,7 +151,7 @@ could not be re-read is shown as retained, with the time it was last live. A los
 Mission Control connection shows the last known state, also dated, and comes back
 on its own once the connection does.
 
-A binding that is no longer exactly one recognized occupant is two different
+A binding that is no longer exactly one recognized occupant is three different
 problems, and the tile says which:
 
 - **The pane belongs to an earlier membership.** The group was edited while
@@ -157,6 +159,13 @@ problems, and the tile says which:
 - **Two Herdr panes claim this worker.** Nothing Tether does settles which one is
   real, and retrying reports the same two claims every time. Close one in Herdr,
   then `r`. Closing a Herdr pane does not stop the workload.
+- **Another agent took this pane.** The membership is still claimed, by a
+  different occupant than the one Tether bound: a different Herdr terminal, or a
+  rename. Resnapshotting reports the same newcomer every time, so the remedy is
+  to open the workload again, which binds the pane you just asked for. A
+  workload restarted anywhere clears it too, because that is a new `tmux`
+  session. A verified pane move by the same occupant is not this, and stays
+  accepted.
 
 `UNREACHABLE` means nothing answered. When there is nothing retained the tile
 says so, because there is no remembered output to read; when Herdr is

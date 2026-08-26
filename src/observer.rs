@@ -201,6 +201,11 @@ pub enum StaleReason {
     /// Nothing Tether can do settles which one is real, so the remedy is in
     /// Herdr: one of the two panes has to go.
     AmbiguousClaim,
+    /// Something other than the agent Tether bound is in the worker's pane.
+    ///
+    /// A resnapshot reports the same newcomer every time, so the only remedy is
+    /// to open the workload again.
+    ReplacedOccupant,
     /// Mission Control lost the connection that was reporting this worker.
     Connection,
     /// The observed output could not be re-read, so what is shown is retained.
@@ -1358,6 +1363,22 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, view: &TileView<'_>) {
                     "STALE · two panes claim it · close one".to_owned(),
                     "STALE · 2 panes claim it · close one".to_owned(),
                     "STALE · 2 claims · close one".to_owned(),
+                ],
+            ))
+        }
+        ObserverAgentState::Stale if worker.stale_reason == Some(StaleReason::ReplacedOccupant) => {
+            Some(widest_that_fits(
+                inner_width,
+                &[
+                    "STALE · another agent took this pane · reopen the workload".to_owned(),
+                    "STALE · another agent took this pane · reopen it".to_owned(),
+                    // As with two claims, every rung keeps the action: a
+                    // resnapshot reports the same newcomer every time, so the
+                    // one thing the shorter lines must not fall back to is the
+                    // retry.
+                    "STALE · another agent took it · reopen it".to_owned(),
+                    "STALE · pane taken · reopen it".to_owned(),
+                    "STALE · reopen it".to_owned(),
                 ],
             ))
         }
