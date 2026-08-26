@@ -164,6 +164,13 @@ status. A record written before Tether recorded panes has none to ask about and
 keeps the session-scoped reading it was written under, which is less precise and
 never leaves it unactionable.
 
+A pane can also be destroyed inside a session that survives it, and that is not
+the same as the workload being gone: the session is still owned and a stop still
+has to reap it. Tether asks about the session before reading an unanswered pane
+as absence, and ends such a record without a status - the pane that could have
+reported one no longer exists, and the session's remaining panes are somebody
+else's work.
+
 In the `snapshot` JSON such a workload reads `workload_status: "exited"`.
 
 ## Serving is a different question from running

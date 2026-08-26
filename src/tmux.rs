@@ -669,7 +669,20 @@ impl DurableBackend for TmuxBackend {
     ) -> Result<WorkloadState> {
         let spec = self.inspect_exact_spec(id, ownership_proof, pane)?;
         let output = self.output(&spec)?;
-        Ok(self.classify_exact_inspect(id, ownership_proof, &output, false))
+        let state = self.classify_exact_inspect(id, ownership_proof, &output, false);
+        if pane.is_none() || state != WorkloadState::Missing {
+            return Ok(state);
+        }
+        // The launched pane answered nothing, which is absence only if its
+        // session is gone too.
+        let session_spec = self.inspect_exact_spec(id, ownership_proof, None)?;
+        let session_output = self.output(&session_spec)?;
+        Ok(workload_without_its_pane(self.classify_exact_inspect(
+            id,
+            ownership_proof,
+            &session_output,
+            false,
+        )))
     }
 
     fn attach_command(
@@ -846,6 +859,30 @@ fn classify_exact_inspect(
         // when it holds no matching session, so nothing here is evidence that the
         // workload has gone.
         WorkloadState::Unknown
+    }
+}
+
+/// What a launched pane that answered nothing means, once its session has been
+/// asked about too.
+///
+/// A pinned query answers exit 0 with no line in two different situations: the
+/// workload's session is gone, and the launched pane was destroyed inside a
+/// session that survives. Only the first is an absence. The second leaves an
+/// owned session that a stop still has to reap, and reading it as absence would
+/// finalize the record while that session kept running, unreferenced by anything.
+///
+/// The workload's command is over either way, because the pane that held it no
+/// longer exists. No status comes with it: the pane that could have reported one
+/// is gone, and the session's remaining panes are somebody else's.
+pub(crate) const fn workload_without_its_pane(session_scoped: WorkloadState) -> WorkloadState {
+    match session_scoped {
+        WorkloadState::Running { identity, .. } | WorkloadState::Ended { identity, .. } => {
+            WorkloadState::Ended {
+                identity,
+                exit_status: None,
+            }
+        }
+        absent_or_unproven => absent_or_unproven,
     }
 }
 

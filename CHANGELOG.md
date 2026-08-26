@@ -16,6 +16,21 @@
   Creation already learned the launched pane and discarded it; it is now recorded,
   and every exact inspection asks `list-panes` about that pane by id, alongside
   the session name and the ownership proof it already checked.
+- A pinned query that finds nothing is checked against the session before it is
+  read as absence. Exit 0 with no line means both "the workload's session is
+  gone" and "the launched pane was destroyed inside a session that survives", and
+  only the first is an absence: finalizing the second would have left an owned
+  `tmux` session running with no record referring to it, and a later restart of
+  that id failing forever on `duplicate session`. The surviving session is
+  reaped, and the end carries no status, because the pane that could have
+  reported one is gone and the session's remaining panes are somebody else's.
+  This costs one extra `tmux` invocation, only when a pinned query comes back
+  empty, and only on operations that act on a single workload.
+- A restart reservation forgets the pane of the incarnation it closed. `tmux`
+  never reuses a pane id, so a reservation still pinned to the old pane would ask
+  about a pane that cannot exist - and the retry a reservation exists for, a
+  creation that committed but could not be confirmed, would then fail to
+  recognize its own session and try to create a duplicate of it.
 - **State schema version 6.** The launched pane is a new field on each session
   record, so a version 5 file is migrated on load. A migrated record has no pane
   and keeps being judged as a whole session: a session's only pane is usually the

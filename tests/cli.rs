@@ -901,7 +901,10 @@ case "$command" in
   list-panes)
     id=$(cat '{id_file}' 2>/dev/null)
     proof=$(cat '{proof_file}' 2>/dev/null)
-    if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi
+    case "$*" in
+      *'#{{pane_dead}}'*) if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi ;;
+      *) if [ -n "$id" ]; then printf '%s:4242' "$id"; fi ;;
+    esac
     ;;
   if-shell)
     case "$*" in *'kill-session -t'*) rm -f '{id_file}' '{proof_file}' ;; esac

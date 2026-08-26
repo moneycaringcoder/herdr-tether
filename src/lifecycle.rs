@@ -11,7 +11,7 @@ use crate::{
     model::{OwnershipProof, SessionId, TmuxPaneId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, run_bounded},
-    tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend},
+    tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend, workload_without_its_pane},
 };
 
 /// Exact lifecycle inspection and close transports get three seconds each.
@@ -269,6 +269,29 @@ impl LifecycleService {
     }
 
     fn inspect_exact(
+        &self,
+        backend: &TmuxBackend,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
+    ) -> Result<WorkloadState, CloseOwnedError> {
+        let state = self.ask_exact(backend, id, ownership_proof, pane)?;
+        if pane.is_none() || state != WorkloadState::Missing {
+            return Ok(state);
+        }
+        // The launched pane answered nothing, which is absence only if its
+        // session is gone too. A session that outlived its launched pane is
+        // still owned and still has to be reapable, so it must not be finalized
+        // as though nothing were there.
+        Ok(workload_without_its_pane(self.ask_exact(
+            backend,
+            id,
+            ownership_proof,
+            None,
+        )?))
+    }
+
+    fn ask_exact(
         &self,
         backend: &TmuxBackend,
         id: &SessionId,
@@ -684,6 +707,12 @@ impl LifecycleService {
                 }
                 current.status = SessionStatus::Creating;
                 current.tmux_session_id = None;
+                // The pane goes with the incarnation that held it. tmux never
+                // reuses a pane id, so a reservation still pinned to the closed
+                // incarnation's pane would ask about a pane that cannot exist -
+                // and the retry this reservation exists for would read that as
+                // an absent workload and try to create a duplicate.
+                current.tmux_pane_id = None;
                 current.closed_at = None;
                 current.exit_status = None;
                 Ok(())

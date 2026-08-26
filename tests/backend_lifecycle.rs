@@ -348,6 +348,137 @@ fn the_launched_pane_ending_is_still_recorded_with_its_status() {
     assert_eq!(record.exit_status, Some(3));
 }
 
+#[test]
+fn a_session_that_outlived_its_launched_pane_is_still_reaped() {
+    // A pinned query answers exit 0 with no line both when the workload's
+    // session is gone and when the launched pane was destroyed inside a session
+    // that survives. Reading the second as absence would finalize the record
+    // while an owned session kept running with nothing referring to it, and a
+    // later restart of that id would fail forever on `duplicate session`.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let state_path = temp.path().join("state.json");
+    let store = StateStore::new(state_path);
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    // The launched pane is gone; the session is still there, holding a pane
+    // somebody else added. `if-shell` is the guarded close, and it must run.
+    let script = format!(
+        "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nprintf '\\000' >> '{log}'\ncase \"$1\" in\n  list-panes) : ;;\n  list-sessions) printf '{id}:$7:1:0::{proof}' ;;\nesac\nexit 0\n",
+        log = log.display(),
+        id = id(),
+        proof = proof(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let result = service.stop_owned(id()).unwrap();
+
+    assert_eq!(
+        result.workload,
+        ClosedWorkload::Terminated,
+        "the surviving session is reaped rather than left behind"
+    );
+    let argv = read_argv(&log);
+    assert!(
+        argv.iter().any(|argument| argument == "if-shell"),
+        "the guarded close has to run, or the session is orphaned: {argv:?}"
+    );
+    let record = &store.load().unwrap().sessions[0];
+    assert_eq!(record.status, SessionStatus::Ended);
+    assert_eq!(
+        record.exit_status, None,
+        "the pane that could have reported a status no longer exists, and the \
+         session's remaining panes are somebody else's"
+    );
+}
+
+#[test]
+fn a_restart_reservation_forgets_the_pane_of_the_incarnation_it_closed() {
+    // tmux never reuses a pane id, so a reservation still pinned to the closed
+    // incarnation's pane would ask about a pane that cannot exist. The retry the
+    // reservation exists for - a creation that committed but could not be
+    // confirmed - would then fail to recognize its own created session and try
+    // to create a duplicate of it, which tmux refuses forever.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Ended);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+
+    // A creation that refuses, which is the case the reservation exists for.
+    let refusing = temp.path().join("refusing-tmux");
+    fs::write(
+        &refusing,
+        "#!/bin/sh\ncase \"$1\" in\n  list-panes) : ;;\n  list-sessions) : ;;\n  new-session) exit 1 ;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&refusing, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", &refusing))
+            .restart_owned(id())
+            .is_err()
+    );
+
+    let reserved = &store.load().unwrap().sessions[0];
+    assert_eq!(reserved.status, SessionStatus::Creating);
+    assert_eq!(
+        reserved.tmux_pane_id, None,
+        "the pane belongs to the incarnation that held it"
+    );
+
+    // The retry, against an honest `tmux`: the closed incarnation's pane is gone,
+    // and the session the uncertain creation left behind is there.
+    let honest = temp.path().join("honest-tmux");
+    fs::write(
+        &honest,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  list-panes) : ;;\n  list-sessions) printf '{id}:$9:0:0::{proof}' ;;\n  new-session) exit 1 ;;\nesac\nexit 0\n",
+            id = id(),
+            proof = proof(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&honest, fs::Permissions::from_mode(0o700)).unwrap();
+    let retried = LifecycleService::new(store.clone(), ProcessBinaries::new("unused-ssh", &honest))
+        .restart_owned(id())
+        .expect("the retry promotes the session the creation already made");
+
+    assert_eq!(retried.identity, "$9".parse().unwrap());
+    let promoted = &store.load().unwrap().sessions[0];
+    assert_eq!(promoted.status, SessionStatus::Running);
+    assert_eq!(promoted.tmux_session_id, Some("$9".parse().unwrap()));
+    assert_eq!(
+        promoted.tmux_pane_id, None,
+        "a promotion reconciles a session it did not create, so it invents no pane"
+    );
+}
+
 /// A fake `tmux` that answers the exact inspection with `line` and lets the
 /// close path succeed, which needs `if-shell` to exit cleanly with no output.
 fn write_close_aware_fake(path: &Path, log: &Path, line: &str) {
