@@ -16,8 +16,12 @@
   state change is the agent working rather than a new occupant. The first
   occupant is kept rather than the newcomer, so the tile keeps saying so until
   the workload is opened again instead of presenting the replacement as the
-  worker's agent on the next refresh. The memory is per Observer session and
-  nothing is persisted.
+  worker's agent on the next refresh. The remedy ends it: opening the workload
+  again materializes the pane the operator asked for, and a workload restarted
+  anywhere is a new `tmux` session, so an occupant remembered for an earlier
+  incarnation stops being evidence about this one. An open that failed forgets
+  nothing, because a tile must not go quiet about a pane still in other hands.
+  The memory is per Observer session and nothing is persisted.
 
 ### Changed
 

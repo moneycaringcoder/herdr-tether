@@ -162,8 +162,10 @@ problems, and the tile says which:
 - **Another agent took this pane.** The membership is still claimed, by a
   different occupant than the one Tether bound: a different Herdr terminal, or a
   rename. Resnapshotting reports the same newcomer every time, so the remedy is
-  to open the workload again. A verified pane move by the same occupant is not
-  this, and stays accepted.
+  to open the workload again, which binds the pane you just asked for. A
+  workload restarted anywhere clears it too, because that is a new `tmux`
+  session. A verified pane move by the same occupant is not this, and stays
+  accepted.
 
 `UNREACHABLE` means nothing answered. When there is nothing retained the tile
 says so, because there is no remembered output to read; when Herdr is
