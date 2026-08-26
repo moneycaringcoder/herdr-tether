@@ -90,19 +90,51 @@ pub struct AgentBinding {
     pub revision: u64,
 }
 
+/// Who Herdr has in a worker's pane, without where it sits or what it is doing.
+///
+/// A verified pane move keeps every field here, which is why a move is accepted:
+/// `pane_id` and `revision` say where the occupant sits, and `state_change_seq`
+/// says what it is doing. A different terminal, a different recognized agent, or
+/// a rename in the same membership is a different occupant, and no resnapshot
+/// turns it back into the one Tether bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Occupant {
+    pub group_id: OrchestrationGroupId,
+    pub session_id: SessionId,
+    pub membership_id: OrchestrationMembershipId,
+    pub terminal_id: String,
+    pub agent: String,
+    pub name: Option<String>,
+}
+
 impl AgentBinding {
     pub fn target(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.pane_id)
     }
 
-    fn same_occupant_or_move(&self, next: &Self) -> bool {
-        self.group_id == next.group_id
-            && self.session_id == next.session_id
-            && self.membership_id == next.membership_id
-            && self.terminal_id == next.terminal_id
-            && self.agent == next.agent
-            && self.name == next.name
-            && next.state_change_seq == self.state_change_seq
+    /// The occupant this binding found, kept so a later one can be compared.
+    pub fn occupant(&self) -> Occupant {
+        Occupant {
+            group_id: self.group_id.clone(),
+            session_id: self.session_id,
+            membership_id: self.membership_id,
+            terminal_id: self.terminal_id.clone(),
+            agent: self.agent.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// Whether this binding found the occupant that was there before.
+    ///
+    /// Compared field by field rather than by building an `Occupant`, because
+    /// every Observer refresh asks this of every worker.
+    pub fn is_occupied_by(&self, occupant: &Occupant) -> bool {
+        self.group_id == occupant.group_id
+            && self.session_id == occupant.session_id
+            && self.membership_id == occupant.membership_id
+            && self.terminal_id == occupant.terminal_id
+            && self.agent == occupant.agent
+            && self.name == occupant.name
     }
 }
 
@@ -306,8 +338,17 @@ impl<C: MissionHerdr> MissionControlService<C> {
                 .context("revalidate Herdr pane binding")?;
             let binding = resolve_binding(&snapshot, &expectation)
                 .map_err(|failure| anyhow::anyhow!(failure.message()))?;
-            if !first.binding.same_occupant_or_move(&binding) {
-                anyhow::bail!("materialized pane occupant changed before prompt delivery");
+            // Two facts, two refusals: a pane something else took is the failure
+            // the tile also names, while an agent that merely moved on since it
+            // was authorized is still the same occupant.
+            if !binding.is_occupied_by(&first.binding.occupant()) {
+                anyhow::bail!(
+                    "{} before prompt delivery",
+                    BindingFailure::Replaced.message()
+                );
+            }
+            if binding.state_change_seq != first.binding.state_change_seq {
+                anyhow::bail!("the agent changed state before prompt delivery");
             }
             if !binding.status.is_settled() {
                 anyhow::bail!("agent must be IDLE or DONE before prompt delivery");
@@ -967,8 +1008,110 @@ mod tests {
             "Do work",
             true,
         );
-        assert!(matches!(result[0], TargetDelivery::Rejected { .. }));
+        assert!(
+            matches!(
+                &result[0],
+                TargetDelivery::Rejected { reason, .. }
+                    if reason.contains(BindingFailure::Replaced.message())
+            ),
+            "a replaced occupant is refused as a replacement, not as something else: {:?}",
+            result[0]
+        );
         assert!(prompts.lock().is_empty());
+    }
+
+    #[test]
+    fn an_agent_that_moved_on_is_still_the_same_occupant() {
+        // The state-change sequence advancing means the agent did something, not
+        // that something else took its pane. Both refuse the prompt, and a
+        // reader has to be told which happened.
+        let first = agent(
+            MEMBERSHIP,
+            "w1:p1",
+            "term-1",
+            Some("codex"),
+            AgentStatus::Idle,
+        );
+        let mut progressed = first.clone();
+        progressed.state_change_seq = first.state_change_seq + 1;
+        let (service, prompts, _temp) = service(
+            &test_state(true),
+            vec![snapshot(vec![first.clone()]), snapshot(vec![progressed])],
+            Ok(first),
+        );
+        let result = service.deliver_reviewed_prompt(
+            &"build-group".parse().unwrap(),
+            &[MemberTarget {
+                session_id: SESSION.parse().unwrap(),
+                membership_id: MEMBERSHIP.parse().unwrap(),
+            }],
+            "Do work",
+            true,
+        );
+        assert!(
+            matches!(
+                &result[0],
+                TargetDelivery::Rejected { reason, .. }
+                    if reason.contains("changed state")
+                        && !reason.contains(BindingFailure::Replaced.message())
+            ),
+            "an agent that changed state is not a replaced occupant: {:?}",
+            result[0]
+        );
+        assert!(prompts.lock().is_empty());
+    }
+
+    #[test]
+    fn occupant_identity_survives_a_move_and_not_a_new_terminal() {
+        let here = resolve_binding(
+            &snapshot(vec![agent(
+                MEMBERSHIP,
+                "w1:p1",
+                "term-1",
+                Some("codex"),
+                AgentStatus::Idle,
+            )]),
+            &expected(),
+        )
+        .unwrap();
+        let mut moved_agent = agent(
+            MEMBERSHIP,
+            "w9:p9",
+            "term-1",
+            Some("codex"),
+            AgentStatus::Working,
+        );
+        moved_agent.revision += 3;
+        moved_agent.state_change_seq += 3;
+        let moved = resolve_binding(&snapshot(vec![moved_agent]), &expected()).unwrap();
+        assert!(
+            moved.is_occupied_by(&here.occupant()),
+            "a pane move by the same occupant is accepted, and must stay accepted"
+        );
+
+        let elsewhere = resolve_binding(
+            &snapshot(vec![agent(
+                MEMBERSHIP,
+                "w1:p1",
+                "term-2",
+                Some("codex"),
+                AgentStatus::Idle,
+            )]),
+            &expected(),
+        )
+        .unwrap();
+        assert!(!elsewhere.is_occupied_by(&here.occupant()));
+
+        let mut renamed_agent = agent(
+            MEMBERSHIP,
+            "w1:p1",
+            "term-1",
+            Some("codex"),
+            AgentStatus::Idle,
+        );
+        renamed_agent.name = Some("someone-else".to_owned());
+        let renamed = resolve_binding(&snapshot(vec![renamed_agent]), &expected()).unwrap();
+        assert!(!renamed.is_occupied_by(&here.occupant()));
     }
 
     #[test]

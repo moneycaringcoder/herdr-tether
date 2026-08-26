@@ -626,7 +626,7 @@ fn an_unreachable_tile_never_claims_more_than_it_retained() {
 
 #[test]
 fn each_binding_failure_names_itself_and_its_own_remedy() {
-    // The two ways a binding stops being exactly one recognized occupant need
+    // The three ways a binding stops being exactly one recognized occupant need
     // different things from a reader, so a tile that said only "binding" sent
     // everyone to the same retry.
     for (reason, expected, forbidden) in [
@@ -641,6 +641,9 @@ fn each_binding_failure_names_itself_and_its_own_remedy() {
         // from this surface, so the tile must name the action rather than a retry
         // that reports the same two claims every time.
         (StaleReason::AmbiguousClaim, "close one in Herdr", "reopen"),
+        // Something else is in the pane. A resnapshot reports the same newcomer,
+        // so the remedy is to open the workload again.
+        (StaleReason::ReplacedOccupant, "reopen", "close one"),
     ] {
         let observer = ObserverState::new(vec![ObserverWorker {
             capture: Some("looks fine".to_owned()),
@@ -684,6 +687,25 @@ fn each_binding_failure_names_itself_and_its_own_remedy() {
         );
         assert!(
             body.contains("close"),
+            "width {width} must still name the action: {body}"
+        );
+    }
+
+    // The same holds for a pane something else took: the retry reports the same
+    // newcomer at every width, so every rung has to keep the reopen.
+    for width in [64, 80, 96, 120] {
+        let observer = ObserverState::new(vec![
+            ObserverWorker {
+                capture: None,
+                sampled: false,
+                stale_reason: Some(StaleReason::ReplacedOccupant),
+                ..live_worker("a", ObserverAgentState::Stale)
+            },
+            live_worker("b", ObserverAgentState::Working),
+        ]);
+        let body = tile_body(&render_to_text(width, 14, &observer).unwrap());
+        assert!(
+            body.contains("reopen"),
             "width {width} must still name the action: {body}"
         );
     }

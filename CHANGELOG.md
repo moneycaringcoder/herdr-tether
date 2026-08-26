@@ -2,8 +2,29 @@
 
 ## [Unreleased]
 
+### Added
+
+- A pane something else took is named on the tile, with the remedy it actually
+  needs. `BindingFailure::Replaced` existed with a state and a message and was
+  constructed nowhere, so a replaced occupant arrived as an earlier membership,
+  whose remedy is `r` — a retry that reports the same newcomer every time. A
+  binding resolves against one snapshot and cannot see a replacement, so Mission
+  Control now remembers who was in each worker's pane the last time it resolved,
+  and a resolution that finds a different occupant reads as `STALE · another agent
+  took this pane · reopen the workload`. Occupant means terminal, recognized
+  agent, and name: a verified pane move keeps all three and stays accepted, and a
+  state change is the agent working rather than a new occupant. The first
+  occupant is kept rather than the newcomer, so the tile keeps saying so until
+  the workload is opened again instead of presenting the replacement as the
+  worker's agent on the next refresh. The memory is per Observer session and
+  nothing is persisted.
+
 ### Changed
 
+- A prompt refused because the pane changed hands now says so, and a prompt
+  refused because the agent moved on says that instead. Both were reported as a
+  changed occupant, which was wrong for the far more common one: an agent that
+  merely changed state between authorization and delivery.
 - A tag that passes every gate now publishes its own GitHub release. Release
   validation gained a `publish` job that depends on every other job, is the only
   job granted write access, and re-runs the identity check in the checkout it
