@@ -7,7 +7,18 @@ fn manifest_declares_build_startup_actions_and_managed_popup_panes() {
 
     assert_eq!(value["id"].as_str(), Some("moneycaringcoder.tether"));
     assert_eq!(value["name"].as_str(), Some("Tether for Herdr"));
-    assert_eq!(value["version"].as_str(), Some("0.7.3"));
+    // The marketplace version is the crate version, checked as that rather than
+    // as a literal: `check_release.py` already refuses a tag whose crate,
+    // manifest, and lock versions disagree, so a second copy of the number here
+    // only ever rots at release time.
+    let crate_version = toml::from_str::<toml::Value>(
+        &fs::read_to_string("Cargo.toml").expect("Cargo.toml is present"),
+    )
+    .expect("Cargo.toml is valid TOML")["package"]["version"]
+        .as_str()
+        .expect("the crate declares a version")
+        .to_owned();
+    assert_eq!(value["version"].as_str(), Some(crate_version.as_str()));
     assert_eq!(value["min_herdr_version"].as_str(), Some("0.8.0"));
     assert_eq!(
         value["description"].as_str(),
