@@ -21,6 +21,11 @@ REMOTE_SMOKE_SECRETS = {
 }
 UPSTREAM_DAILY_CRON = "23 5 * * *"
 UPSTREAM_WEEKLY_MACOS_CRON = "41 5 * * 0"
+# Publication is the one act that needs write access, so it is the one job that
+# gets it: a single override, in a single named job, holding a single scope.
+PUBLISH_WORKFLOW = "release.yml"
+PUBLISH_JOB = "publish"
+PUBLISH_PERMISSIONS = ["contents: write"]
 
 
 class WorkflowContractError(ValueError):
@@ -40,6 +45,57 @@ def top_level_block(text: str, key: str) -> str:
             break
         block.append(line)
     return "\n".join(block)
+
+
+def indented_block(text: str, key: str, indent: int) -> str:
+    lines = text.splitlines()
+    marker = " " * indent + f"{key}:"
+    try:
+        start = lines.index(marker) + 1
+    except ValueError as error:
+        raise WorkflowContractError(f"missing block-form {marker.strip()}") from error
+    block: list[str] = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith(" " * (indent + 1)):
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+def block_entries(block: str) -> list[str]:
+    return [line.strip() for line in block.splitlines() if line.strip()]
+
+
+def workflow_job_names(text: str) -> list[str]:
+    return [
+        line.strip()[:-1]
+        for line in top_level_block(text, "jobs").splitlines()
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:", line)
+    ]
+
+
+def validate_scoped_write_permissions(name: str, text: str) -> None:
+    """Only the publishing job may hold a permission the workflow root does not."""
+    overrides = [
+        indent
+        for indent in re.findall(r"^( *)permissions *:", text, re.MULTILINE)
+        if indent
+    ]
+    if name != PUBLISH_WORKFLOW:
+        if overrides:
+            raise WorkflowContractError(
+                f"{name} must not override permissions below the workflow level"
+            )
+        return
+    if overrides != ["    "]:
+        raise WorkflowContractError(
+            f"{name} must override permissions exactly once, in one job"
+        )
+    job = workflow_job_block(text, PUBLISH_JOB)
+    if block_entries(indented_block(job, "permissions", 4)) != PUBLISH_PERMISSIONS:
+        raise WorkflowContractError(
+            f"{name} {PUBLISH_JOB} permissions are not exactly {PUBLISH_PERMISSIONS}"
+        )
 
 
 def validate_workflow(name: str, text: str) -> None:
@@ -71,10 +127,7 @@ def validate_workflow(name: str, text: str) -> None:
         raise WorkflowContractError(
             f"{name} permissions do not match the workflow trust boundary"
         )
-    if re.findall(r"^( *)permissions *:", text, re.MULTILINE) != [""]:
-        raise WorkflowContractError(
-            f"{name} must not override permissions below the workflow level"
-        )
+    validate_scoped_write_permissions(name, text)
     if "pull_request_target:" in on_block:
         raise WorkflowContractError(f"{name} must not use pull_request_target")
 
@@ -276,6 +329,50 @@ def validate_upstream_canary_boundaries(workflows: dict[str, str]) -> None:
         raise WorkflowContractError("upstream canary gates or reporting are incomplete")
 
 
+def validate_release_publish_boundaries(workflows: dict[str, str]) -> None:
+    release = workflows[PUBLISH_WORKFLOW]
+    jobs = workflow_job_names(release)
+    if jobs[-1:] != [PUBLISH_JOB]:
+        raise WorkflowContractError("publication must be the last release job")
+    gates = [job for job in jobs if job != PUBLISH_JOB]
+    if not gates:
+        raise WorkflowContractError("publication must depend on at least one gate")
+    publish = workflow_job_block(release, PUBLISH_JOB)
+    needed = [
+        line.strip()[2:]
+        for line in indented_block(publish, "needs", 4).splitlines()
+        if line.strip()
+    ]
+    if sorted(needed) != sorted(gates):
+        raise WorkflowContractError(
+            "publication does not depend on every other release job"
+        )
+    # The notes come from the checkout being published from, re-verified there,
+    # rather than from an artifact another job could have substituted.
+    if (
+        '--notes-out "${RUNNER_TEMP}/notes.md"' not in publish
+        or "tools/check_release.py" not in publish
+        or "--release" not in publish
+        or "actions/upload-artifact@" in release
+        or "actions/download-artifact@" in release
+    ):
+        raise WorkflowContractError("release notes are not collected in the publishing checkout")
+    if (
+        'if [[ ! "$TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then' not in publish
+        or "--verify-tag" not in publish
+        or '--notes-file "$RUNNER_TEMP/notes.md"' not in publish
+    ):
+        raise WorkflowContractError("publication does not refuse an unverified or unexpected tag")
+    if "set -euo pipefail" not in publish:
+        raise WorkflowContractError("publication does not fail closed on a failed step")
+    # `needs` only orders jobs; `if: always()` would run publication anyway, and
+    # a tolerated failure in a gate would let a broken tag through.
+    if re.search(r"^    if *:", publish, re.MULTILINE):
+        raise WorkflowContractError("publication must not run on a condition")
+    if "continue-on-error" in release:
+        raise WorkflowContractError("a release gate must not tolerate its own failure")
+
+
 def minimal_workflow(*, action: str, checkout_option: str = "persist-credentials: false") -> str:
     return f"""\
 name: Fixture
@@ -331,6 +428,86 @@ class WorkflowSecurityTests(unittest.TestCase):
                 validate_workflow(name, text)
         validate_live_product_boundaries(workflows)
         validate_upstream_canary_boundaries(workflows)
+        validate_release_publish_boundaries(workflows)
+
+    def test_release_publication_boundary_fails_closed(self) -> None:
+        baseline = self.repository_workflows()
+        mutations = []
+        for old, new in (
+            ("      - msrv\n", ""),
+            ("      - gates\n", ""),
+            ("      - identity\n", ""),
+            ("--verify-tag", "--target main"),
+            ("          set -euo pipefail\n          if [[ ! \"$TAG\"", "          if [[ ! \"$TAG\""),
+            (
+                'if [[ ! "$TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then',
+                'if [[ -z "$TAG" ]]; then',
+            ),
+            (
+                '--notes-out "${RUNNER_TEMP}/notes.md"',
+                '--notes-out "${RUNNER_TEMP}/other.md"',
+            ),
+            (
+                "  publish:\n    name: publish the GitHub release\n",
+                "  publish:\n    name: publish the GitHub release\n    if: always()\n",
+            ),
+            (
+                "  msrv:\n    name: rust-1.88 release\n",
+                "  msrv:\n    name: rust-1.88 release\n    continue-on-error: true\n",
+            ),
+        ):
+            changed = dict(baseline)
+            changed[PUBLISH_WORKFLOW] = changed[PUBLISH_WORKFLOW].replace(old, new, 1)
+            self.assertNotEqual(changed[PUBLISH_WORKFLOW], baseline[PUBLISH_WORKFLOW])
+            mutations.append(changed)
+
+        carried = dict(baseline)
+        carried[PUBLISH_WORKFLOW] += (
+            "      - uses: actions/download-artifact@"
+            + "a" * 40
+            + "\n        with:\n          name: notes\n"
+        )
+        mutations.append(carried)
+
+        reordered = dict(baseline)
+        publish = workflow_job_block(reordered[PUBLISH_WORKFLOW], PUBLISH_JOB)
+        reordered[PUBLISH_WORKFLOW] = reordered[PUBLISH_WORKFLOW].replace(
+            publish, ""
+        ).replace("jobs:\n", f"jobs:\n{publish}\n", 1)
+        mutations.append(reordered)
+
+        for workflows in mutations:
+            with self.subTest(workflows=workflows), self.assertRaises(
+                WorkflowContractError
+            ):
+                validate_release_publish_boundaries(workflows)
+
+    def test_only_the_publishing_job_may_hold_write_access(self) -> None:
+        baseline = self.repository_workflows()
+        for name in baseline:
+            with self.subTest(name=name):
+                validate_scoped_write_permissions(name, baseline[name])
+
+        widened = baseline[PUBLISH_WORKFLOW].replace(
+            "      contents: write", "      contents: write\n      id-token: write", 1
+        )
+        second = baseline[PUBLISH_WORKFLOW].replace(
+            "  msrv:\n    name: rust-1.88 release\n",
+            "  msrv:\n    name: rust-1.88 release\n    permissions:\n      contents: write\n",
+            1,
+        )
+        moved = baseline[PUBLISH_WORKFLOW].replace(
+            "    permissions:\n      contents: write\n", "", 1
+        )
+        for text in (widened, second, moved):
+            with self.subTest(text=text), self.assertRaises(WorkflowContractError):
+                validate_scoped_write_permissions(PUBLISH_WORKFLOW, text)
+
+        elsewhere = baseline["ci.yml"].replace(
+            "jobs:\n", "jobs:\n  leak:\n    permissions:\n      contents: write\n", 1
+        )
+        with self.assertRaisesRegex(WorkflowContractError, "below the workflow level"):
+            validate_scoped_write_permissions("ci.yml", elsewhere)
 
     def test_live_product_secret_boundary_fails_closed(self) -> None:
         baseline = self.repository_workflows()

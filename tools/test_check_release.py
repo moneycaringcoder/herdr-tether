@@ -1,14 +1,84 @@
 #!/usr/bin/env python3
+import re
 import unittest
 
 from check_release import (
     PUBLIC_RELEASE_FILES,
+    ROOT,
     ReleaseIdentityError,
+    changelog_notes,
+    load_toml,
     resolve_target_tag,
     validate_readme_install,
     validate_hermes_install,
     validate_release_context,
 )
+
+
+class ChangelogNotesTests(unittest.TestCase):
+    CHANGELOG = """\
+# Changelog
+
+## [0.7.3] - 2026-08-22
+
+### Added
+
+- The newest thing.
+
+## [0.7.2] - 2026-08-16
+
+- The older thing.
+"""
+
+    def test_notes_are_one_section_without_the_next_one(self) -> None:
+        self.assertEqual(
+            changelog_notes(self.CHANGELOG, "0.7.3"),
+            "### Added\n\n- The newest thing.\n",
+        )
+
+    def test_the_last_section_ends_at_the_end_of_the_file(self) -> None:
+        self.assertEqual(
+            changelog_notes(self.CHANGELOG, "0.7.2"), "- The older thing.\n"
+        )
+
+    def test_a_section_saying_only_headings_is_refused(self) -> None:
+        empty = self.CHANGELOG.replace("- The newest thing.\n", "")
+        with self.assertRaisesRegex(ReleaseIdentityError, "says nothing"):
+            changelog_notes(empty, "0.7.3")
+
+    def test_an_undated_heading_is_named_as_the_reason(self) -> None:
+        undated = self.CHANGELOG.replace("## [0.7.3] - 2026-08-22", "## [0.7.3]")
+        with self.assertRaisesRegex(ReleaseIdentityError, "no ISO-8601 date"):
+            changelog_notes(undated, "0.7.3")
+
+    def test_a_missing_section_is_refused(self) -> None:
+        with self.assertRaisesRegex(ReleaseIdentityError, r"no dated \[0\.8\.0\]"):
+            changelog_notes(self.CHANGELOG, "0.8.0")
+
+    def test_a_fenced_block_can_hold_a_line_that_looks_like_a_heading(self) -> None:
+        fenced = self.CHANGELOG.replace(
+            "- The newest thing.\n",
+            "- The newest thing.\n\n```\n## not a section\n```\n",
+        )
+        notes = changelog_notes(fenced, "0.7.3")
+        self.assertIn("## not a section", notes)
+        self.assertNotIn("0.7.2", notes)
+
+    def test_an_unclosed_fence_is_refused_rather_than_swallowing_the_file(self) -> None:
+        unclosed = self.CHANGELOG.replace(
+            "- The newest thing.\n", "- The newest thing.\n\n```\n"
+        )
+        with self.assertRaisesRegex(ReleaseIdentityError, "code fence open"):
+            changelog_notes(unclosed, "0.7.3")
+
+    def test_the_repository_changelog_publishes_the_current_version(self) -> None:
+        version = load_toml(ROOT / "Cargo.toml")["package"]["version"]
+        text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        notes = changelog_notes(text, version)
+        self.assertTrue(notes.endswith("\n"))
+        self.assertIn(notes.strip("\n"), text)
+        for heading in re.findall(r"^## \[.+\](?: - .+)?$", text, re.MULTILINE):
+            self.assertNotIn(heading, notes)
 
 
 class TargetTagTests(unittest.TestCase):

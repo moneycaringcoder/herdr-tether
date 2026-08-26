@@ -103,6 +103,14 @@ approval. Keep temporary scope, sequencing, acceptance, and rollout
 coordination in GitHub issues and pull requests rather than product
 documentation.
 
+Pushing the tag is the decision to release, and it is the last manual step.
+`.github/workflows/release.yml` publishes the GitHub release itself once every
+gate on that tag has passed, with the notes taken from that version's dated
+`CHANGELOG.md` section, so a tag that fails a gate leaves no release behind and
+a tag that passes cannot be forgotten. Write the changelog section before
+tagging: a version whose section is missing, undated, or empty fails the
+identity check rather than publishing an empty release page.
+
 ## Public documentation boundary
 
 README, changelog, architecture, security, and plugin metadata describe the product and its supported behavior. Keep temporary planning, release coordination, test-machine details, review transcripts, local usernames, and local paths out of tracked product documentation. Use pull requests or untracked working notes for temporary coordination.
