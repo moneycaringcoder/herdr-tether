@@ -38,9 +38,9 @@ and a second way to add a preset, in exchange for a paste — and it would make
 preset text something Tether itself takes from elsewhere and then executes, which
 is the one intake boundary worth not moving for convenience.
 
-What remains worth doing is unrelated to sharing and is tracked as issue #110:
-showing a preset's command before it runs, for every preset rather than only for
-adopted ones.
+Showing a preset's command before it runs was the part worth doing, and it is
+built: `host presets` and the picker both show the exact `command` and
+`health_command` for every preset, not only for adopted ones.
 
 ### Naming the workload in a toast
 
