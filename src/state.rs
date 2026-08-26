@@ -14,7 +14,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use crate::{
     model::{
         HerdrAgentKind, OrchestrationGroupId, OrchestrationMembershipId, OrchestrationTitle,
-        OwnershipProof, SessionId, TmuxSessionId,
+        OwnershipProof, SessionId, TmuxPaneId, TmuxSessionId,
     },
     storage::{atomic_write_resolved, with_advisory_lock},
 };
@@ -72,6 +72,14 @@ pub struct SessionRecord {
     /// Immutable tmux incarnation captured after successful creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session_id: Option<TmuxSessionId>,
+    /// Immutable tmux pane captured after successful creation.
+    ///
+    /// The pane the workload's command runs in. Its own end and exit status are
+    /// pane-scoped facts, and a session-scoped query answers them for whichever
+    /// pane is active instead - so a record without this field cannot be judged
+    /// that way and keeps the session-scoped reading it was written under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_pane_id: Option<TmuxPaneId>,
     /// Private capability shared only with the exact tmux incarnation.
     ///
     /// Legacy records deliberately have no proof and therefore cannot confer
@@ -377,6 +385,7 @@ mod pace_tests {
             preset: None,
             command: Some("exec shell".to_owned()),
             tmux_session_id: None,
+            tmux_pane_id: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: started,
@@ -515,7 +524,7 @@ pub struct State {
 }
 
 impl State {
-    pub const CURRENT_VERSION: u32 = 5;
+    pub const CURRENT_VERSION: u32 = 6;
     pub const MAX_ORCHESTRATION_GROUPS: usize = 32;
     pub const MAX_SESSIONS: usize = 1_024;
     pub const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -756,11 +765,24 @@ impl StateStore {
             })?;
 
         match version {
-            5 => {
+            6 => {
                 let state: State = serde_json::from_str(&source).with_context(|| {
-                    format!("decode state version 5 from `{}`", self.path.display())
+                    format!("decode state version 6 from `{}`", self.path.display())
                 })?;
                 state.validate()?;
+                Ok(state)
+            }
+            5 => {
+                let legacy: StateV5 = serde_json::from_str(&source).with_context(|| {
+                    format!("decode state version 5 from `{}`", self.path.display())
+                })?;
+                let state = legacy.migrate();
+                state.validate()?;
+                if persist_migration {
+                    self.save_unlocked(&state).with_context(|| {
+                        format!("rewrite migrated state `{}`", self.path.display())
+                    })?;
+                }
                 Ok(state)
             }
             4 => {
@@ -939,6 +961,36 @@ impl StateV4 {
     }
 }
 
+/// The shape a version 5 document has: everything current except the launched
+/// pane, which was not recorded when the document was written.
+///
+/// It decodes into the current record type, so the absent pane defaults to
+/// `None`. Nothing here guesses one. A session's only pane is usually the
+/// launched one, but "usually" is exactly the assumption this field exists to
+/// remove, and a wrong pane id would read as a workload that has gone. A record
+/// with no pane keeps the session-scoped reading it was written under, which is
+/// less precise and never unactionable.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateV5 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    orchestration_groups: Vec<OrchestrationGroup>,
+}
+
+impl StateV5 {
+    fn migrate(self) -> State {
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: self.sessions,
+            orchestration_groups: self.orchestration_groups,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateV3 {
@@ -1039,6 +1091,9 @@ impl From<SessionRecordV2> for SessionRecord {
             herdr_agent: None,
             command: record.command,
             tmux_session_id: record.tmux_session_id,
+            // No older schema recorded a pane, and none is invented: a guessed
+            // pane would read as a workload that has gone.
+            tmux_pane_id: None,
             ownership_proof: record.ownership_proof,
             status: record.status,
             created_at: record.created_at,
@@ -1115,6 +1170,7 @@ impl StateV1 {
                         herdr_agent: None,
                         command: None,
                         tmux_session_id: None,
+                        tmux_pane_id: None,
                         ownership_proof: None,
                         status,
                         created_at: session.created_at,
@@ -1166,6 +1222,7 @@ impl StateV0 {
                     herdr_agent: None,
                     command: None,
                     tmux_session_id: None,
+                    tmux_pane_id: None,
                     ownership_proof: None,
                     status: SessionStatus::Running,
                     created_at: session.created_at,

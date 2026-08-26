@@ -234,6 +234,44 @@ impl FromStr for TmuxSessionId {
     }
 }
 
+/// The immutable tmux pane identity captured when an owned session is created.
+///
+/// A session's pane-scoped facts - whether the program ended, and with what
+/// status - are only about the pane they are asked of. `list-sessions` answers
+/// them for whichever pane is active, which is not the launched one as soon as
+/// someone attaches and splits, so the pane Tether launched is recorded and
+/// asked about directly.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct TmuxPaneId(u64);
+
+impl fmt::Display for TmuxPaneId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "%{}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("invalid tmux pane identity `{value}`")]
+pub struct TmuxPaneIdError {
+    value: String,
+}
+
+impl FromStr for TmuxPaneId {
+    type Err = TmuxPaneIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || TmuxPaneIdError {
+            value: value.to_owned(),
+        };
+        let encoded = value.strip_prefix('%').ok_or_else(invalid)?;
+        if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        encoded.parse().map(Self).map_err(|_| invalid())
+    }
+}
+
 /// A validated, non-Tether tmux session name that may only be attached.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExternalSessionName(String);

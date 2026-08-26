@@ -27,6 +27,7 @@ fn session(suffix: u8, host: &str, directory: &str, preset: Option<&str>) -> Ses
         preset: preset.map(str::to_owned),
         command: Some("exec true".to_owned()),
         tmux_session_id: Some(format!("${suffix}").parse().unwrap()),
+        tmux_pane_id: None,
         ownership_proof: Some(
             format!("0197f1980000700080000000000000{suffix:02}")
                 .parse()

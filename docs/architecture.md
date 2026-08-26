@@ -271,7 +271,7 @@ Literal remote `~` and `~/...` paths expand in the remote login environment befo
 
 Tether makes one bounded, non-destructive catalog observation per host and derives both owned and external rows from it. Probes have deadlines, output caps, cancellation, and child-process-group cleanup. One slow host does not block completed hosts.
 
-For owned work, observation prefers native `tmux` evidence such as `remain-on-exit`, `pane_dead`, and pane exit status when supported. This distinguishes:
+For owned work, observation prefers native `tmux` evidence such as `remain-on-exit`, `pane_dead`, and pane exit status when supported. Those fields are pane-scoped, so an exact inspection asks them of the pane the workload was launched in, recorded at creation from state schema version 6 onward; a record migrated from an earlier schema has no pane and is asked about its session instead. This distinguishes:
 
 - a process that is still running;
 - a process that ended with available exit context;

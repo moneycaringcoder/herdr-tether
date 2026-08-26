@@ -2764,6 +2764,7 @@ mod tests {
             preset: None,
             command: Some("exec true".to_owned()),
             tmux_session_id: Some(tmux_id.parse().unwrap()),
+            tmux_pane_id: None,
             ownership_proof: Some(
                 format!(
                     "0197f1980000700080000000000000{:0>2}",
@@ -3812,6 +3813,7 @@ mod tests {
                     preset: None,
                     command: Some("exec true".to_owned()),
                     tmux_session_id: Some("$7".parse().unwrap()),
+                    tmux_pane_id: None,
                     ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
                     status: SessionStatus::Running,
                     created_at: now,
@@ -4435,6 +4437,7 @@ mod tests {
             preset: None,
             command: Some("exec true".to_owned()),
             tmux_session_id: Some("$7".parse().unwrap()),
+            tmux_pane_id: None,
             ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
             status: SessionStatus::Running,
             created_at: now,
@@ -4555,6 +4558,7 @@ mod tests {
             preset: None,
             command: Some("exec true".to_owned()),
             tmux_session_id: Some("$7".parse().unwrap()),
+            tmux_pane_id: None,
             ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
             status: SessionStatus::Running,
             created_at: now,
@@ -4596,6 +4600,7 @@ mod tests {
             id: "tether-0197f198000070008000000000000007".parse().unwrap(),
             status: SessionStatus::Creating,
             tmux_session_id: None,
+            tmux_pane_id: None,
             ..base.clone()
         };
         let stopping = SessionRecord {

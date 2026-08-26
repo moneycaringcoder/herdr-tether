@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An exact inspection judges the pane the workload was launched in, not whichever
+  pane happens to be active. `pane_dead` and `pane_dead_status` are pane-scoped,
+  and in `list-sessions` they resolve to the active pane of the session's current
+  window — so a workload someone attached to and split could be recorded as
+  finished with a foreign pane's exit status while its own command kept running.
+  Unlike the host-wide refresh, this path persists what it reads: a Stop then
+  reported success for a workload that never stopped, and a Restart created a
+  second incarnation beside the first. Reaching it took nothing more than
+  attaching and splitting, which is ordinary use of a terminal multiplexer.
+  Creation already learned the launched pane and discarded it; it is now recorded,
+  and every exact inspection asks `list-panes` about that pane by id, alongside
+  the session name and the ownership proof it already checked.
+- A pinned query that finds nothing is checked against the session before it is
+  read as absence. Exit 0 with no line means both "the workload's session is
+  gone" and "the launched pane was destroyed inside a session that survives", and
+  only the first is an absence: finalizing the second would have left an owned
+  `tmux` session running with no record referring to it, and a later restart of
+  that id failing forever on `duplicate session`. The surviving session is
+  reaped, and the end carries no status, because the pane that could have
+  reported one is gone and the session's remaining panes are somebody else's.
+  This costs one extra `tmux` invocation, only when a pinned query comes back
+  empty, and only on operations that act on a single workload.
+- A restart reservation forgets the pane of the incarnation it closed. `tmux`
+  never reuses a pane id, so a reservation still pinned to the old pane would ask
+  about a pane that cannot exist - and the retry a reservation exists for, a
+  creation that committed but could not be confirmed, would then fail to
+  recognize its own session and try to create a duplicate of it.
+- **State schema version 6.** The launched pane is a new field on each session
+  record, so a version 5 file is migrated on load. A migrated record has no pane
+  and keeps being judged as a whole session: a session's only pane is usually the
+  launched one, and "usually" is the assumption this field exists to remove, while
+  a guessed pane id would read as a workload that has gone. An absent pane is
+  omitted from the document rather than written as null.
+
 ### Added
 
 - A pane something else took is named on the tile, with the remedy it actually

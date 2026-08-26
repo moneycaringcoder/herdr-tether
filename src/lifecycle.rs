@@ -8,10 +8,10 @@ use chrono::{DateTime, Duration, Utc};
 use crate::{
     audit::{AuditAction, AuditEntry, AuditStore},
     backend::{CommandSpec, DurableBackend, LaunchSpec, ProcessBinaries, WorkloadState},
-    model::{OwnershipProof, SessionId, TmuxSessionId},
+    model::{OwnershipProof, SessionId, TmuxPaneId, TmuxSessionId},
     state::{SessionRecord, SessionStatus, State, StateStore},
     status::{BoundedOutput, run_bounded},
-    tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend},
+    tmux::{OWNERSHIP_GUARD_REJECTED, TmuxBackend, workload_without_its_pane},
 };
 
 /// Exact lifecycle inspection and close transports get three seconds each.
@@ -190,7 +190,7 @@ impl LifecycleService {
         let record = self.lookup_owned(&id)?;
         let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let inspected = self.inspect_exact(&backend, &id, &ownership_proof)?;
+        let inspected = self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)?;
         if inspected == WorkloadState::Unknown {
             return Err(CloseOwnedError::WorkloadUnknown(id));
         }
@@ -229,7 +229,7 @@ impl LifecycleService {
         // than the work.
         let mut observed_exit_status = None;
         let workload = if let Some(identity) = identity {
-            match self.inspect_exact(&backend, &id, &ownership_proof)? {
+            match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
                 WorkloadState::Running {
                     identity: current, ..
                 } if current == identity => {
@@ -273,9 +273,33 @@ impl LifecycleService {
         backend: &TmuxBackend,
         id: &SessionId,
         ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
+    ) -> Result<WorkloadState, CloseOwnedError> {
+        let state = self.ask_exact(backend, id, ownership_proof, pane)?;
+        if pane.is_none() || state != WorkloadState::Missing {
+            return Ok(state);
+        }
+        // The launched pane answered nothing, which is absence only if its
+        // session is gone too. A session that outlived its launched pane is
+        // still owned and still has to be reapable, so it must not be finalized
+        // as though nothing were there.
+        Ok(workload_without_its_pane(self.ask_exact(
+            backend,
+            id,
+            ownership_proof,
+            None,
+        )?))
+    }
+
+    fn ask_exact(
+        &self,
+        backend: &TmuxBackend,
+        id: &SessionId,
+        ownership_proof: &OwnershipProof,
+        pane: Option<TmuxPaneId>,
     ) -> Result<WorkloadState, CloseOwnedError> {
         let spec = backend
-            .inspect_exact_spec(id, ownership_proof)
+            .inspect_exact_spec(id, ownership_proof, pane)
             .map_err(|source| CloseOwnedError::Inspect { id: *id, source })?;
         let cancelled = AtomicBool::new(false);
         match run_bounded(&spec, LIFECYCLE_TRANSPORT_TIMEOUT, &cancelled) {
@@ -456,17 +480,18 @@ impl LifecycleService {
         }
         let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let identity = match self.inspect_exact(&backend, &id, &ownership_proof)? {
-            WorkloadState::Running { identity, .. } => identity,
-            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
-            WorkloadState::Missing | WorkloadState::Ended { .. } => {
-                return Err(CloseOwnedError::InvalidStatus {
-                    id,
-                    operation: "opened",
-                    status: SessionStatus::Ended,
-                });
-            }
-        };
+        let identity =
+            match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
+                WorkloadState::Running { identity, .. } => identity,
+                WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+                WorkloadState::Missing | WorkloadState::Ended { .. } => {
+                    return Err(CloseOwnedError::InvalidStatus {
+                        id,
+                        operation: "opened",
+                        status: SessionStatus::Ended,
+                    });
+                }
+            };
         if record
             .tmux_session_id
             .is_some_and(|expected| expected != identity)
@@ -488,7 +513,7 @@ impl LifecycleService {
                 Ok(())
             })
             .map_err(|_| CloseOwnedError::ConcurrentModification(id))?;
-        match self.inspect_exact(&backend, &id, &ownership_proof)? {
+        match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
             WorkloadState::Running {
                 identity: current, ..
             } if current == identity => backend
@@ -506,7 +531,7 @@ impl LifecycleService {
             .ok_or(CloseOwnedError::UnknownSession(id))?;
         let ownership_proof = self.require_ownership_proof(&record)?;
         let backend = self.backend_for(&id, &record.target)?;
-        let observed = self.inspect_exact(&backend, &id, &ownership_proof)?;
+        let observed = self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)?;
         match observed {
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
             WorkloadState::Running { identity, .. } => {
@@ -617,14 +642,14 @@ impl LifecycleService {
             .clone()
             .ok_or(CloseOwnedError::MissingCommand(id))?;
         let backend = self.backend_for(&id, &record.target)?;
-        match self.inspect_exact(&backend, &id, &ownership_proof)? {
+        match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
             WorkloadState::Running { identity, .. } => {
                 if record.status != SessionStatus::Creating
                     && record.tmux_session_id != Some(identity)
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                self.promote_running(&record, identity)?;
+                self.promote_running(&record, identity, record.tmux_pane_id)?;
                 self.note(
                     &SessionRecord {
                         tmux_session_id: Some(identity),
@@ -644,7 +669,7 @@ impl LifecycleService {
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                match self.inspect_exact(&backend, &id, &ownership_proof)? {
+                match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
                     WorkloadState::Ended {
                         identity: current, ..
                     } if current == identity => {
@@ -682,6 +707,12 @@ impl LifecycleService {
                 }
                 current.status = SessionStatus::Creating;
                 current.tmux_session_id = None;
+                // The pane goes with the incarnation that held it. tmux never
+                // reuses a pane id, so a reservation still pinned to the closed
+                // incarnation's pane would ask about a pane that cannot exist -
+                // and the retry this reservation exists for would read that as
+                // an absent workload and try to create a duplicate.
+                current.tmux_pane_id = None;
                 current.closed_at = None;
                 current.exit_status = None;
                 Ok(())
@@ -700,7 +731,7 @@ impl LifecycleService {
             record.status,
             SessionStatus::Creating,
         );
-        let identity = backend
+        let created = backend
             .create(&LaunchSpec {
                 id,
                 ownership_proof,
@@ -708,10 +739,11 @@ impl LifecycleService {
                 command,
             })
             .map_err(|source| CloseOwnedError::Create { id, source })?;
-        self.promote_running(&reservation, identity)?;
+        self.promote_running(&reservation, created.session, Some(created.pane))?;
         self.note(
             &SessionRecord {
-                tmux_session_id: Some(identity),
+                tmux_session_id: Some(created.session),
+                tmux_pane_id: Some(created.pane),
                 exit_status: None,
                 ..reservation.clone()
             },
@@ -719,7 +751,10 @@ impl LifecycleService {
             SessionStatus::Creating,
             SessionStatus::Running,
         );
-        Ok(RestartOwnedResult { id, identity })
+        Ok(RestartOwnedResult {
+            id,
+            identity: created.session,
+        })
     }
 
     /// Finalizes ended metadata, or forgets proofless legacy metadata without transport.
@@ -772,28 +807,35 @@ impl LifecycleService {
             });
         }
         let backend = self.backend_for(&id, &record.target)?;
-        let workload = match self.inspect_exact(&backend, &id, &ownership_proof)? {
-            WorkloadState::Ended { identity, .. }
-                if record.tmux_session_id.is_none() || record.tmux_session_id == Some(identity) =>
-            {
-                match self.inspect_exact(&backend, &id, &ownership_proof)? {
-                    WorkloadState::Ended {
-                        identity: current, ..
-                    } if current == identity => {
-                        self.close_exact(&backend, id, &ownership_proof, identity)?
+        let workload =
+            match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
+                WorkloadState::Ended { identity, .. }
+                    if record.tmux_session_id.is_none()
+                        || record.tmux_session_id == Some(identity) =>
+                {
+                    match self.inspect_exact(
+                        &backend,
+                        &id,
+                        &ownership_proof,
+                        record.tmux_pane_id,
+                    )? {
+                        WorkloadState::Ended {
+                            identity: current, ..
+                        } if current == identity => {
+                            self.close_exact(&backend, id, &ownership_proof, identity)?
+                        }
+                        WorkloadState::Missing => {}
+                        WorkloadState::Unknown => {
+                            return Err(CloseOwnedError::WorkloadUnknown(id));
+                        }
+                        _ => return Err(CloseOwnedError::ConcurrentModification(id)),
                     }
-                    WorkloadState::Missing => {}
-                    WorkloadState::Unknown => {
-                        return Err(CloseOwnedError::WorkloadUnknown(id));
-                    }
-                    _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+                    ClosedWorkload::Terminated
                 }
-                ClosedWorkload::Terminated
-            }
-            WorkloadState::Missing => ClosedWorkload::Missing,
-            WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
-            _ => return Err(CloseOwnedError::ConcurrentModification(id)),
-        };
+                WorkloadState::Missing => ClosedWorkload::Missing,
+                WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
+                _ => return Err(CloseOwnedError::ConcurrentModification(id)),
+            };
         self.store
             .update(|state| {
                 let current = state
@@ -866,7 +908,8 @@ impl LifecycleService {
     fn promote_running(
         &self,
         snapshot: &SessionRecord,
-        identity: TmuxSessionId,
+        session: TmuxSessionId,
+        pane: Option<TmuxPaneId>,
     ) -> Result<(), CloseOwnedError> {
         self.store
             .update(|state| {
@@ -879,7 +922,10 @@ impl LifecycleService {
                     return Err(anyhow!("session changed"));
                 }
                 current.status = SessionStatus::Running;
-                current.tmux_session_id = Some(identity);
+                current.tmux_session_id = Some(session);
+                // A reconciled record keeps the pane it already had, and a
+                // record written before panes were recorded still has none.
+                current.tmux_pane_id = pane;
                 current.closed_at = None;
                 current.exit_status = None;
                 // The history is deliberately kept here. A workload in a loop
@@ -1258,6 +1304,7 @@ mod tests {
                     preset: Some("shell".into()),
                     command: Some("exec shell".into()),
                     tmux_session_id: None,
+                    tmux_pane_id: None,
                     ownership_proof: Some(test_proof()),
                     status: SessionStatus::Running,
                     created_at: timestamp,

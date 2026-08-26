@@ -1488,6 +1488,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         herdr_agent: herdr_agent.clone(),
         command: Some(selection.command),
         tmux_session_id: None,
+        tmux_pane_id: None,
         ownership_proof: Some(ownership_proof),
         status: SessionStatus::Creating,
         created_at: now,
@@ -1512,8 +1513,8 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         SessionStatus::Creating,
         None,
     );
-    let identity = match backend.create(&launch) {
-        Ok(identity) => identity,
+    let created = match backend.create(&launch) {
+        Ok(created) => created,
         Err(error) => {
             if !create_outcome_is_uncertain(&error) {
                 let _ = store.update(|state| {
@@ -1538,7 +1539,8 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
             if current.status != SessionStatus::Creating || current.tmux_session_id.is_some() {
                 bail!("reserved session `{id}` changed while it was being created");
             }
-            current.tmux_session_id = Some(identity);
+            current.tmux_session_id = Some(created.session);
+            current.tmux_pane_id = Some(created.pane);
             current.status = SessionStatus::Running;
             current.last_used_at = Utc::now();
             Ok(())
@@ -1554,13 +1556,13 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         AuditAction::Activate,
         Some(SessionStatus::Creating),
         SessionStatus::Running,
-        Some(identity),
+        Some(created.session),
     );
 
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let attach = attach_with_agent_hint(
-            backend.attach_command(&id, &ownership_proof, identity)?,
+            backend.attach_command(&id, &ownership_proof, created.session)?,
             herdr_agent.as_ref(),
         )?;
         let client = HerdrClient::new(context);
@@ -1578,7 +1580,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
     } else {
         println!("created {id}");
         run_attach(attach_with_agent_hint(
-            backend.attach_command(&id, &ownership_proof, identity)?,
+            backend.attach_command(&id, &ownership_proof, created.session)?,
             herdr_agent.as_ref(),
         )?)
     }
@@ -3206,6 +3208,7 @@ mod tests {
             preset: None,
             command: None,
             tmux_session_id: None,
+            tmux_pane_id: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: Utc::now() - chrono::Duration::minutes(30),
@@ -3397,6 +3400,7 @@ mod tests {
             preset: None,
             command: Some("exec /opt/agents/codex --token raw-secret".into()),
             tmux_session_id: None,
+            tmux_pane_id: None,
             ownership_proof: None,
             status: SessionStatus::Running,
             created_at: now,

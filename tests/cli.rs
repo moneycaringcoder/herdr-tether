@@ -154,7 +154,7 @@ fn active_state_many(ids: &[String]) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&serde_json::json!({
-        "version": 5,
+        "version": 6,
         "sessions": sessions,
         "orchestration_groups": []
     }))
@@ -513,7 +513,7 @@ fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
         ));
 
     let state = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(state.contains("\"version\": 5"));
+    assert!(state.contains("\"version\": 6"));
     assert!(state.contains("\"orchestration_groups\": []"));
 }
 
@@ -896,6 +896,14 @@ case "$command" in
       *TETHER_OWNERSHIP_PROOF*) if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi ;;
       *'#{{session_id}}'*) if [ -n "$id" ]; then printf '%s:$7' "$id"; fi ;;
       *) if [ -n "$id" ]; then printf '%s:0:1:1:0::' "$id"; fi ;;
+    esac
+    ;;
+  list-panes)
+    id=$(cat '{id_file}' 2>/dev/null)
+    proof=$(cat '{proof_file}' 2>/dev/null)
+    case "$*" in
+      *'#{{pane_dead}}'*) if [ -n "$id" ]; then printf '%s:$7:0:0::%s' "$id" "$proof"; fi ;;
+      *) if [ -n "$id" ]; then printf '%s:4242' "$id"; fi ;;
     esac
     ;;
   if-shell)
@@ -1317,7 +1325,7 @@ fn migrated_v022_record_can_only_remove_metadata_without_transport() {
         ));
     assert!(!log.exists(), "legacy Remove must not invoke tmux");
     let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(migrated.contains(r#""version": 5"#));
+    assert!(migrated.contains(r#""version": 6"#));
     assert!(migrated.contains(r#""status": "removed""#));
     assert!(!migrated.contains("ownership_proof"));
 }
@@ -1342,7 +1350,7 @@ fn session_list_json_never_exposes_private_ownership_proof() {
 fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":5,"sessions":[
+    let state = r#"{"version":6,"sessions":[
 {"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/ended","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/older-active","preset":null,"status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
@@ -1400,7 +1408,7 @@ fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() 
 fn session_lists_name_a_failing_exit_in_text_and_keep_the_status_in_json() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":5,"sessions":[
+    let state = r#"{"version":6,"sessions":[
 {"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/failed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-04T00:00:00Z","exit_status":2},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/clean","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-03T00:00:00Z","exit_status":0}
 ],"orchestration_groups":[]}"#;
@@ -1446,7 +1454,7 @@ fn restarting_a_workload_that_failed_immediately_is_declined_with_the_wait() {
     let now = chrono::Utc::now();
     let closed_at = now - chrono::Duration::seconds(2);
     let state = serde_json::json!({
-        "version": 5,
+        "version": 6,
         "sessions": [{
             "id": SESSION_ID,
             "host": "local",
@@ -1488,7 +1496,7 @@ fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone()
     let now = chrono::Utc::now();
     let legacy_id = "tether-0197f198000070008000000000000042";
     let state = serde_json::json!({
-        "version": 5,
+        "version": 6,
         "sessions": [
             {
                 "id": SESSION_ID,
