@@ -317,6 +317,14 @@ directory, command, capture, and prompt text are never included. Tether notifies
 only while a Mission Control surface is open; nothing observes a workload or an
 agent when no Tether surface is running.
 
+Letting the title travel instead was considered and declined. It would be more
+useful with several workloads open, since the reference makes you look the
+workload up rather than telling you which one wants you. It would also move a
+documented boundary: a toast is rendered by Herdr, so it can appear on a surface
+Tether does not control, and the generated title says where the work runs and
+what it runs. That is a permanent cost for a convenience, and the tile beside the
+toast already carries the title.
+
 ### Retention
 
 `retention.closed_days` controls when safely finalized ended history becomes eligible for metadata-only cleanup. The default is 30 days and the value must be positive. Cleanup does not contact a host, invoke `tmux`, or stop a workload.

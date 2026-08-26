@@ -42,6 +42,19 @@ What remains worth doing is unrelated to sharing and is tracked as issue #110:
 showing a preset's command before it runs, for every preset rather than only for
 adopted ones.
 
+### Naming the workload in a toast
+
+A toast carries a short workload reference rather than the tile's display title,
+and [Configuration](configuration.md) documents why. Letting the title travel
+would read better with several workloads open, and it was declined because the
+title is generated from host, repository name, and preset, while a toast is
+rendered by Herdr and can land on a surface Tether does not control.
+
+Distinguishing a title a person typed from one Tether generated, and letting only
+the first travel, would satisfy both. It was declined on cost: it needs provenance
+on the orchestration member, which is a state schema change and a second class of
+member, for text the tile beside the toast already shows.
+
 ## Shipped
 
 Everything this file previously listed as an idea has been built, and the entries
