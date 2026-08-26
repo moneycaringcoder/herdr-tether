@@ -168,6 +168,7 @@ fi
 fn write_fake_tmux_for_open(path: &Path, state: &Path) {
     let script = format!(
         r#"#!/bin/sh
+if [ "$1" = '-S' ]; then shift 2; fi
 command=$1
 shift
 case "$command" in
@@ -179,7 +180,7 @@ case "$command" in
       case "$arg" in TETHER_OWNERSHIP_PROOF=*) printf '%s' "${{arg#*=}}" > '{proof}' ;; esac
       previous=$arg
     done
-    printf '$7:%%3'
+    printf '$7:%%3:/tmp/tmux-1000/default'
     ;;
   list-sessions)
     id=$(cat '{id}' 2>/dev/null)
@@ -213,7 +214,7 @@ case "$remote" in
     printf '%s' "${{value%%\'*}}" > '{proof}'
     value=${{remote#*"'-c' '"}}
     printf '%s' "${{value%%\'*}}" > '{cwd}'
-    printf '$7:%%3'
+    printf '$7:%%3:/tmp/tmux-1000/default'
     ;;
   *"'list-sessions'"*)
     id=$(cat '{id}' 2>/dev/null)
@@ -452,7 +453,7 @@ fn orchestration_observe_creates_one_outer_pane_with_exact_destination_context()
     fs::write(
         state_file,
         r#"{
-  "version": 6,
+  "version": 7,
   "sessions": [],
   "orchestration_groups": [{
     "id": "build-fleet",
@@ -933,6 +934,7 @@ fn picker_fixture() -> (Config, State) {
                 command: Some("exec ${SHELL:-/bin/sh}".into()),
                 tmux_session_id: None,
                 tmux_pane_id: None,
+                tmux_socket: None,
                 ownership_proof: Some("0197f198000070008000000000000091".parse().unwrap()),
                 status: SessionStatus::Running,
                 created_at: now - Duration::days(2),
@@ -953,6 +955,7 @@ fn picker_fixture() -> (Config, State) {
                 command: Some("exec ${SHELL:-/bin/sh}".into()),
                 tmux_session_id: None,
                 tmux_pane_id: None,
+                tmux_socket: None,
                 ownership_proof: Some("0197f198000070008000000000000092".parse().unwrap()),
                 status: SessionStatus::Running,
                 created_at: now - Duration::days(1),
@@ -1704,6 +1707,7 @@ fn picker_retains_exact_removed_and_retargeted_lifecycle_groups() {
         command: Some("exec ${SHELL:-/bin/sh}".into()),
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: Some("0197f198000070008000000000000093".parse().unwrap()),
         status: SessionStatus::Running,
         created_at: now,
@@ -3237,6 +3241,7 @@ fn prune_preview(days: u64, count: usize) -> PrunePreview {
             command: Some("exec ${SHELL:-/bin/sh}".into()),
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
@@ -3273,6 +3278,7 @@ fn prune_reconciliation_removes_only_returned_ids_and_empty_retained_groups() {
             command: Some("exec ${SHELL:-/bin/sh}".into()),
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: now - Duration::days(60),
@@ -3339,6 +3345,7 @@ fn prune_preserves_selected_exact_resource_when_an_earlier_row_is_removed() {
             command: Some("exec ${SHELL:-/bin/sh}".into()),
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: Some("0197f198000070008000000000000094".parse().unwrap()),
             status,
             created_at: now - Duration::days(60),

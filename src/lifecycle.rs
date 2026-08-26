@@ -189,7 +189,7 @@ impl LifecycleService {
     pub fn stop_owned(&self, id: SessionId) -> Result<CloseOwnedResult, CloseOwnedError> {
         let record = self.lookup_owned(&id)?;
         let ownership_proof = self.require_ownership_proof(&record)?;
-        let backend = self.backend_for(&id, &record.target)?;
+        let backend = self.backend_for(&id, &record.target, record.tmux_socket.clone())?;
         let inspected = self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)?;
         if inspected == WorkloadState::Unknown {
             return Err(CloseOwnedError::WorkloadUnknown(id));
@@ -479,7 +479,7 @@ impl LifecycleService {
             });
         }
         let ownership_proof = self.require_ownership_proof(&record)?;
-        let backend = self.backend_for(&id, &record.target)?;
+        let backend = self.backend_for(&id, &record.target, record.tmux_socket.clone())?;
         let identity =
             match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
                 WorkloadState::Running { identity, .. } => identity,
@@ -530,7 +530,7 @@ impl LifecycleService {
             .owned_record(id)?
             .ok_or(CloseOwnedError::UnknownSession(id))?;
         let ownership_proof = self.require_ownership_proof(&record)?;
-        let backend = self.backend_for(&id, &record.target)?;
+        let backend = self.backend_for(&id, &record.target, record.tmux_socket.clone())?;
         let observed = self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)?;
         match observed {
             WorkloadState::Unknown => return Err(CloseOwnedError::WorkloadUnknown(id)),
@@ -641,7 +641,7 @@ impl LifecycleService {
             .command
             .clone()
             .ok_or(CloseOwnedError::MissingCommand(id))?;
-        let backend = self.backend_for(&id, &record.target)?;
+        let backend = self.backend_for(&id, &record.target, record.tmux_socket.clone())?;
         match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
             WorkloadState::Running { identity, .. } => {
                 if record.status != SessionStatus::Creating
@@ -649,7 +649,12 @@ impl LifecycleService {
                 {
                     return Err(CloseOwnedError::ConcurrentModification(id));
                 }
-                self.promote_running(&record, identity, record.tmux_pane_id)?;
+                self.promote_running(
+                    &record,
+                    identity,
+                    record.tmux_pane_id,
+                    record.tmux_socket.clone(),
+                )?;
                 self.note(
                     &SessionRecord {
                         tmux_session_id: Some(identity),
@@ -713,6 +718,10 @@ impl LifecycleService {
                 // and the retry this reservation exists for would read that as
                 // an absent workload and try to create a duplicate.
                 current.tmux_pane_id = None;
+                // The socket goes with the incarnation too: a restart creates on
+                // whichever socket this run resolves, which need not be the one
+                // the closed incarnation lived on.
+                current.tmux_socket = None;
                 current.closed_at = None;
                 current.exit_status = None;
                 Ok(())
@@ -731,7 +740,15 @@ impl LifecycleService {
             record.status,
             SessionStatus::Creating,
         );
-        let created = backend
+        // The reservation names no socket, and this is why: a new incarnation is
+        // created wherever this run's `tmux` resolves, which need not be where
+        // the closed one lived. Creating on the old socket would leave the
+        // reservation describing the wrong server, so an uncertain create - one
+        // that committed but could not be read back - would be retried against a
+        // socket the session is not on, and the retry would make a second live
+        // incarnation of it.
+        let creating = self.backend_for(&id, &reservation.target, None)?;
+        let created = creating
             .create(&LaunchSpec {
                 id,
                 ownership_proof,
@@ -739,11 +756,17 @@ impl LifecycleService {
                 command,
             })
             .map_err(|source| CloseOwnedError::Create { id, source })?;
-        self.promote_running(&reservation, created.session, Some(created.pane))?;
+        self.promote_running(
+            &reservation,
+            created.session,
+            Some(created.pane),
+            Some(created.socket.clone()),
+        )?;
         self.note(
             &SessionRecord {
                 tmux_session_id: Some(created.session),
                 tmux_pane_id: Some(created.pane),
+                tmux_socket: Some(created.socket.clone()),
                 exit_status: None,
                 ..reservation.clone()
             },
@@ -806,7 +829,7 @@ impl LifecycleService {
                 status: record.status,
             });
         }
-        let backend = self.backend_for(&id, &record.target)?;
+        let backend = self.backend_for(&id, &record.target, record.tmux_socket.clone())?;
         let workload =
             match self.inspect_exact(&backend, &id, &ownership_proof, record.tmux_pane_id)? {
                 WorkloadState::Ended { identity, .. }
@@ -910,6 +933,7 @@ impl LifecycleService {
         snapshot: &SessionRecord,
         session: TmuxSessionId,
         pane: Option<TmuxPaneId>,
+        socket: Option<String>,
     ) -> Result<(), CloseOwnedError> {
         self.store
             .update(|state| {
@@ -923,9 +947,11 @@ impl LifecycleService {
                 }
                 current.status = SessionStatus::Running;
                 current.tmux_session_id = Some(session);
-                // A reconciled record keeps the pane it already had, and a
-                // record written before panes were recorded still has none.
+                // A reconciled record keeps the pane and socket it already
+                // had, and a record written before either was recorded still has
+                // none.
                 current.tmux_pane_id = pane;
+                current.tmux_socket = socket;
                 current.closed_at = None;
                 current.exit_status = None;
                 // The history is deliberately kept here. A workload in a loop
@@ -939,13 +965,26 @@ impl LifecycleService {
             .map_err(|_| CloseOwnedError::ConcurrentModification(snapshot.id))
     }
 
-    fn backend_for(&self, id: &SessionId, target: &str) -> Result<TmuxBackend, CloseOwnedError> {
-        if target == "local" {
-            Ok(TmuxBackend::local(self.binaries.clone()))
+    /// A backend for one workload, bound to the socket it was created on.
+    ///
+    /// Every command this builds names that socket, so absence is absence on the
+    /// server that holds the workload rather than on whichever one this process
+    /// happens to resolve. A record written before the socket was recorded has
+    /// none to name and keeps the environment's socket, which is what it was
+    /// written under.
+    fn backend_for(
+        &self,
+        id: &SessionId,
+        target: &str,
+        socket: Option<String>,
+    ) -> Result<TmuxBackend, CloseOwnedError> {
+        let backend = if target == "local" {
+            TmuxBackend::local(self.binaries.clone())
         } else {
             TmuxBackend::remote(target.to_owned(), self.binaries.clone())
-                .map_err(|source| CloseOwnedError::BackendConfiguration { id: *id, source })
-        }
+                .map_err(|source| CloseOwnedError::BackendConfiguration { id: *id, source })?
+        };
+        Ok(backend.on_socket(socket))
     }
 }
 
@@ -1305,6 +1344,7 @@ mod tests {
                     command: Some("exec shell".into()),
                     tmux_session_id: None,
                     tmux_pane_id: None,
+                    tmux_socket: None,
                     ownership_proof: Some(test_proof()),
                     status: SessionStatus::Running,
                     created_at: timestamp,

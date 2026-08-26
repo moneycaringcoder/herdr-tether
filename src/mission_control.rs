@@ -683,6 +683,7 @@ mod tests {
                 command: Some("codex".to_owned()),
                 tmux_session_id: Some("$1".parse::<TmuxSessionId>().unwrap()),
                 tmux_pane_id: None,
+                tmux_socket: None,
                 ownership_proof: Some(
                     "0197f198000070008000000000000099"
                         .parse::<OwnershipProof>()

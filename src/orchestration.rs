@@ -2365,6 +2365,9 @@ fn capture_record(record: &SessionRecord) -> ObserverCapture {
     let Ok(backend) = backend_for_target(&record.target) else {
         return ObserverCapture::Unavailable;
     };
+    // Capture reads one owned workload, so it asks the socket that workload was
+    // created on rather than whichever one this process resolves.
+    let backend = backend.on_socket(record.tmux_socket.clone());
     match backend.capture_owned(&record.id, proof, identity) {
         Ok(capture) => ObserverCapture::Ready(capture.into_text()),
         Err(_) => ObserverCapture::Unavailable,
@@ -2765,6 +2768,7 @@ mod tests {
             command: Some("exec true".to_owned()),
             tmux_session_id: Some(tmux_id.parse().unwrap()),
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: Some(
                 format!(
                     "0197f1980000700080000000000000{:0>2}",
@@ -3814,6 +3818,7 @@ mod tests {
                     command: Some("exec true".to_owned()),
                     tmux_session_id: Some("$7".parse().unwrap()),
                     tmux_pane_id: None,
+                    tmux_socket: None,
                     ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
                     status: SessionStatus::Running,
                     created_at: now,
@@ -4438,6 +4443,7 @@ mod tests {
             command: Some("exec true".to_owned()),
             tmux_session_id: Some("$7".parse().unwrap()),
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
             status: SessionStatus::Running,
             created_at: now,
@@ -4559,6 +4565,7 @@ mod tests {
             command: Some("exec true".to_owned()),
             tmux_session_id: Some("$7".parse().unwrap()),
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: Some("0197f198000070008000000000000099".parse().unwrap()),
             status: SessionStatus::Running,
             created_at: now,
@@ -4601,6 +4608,7 @@ mod tests {
             status: SessionStatus::Creating,
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ..base.clone()
         };
         let stopping = SessionRecord {

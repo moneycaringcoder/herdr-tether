@@ -154,7 +154,7 @@ fn active_state_many(ids: &[String]) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&serde_json::json!({
-        "version": 6,
+        "version": 7,
         "sessions": sessions,
         "orchestration_groups": []
     }))
@@ -513,7 +513,7 @@ fn orchestration_crud_is_opt_in_state_only_and_exact_id() {
         ));
 
     let state = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(state.contains("\"version\": 6"));
+    assert!(state.contains("\"version\": 7"));
     assert!(state.contains("\"orchestration_groups\": []"));
 }
 
@@ -872,8 +872,13 @@ fn keybinding_reload_failure_reports_written_state_and_rollback_without_leaking_
 fn write_fake_tmux(path: &Path, log: &Path) {
     let proof_file = log.with_extension("proof");
     let id_file = log.with_extension("id");
+    let socket_file = log.with_extension("socket");
     let script = format!(
         r#"#!/bin/sh
+if [ "$1" = '-S' ]; then
+  printf '%s' "$2" > '{socket_file}'
+  shift 2
+fi
 printf '%s' "$1" >> '{log}'
 command=$1
 shift
@@ -887,7 +892,7 @@ case "$command" in
       case "$arg" in TETHER_OWNERSHIP_PROOF=*) printf '%s' "${{arg#*=}}" > '{proof_file}' ;; esac
       previous=$arg
     done
-    printf '$7:%%3'
+    printf '$7:%%3:/tmp/tmux-1000/default'
     ;;
   list-sessions)
     id=$(cat '{id_file}' 2>/dev/null)
@@ -916,6 +921,7 @@ exit 0
         log = log.display(),
         proof_file = proof_file.display(),
         id_file = id_file.display(),
+        socket_file = socket_file.display(),
     );
     fs::write(path, script).unwrap();
     #[cfg(unix)]
@@ -969,6 +975,15 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
     assert!(transcript.contains("new-session"));
     assert!(transcript.contains("attach-session"));
     assert!(!transcript.contains("kill-session"));
+    // The attach that follows a create is a command for a recorded workload, so
+    // it names the socket the create just reported. The Herdr placement path
+    // hands that command to a pane whose environment is not this process's, so
+    // resolving it again there would reach a different server.
+    assert_eq!(
+        fs::read_to_string(log.with_extension("socket")).unwrap(),
+        "/tmp/tmux-1000/default",
+        "every command for the created workload names its socket: {transcript}"
+    );
 
     sandbox
         .command()
@@ -1325,7 +1340,7 @@ fn migrated_v022_record_can_only_remove_metadata_without_transport() {
         ));
     assert!(!log.exists(), "legacy Remove must not invoke tmux");
     let migrated = fs::read_to_string(sandbox.state_file()).unwrap();
-    assert!(migrated.contains(r#""version": 6"#));
+    assert!(migrated.contains(r#""version": 7"#));
     assert!(migrated.contains(r#""status": "removed""#));
     assert!(!migrated.contains("ownership_proof"));
 }
@@ -1350,7 +1365,7 @@ fn session_list_json_never_exposes_private_ownership_proof() {
 fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":6,"sessions":[
+    let state = r#"{"version":7,"sessions":[
 {"id":"tether-0197f198000070008000000000000004","host":"local","target":"local","directory":"/removed","preset":null,"status":"removed","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-05T00:00:00Z","closed_at":"2026-01-05T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000003","host":"local","target":"local","directory":"/ended","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-04T00:00:00Z","closed_at":"2026-01-04T00:00:00Z"},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/older-active","preset":null,"status":"stopping","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-02T00:00:00Z","closed_at":null},
@@ -1408,7 +1423,7 @@ fn session_lists_hide_removed_and_order_normal_records_without_mutating_state() 
 fn session_lists_name_a_failing_exit_in_text_and_keep_the_status_in_json() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.state_file().parent().unwrap()).unwrap();
-    let state = r#"{"version":6,"sessions":[
+    let state = r#"{"version":7,"sessions":[
 {"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/failed","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-04T00:00:00Z","exit_status":2},
 {"id":"tether-0197f198000070008000000000000002","host":"local","target":"local","directory":"/clean","preset":null,"status":"ended","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-03T00:00:00Z","closed_at":"2026-01-03T00:00:00Z","exit_status":0}
 ],"orchestration_groups":[]}"#;
@@ -1454,7 +1469,7 @@ fn restarting_a_workload_that_failed_immediately_is_declined_with_the_wait() {
     let now = chrono::Utc::now();
     let closed_at = now - chrono::Duration::seconds(2);
     let state = serde_json::json!({
-        "version": 6,
+        "version": 7,
         "sessions": [{
             "id": SESSION_ID,
             "host": "local",
@@ -1496,7 +1511,7 @@ fn a_group_action_refuses_to_assume_consent_and_leaves_unownable_members_alone()
     let now = chrono::Utc::now();
     let legacy_id = "tether-0197f198000070008000000000000042";
     let state = serde_json::json!({
-        "version": 6,
+        "version": 7,
         "sessions": [
             {
                 "id": SESSION_ID,
@@ -1789,7 +1804,7 @@ fn open_fails_closed_when_reservation_disappears_after_backend_creation() {
     let concurrent_id = "tether-0197f198000070008000000000000002";
     let concurrent_state = active_state(concurrent_id);
     let body = format!(
-        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; printf '$7:%%3'; fi\nif [ \"$1\" = display-message ]; then printf '%s' '/tmp'; fi\nif [ \"$1\" = list-sessions ]; then filter=; for arg do filter=$arg; done; id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7:0:0:' \"$id\" ;; *) printf '%s:$7:0:0:' \"$id\" ;; esac; fi\nexit 0",
+        "if [ \"$1\" = new-session ]; then printf '%s' '{}' > '{}'; printf '$7:%%3:/tmp/tmux-1000/default'; fi\nif [ \"$1\" = display-message ]; then printf '%s' '/tmp'; fi\nif [ \"$1\" = list-sessions ]; then filter=; for arg do filter=$arg; done; id=$(printf '%s' \"$filter\" | cut -d, -f2- | rev | cut -c2- | rev); case \"$*\" in *'#{{session_id}}'*) printf '%s:$7:0:0:' \"$id\" ;; *) printf '%s:$7:0:0:' \"$id\" ;; esac; fi\nexit 0",
         concurrent_state,
         sandbox.state_file().display()
     );

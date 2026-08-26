@@ -107,6 +107,15 @@ enum Location {
 pub struct TmuxBackend {
     location: Location,
     binaries: ProcessBinaries,
+    /// The socket every command from this backend acts on, when one is known.
+    ///
+    /// `tmux` picks its socket from the environment - `TMUX_TMPDIR`, the uid, and
+    /// the default `/tmp/tmux-<uid>/default` - so without this every command
+    /// reaches whatever socket the running process happens to resolve. A
+    /// workload created under a different `TMUX_TMPDIR` would then be invisible,
+    /// and its absence there is not evidence about the server that holds it.
+    /// Naming the socket makes the question the record's own.
+    socket: Option<String>,
 }
 
 impl TmuxBackend {
@@ -114,6 +123,7 @@ impl TmuxBackend {
         Self {
             location: Location::Local,
             binaries,
+            socket: None,
         }
     }
 
@@ -122,10 +132,28 @@ impl TmuxBackend {
         Ok(Self {
             location: Location::Remote(target),
             binaries,
+            socket: None,
         })
     }
 
+    /// Binds every command from this backend to one workload's own socket.
+    #[must_use]
+    pub fn on_socket(mut self, socket: Option<String>) -> Self {
+        self.socket = socket;
+        self
+    }
+
     fn tmux_spec(&self, arguments: Vec<String>, interactive: bool) -> Result<CommandSpec> {
+        let arguments = match &self.socket {
+            Some(socket) => {
+                let mut named = Vec::with_capacity(arguments.len() + 2);
+                named.push("-S".to_owned());
+                named.push(socket.clone());
+                named.extend(arguments);
+                named
+            }
+            None => arguments,
+        };
         match &self.location {
             Location::Local => Ok(CommandSpec::new(self.binaries.tmux(), arguments)),
             Location::Remote(target) => {
@@ -607,7 +635,7 @@ impl DurableBackend for TmuxBackend {
                 format!("TETHER_OWNERSHIP_PROOF={}", launch.ownership_proof),
                 "-P".to_owned(),
                 "-F".to_owned(),
-                "#{session_id}:#{pane_id}".to_owned(),
+                "#{session_id}:#{pane_id}:#{socket_path}".to_owned(),
                 "--".to_owned(),
                 "/bin/sh".to_owned(),
                 "-lc".to_owned(),
@@ -634,14 +662,20 @@ impl DurableBackend for TmuxBackend {
             .map_err(CreateOutcomeUncertain::new)?
             .trim_end_matches(['\r', '\n']);
         let identities = (|| {
-            let (session_target, pane_target) = created
-                .split_once(':')
-                .context("tmux create did not return session and pane identities")?;
+            let mut fields = created.splitn(3, ':');
+            let (Some(session_target), Some(pane_target), Some(socket)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                bail!("tmux create did not return session, pane, and socket identities");
+            };
             let session_target = session_target.parse::<TmuxSessionId>()?;
             let pane_target = pane_target.parse::<TmuxPaneId>()?;
-            Ok::<_, anyhow::Error>((session_target, pane_target))
+            if socket.is_empty() {
+                bail!("tmux create returned an empty socket path");
+            }
+            Ok::<_, anyhow::Error>((session_target, pane_target, socket.to_owned()))
         })();
-        let (session_target, pane_target) = match identities {
+        let (session_target, pane_target, socket) = match identities {
             Ok(identities) => identities,
             // Creation is committed, but malformed output does not provide a
             // trustworthy internal target. Preserve the reservation so a
@@ -658,6 +692,7 @@ impl DurableBackend for TmuxBackend {
         Ok(CreatedWorkload {
             session: session_target,
             pane: pane_target,
+            socket,
         })
     }
 
@@ -848,9 +883,10 @@ fn classify_exact_inspect(
         // and reading it as anything else would leave every record on a rebooted
         // machine impossible to stop, restart, remove, or prune.
         //
-        // The socket depends on the environment, so this is absence on the socket
-        // Tether can see rather than proof about every server on the host. Closing
-        // that gap needs the socket recorded when the workload is created.
+        // The socket is the workload's own whenever its record carries one, so
+        // this is absence where the workload lives rather than absence on
+        // whichever server this process happened to reach. A record written
+        // before sockets were recorded still asks the environment's.
         WorkloadState::Missing
     } else {
         // Exit 1 for any other reason is a failure to ask, not an answer: a
