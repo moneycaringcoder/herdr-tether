@@ -106,6 +106,7 @@ fn owned_record(status: SessionStatus) -> SessionRecord {
         command: Some("exec shell".into()),
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: Some(proof()),
         status,
         created_at: now,
@@ -477,6 +478,68 @@ fn a_restart_reservation_forgets_the_pane_of_the_incarnation_it_closed() {
         promoted.tmux_pane_id, None,
         "a promotion reconciles a session it did not create, so it invents no pane"
     );
+}
+
+#[test]
+fn every_command_for_a_recorded_workload_names_its_own_socket() {
+    // `tmux` resolves its socket from the environment, so without naming one an
+    // inspection reads whichever socket this process happens to resolve. A
+    // workload created under a different `TMUX_TMPDIR` is invisible there, and
+    // its absence on the wrong socket is not evidence that it ended.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Running);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    record.tmux_socket = Some("/run/tether/tmux-1000/default".to_owned());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    write_fake(
+        &tmux,
+        &log,
+        &format!("{id}:$7:0:0::{proof}", id = id(), proof = proof()),
+        0,
+    );
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    service.observe_owned(id()).unwrap();
+
+    let argv = read_argv(&log);
+    assert_eq!(
+        &argv[..2],
+        ["-S", "/run/tether/tmux-1000/default"],
+        "the socket has to come before the command, as tmux requires: {argv:?}"
+    );
+}
+
+#[test]
+fn a_record_written_before_sockets_were_kept_asks_the_environment_as_it_always_did() {
+    // A migrated record has no socket to name. Naming the one this run resolves
+    // would turn a guess into a record, and refusing to ask at all would leave
+    // every such workload unactionable.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let (temp, _store, service, log) =
+        lifecycle_fixture(&format!("{id}:$7:0:0::{proof}", id = id(), proof = proof()));
+
+    service.observe_owned(id()).unwrap();
+
+    let argv = read_argv(&log);
+    assert!(
+        !argv.iter().any(|argument| argument == "-S"),
+        "a record with no socket names none: {argv:?}"
+    );
+    drop(temp);
 }
 
 /// A fake `tmux` that answers the exact inspection with `line` and lets the
@@ -1210,7 +1273,7 @@ fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() 
         let tmux = temp.path().join("tmux");
         let log = temp.path().join("calls");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3'; elif [ \"$1\" = display-message ]; then printf '%s' '{reported_cwd}'; fi\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3:/tmp/tmux-1000/default'; elif [ \"$1\" = display-message ]; then printf '%s' '{reported_cwd}'; fi\n",
             log = log.display(),
         );
         fs::write(&tmux, script).unwrap();
@@ -1228,7 +1291,7 @@ fn owned_create_verifies_exact_cwd_sets_session_mouse_and_rolls_back_mismatch() 
 
         let calls = fs::read_to_string(log).unwrap();
         assert!(calls.contains(
-            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -e TETHER_OWNERSHIP_PROOF=0197f198000070008000000000000002 -P -F #{session_id}:#{pane_id} -- /bin/sh -lc"
+            "new-session -d -s tether-0197f198000070008000000000000001 -c /work/repo -e TETHER_OWNERSHIP_PROOF=0197f198000070008000000000000002 -P -F #{session_id}:#{pane_id}:#{socket_path} -- /bin/sh -lc"
         ));
         assert!(
             calls.contains(
@@ -1261,7 +1324,7 @@ fn owned_create_accepts_symlinked_directory_with_same_inode() {
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("calls");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3'; elif [ \"$1\" = display-message ]; then printf '%s' '{real}'; fi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = new-session ]; then printf '$7:%%3:/tmp/tmux-1000/default'; elif [ \"$1\" = display-message ]; then printf '%s' '{real}'; fi\n",
         log = log.display(),
         real = real.display(),
     );
@@ -1544,7 +1607,7 @@ fn remote_create_passes_one_fully_quoted_command_to_fake_ssh() {
     let command = "printf '%s\\n' \"$HOME\"; echo `id`";
     let escaped_directory = "/canonical/repo";
     let script = format!(
-        "#!/bin/sh\nfor remote do :; done\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
+        "#!/bin/sh\nfor remote do :; done\nprintf '%s\\n' \"$remote\" >> '{calls}'\ncase \"$remote\" in\n  *\"'new-session'\"*) : > '{log}'; for arg do printf '%s\\000' \"$arg\" >> '{log}'; done; printf '$7:%%3:/tmp/tmux-1000/default' ;;\n  *\"'#{{pane_current_path}}'\"*) printf '%s' '{escaped_directory}' ;;\nesac\n",
         log = log.display(),
         calls = calls.display(),
     );
@@ -2041,6 +2104,7 @@ fn cleanup_never_selects_active_unknown_or_recent_sessions() {
         command: Some("exec shell".into()),
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: Some(proof()),
         status: SessionStatus::Running,
         created_at: now - Duration::days(30),
@@ -2123,6 +2187,7 @@ fn prune_record(
         command: Some("exec shell".into()),
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: Some(proof()),
         status,
         created_at,

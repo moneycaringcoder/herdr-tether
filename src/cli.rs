@@ -1489,6 +1489,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         command: Some(selection.command),
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: Some(ownership_proof),
         status: SessionStatus::Creating,
         created_at: now,
@@ -1541,6 +1542,7 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
             }
             current.tmux_session_id = Some(created.session);
             current.tmux_pane_id = Some(created.pane);
+            current.tmux_socket = Some(created.socket.clone());
             current.status = SessionStatus::Running;
             current.last_used_at = Utc::now();
             Ok(())
@@ -3209,6 +3211,7 @@ mod tests {
             command: None,
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: Utc::now() - chrono::Duration::minutes(30),
@@ -3401,6 +3404,7 @@ mod tests {
             command: Some("exec /opt/agents/codex --token raw-secret".into()),
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: None,
             status: SessionStatus::Running,
             created_at: now,

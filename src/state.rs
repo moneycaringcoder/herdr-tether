@@ -80,6 +80,17 @@ pub struct SessionRecord {
     /// that way and keeps the session-scoped reading it was written under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_pane_id: Option<TmuxPaneId>,
+    /// The tmux socket this workload was created on.
+    ///
+    /// `tmux` resolves its socket from the environment, so without this every
+    /// inspection reads whichever socket the running process happens to resolve -
+    /// and a workload created under a different `TMUX_TMPDIR` is invisible to a
+    /// run without it. Absence on the wrong socket is not evidence, so every
+    /// command for a record that carries one names it with `-S`. A record written
+    /// before the socket was recorded has none to name and keeps reading whatever
+    /// the environment resolves, which is what it was written under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
     /// Private capability shared only with the exact tmux incarnation.
     ///
     /// Legacy records deliberately have no proof and therefore cannot confer
@@ -386,6 +397,7 @@ mod pace_tests {
             command: Some("exec shell".to_owned()),
             tmux_session_id: None,
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: None,
             status: SessionStatus::Ended,
             created_at: started,
@@ -524,7 +536,7 @@ pub struct State {
 }
 
 impl State {
-    pub const CURRENT_VERSION: u32 = 6;
+    pub const CURRENT_VERSION: u32 = 7;
     pub const MAX_ORCHESTRATION_GROUPS: usize = 32;
     pub const MAX_SESSIONS: usize = 1_024;
     pub const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -765,11 +777,24 @@ impl StateStore {
             })?;
 
         match version {
-            6 => {
+            7 => {
                 let state: State = serde_json::from_str(&source).with_context(|| {
-                    format!("decode state version 6 from `{}`", self.path.display())
+                    format!("decode state version 7 from `{}`", self.path.display())
                 })?;
                 state.validate()?;
+                Ok(state)
+            }
+            6 => {
+                let legacy: StateV6 = serde_json::from_str(&source).with_context(|| {
+                    format!("decode state version 6 from `{}`", self.path.display())
+                })?;
+                let state = legacy.migrate();
+                state.validate()?;
+                if persist_migration {
+                    self.save_unlocked(&state).with_context(|| {
+                        format!("rewrite migrated state `{}`", self.path.display())
+                    })?;
+                }
                 Ok(state)
             }
             5 => {
@@ -961,6 +986,34 @@ impl StateV4 {
     }
 }
 
+/// The shape a version 6 document has: everything current except the socket the
+/// workload was created on, which was not recorded when the document was written.
+///
+/// It decodes into the current record type, so the absent socket defaults to
+/// `None`. Nothing here guesses one: the socket a Tether run resolves now is the
+/// evidence this field exists to stop standing in for the one the workload was
+/// created on, and writing it in would make a guess look like a record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateV6 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    orchestration_groups: Vec<OrchestrationGroup>,
+}
+
+impl StateV6 {
+    fn migrate(self) -> State {
+        State {
+            version: State::CURRENT_VERSION,
+            sessions: self.sessions,
+            orchestration_groups: self.orchestration_groups,
+        }
+    }
+}
+
 /// The shape a version 5 document has: everything current except the launched
 /// pane, which was not recorded when the document was written.
 ///
@@ -1094,6 +1147,7 @@ impl From<SessionRecordV2> for SessionRecord {
             // No older schema recorded a pane, and none is invented: a guessed
             // pane would read as a workload that has gone.
             tmux_pane_id: None,
+            tmux_socket: None,
             ownership_proof: record.ownership_proof,
             status: record.status,
             created_at: record.created_at,
@@ -1171,6 +1225,7 @@ impl StateV1 {
                         command: None,
                         tmux_session_id: None,
                         tmux_pane_id: None,
+                        tmux_socket: None,
                         ownership_proof: None,
                         status,
                         created_at: session.created_at,
@@ -1223,6 +1278,7 @@ impl StateV0 {
                     command: None,
                     tmux_session_id: None,
                     tmux_pane_id: None,
+                    tmux_socket: None,
                     ownership_proof: None,
                     status: SessionStatus::Running,
                     created_at: session.created_at,

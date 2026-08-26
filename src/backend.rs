@@ -158,10 +158,12 @@ pub enum WorkloadState {
 /// The pane is carried alongside the session because a workload's own end is a
 /// pane-scoped fact: asking a session for it answers about whichever pane is
 /// active, which stops being the launched one the moment someone splits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatedWorkload {
     pub session: TmuxSessionId,
     pub pane: TmuxPaneId,
+    /// The socket the workload was created on, as `tmux` resolved it.
+    pub socket: String,
 }
 
 /// Operations required from a durable session backend.

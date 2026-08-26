@@ -506,6 +506,7 @@ fn snapshot_surfaces_status_workload_limit_as_typed_partial_data() {
         command: None,
         tmux_session_id: None,
         tmux_pane_id: None,
+        tmux_socket: None,
         ownership_proof: None,
         status: SessionStatus::Running,
         created_at: now,

@@ -126,10 +126,18 @@ executed, one that rejected the query, or one whose output could not be trusted.
 A `tmux` too old for the inspection Tether needs falls here, and reads as a
 workload whose state cannot be proven rather than as one that ended.
 
-The limit worth knowing: `tmux` chooses its socket from the environment, so what
-Tether can see is the server its own invocation reaches. A workload started under
-a different `TMUX_TMPDIR` is not visible to a Tether run without it, and reads as
-ended. Recording the socket a workload was created on would close that gap.
+Every command for a workload names the socket that workload was created on, so
+the server being asked is the one that holds it. `tmux` otherwise chooses its
+socket from the environment, and a workload started under a different
+`TMUX_TMPDIR` would be invisible to a Tether run without it - and its absence
+there would read as an end, so a restart would create a second incarnation of
+something that never stopped. Absence on the workload's own socket is still an
+end, which is what keeps a rebooted host actionable.
+
+A record written before Tether recorded sockets has none to name and keeps
+reading whatever the environment resolves, which is what it was written under.
+The socket a Tether run resolves now is exactly the evidence this replaces, so
+nothing writes one into an older record.
 
 ## Noticing an end nobody asked about
 
