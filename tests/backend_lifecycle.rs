@@ -502,25 +502,106 @@ fn every_command_for_a_recorded_workload_names_its_own_socket() {
         .unwrap();
     let tmux = temp.path().join("tmux");
     let log = temp.path().join("tmux.args");
-    write_fake(
-        &tmux,
-        &log,
-        &format!("{id}:$7:0:0::{proof}", id = id(), proof = proof()),
-        0,
+    // Appends rather than truncating, so one run records every invocation, with
+    // a marker between them.
+    let script = format!(
+        "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nprintf 'end-of-call\\000' >> '{log}'\ncase \"$*\" in\n  *list-panes*) printf '{id}:$7:0:0::{proof}' ;;\nesac\nexit 0\n",
+        log = log.display(),
+        id = id(),
+        proof = proof(),
     );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
     let service = LifecycleService::new(
         store.clone(),
         ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
     );
 
-    service.observe_owned(id()).unwrap();
+    // Stop inspects, inspects again, and then runs the guarded close, so one
+    // call exercises a read and a mutation.
+    service.stop_owned(id()).unwrap();
 
-    let argv = read_argv(&log);
-    assert_eq!(
-        &argv[..2],
-        ["-S", "/run/tether/tmux-1000/default"],
-        "the socket has to come before the command, as tmux requires: {argv:?}"
+    let calls: Vec<Vec<String>> = read_argv(&log)
+        .split(|argument| argument == "end-of-call")
+        .filter(|call| !call.is_empty())
+        .map(<[String]>::to_vec)
+        .collect();
+    assert!(
+        calls.len() >= 3,
+        "expected inspect, inspect, close: {calls:?}"
     );
+    for call in &calls {
+        assert_eq!(
+            &call[..2],
+            ["-S", "/run/tether/tmux-1000/default"],
+            "the socket has to come before the command, as tmux requires: {call:?}"
+        );
+    }
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.iter().any(|argument| argument == "if-shell")),
+        "the guarded close must be one of the commands that named the socket: {calls:?}"
+    );
+}
+
+#[test]
+fn a_restart_creates_on_this_run_socket_not_the_closed_incarnation_one() {
+    // A new incarnation is created wherever this run's `tmux` resolves, and the
+    // reservation says so by carrying no socket. Creating on the closed
+    // incarnation's socket instead would leave the reservation describing the
+    // wrong server, so an uncertain create - one that committed but could not be
+    // read back - would be retried against a socket the session is not on, and
+    // the retry would make a second live incarnation of it.
+    let _guard = FAKE_PROCESS_LOCK.lock();
+    let temp = tempdir().unwrap();
+    let store = StateStore::new(temp.path().join("state.json"));
+    let mut record = owned_record(SessionStatus::Ended);
+    record.tmux_session_id = Some("$7".parse().unwrap());
+    record.tmux_pane_id = Some("%3".parse().unwrap());
+    record.tmux_socket = Some("/run/stale/tmux-1000/default".to_owned());
+    store
+        .save(&State {
+            version: State::CURRENT_VERSION,
+            sessions: vec![record],
+            orchestration_groups: Vec::new(),
+        })
+        .unwrap();
+    let tmux = temp.path().join("tmux");
+    let log = temp.path().join("tmux.args");
+    let script = format!(
+        "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\" >> '{log}'; done\nprintf 'end-of-call\\000' >> '{log}'\ncase \"$*\" in\n  *new-session*) printf '$9:%%5:/run/fresh/tmux-1000/default' ;;\n  *display-message*) printf '%s' '/srv/code' ;;\nesac\nexit 0\n",
+        log = log.display(),
+    );
+    fs::write(&tmux, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let service = LifecycleService::new(
+        store.clone(),
+        ProcessBinaries::new(temp.path().join("unused-ssh"), tmux),
+    );
+
+    let restarted = service.restart_owned(id()).unwrap();
+
+    assert_eq!(restarted.identity, "$9".parse().unwrap());
+    let creation = read_argv(&log)
+        .split(|argument| argument == "end-of-call")
+        .find(|call| call.iter().any(|argument| argument == "new-session"))
+        .map(<[String]>::to_vec)
+        .expect("the restart created a session");
+    assert_eq!(
+        creation.first().map(String::as_str),
+        Some("new-session"),
+        "creation names no socket, because it makes the one it will record: {creation:?}"
+    );
+    let promoted = &store.load().unwrap().sessions[0];
+    assert_eq!(
+        promoted.tmux_socket.as_deref(),
+        Some("/run/fresh/tmux-1000/default"),
+        "the record carries the socket the new incarnation was actually created on"
+    );
+    assert_eq!(promoted.tmux_pane_id, Some("%5".parse().unwrap()));
 }
 
 #[test]

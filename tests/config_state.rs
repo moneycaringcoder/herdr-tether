@@ -952,6 +952,31 @@ fn state_v6_migration_records_no_socket_and_keeps_the_environment_reading() {
 }
 
 #[test]
+fn an_empty_recorded_socket_is_refused_rather_than_read_as_an_end() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    // Creation refuses an empty socket, so this only arrives from a document
+    // Tether did not write - which is what validation exists to fail closed on.
+    // `tmux -S ''` answers "no server running", and that reads as an end: a
+    // permanent false end for a workload that may still be running, and a
+    // restart that then creates a duplicate of it.
+    let source = r#"{"version":7,"sessions":[{"id":"tether-0197f198000070008000000000000001","host":"local","target":"local","directory":"/srv/app","preset":null,"command":"exec shell","tmux_session_id":7,"tmux_socket":"","ownership_proof":"0197f198-0000-7000-8000-000000000099","status":"running","created_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-01T00:00:00Z","closed_at":null}],"orchestration_groups":[]}"#;
+    fs::write(&path, source).unwrap();
+
+    let error = StateStore::new(path.clone())
+        .load()
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("tmux socket"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        source,
+        "a refused document is not rewritten"
+    );
+}
+
+#[test]
 fn future_state_version_fails_closed_without_rewriting_data() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.json");
@@ -1222,6 +1247,7 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
         "session target",
         "session directory",
         "session preset",
+        "session tmux socket",
     ] {
         let mut valid = State {
             version: State::CURRENT_VERSION,
@@ -1233,6 +1259,7 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
             "session target" => valid.sessions[0].target = boundary.clone(),
             "session directory" => valid.sessions[0].directory = boundary.clone(),
             "session preset" => valid.sessions[0].preset = Some(boundary.clone()),
+            "session tmux socket" => valid.sessions[0].tmux_socket = Some(boundary.clone()),
             _ => unreachable!(),
         }
         let mut invalid = valid.clone();
@@ -1241,6 +1268,7 @@ fn state_cardinality_and_string_boundaries_are_enforced_before_persistence() {
             "session target" => invalid.sessions[0].target.push('x'),
             "session directory" => invalid.sessions[0].directory.push('x'),
             "session preset" => invalid.sessions[0].preset.as_mut().unwrap().push('x'),
+            "session tmux socket" => invalid.sessions[0].tmux_socket.as_mut().unwrap().push('x'),
             _ => unreachable!(),
         }
         cases.push((field, valid, invalid));

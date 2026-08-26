@@ -49,6 +49,19 @@
   `Ended` while it kept running, and a restart created a second incarnation of
   something that never stopped. Absence on the workload's own socket is still an
   end, which is what keeps a rebooted host stoppable, restartable, and prunable.
+  A restart creates on whichever socket that run resolves, so its reservation
+  names none and the creation itself names none either: creating on the closed
+  incarnation's socket would leave the reservation describing the wrong server,
+  and an uncertain create retried against it would make a second live
+  incarnation. The host-wide scan behind the picker and `snapshot` still reads
+  the environment's socket, because one `list-sessions` covers every workload on
+  a host and cannot name one socket; its absence was never authoritative, which
+  is why the picker re-asks anything it reports as missing or ended through the
+  workload's own socket.
+- A recorded socket is validated like every other free-form string on a record.
+  Creation refuses an empty one, so an empty socket can only arrive in a document
+  Tether did not write - and `tmux -S ''` answers "no server running", which would
+  read as a permanent end for a workload that may still be running.
 - **State schema version 7.** The socket is a new field on each session record, so
   a version 6 file is migrated on load. A migrated record carries no socket and
   keeps reading whatever the environment resolves: the socket a Tether run

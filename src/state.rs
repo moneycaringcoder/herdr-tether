@@ -585,6 +585,14 @@ impl State {
                 require_nonempty(preset, &format!("session `{}` preset", session.id))?;
                 require_max_bytes(preset, Self::MAX_STRING_BYTES, "session preset")?;
             }
+            if let Some(socket) = &session.tmux_socket {
+                // A record Tether wrote never carries an empty socket, because
+                // creation refuses one. A document Tether did not write can, and
+                // `tmux -S ''` answers "no server running" - which reads as an
+                // end, permanently, for a workload that may still be running.
+                require_nonempty(socket, &format!("session `{}` tmux socket", session.id))?;
+                require_max_bytes(socket, Self::MAX_STRING_BYTES, "session tmux socket")?;
+            }
             if session.last_used_at < session.created_at {
                 bail!(
                     "session `{}` last_used_at must not be earlier than created_at",

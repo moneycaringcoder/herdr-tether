@@ -740,7 +740,15 @@ impl LifecycleService {
             record.status,
             SessionStatus::Creating,
         );
-        let created = backend
+        // The reservation names no socket, and this is why: a new incarnation is
+        // created wherever this run's `tmux` resolves, which need not be where
+        // the closed one lived. Creating on the old socket would leave the
+        // reservation describing the wrong server, so an uncertain create - one
+        // that committed but could not be read back - would be retried against a
+        // socket the session is not on, and the retry would make a second live
+        // incarnation of it.
+        let creating = self.backend_for(&id, &reservation.target, None)?;
+        let created = creating
             .create(&LaunchSpec {
                 id,
                 ownership_proof,

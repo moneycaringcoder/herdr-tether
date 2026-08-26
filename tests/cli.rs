@@ -975,6 +975,15 @@ fn local_open_resume_close_and_prune_preserve_lifecycle_contracts() {
     assert!(transcript.contains("new-session"));
     assert!(transcript.contains("attach-session"));
     assert!(!transcript.contains("kill-session"));
+    // The attach that follows a create is a command for a recorded workload, so
+    // it names the socket the create just reported. The Herdr placement path
+    // hands that command to a pane whose environment is not this process's, so
+    // resolving it again there would reach a different server.
+    assert_eq!(
+        fs::read_to_string(log.with_extension("socket")).unwrap(),
+        "/tmp/tmux-1000/default",
+        "every command for the created workload names its socket: {transcript}"
+    );
 
     sandbox
         .command()

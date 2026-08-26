@@ -1561,6 +1561,12 @@ fn create_and_attach(paths: &AppPaths, config: &Config, selection: OpenSelection
         Some(created.session),
     );
 
+    // Every command for a recorded workload names its socket, and the attach that
+    // follows a create is no exception. The Herdr placement path hands this
+    // command to a pane whose environment is not this process's, so the socket
+    // has to travel in the command rather than be resolved again there.
+    let backend = backend.on_socket(Some(created.socket.clone()));
+
     if env::var_os("HERDR_BIN_PATH").is_some() {
         let context = HerdrContext::from_env()?;
         let attach = attach_with_agent_hint(
