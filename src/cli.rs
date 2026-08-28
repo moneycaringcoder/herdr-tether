@@ -1288,14 +1288,18 @@ fn selection_from_picker(
     if let Some(requested) = requested_host {
         picker_config.hosts.retain(|host| host.name == requested);
     }
+    let invocation = crate::herdr::InvocationLocation::from_plugin_env()
+        .context("resolve Tether invocation repository")?;
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
-    let invocation = crate::herdr::InvocationLocation::from_plugin_env();
-    options.prefer_invocation_location_with_worktrees(
-        invocation.as_ref(),
-        state,
-        &invocation_worktrees(invocation.as_ref()),
-    );
+    if let Some(invocation) = invocation.as_ref() {
+        let already_offered = options.offers_invocation_location(invocation, state);
+        let worktrees = invocation_worktrees(invocation);
+        options.prefer_invocation_location_with_worktrees(Some(invocation), state, &worktrees);
+        if !already_offered {
+            options.add_authoritative_invocation_location(invocation)?;
+        }
+    }
     retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
         options
@@ -2302,10 +2306,8 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
 /// simply leave the ordering alone, and none of them is worth a warning on
 /// every picker open. An answer Tether refuses to use is different: something
 /// was reported and deliberately left out, so it is said out loud.
-fn invocation_worktrees(location: Option<&crate::herdr::InvocationLocation>) -> Vec<PathBuf> {
-    let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
-        return Vec::new();
-    };
+fn invocation_worktrees(location: &crate::herdr::InvocationLocation) -> Vec<PathBuf> {
+    let directory = location.directory();
     let Ok(client) = HerdrSocketClient::from_env() else {
         return Vec::new();
     };

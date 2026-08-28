@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Output,
     sync::atomic::AtomicBool,
@@ -23,44 +23,140 @@ pub const PLUGIN_ID: &str = "moneycaringcoder.tether";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INVOCATION_DIRECTORY_BYTES: usize = 4096;
 
-/// A validated invocation directory supplied by Herdr's documented plugin context.
+/// A validated invocation directory from Herdr context or direct process context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationLocation {
     directory: PathBuf,
 }
 
 impl InvocationLocation {
-    /// Reads an optional picker preference from Herdr's plugin action context.
+    /// Resolves the repository location for either a Herdr plugin invocation or
+    /// a direct/manual invocation.
     ///
-    /// Invalid or unavailable context is deliberately ignored. Placement context
-    /// is parsed separately and retains its stricter error behavior.
-    pub fn from_plugin_env() -> Option<Self> {
-        let context = env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
-        Self::from_plugin_context_json(Some(&context))
+    /// A present plugin context is authoritative and must be usable. Process CWD
+    /// fallback is available only when both plugin context and the plugin-root
+    /// signal are absent; Herdr runs plugin commands from their installation
+    /// checkout, which must never become the invoking user's repository.
+    pub fn from_plugin_env() -> Result<Option<Self>> {
+        let context = plugin_context_env()?;
+        match context.as_deref() {
+            Some(context) => Self::from_plugin_context_json(context),
+            None => {
+                let process_cwd = env::current_dir()
+                    .context("determine the working directory for direct Tether invocation")?;
+                let plugin_root = env::var_os("HERDR_PLUGIN_ROOT");
+                Self::from_absent_context(plugin_root.as_deref(), &process_cwd)
+            }
+        }
     }
 
-    /// Parses only Herdr's documented invocation CWD fields.
+    /// Parses Herdr's documented invocation CWD and identifier fields.
     ///
-    /// Pane context takes precedence over workspace context. If the pane field is
-    /// present but unusable, the workspace field is not used as a fallback.
-    pub fn from_plugin_context_json(plugin_context: Option<&str>) -> Option<Self> {
-        let context: Value = serde_json::from_str(plugin_context?).ok()?;
-        let context = context.as_object()?;
-        let directory = match context.get("focused_pane_cwd") {
-            Some(value) => value.as_str()?,
-            None => context.get("workspace_cwd")?.as_str()?,
+    /// Pane context takes precedence over workspace context. If the pane field
+    /// is present but unusable, the workspace field is not used as a fallback.
+    /// Herdr 0.8.0 context legitimately omitted both CWD fields; that produces
+    /// no location rather than consulting the plugin process CWD. Direct/manual
+    /// fallback is deliberately confined to [`Self::from_plugin_env`].
+    pub fn from_plugin_context_json(plugin_context: &str) -> Result<Option<Self>> {
+        Self::from_values(Some(plugin_context), None)
+    }
+
+    fn from_absent_context(
+        plugin_root: Option<&OsStr>,
+        process_cwd: &Path,
+    ) -> Result<Option<Self>> {
+        if plugin_root.is_some_and(|root| !root.to_string_lossy().trim().is_empty()) {
+            bail!(
+                "Herdr plugin execution did not provide HERDR_PLUGIN_CONTEXT_JSON; refusing to use HERDR_PLUGIN_ROOT as the invocation repository"
+            );
+        }
+        Self::from_values(None, Some(process_cwd))
+    }
+
+    fn from_values(
+        plugin_context: Option<&str>,
+        process_cwd: Option<&Path>,
+    ) -> Result<Option<Self>> {
+        let (directory, source) = match plugin_context {
+            Some(plugin_context) => {
+                let context: Value = serde_json::from_str(plugin_context)
+                    .context("decode HERDR_PLUGIN_CONTEXT_JSON")?;
+                let context = context.as_object().ok_or_else(|| {
+                    anyhow::anyhow!("HERDR_PLUGIN_CONTEXT_JSON was not a JSON object")
+                })?;
+
+                for name in ["workspace_id", "tab_id", "focused_pane_id"] {
+                    let Some(value) = context.get(name) else {
+                        continue;
+                    };
+                    let value = value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("HERDR_PLUGIN_CONTEXT_JSON {name} was not a string")
+                    })?;
+                    require_nonempty_env(
+                        &format!("HERDR_PLUGIN_CONTEXT_JSON {name}"),
+                        value.to_owned(),
+                    )?;
+                }
+
+                let (directory, id_name) = match context.get("focused_pane_cwd") {
+                    Some(value) => (
+                        value.as_str().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "HERDR_PLUGIN_CONTEXT_JSON focused_pane_cwd was not a string"
+                            )
+                        })?,
+                        "focused_pane_id",
+                    ),
+                    None => {
+                        let Some(value) = context.get("workspace_cwd") else {
+                            return Ok(None);
+                        };
+                        (
+                            value.as_str().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "HERDR_PLUGIN_CONTEXT_JSON workspace_cwd was not a string"
+                                )
+                            })?,
+                            "workspace_id",
+                        )
+                    }
+                };
+                if !context.contains_key(id_name) {
+                    bail!(
+                        "Herdr plugin context reported an invocation directory without {id_name}"
+                    );
+                }
+                (
+                    PathBuf::from(directory),
+                    "Herdr plugin invocation directory",
+                )
+            }
+            None => (
+                process_cwd
+                    .context(
+                        "direct Tether invocation did not provide a process working directory",
+                    )?
+                    .to_path_buf(),
+                "process working directory",
+            ),
         };
-        if directory.is_empty()
-            || directory.len() > MAX_INVOCATION_DIRECTORY_BYTES
-            || directory.chars().any(char::is_control)
-        {
-            return None;
+
+        let directory_text = directory
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("{source} was not valid UTF-8"))?;
+        if directory_text.trim().is_empty() {
+            bail!("{source} was empty");
         }
-        let directory = PathBuf::from(directory);
+        if directory_text.len() > MAX_INVOCATION_DIRECTORY_BYTES {
+            bail!("{source} exceeded {MAX_INVOCATION_DIRECTORY_BYTES} bytes");
+        }
+        if directory_text.chars().any(char::is_control) {
+            bail!("{source} contained control characters");
+        }
         if !directory.is_absolute() {
-            return None;
+            bail!("{source} was not an absolute path");
         }
-        Some(Self { directory })
+        Ok(Some(Self { directory }))
     }
 
     pub fn directory(&self) -> &Path {
@@ -1038,6 +1134,31 @@ fn result_string(envelope: &Value, path: &[&str], description: &str) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_cwd_fallback_is_only_for_direct_invocation() {
+        let direct = InvocationLocation::from_absent_context(None, Path::new("/home/user/project"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.directory(), Path::new("/home/user/project"));
+
+        let error = InvocationLocation::from_absent_context(
+            Some(OsStr::new("/managed/plugin/checkout")),
+            Path::new("/managed/plugin/checkout"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not provide HERDR_PLUGIN_CONTEXT_JSON"));
+        assert!(error.contains("refusing to use HERDR_PLUGIN_ROOT"));
+
+        let malformed = InvocationLocation::from_values(
+            Some(r#"{"workspace_id":"w1","workspace_cwd":"relative"}"#),
+            Some(Path::new("/managed/plugin/checkout")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(malformed.contains("not an absolute path"), "{malformed}");
+    }
 
     #[test]
     fn plugin_pane_context_targets_the_invoking_pane() {

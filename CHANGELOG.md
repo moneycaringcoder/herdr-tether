@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Installed Tether picker actions now use the invoking pane's validated Herdr
+  context instead of the managed plugin checkout working directory. A unique
+  existing host retains ownership and ordering; an otherwise unknown exact
+  invocation directory is added only to the effective local picker host, while
+  multi-host ambiguity, malformed context, and invalid relative paths fail
+  closed. Herdr 0.8.0 context that carries ids but no CWD remains compatible:
+  it adds no location and never falls back to the plugin checkout.
+
 - An exact inspection judges the pane the workload was launched in, not whichever
   pane happens to be active. `pane_dead` and `pane_dead_status` are pane-scoped,
   and in `list-sessions` they resolve to the active pane of the session's current
