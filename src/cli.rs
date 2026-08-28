@@ -1293,12 +1293,12 @@ fn selection_from_picker(
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
     if let Some(invocation) = invocation.as_ref() {
-        place_invocation_repository(&mut options, invocation)?;
-        options.prefer_invocation_location_with_worktrees(
-            Some(invocation),
-            state,
-            &invocation_worktrees(invocation),
-        );
+        let already_offered = options.offers_invocation_location(invocation, state);
+        let worktrees = invocation_worktrees(invocation);
+        options.prefer_invocation_location_with_worktrees(Some(invocation), state, &worktrees);
+        if !already_offered {
+            options.add_authoritative_invocation_location(invocation)?;
+        }
     }
     retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
@@ -2299,37 +2299,6 @@ fn prune(store: &StateStore, args: PruneArgs, days: u64, source: &str) -> Result
     Ok(())
 }
 
-/// Places the invoking repository at the front of the effective local host.
-///
-/// Herdr runs a managed plugin pane from the plugin installation checkout. The
-/// authoritative invocation directory therefore has to be added explicitly;
-/// consulting the process CWD here would make the plugin checkout the default
-/// repository. A remote-only picker has no local destination and is unchanged.
-fn place_invocation_repository(
-    options: &mut PickerOptions,
-    location: &crate::herdr::InvocationLocation,
-) -> Result<()> {
-    let directory = location
-        .directory()
-        .to_str()
-        .context("Tether invocation repository path was not valid UTF-8")?;
-    let Some(local) = options.hosts.iter_mut().find(|host| {
-        host.name == "local" && host.target.is_none() && host.origin == PickerHostOrigin::Effective
-    }) else {
-        return Ok(());
-    };
-    if let Some(index) = local
-        .directories
-        .iter()
-        .position(|candidate| Path::new(candidate) == location.directory())
-    {
-        local.directories[..=index].rotate_right(1);
-    } else {
-        local.directories.insert(0, directory.to_owned());
-    }
-    Ok(())
-}
-
 /// Lists the worktrees sharing a repository with the invoking pane.
 ///
 /// Purely a picker preference, so an absent capability returns nothing: no
@@ -3014,44 +2983,6 @@ fn parse_preset(value: &str) -> std::result::Result<CommandPresetArg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn invocation_repository_precedes_the_plugin_checkout() {
-        let invocation = crate::herdr::InvocationLocation::from_plugin_context_json(Some(
-            r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/home/user/repository"}"#,
-        ))
-        .unwrap()
-        .unwrap();
-        let mut options = PickerOptions {
-            hosts: vec![crate::tui::PickerHost {
-                name: "local".to_owned(),
-                label: "local".to_owned(),
-                target: None,
-                origin: PickerHostOrigin::Effective,
-                directories: vec![
-                    "/home/user".to_owned(),
-                    "/managed/plugins/tether".to_owned(),
-                ],
-                scan_roots: vec!["/home/user".to_owned()],
-                commands: Vec::new(),
-                workloads: Vec::new(),
-                allow_existing: true,
-                allow_create: true,
-            }],
-            default_placement: Placement::SplitRight,
-        };
-
-        place_invocation_repository(&mut options, &invocation).unwrap();
-
-        assert_eq!(
-            options.hosts[0].directories,
-            [
-                "/home/user/repository",
-                "/home/user",
-                "/managed/plugins/tether"
-            ]
-        );
-    }
 
     /// Writes an executable script that never returns, so a probe run against it
     /// can only end on its deadline.

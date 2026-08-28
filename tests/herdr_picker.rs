@@ -1,4 +1,10 @@
-use std::{fs, io::Write, path::Path, sync::Mutex, time::SystemTime};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
+};
 
 #[cfg(unix)]
 use std::io::BufRead;
@@ -978,21 +984,21 @@ fn plugin_invocation_location_uses_only_documented_absolute_cwds() {
     let legacy = r#"{"workspace_id":"w1","tab_id":"w1:t1","focused_pane_id":"w1:p2","invocation_source":"action"}"#;
 
     assert_eq!(
-        InvocationLocation::from_plugin_context_json(Some(workspace))
+        InvocationLocation::from_plugin_context_json(workspace)
             .unwrap()
             .unwrap()
             .directory(),
         Path::new("/home/user/code")
     );
     assert_eq!(
-        InvocationLocation::from_plugin_context_json(Some(pane))
+        InvocationLocation::from_plugin_context_json(pane)
             .unwrap()
             .unwrap()
             .directory(),
         Path::new("/srv/shared")
     );
     assert_eq!(
-        InvocationLocation::from_plugin_context_json(Some(legacy)).unwrap(),
+        InvocationLocation::from_plugin_context_json(legacy).unwrap(),
         None,
         "Herdr 0.8.0 context without cwd must not use the plugin process cwd"
     );
@@ -1049,7 +1055,7 @@ fn malformed_present_plugin_invocation_context_fails_explicitly() {
     ];
 
     for (context, expected) in cases {
-        let error = InvocationLocation::from_plugin_context_json(Some(context))
+        let error = InvocationLocation::from_plugin_context_json(context)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1057,6 +1063,73 @@ fn malformed_present_plugin_invocation_context_fails_explicitly() {
             "unexpected error for {context:?}: {error}"
         );
     }
+}
+
+#[test]
+fn authoritative_invocation_is_added_only_when_no_existing_host_offers_it() {
+    let (config, state) = picker_fixture();
+
+    let existing = InvocationLocation::from_plugin_context_json(
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+    )
+    .unwrap()
+    .unwrap();
+    let mut existing_options =
+        PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    existing_options
+        .hosts
+        .iter_mut()
+        .find(|host| host.name == "build-box")
+        .unwrap()
+        .directories
+        .retain(|directory| directory != "/srv/shared");
+    let existing_offered = existing_options.offers_invocation_location(&existing, &state);
+    existing_options.prefer_invocation_location_with_worktrees(
+        Some(&existing),
+        &state,
+        &[PathBuf::from("/srv/configured")],
+    );
+    if !existing_offered {
+        existing_options
+            .add_authoritative_invocation_location(&existing)
+            .unwrap();
+    }
+    assert_eq!(existing_options.hosts[0].name, "build-box");
+    assert_eq!(
+        existing_options.hosts[0].directories,
+        ["/srv/configured", "/srv/recent"]
+    );
+    assert_eq!(
+        existing_options.hosts[0].workloads[0].id,
+        state.sessions[0].id
+    );
+    assert!(
+        existing_options.hosts[1]
+            .directories
+            .iter()
+            .all(|directory| directory != "/srv/shared"),
+        "a workload-only match must not duplicate its path onto local"
+    );
+
+    let unknown = InvocationLocation::from_plugin_context_json(
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/home/user/new-repository"}"#,
+    )
+    .unwrap()
+    .unwrap();
+    let mut unknown_options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
+    let unknown_offered = unknown_options.offers_invocation_location(&unknown, &state);
+    unknown_options.prefer_invocation_location(Some(&unknown), &state);
+    if !unknown_offered {
+        unknown_options
+            .add_authoritative_invocation_location(&unknown)
+            .unwrap();
+    }
+    assert_eq!(unknown_options.hosts[0].name, "local");
+    assert_eq!(
+        unknown_options.hosts[0].directories,
+        ["/home/user/new-repository", "/home/user/code", "/opt/work"],
+        "the authoritative invocation must prepend without erasing effective-local directories"
+    );
 }
 
 #[test]
@@ -1070,9 +1143,9 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
     });
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let before = options.clone();
-    let preference = InvocationLocation::from_plugin_context_json(Some(
+    let preference = InvocationLocation::from_plugin_context_json(
         r#"{"workspace_id":"w1","workspace_cwd":"/home/user/code","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
-    ))
+    )
     .unwrap()
     .unwrap();
 
@@ -1106,9 +1179,9 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
     assert_eq!(options.hosts[2], before.hosts[2]);
 
     let unchanged = options.clone();
-    let unknown = InvocationLocation::from_plugin_context_json(Some(
+    let unknown = InvocationLocation::from_plugin_context_json(
         r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/untrusted/not-configured"}"#,
-    ))
+    )
     .unwrap()
     .unwrap();
     options.prefer_invocation_location(Some(&unknown), &state);
@@ -1121,9 +1194,9 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
 fn worktree_siblings_are_preferred_after_the_invocation_directory() {
     let (config, state) = picker_fixture();
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
-    let preference = InvocationLocation::from_plugin_context_json(Some(
+    let preference = InvocationLocation::from_plugin_context_json(
         r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
-    ))
+    )
     .unwrap()
     .unwrap();
 
@@ -1152,9 +1225,9 @@ fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let with_worktrees = {
         let mut options = options.clone();
-        let preference = InvocationLocation::from_plugin_context_json(Some(
+        let preference = InvocationLocation::from_plugin_context_json(
             r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
-        ))
+        )
         .unwrap()
         .unwrap();
         options.prefer_invocation_location_with_worktrees(
@@ -1169,9 +1242,9 @@ fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
         );
         options
     };
-    let preference = InvocationLocation::from_plugin_context_json(Some(
+    let preference = InvocationLocation::from_plugin_context_json(
         r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
-    ))
+    )
     .unwrap()
     .unwrap();
     options.prefer_invocation_location(Some(&preference), &state);
@@ -1324,7 +1397,7 @@ fn a_submodule_checkout_is_preferred_without_promoting_its_git_directory() {
         r#"{{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"{}"}}"#,
         checkouts[0].display()
     );
-    let preference = InvocationLocation::from_plugin_context_json(Some(&context))
+    let preference = InvocationLocation::from_plugin_context_json(&context)
         .unwrap()
         .unwrap();
 
@@ -1369,13 +1442,19 @@ fn invocation_location_does_not_choose_between_ambiguous_hosts() {
     config.discovery.local_roots.push("/srv/shared".into());
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let before = options.clone();
-    let preference = InvocationLocation::from_plugin_context_json(Some(
+    let preference = InvocationLocation::from_plugin_context_json(
         r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
-    ))
+    )
     .unwrap()
     .unwrap();
 
+    let already_offered = options.offers_invocation_location(&preference, &state);
     options.prefer_invocation_location(Some(&preference), &state);
+    if !already_offered {
+        options
+            .add_authoritative_invocation_location(&preference)
+            .unwrap();
+    }
 
     assert_eq!(options, before);
 }

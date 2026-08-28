@@ -40,7 +40,7 @@ impl InvocationLocation {
     pub fn from_plugin_env() -> Result<Option<Self>> {
         let context = plugin_context_env()?;
         match context.as_deref() {
-            Some(context) => Self::from_plugin_context_json(Some(context)),
+            Some(context) => Self::from_plugin_context_json(context),
             None => {
                 let process_cwd = env::current_dir()
                     .context("determine the working directory for direct Tether invocation")?;
@@ -55,17 +55,10 @@ impl InvocationLocation {
     /// Pane context takes precedence over workspace context. If the pane field
     /// is present but unusable, the workspace field is not used as a fallback.
     /// Herdr 0.8.0 context legitimately omitted both CWD fields; that produces
-    /// no location rather than consulting the plugin process CWD. An absent JSON
-    /// value is intended only for direct/manual invocation.
-    pub fn from_plugin_context_json(plugin_context: Option<&str>) -> Result<Option<Self>> {
-        match plugin_context {
-            Some(context) => Self::from_values(Some(context), None),
-            None => {
-                let process_cwd = env::current_dir()
-                    .context("determine the working directory for direct Tether invocation")?;
-                Self::from_values(None, Some(&process_cwd))
-            }
-        }
+    /// no location rather than consulting the plugin process CWD. Direct/manual
+    /// fallback is deliberately confined to [`Self::from_plugin_env`].
+    pub fn from_plugin_context_json(plugin_context: &str) -> Result<Option<Self>> {
+        Self::from_values(Some(plugin_context), None)
     }
 
     fn from_absent_context(

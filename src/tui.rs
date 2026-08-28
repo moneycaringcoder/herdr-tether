@@ -300,10 +300,59 @@ impl PickerOptions {
         }
     }
 
-    /// Stably prioritizes entries already authorized by picker configuration or state.
+    /// Whether any configured or retained host already offers the invocation.
     ///
-    /// The invocation directory is only a preference: it cannot add a host,
-    /// directory, workload, command, or selection.
+    /// Both directory entries and persisted workloads count. Callers use this
+    /// before preference ordering so a unique existing host remains authoritative
+    /// and a path shared by multiple hosts remains ambiguous rather than being
+    /// duplicated onto local.
+    pub fn offers_invocation_location(
+        &self,
+        location: &crate::herdr::InvocationLocation,
+        state: &State,
+    ) -> bool {
+        self.hosts
+            .iter()
+            .any(|host| host_offers_invocation_location(host, state, location.directory()))
+    }
+
+    /// Adds a validated authoritative invocation to the effective local host.
+    ///
+    /// This is only for a location that no configured or retained host already
+    /// offers. Herdr plugin context may therefore add the otherwise unknown
+    /// invoking directory without changing configuration, while existing and
+    /// ambiguous host ownership stays untouched.
+    pub fn add_authoritative_invocation_location(
+        &mut self,
+        location: &crate::herdr::InvocationLocation,
+    ) -> Result<()> {
+        let directory = location
+            .directory()
+            .to_str()
+            .context("Tether invocation repository path was not valid UTF-8")?;
+        let Some(local) = self.hosts.iter_mut().find(|host| {
+            host.name == "local"
+                && host.target.is_none()
+                && host.origin == PickerHostOrigin::Effective
+        }) else {
+            return Ok(());
+        };
+        if let Some(index) = local
+            .directories
+            .iter()
+            .position(|candidate| Path::new(candidate) == location.directory())
+        {
+            local.directories[..=index].rotate_right(1);
+        } else {
+            local.directories.insert(0, directory.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Stably prioritizes entries already offered by picker configuration or state.
+    ///
+    /// This method only reorders. A caller may separately add an authoritative,
+    /// validated plugin invocation that no existing host offers.
     pub fn prefer_invocation_location(
         &mut self,
         location: Option<&crate::herdr::InvocationLocation>,
@@ -316,9 +365,9 @@ impl PickerOptions {
     ///
     /// Sibling worktrees of the pane's repository are the directories most
     /// likely wanted next, and they are easy to mistake for one another because
-    /// their basenames often differ only by branch. They are still only a
-    /// preference: an entry the picker does not already have stays absent, and
-    /// the exact invocation directory keeps priority over its siblings.
+    /// their basenames often differ only by branch. Worktrees remain a
+    /// preference over existing entries; only the separately validated exact
+    /// invocation directory may be added by the caller.
     pub fn prefer_invocation_location_with_worktrees(
         &mut self,
         location: Option<&crate::herdr::InvocationLocation>,
@@ -328,16 +377,11 @@ impl PickerOptions {
         let Some(directory) = location.map(crate::herdr::InvocationLocation::directory) else {
             return;
         };
-        let mut matching_hosts = self.hosts.iter().enumerate().filter(|(_, host)| {
-            host.directories
-                .iter()
-                .any(|candidate| Path::new(candidate) == directory)
-                || host.workloads.iter().any(|workload| {
-                    state.sessions.iter().any(|session| {
-                        session.id == workload.id && Path::new(&session.directory) == directory
-                    })
-                })
-        });
+        let mut matching_hosts = self
+            .hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| host_offers_invocation_location(host, state, directory));
         let Some((host_index, _)) = matching_hosts.next() else {
             return;
         };
@@ -363,6 +407,17 @@ impl PickerOptions {
             })
         });
     }
+}
+
+fn host_offers_invocation_location(host: &PickerHost, state: &State, directory: &Path) -> bool {
+    host.directories
+        .iter()
+        .any(|candidate| Path::new(candidate) == directory)
+        || host.workloads.iter().any(|workload| {
+            state.sessions.iter().any(|session| {
+                session.id == workload.id && Path::new(&session.directory) == directory
+            })
+        })
 }
 
 fn stable_prefer<T>(values: &mut [T], mut preferred: impl FnMut(&T) -> bool) {

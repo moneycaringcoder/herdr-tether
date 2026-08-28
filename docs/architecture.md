@@ -394,12 +394,19 @@ or backups. Cargo remains an installation/build prerequisite rather than a
 runtime setup dependency.
 
 The picker consumes only Herdr's documented optional `focused_pane_cwd` and
-`workspace_cwd` context fields, with pane context taking precedence. A match
-can stably reorder existing authorized picker entries; unknown, malformed, or
-multi-host ambiguous paths are ignored and never become new configuration or
-selection data. Plugin-managed failures cross one redaction boundary: raw
-error chains stay out of action logs, while a bounded validated
-`correlation_id` remains available for support.
+`workspace_cwd` context fields, with pane context taking precedence, and
+requires the corresponding non-empty pane or workspace id. A unique existing
+configured or retained host is promoted with its matching workloads and known
+sibling worktrees. When no host already offers the validated invocation path,
+the exact path is added to the effective local picker host without becoming
+configuration; reported sibling worktrees remain preferences over entries that
+already exist. A path offered by multiple hosts remains ambiguous and is
+neither promoted nor added elsewhere. Malformed JSON, wrong field types, empty
+ids, and invalid or relative CWDs fail closed. Valid legacy context with no CWD
+adds nothing, and installed execution never substitutes the plugin checkout's
+process CWD. Plugin-managed failures cross one redaction boundary: raw error
+chains stay out of action logs, while a bounded validated `correlation_id`
+remains available for support.
 
 The official-Herdr product smoke drives the installed `prefix+t` action through
 Herdr's PTY at 80×24 and 48×14, verifies semantic picker transitions using only
