@@ -37,7 +37,7 @@ impl InvocationLocation {
     /// fallback is available only when both plugin context and the plugin-root
     /// signal are absent; Herdr runs plugin commands from their installation
     /// checkout, which must never become the invoking user's repository.
-    pub fn from_plugin_env() -> Result<Self> {
+    pub fn from_plugin_env() -> Result<Option<Self>> {
         let context = plugin_context_env()?;
         match context.as_deref() {
             Some(context) => Self::from_plugin_context_json(Some(context)),
@@ -54,8 +54,10 @@ impl InvocationLocation {
     ///
     /// Pane context takes precedence over workspace context. If the pane field
     /// is present but unusable, the workspace field is not used as a fallback.
-    /// An absent JSON value is intended only for direct/manual invocation.
-    pub fn from_plugin_context_json(plugin_context: Option<&str>) -> Result<Self> {
+    /// Herdr 0.8.0 context legitimately omitted both CWD fields; that produces
+    /// no location rather than consulting the plugin process CWD. An absent JSON
+    /// value is intended only for direct/manual invocation.
+    pub fn from_plugin_context_json(plugin_context: Option<&str>) -> Result<Option<Self>> {
         match plugin_context {
             Some(context) => Self::from_values(Some(context), None),
             None => {
@@ -66,7 +68,10 @@ impl InvocationLocation {
         }
     }
 
-    fn from_absent_context(plugin_root: Option<&OsStr>, process_cwd: &Path) -> Result<Self> {
+    fn from_absent_context(
+        plugin_root: Option<&OsStr>,
+        process_cwd: &Path,
+    ) -> Result<Option<Self>> {
         if plugin_root.is_some_and(|root| !root.to_string_lossy().trim().is_empty()) {
             bail!(
                 "Herdr plugin execution did not provide HERDR_PLUGIN_CONTEXT_JSON; refusing to use HERDR_PLUGIN_ROOT as the invocation repository"
@@ -75,7 +80,10 @@ impl InvocationLocation {
         Self::from_values(None, Some(process_cwd))
     }
 
-    fn from_values(plugin_context: Option<&str>, process_cwd: Option<&Path>) -> Result<Self> {
+    fn from_values(
+        plugin_context: Option<&str>,
+        process_cwd: Option<&Path>,
+    ) -> Result<Option<Self>> {
         let (directory, source) = match plugin_context {
             Some(plugin_context) => {
                 let context: Value = serde_json::from_str(plugin_context)
@@ -106,22 +114,19 @@ impl InvocationLocation {
                         })?,
                         "focused_pane_id",
                     ),
-                    None => (
-                        context
-                            .get("workspace_cwd")
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Herdr plugin context did not report an invocation directory"
-                                )
-                            })?
-                            .as_str()
-                            .ok_or_else(|| {
+                    None => {
+                        let Some(value) = context.get("workspace_cwd") else {
+                            return Ok(None);
+                        };
+                        (
+                            value.as_str().ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "HERDR_PLUGIN_CONTEXT_JSON workspace_cwd was not a string"
                                 )
                             })?,
-                        "workspace_id",
-                    ),
+                            "workspace_id",
+                        )
+                    }
                 };
                 if !context.contains_key(id_name) {
                     bail!(
@@ -158,7 +163,7 @@ impl InvocationLocation {
         if !directory.is_absolute() {
             bail!("{source} was not an absolute path");
         }
-        Ok(Self { directory })
+        Ok(Some(Self { directory }))
     }
 
     pub fn directory(&self) -> &Path {
@@ -1139,8 +1144,9 @@ mod tests {
 
     #[test]
     fn process_cwd_fallback_is_only_for_direct_invocation() {
-        let direct =
-            InvocationLocation::from_absent_context(None, Path::new("/home/user/project")).unwrap();
+        let direct = InvocationLocation::from_absent_context(None, Path::new("/home/user/project"))
+            .unwrap()
+            .unwrap();
         assert_eq!(direct.directory(), Path::new("/home/user/project"));
 
         let error = InvocationLocation::from_absent_context(

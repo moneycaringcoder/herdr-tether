@@ -1292,12 +1292,14 @@ fn selection_from_picker(
         .context("resolve Tether invocation repository")?;
     let home = env::var("HOME").unwrap_or_else(|_| "~".to_owned());
     let mut options = PickerOptions::from_config_state(&picker_config, state, &home, include_local);
-    place_invocation_repository(&mut options, &invocation)?;
-    options.prefer_invocation_location_with_worktrees(
-        Some(&invocation),
-        state,
-        &invocation_worktrees(&invocation),
-    );
+    if let Some(invocation) = invocation.as_ref() {
+        place_invocation_repository(&mut options, invocation)?;
+        options.prefer_invocation_location_with_worktrees(
+            Some(invocation),
+            state,
+            &invocation_worktrees(invocation),
+        );
+    }
     retain_requested_host_groups(&mut options, requested_host);
     if args.directory.is_some() || args.command.is_some() || args.preset.is_some() {
         options
@@ -3018,6 +3020,7 @@ mod tests {
         let invocation = crate::herdr::InvocationLocation::from_plugin_context_json(Some(
             r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/home/user/repository"}"#,
         ))
+        .unwrap()
         .unwrap();
         let mut options = PickerOptions {
             hosts: vec![crate::tui::PickerHost {
