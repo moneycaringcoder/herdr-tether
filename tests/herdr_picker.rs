@@ -972,15 +972,10 @@ fn picker_fixture() -> (Config, State) {
 
 #[test]
 fn plugin_invocation_location_uses_only_documented_absolute_cwds() {
-    let global = r#"{"invocation_source":"command_palette","correlation_id":"global-1"}"#;
     let workspace =
         r#"{"workspace_id":"w1","workspace_cwd":"/home/user/code","invocation_source":"action"}"#;
-    let pane = r#"{"workspace_cwd":"/home/user/code","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#;
+    let pane = r#"{"workspace_id":"w1","workspace_cwd":"/home/user/code","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#;
 
-    assert_eq!(
-        InvocationLocation::from_plugin_context_json(Some(global)),
-        None
-    );
     assert_eq!(
         InvocationLocation::from_plugin_context_json(Some(workspace))
             .unwrap()
@@ -996,29 +991,66 @@ fn plugin_invocation_location_uses_only_documented_absolute_cwds() {
 }
 
 #[test]
-fn plugin_invocation_location_rejects_hostile_unknown_and_missing_context() {
-    let oversized = format!(r#"{{"focused_pane_cwd":"/{}"}}"#, "a".repeat(4096));
+fn malformed_present_plugin_invocation_context_fails_explicitly() {
+    let oversized = format!(
+        r#"{{"workspace_id":"w1","focused_pane_id":"w1:p1","focused_pane_cwd":"/{}"}}"#,
+        "a".repeat(4096)
+    );
     let cases = [
-        None,
-        Some(""),
-        Some("{"),
-        Some("[]"),
-        Some(r#"{"focused_pane_cwd":17,"workspace_cwd":"/safe"}"#),
-        Some(r#"{"focused_pane_cwd":"","workspace_cwd":"/safe"}"#),
-        Some(r#"{"focused_pane_cwd":"relative","workspace_cwd":"/safe"}"#),
-        Some("{\"focused_pane_cwd\":\"/safe\\u0000hostile\"}"),
-        Some("{\"focused_pane_cwd\":\"/safe\\u001fhostile\"}"),
-        Some(r#"{"workspace_cwd":false}"#),
-        Some(r#"{"workspace_cwd":"relative"}"#),
-        Some(r#"{"clicked_url":"file:///srv/shared","host":"build-box"}"#),
-        Some(oversized.as_str()),
+        ("", "decode HERDR_PLUGIN_CONTEXT_JSON"),
+        ("{", "decode HERDR_PLUGIN_CONTEXT_JSON"),
+        ("[]", "was not a JSON object"),
+        (
+            r#"{"workspace_id":"w1","focused_pane_id":"w1:p1","focused_pane_cwd":17,"workspace_cwd":"/safe"}"#,
+            "focused_pane_cwd was not a string",
+        ),
+        (
+            r#"{"workspace_id":"w1","focused_pane_id":"w1:p1","focused_pane_cwd":"","workspace_cwd":"/safe"}"#,
+            "invocation directory was empty",
+        ),
+        (
+            r#"{"workspace_id":"w1","focused_pane_id":"w1:p1","focused_pane_cwd":"relative","workspace_cwd":"/safe"}"#,
+            "was not an absolute path",
+        ),
+        (
+            "{\"workspace_id\":\"w1\",\"focused_pane_id\":\"w1:p1\",\"focused_pane_cwd\":\"/safe\\u0000hostile\"}",
+            "contained control characters",
+        ),
+        (
+            r#"{"workspace_id":"w1","workspace_cwd":false}"#,
+            "workspace_cwd was not a string",
+        ),
+        (
+            r#"{"workspace_id":"w1","workspace_cwd":"relative"}"#,
+            "was not an absolute path",
+        ),
+        (
+            r#"{"workspace_id":"","workspace_cwd":"/safe"}"#,
+            "empty HERDR_PLUGIN_CONTEXT_JSON workspace_id",
+        ),
+        (
+            r#"{"workspace_id":"w1","focused_pane_id":false,"workspace_cwd":"/safe"}"#,
+            "focused_pane_id was not a string",
+        ),
+        (
+            r#"{"workspace_id":"w1","focused_pane_cwd":"/safe"}"#,
+            "without focused_pane_id",
+        ),
+        (r#"{"workspace_cwd":"/safe"}"#, "without workspace_id"),
+        (
+            r#"{"invocation_source":"command_palette","correlation_id":"global-1"}"#,
+            "did not report an invocation directory",
+        ),
+        (oversized.as_str(), "exceeded 4096 bytes"),
     ];
 
-    for context in cases {
-        assert_eq!(
-            InvocationLocation::from_plugin_context_json(context),
-            None,
-            "unexpected preference for {context:?}"
+    for (context, expected) in cases {
+        let error = InvocationLocation::from_plugin_context_json(Some(context))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "unexpected error for {context:?}: {error}"
         );
     }
 }
@@ -1035,10 +1067,11 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let before = options.clone();
     let preference = InvocationLocation::from_plugin_context_json(Some(
-        r#"{"workspace_cwd":"/home/user/code","focused_pane_cwd":"/srv/shared"}"#,
-    ));
+        r#"{"workspace_id":"w1","workspace_cwd":"/home/user/code","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+    ))
+    .unwrap();
 
-    options.prefer_invocation_location(preference.as_ref(), &state);
+    options.prefer_invocation_location(Some(&preference), &state);
 
     assert_eq!(
         options
@@ -1069,9 +1102,10 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
 
     let unchanged = options.clone();
     let unknown = InvocationLocation::from_plugin_context_json(Some(
-        r#"{"focused_pane_cwd":"/untrusted/not-configured"}"#,
-    ));
-    options.prefer_invocation_location(unknown.as_ref(), &state);
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/untrusted/not-configured"}"#,
+    ))
+    .unwrap();
+    options.prefer_invocation_location(Some(&unknown), &state);
     assert_eq!(options, unchanged);
     options.prefer_invocation_location(None, &state);
     assert_eq!(options, unchanged);
@@ -1081,12 +1115,14 @@ fn invocation_location_stably_prioritizes_only_authorized_picker_entries() {
 fn worktree_siblings_are_preferred_after_the_invocation_directory() {
     let (config, state) = picker_fixture();
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
-    let preference =
-        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
+    let preference = InvocationLocation::from_plugin_context_json(Some(
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+    ))
+    .unwrap();
 
     // `/srv/configured` stands in for a sibling worktree of the same repository.
     options.prefer_invocation_location_with_worktrees(
-        preference.as_ref(),
+        Some(&preference),
         &state,
         &[std::path::PathBuf::from("/srv/configured")],
     );
@@ -1110,10 +1146,11 @@ fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
     let with_worktrees = {
         let mut options = options.clone();
         let preference = InvocationLocation::from_plugin_context_json(Some(
-            r#"{"focused_pane_cwd":"/srv/shared"}"#,
-        ));
+            r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+        ))
+        .unwrap();
         options.prefer_invocation_location_with_worktrees(
-            preference.as_ref(),
+            Some(&preference),
             &state,
             // A real worktree the picker has no entry for, and one that is not a
             // directory of this host at all.
@@ -1124,9 +1161,11 @@ fn worktree_siblings_never_add_a_directory_the_picker_lacks() {
         );
         options
     };
-    let preference =
-        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
-    options.prefer_invocation_location(preference.as_ref(), &state);
+    let preference = InvocationLocation::from_plugin_context_json(Some(
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+    ))
+    .unwrap();
+    options.prefer_invocation_location(Some(&preference), &state);
 
     // Worktree paths are a preference over entries that already exist. An
     // unknown path must not appear, and must not change the ordering either.
@@ -1272,8 +1311,11 @@ fn a_submodule_checkout_is_preferred_without_promoting_its_git_directory() {
         checkouts[0].display().to_string(),
     ];
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
-    let context = format!(r#"{{"focused_pane_cwd":"{}"}}"#, checkouts[0].display());
-    let preference = InvocationLocation::from_plugin_context_json(Some(&context));
+    let context = format!(
+        r#"{{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"{}"}}"#,
+        checkouts[0].display()
+    );
+    let preference = InvocationLocation::from_plugin_context_json(Some(&context)).unwrap();
 
     let socket = temp.path().join("herdr.sock");
     let reported = vec![
@@ -1286,11 +1328,7 @@ fn a_submodule_checkout_is_preferred_without_promoting_its_git_directory() {
         .unwrap();
     server.join().unwrap();
 
-    options.prefer_invocation_location_with_worktrees(
-        preference.as_ref(),
-        &state,
-        &worktrees.paths,
-    );
+    options.prefer_invocation_location_with_worktrees(Some(&preference), &state, &worktrees.paths);
 
     // The invoking checkout first, the submodule checkout pulled ahead of the
     // rest, and the submodule's Git directory left where it was, behind the
@@ -1320,10 +1358,12 @@ fn invocation_location_does_not_choose_between_ambiguous_hosts() {
     config.discovery.local_roots.push("/srv/shared".into());
     let mut options = PickerOptions::from_config_state(&config, &state, "/home/user", true);
     let before = options.clone();
-    let preference =
-        InvocationLocation::from_plugin_context_json(Some(r#"{"focused_pane_cwd":"/srv/shared"}"#));
+    let preference = InvocationLocation::from_plugin_context_json(Some(
+        r#"{"workspace_id":"w1","focused_pane_id":"w1:p2","focused_pane_cwd":"/srv/shared"}"#,
+    ))
+    .unwrap();
 
-    options.prefer_invocation_location(preference.as_ref(), &state);
+    options.prefer_invocation_location(Some(&preference), &state);
 
     assert_eq!(options, before);
 }
